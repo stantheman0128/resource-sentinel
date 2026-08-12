@@ -385,19 +385,29 @@ if ($null -ne $tg -and $tg.enabled) {
         } catch { }
         if ($null -ne $tg.chat_id) { $chat = [string]$tg.chat_id }
         if ($token -and $chat) {
+            $tpl = $null
+            try { $tpl = Get-Content (Join-Path $PSScriptRoot 'messages.json') -Raw | ConvertFrom-Json } catch { }
             $topTree = ''
-            if ($trees.Count -gt 0) {
-                $topTree = " | top: $($trees[0].root)#$($trees[0].pid) $($trees[0].ram_mb)MB"
+            if ($trees.Count -gt 0 -and $null -ne $tpl) {
+                $topTree = $tpl.top_tree.Replace('{root}', $trees[0].root).
+                    Replace('{pid}', [string]$trees[0].pid).
+                    Replace('{ram_mb}', [string]$trees[0].ram_mb)
             }
-            $msg = if ($fire) {
-                "[sentinel] RED for $($alertState.streak) min. CPU5m $cpu5% RAM $ramUsedPct% C: $sysFreeGb GB free$topTree"
+            $msg = if ($null -eq $tpl) {
+                "[sentinel] light=$light CPU5m $cpu5% RAM $ramUsedPct%"
+            } elseif ($fire) {
+                $tpl.red_alert.Replace('{streak}', [string]$alertState.streak).
+                    Replace('{cpu}', [string]$cpu5).Replace('{ram}', [string]$ramUsedPct).
+                    Replace('{disk}', [string]$sysFreeGb).Replace('{top}', $topTree)
             } else {
-                "[sentinel] recovered: GREEN. CPU5m $cpu5% RAM $ramUsedPct%"
+                $tpl.recovered.Replace('{cpu}', [string]$cpu5).Replace('{ram}', [string]$ramUsedPct)
             }
             try {
+                $body = "chat_id=$chat&text=" + [uri]::EscapeDataString($msg)
                 Invoke-RestMethod -Uri "https://api.telegram.org/bot$token/sendMessage" `
                     -Method Post -TimeoutSec 5 `
-                    -Body @{ chat_id = $chat; text = $msg } | Out-Null
+                    -ContentType 'application/x-www-form-urlencoded; charset=utf-8' `
+                    -Body ([System.Text.Encoding]::UTF8.GetBytes($body)) | Out-Null
                 if ($fire) { $alertState.last_ts = $nowEpochA; $alertState.active = $true }
                 if ($clear) { $alertState.active = $false }
             } catch { }
@@ -604,6 +614,11 @@ if ((Test-Path $dashSrc) -and (
         -not (Test-Path $dashDst) -or
         (Get-Item $dashSrc).LastWriteTime -gt (Get-Item $dashDst).LastWriteTime)) {
     Copy-Item $dashSrc $dashDst -Force
+}
+
+# ---------- optional heartbeat ping (external dead-man switch) ----------
+if ($null -ne $config.heartbeat_url -and $config.heartbeat_url) {
+    try { Invoke-RestMethod -Uri $config.heartbeat_url -TimeoutSec 4 | Out-Null } catch { }
 }
 
 Write-Output "OK light=$light cpu=$cpuTotal ram=$ramUsedPct gpu=$($gpu.util_pct) sysfree=$sysFreeGb trees=$($trees.Count) writers=$($topWriters.Count)"

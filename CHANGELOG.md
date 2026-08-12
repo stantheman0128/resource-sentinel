@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.0 - 2026-08-13
+
+- 排隊制取代單純搶槽：queue.json FIFO、gate 回報佇列位置、10 分鐘未續期自動出隊
+- wait-slot.ps1：被擋 session 跑它保持 active，輪到（隊首＋槽空＋綠/黃燈）即刻返回
+- Telegram 全中文化：messages.json 模板（ASCII 轉義），雙發送端改 UTF-8 URL 編碼
+  修 PS 5.1 hashtable body 中文亂碼雷
+- 看門狗 ResourceSentinelWatchdog（每 5 分鐘）：狀態檔過期先自動重啟採集器，
+  救回/救不回各發中文通知，60 分鐘冷卻；config.heartbeat_url 預留外部 dead-man 接口
+- 驗證：排隊三路徑（擋+報位/放行佔槽/waiter 等到釋放秒過）、看門狗健康靜默、
+  中文訊息實送成功
+
 ## 0.7.0 - 2026-08-13
 
 - Telegram 警報：紅燈連續 5 分鐘發警報、回綠發解除，冷卻 60 分鐘

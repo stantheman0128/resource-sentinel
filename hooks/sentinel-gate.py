@@ -133,10 +133,12 @@ def block(msg):
 
 
 def waiter_hint(pos):
-    return ("你在佇列第 %d 位。要保持等待直到輪到你，執行："
-            "powershell -NoProfile -ExecutionPolicy Bypass -File \"%s\""
-            "（會阻塞到輪到你或 8 分鐘超時，Bash timeout 請設 600000）。"
-            "不想等就先做輕量步驟，稍後重試原指令。" % (pos, WAITER))
+    return ("你在佇列第 %d 位。【不要結束回合、不要只說稍後再試】依序做："
+            "(1) 若有可先做的輕量步驟（讀檔、小改、寫文件）先做完它們；"
+            "(2) 然後執行 powershell -NoProfile -ExecutionPolicy Bypass -File \"%s\" "
+            "並把 Bash timeout 參數設 600000——它會阻塞到輪到你才返回；"
+            "(3) 返回顯示 your turn 後，立刻重跑原本被擋的指令。"
+            "整段流程不需要使用者介入。" % (pos, WAITER))
 
 
 def main():

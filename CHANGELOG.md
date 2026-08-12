@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.10.0 - 2026-08-13
+
+- Stop hook sentinel-stop.py（Stan 明確核可）：session 在重活佇列中想結束回合會被擋回、
+  命令跑 waiter；最多擋 3 次後自動移出佇列放行，防無限迴圈
+- RAM 約束：RAM 達橘燈閾值時對 agent 樹 >300MB 進程做 working set trim
+  （實測釋放 442MB/616MB），10 分鐘防重複，events.log 記錄
+- SSD I/O 約束：橘/紅燈 agent 進程 I/O 優先權降 Low、綠燈恢復 Normal
+  （NtSetInformationProcess，與 CPU 降級同進退）
+- heartbeat 已接 healthchecks.io（Stan 提供 ping URL），整機失聯 10 分鐘雲端通知
+- gate 擋下訊息改指令式三步驟；Codex AGENTS.md 補 waiter 用法
+
 ## 0.9.0 - 2026-08-13
 
 - 每 session 進程明細：採集器輸出每棵樹 RAM 前 8 名成員（top_members），

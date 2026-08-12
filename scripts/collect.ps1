@@ -431,6 +431,29 @@ if ($null -ne $prev -and $null -ne $prev.demoted) {
 }
 $throttleOn = ($light -eq 'ORANGE' -or $light -eq 'RED')
 if ($null -ne $config.throttle_enable -and -not $config.throttle_enable) { $throttleOn = $false }
+
+# native helpers: working-set trim (RAM relief) + per-process IO priority (SSD relief)
+if (-not ('SentinelNative' -as [type])) {
+    try {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class SentinelNative {
+    [DllImport("psapi.dll")]
+    public static extern bool EmptyWorkingSet(IntPtr hProcess);
+    [DllImport("ntdll.dll")]
+    public static extern int NtSetInformationProcess(IntPtr hProcess, int cls, ref int info, int len);
+}
+"@
+    } catch { }
+}
+function Set-IoPriority($proc, [int]$level) {   # 33 = ProcessIoPriority; 1 Low, 2 Normal
+    try {
+        $v = $level
+        [SentinelNative]::NtSetInformationProcess($proc.Handle, 33, [ref]$v, 4) | Out-Null
+    } catch { }
+}
+
 if ($throttleOn) {
     foreach ($pid_ in $treeOf.Keys) {
         $key = [string]$pid_
@@ -441,6 +464,7 @@ if ($throttleOn) {
                 $proc.PriorityClass = 'BelowNormal'
                 if (-not $demoted.ContainsKey($key)) { $demoted[$key] = $orig }
             }
+            Set-IoPriority $proc 1   # SSD: agent IO gives way to desktop/RDP
         } catch { }
     }
 } elseif ($light -eq 'GREEN') {
@@ -455,9 +479,46 @@ if ($throttleOn) {
                 if ($demoted.ContainsKey($key)) { $target = $demoted[$key] }
                 $proc.PriorityClass = $target
             }
+            Set-IoPriority $proc 2
         } catch { }
     }
     $demoted = @{}
+}
+
+# ---------- RAM guard: trim working sets of fat agent procs when RAM tight ----------
+# Non-lethal: idle pages move to the pagefile, physical RAM frees immediately,
+# the process just slows down. Same pid not re-trimmed within 10 minutes.
+$trims = @{}
+if ($null -ne $prev -and $null -ne $prev.trims) {
+    foreach ($tp in $prev.trims.PSObject.Properties) { $trims[$tp.Name] = [double]$tp.Value }
+}
+$trimCount = 0
+$trimTargetMb = 0
+if ($ramUsedPct -ge $config.ram_orange_pct) {
+    $nowEpochT = [double]((Get-Date).ToUniversalTime() - (Get-Date '1970-01-01')).TotalSeconds
+    foreach ($pid_ in $treeOf.Keys) {
+        if (-not $byId.ContainsKey($pid_)) { continue }
+        $node = $byId[$pid_]
+        if ([long]$node.WorkingSetSize -lt 300MB) { continue }
+        $key = [string]$pid_
+        if ($trims.ContainsKey($key) -and ($nowEpochT - $trims[$key]) -lt 600) { continue }
+        try {
+            $proc = Get-Process -Id $pid_ -ErrorAction Stop
+            if ([SentinelNative]::EmptyWorkingSet($proc.Handle)) {
+                $trims[$key] = $nowEpochT
+                $trimCount++
+                $trimTargetMb += [math]::Round([long]$node.WorkingSetSize / 1MB, 0)
+            }
+        } catch { }
+    }
+    if ($trimCount -gt 0) {
+        $evt = [ordered]@{ ts = $nowStr; type = 'ram_trim'; procs = $trimCount
+                           target_mb = $trimTargetMb; ram_used_pct = $ramUsedPct }
+        ($evt | ConvertTo-Json -Compress) | Add-Content $eventsPath -Encoding ascii
+    }
+}
+foreach ($key in @($trims.Keys)) {
+    if (-not $byId.ContainsKey([uint32]$key)) { $trims.Remove($key) }
 }
 # drop entries for dead pids so the map never grows unbounded
 foreach ($key in @($demoted.Keys)) {
@@ -508,7 +569,7 @@ foreach ($p in $procs) {
 }
 $stateDrives = @{}
 foreach ($d in $disks) { $stateDrives[$d.drive] = $d.free_gb }
-$state = @{ ts = $nowStr; drives = $stateDrives; procs = $stateProcs; peaks = $peaks; demoted = $demoted; alert = $alertState }
+$state = @{ ts = $nowStr; drives = $stateDrives; procs = $stateProcs; peaks = $peaks; demoted = $demoted; alert = $alertState; trims = $trims }
 $tmp = "$statePath.tmp"
 ($state | ConvertTo-Json -Depth 4 -Compress) | Out-File $tmp -Encoding ascii
 Move-Item -Force $tmp $statePath

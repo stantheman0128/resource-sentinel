@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.0 - 2026-08-13
+
+- Claude Code hook `sentinel-inject.py`（spec 第 3 步）：每輪注入一行狀態、黃/紅燈升級警告、
+  監控失效偵測、session pid+cwd 登記（沿祖先鏈找 agent 進程，修 shell 隔層問題）
+- 歷史帳本（spec 第 4 步）：session→repo 歸因、per-repo 峰值 RAM 統計（最近 20 筆＋中位數）、
+  修 treeOf uint32/int32 型別 bug
+- Codex 全域 AGENTS.md 接入＋Cursor 貼規則說明（spec 第 5 步，docs/agent-integration.md）
+- README、儀表板樹標籤加 repo 名
+
 ## 0.3.0 - 2026-08-13
 
 - 靜態儀表板 dashboard.html（spec 第 2 步收尾＋Stan 新需求）

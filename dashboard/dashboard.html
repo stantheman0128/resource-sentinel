@@ -161,7 +161,7 @@ if (!S) {
     h += '</table>';
     if (trees.length) {
       h += '<div style="margin-top:8px" class="empty">最大樹：' + trees.slice(0, 4).map(t =>
-        `${t.root}#${t.pid} ${t.ram_mb}MB/${t.procs}procs`).join('　') + '</div>';
+        `${t.root}#${t.pid}${t.repo ? '（' + t.repo + '）' : ''} ${t.ram_mb}MB/${t.procs}procs`).join('　') + '</div>';
     }
     document.getElementById('agents').innerHTML = h;
   }

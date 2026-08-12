@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.0 - 2026-08-13
+
+- Telegram 警報：紅燈連續 5 分鐘發警報、回綠發解除，冷卻 60 分鐘
+  - 共用 mobile-oss bot，config 只存 .env 路徑，token 不進 repo
+  - 實測發送成功（message_id=8）
+- 已知限制：採集器本身掛掉就發不了警報（dead man's switch 需外部服務，未做）
+
 ## 0.6.0 - 2026-08-13
 
 - 中樞調控上線（Stan 核可：槽數 1、黃軟/橘紅硬擋）

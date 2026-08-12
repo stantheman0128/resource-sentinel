@@ -358,6 +358,53 @@ if ($ramUsedPct -ge $config.ram_orange_pct -or $cpu5 -ge $config.cpu_orange_pct 
 if ($ramUsedPct -ge $config.ram_red_pct -or $cpu5 -ge $config.cpu_red_pct -or
     $sysFreeGb -le $config.disk_red_gb) { $light = 'RED' }
 
+# ---------- telegram alert: sustained RED -> alert; recovery -> all-clear ----------
+$alertState = @{ streak = 0; last_ts = [double]0; active = $false }
+if ($null -ne $prev -and $null -ne $prev.alert) {
+    $alertState.streak  = [int]$prev.alert.streak
+    $alertState.last_ts = [double]$prev.alert.last_ts
+    $alertState.active  = [bool]$prev.alert.active
+}
+if ($light -eq 'RED') { $alertState.streak++ } else { $alertState.streak = 0 }
+
+$tg = $config.telegram
+if ($null -ne $tg -and $tg.enabled) {
+    $nowEpochA = [double]((Get-Date).ToUniversalTime() - (Get-Date '1970-01-01')).TotalSeconds
+    $redAfter = 5;   if ($null -ne $tg.red_after_samples) { $redAfter = [int]$tg.red_after_samples }
+    $cooldown = 60;  if ($null -ne $tg.cooldown_min) { $cooldown = [int]$tg.cooldown_min }
+    $fire = ($alertState.streak -ge $redAfter -and
+             ($nowEpochA - $alertState.last_ts) -gt $cooldown * 60)
+    $clear = ($alertState.active -and $light -eq 'GREEN')
+    if ($fire -or $clear) {
+        $token = $null; $chat = $null
+        try {
+            foreach ($ln in (Get-Content $tg.env_path)) {
+                if ($ln -match '^TELEGRAM_BOT_TOKEN=(.+)$') { $token = $Matches[1].Trim() }
+                if ($ln -match '^TELEGRAM_ALLOWED_IDS=(.+)$') { $chat = $Matches[1].Split(',')[0].Trim() }
+            }
+        } catch { }
+        if ($null -ne $tg.chat_id) { $chat = [string]$tg.chat_id }
+        if ($token -and $chat) {
+            $topTree = ''
+            if ($trees.Count -gt 0) {
+                $topTree = " | top: $($trees[0].root)#$($trees[0].pid) $($trees[0].ram_mb)MB"
+            }
+            $msg = if ($fire) {
+                "[sentinel] RED for $($alertState.streak) min. CPU5m $cpu5% RAM $ramUsedPct% C: $sysFreeGb GB free$topTree"
+            } else {
+                "[sentinel] recovered: GREEN. CPU5m $cpu5% RAM $ramUsedPct%"
+            }
+            try {
+                Invoke-RestMethod -Uri "https://api.telegram.org/bot$token/sendMessage" `
+                    -Method Post -TimeoutSec 5 `
+                    -Body @{ chat_id = $chat; text = $msg } | Out-Null
+                if ($fire) { $alertState.last_ts = $nowEpochA; $alertState.active = $true }
+                if ($clear) { $alertState.active = $false }
+            } catch { }
+        }
+    }
+}
+
 # ---------- central throttle: demote agent trees to BelowNormal on ORANGE/RED ----------
 # Works on ANY agent process tree regardless of whether the agent reads status.md.
 # Never kills; only lowers CPU scheduling priority. Restores on GREEN (hysteresis).
@@ -444,7 +491,7 @@ foreach ($p in $procs) {
 }
 $stateDrives = @{}
 foreach ($d in $disks) { $stateDrives[$d.drive] = $d.free_gb }
-$state = @{ ts = $nowStr; drives = $stateDrives; procs = $stateProcs; peaks = $peaks; demoted = $demoted }
+$state = @{ ts = $nowStr; drives = $stateDrives; procs = $stateProcs; peaks = $peaks; demoted = $demoted; alert = $alertState }
 $tmp = "$statePath.tmp"
 ($state | ConvertTo-Json -Depth 4 -Compress) | Out-File $tmp -Encoding ascii
 Move-Item -Force $tmp $statePath

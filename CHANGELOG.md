@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.11.0 - 2026-08-13
+
+- SSD 定位修正（Stan 釐清）：不進排程，專職突縮偵測
+  - 單分鐘剩餘空間縮 ≥5 GB（disk_alert_gb 可調）→ Telegram 通知，
+    附前三名嫌疑寫入者，每磁碟 30 分鐘冷卻
+  - 由你判斷要不要清理；agent 可代查 events.log 完整記錄
+
 ## 0.10.0 - 2026-08-13
 
 - Stop hook sentinel-stop.py（Stan 明確核可）：session 在重活佇列中想結束回合會被擋回、

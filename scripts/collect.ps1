@@ -422,6 +422,50 @@ if ($null -ne $tg -and $tg.enabled) {
     }
 }
 
+# ---------- disk-shrink alert: sharp free-space drop -> telegram with suspects ----------
+$diskAlerts = @{}
+if ($null -ne $prev -and $null -ne $prev.disk_alerts) {
+    foreach ($da in $prev.disk_alerts.PSObject.Properties) { $diskAlerts[$da.Name] = [double]$da.Value }
+}
+if ($null -ne $tg -and $tg.enabled -and $null -ne $prev -and $null -ne $prev.drives) {
+    $shrinkGb = 5; if ($null -ne $config.disk_alert_gb) { $shrinkGb = [double]$config.disk_alert_gb }
+    $nowEpochD = [double]((Get-Date).ToUniversalTime() - (Get-Date '1970-01-01')).TotalSeconds
+    foreach ($d in $disks) {
+        $oldFree = $prev.drives.($d.drive)
+        if ($null -eq $oldFree) { continue }
+        $delta = [math]::Round($d.free_gb - [double]$oldFree, 1)
+        if ($delta -gt -$shrinkGb) { continue }
+        $lastA = 0; if ($diskAlerts.ContainsKey($d.drive)) { $lastA = $diskAlerts[$d.drive] }
+        if (($nowEpochD - $lastA) -lt 1800) { continue }   # 30 min cooldown per drive
+        $tpl2 = $null
+        try { $tpl2 = Get-Content (Join-Path $PSScriptRoot 'messages.json') -Raw | ConvertFrom-Json } catch { }
+        if ($null -eq $tpl2) { continue }
+        $sus = @($topWriters | Select-Object -First 3 | ForEach-Object { "$($_.name) $($_.mb)MB" }) -join ', '
+        if (-not $sus) { $sus = '(no obvious writer this interval)' }
+        $msg2 = $tpl2.disk_shrink.Replace('{drive}', $d.drive).
+            Replace('{delta}', [string][math]::Abs($delta)).
+            Replace('{free}', [string]$d.free_gb).Replace('{writers}', $sus)
+        $token2 = $null; $chat2 = $null
+        try {
+            foreach ($ln in (Get-Content $tg.env_path)) {
+                if ($ln -match '^TELEGRAM_BOT_TOKEN=(.+)$') { $token2 = $Matches[1].Trim() }
+                if ($ln -match '^TELEGRAM_ALLOWED_IDS=(.+)$') { $chat2 = $Matches[1].Split(',')[0].Trim() }
+            }
+        } catch { }
+        if ($null -ne $tg.chat_id) { $chat2 = [string]$tg.chat_id }
+        if ($token2 -and $chat2) {
+            try {
+                $body2 = "chat_id=$chat2&text=" + [uri]::EscapeDataString($msg2)
+                Invoke-RestMethod -Uri "https://api.telegram.org/bot$token2/sendMessage" `
+                    -Method Post -TimeoutSec 5 `
+                    -ContentType 'application/x-www-form-urlencoded; charset=utf-8' `
+                    -Body ([System.Text.Encoding]::UTF8.GetBytes($body2)) | Out-Null
+                $diskAlerts[$d.drive] = $nowEpochD
+            } catch { }
+        }
+    }
+}
+
 # ---------- central throttle: demote agent trees to BelowNormal on ORANGE/RED ----------
 # Works on ANY agent process tree regardless of whether the agent reads status.md.
 # Never kills; only lowers CPU scheduling priority. Restores on GREEN (hysteresis).
@@ -569,7 +613,7 @@ foreach ($p in $procs) {
 }
 $stateDrives = @{}
 foreach ($d in $disks) { $stateDrives[$d.drive] = $d.free_gb }
-$state = @{ ts = $nowStr; drives = $stateDrives; procs = $stateProcs; peaks = $peaks; demoted = $demoted; alert = $alertState; trims = $trims }
+$state = @{ ts = $nowStr; drives = $stateDrives; procs = $stateProcs; peaks = $peaks; demoted = $demoted; alert = $alertState; trims = $trims; disk_alerts = $diskAlerts }
 $tmp = "$statePath.tmp"
 ($state | ConvertTo-Json -Depth 4 -Compress) | Out-File $tmp -Encoding ascii
 Move-Item -Force $tmp $statePath

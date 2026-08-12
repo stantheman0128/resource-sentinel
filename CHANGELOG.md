@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.0 - 2026-08-13
+
+- 每 session 進程明細：採集器輸出每棵樹 RAM 前 8 名成員（top_members），
+  儀表板每個 session 可展開看「開哪些程式、各佔多少 RAM/CPU」
+- config.heartbeat_url 待 Stan 填 healthchecks.io ping URL（接口已就緒）
+
 ## 0.8.0 - 2026-08-13
 
 - 排隊制取代單純搶槽：queue.json FIFO、gate 回報佇列位置、10 分鐘未續期自動出隊

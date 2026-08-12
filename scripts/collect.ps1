@@ -149,6 +149,7 @@ $trees = @()
 foreach ($root in $roots) {
     $label = "$($root.Name)#$($root.ProcessId)"
     $ramBytes = [long]0; $cpuPct = 0.0; $ioBytes = [long]0; $count = 0
+    $members = @()
     $queue = New-Object System.Collections.Queue
     $visited = @{}
     $queue.Enqueue($root.ProcessId)
@@ -163,6 +164,11 @@ foreach ($root in $roots) {
         if ($writeDelta.ContainsKey($pid_)) { $ioBytes += $writeDelta[$pid_] }
         $treeOf[$pid_] = $label
         $count++
+        $members += [PSCustomObject]@{
+            name = $node.Name; pid = $pid_
+            ram_mb = [math]::Round([long]$node.WorkingSetSize / 1MB, 0)
+            cpu_pct = (Get-ProcCpuPct $node)
+        }
         if ($children.ContainsKey($pid_)) {
             foreach ($c in $children[$pid_]) { $queue.Enqueue($c) }
         }
@@ -173,6 +179,7 @@ foreach ($root in $roots) {
         cpu_pct = [math]::Round($cpuPct, 1)
         write_mb = [math]::Round($ioBytes / 1MB, 1)
         procs = $count
+        top_members = @($members | Sort-Object ram_mb -Descending | Select-Object -First 8)
     }
 }
 $trees = @($trees | Sort-Object ram_mb -Descending)

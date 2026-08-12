@@ -319,22 +319,6 @@ if ($histChanged) {
     Move-Item -Force $tmp $historyPath
 }
 
-# ---------- save state for next run ----------
-$stateProcs = @{}
-foreach ($p in $procs) {
-    $stateProcs[[string]$p.ProcessId] = @{
-        w = [long]$p.WriteTransferCount
-        c = [string]$p.CreationDate
-        n = $p.Name
-    }
-}
-$stateDrives = @{}
-foreach ($d in $disks) { $stateDrives[$d.drive] = $d.free_gb }
-$state = @{ ts = $nowStr; drives = $stateDrives; procs = $stateProcs; peaks = $peaks }
-$tmp = "$statePath.tmp"
-($state | ConvertTo-Json -Depth 4 -Compress) | Out-File $tmp -Encoding ascii
-Move-Item -Force $tmp $statePath
-
 # ---------- samples.csv + 5-min cpu avg ----------
 $samplesPath = Join-Path $dataDir 'samples.csv'
 if (-not (Test-Path $samplesPath)) {
@@ -374,6 +358,97 @@ if ($ramUsedPct -ge $config.ram_orange_pct -or $cpu5 -ge $config.cpu_orange_pct 
 if ($ramUsedPct -ge $config.ram_red_pct -or $cpu5 -ge $config.cpu_red_pct -or
     $sysFreeGb -le $config.disk_red_gb) { $light = 'RED' }
 
+# ---------- central throttle: demote agent trees to BelowNormal on ORANGE/RED ----------
+# Works on ANY agent process tree regardless of whether the agent reads status.md.
+# Never kills; only lowers CPU scheduling priority. Restores on GREEN (hysteresis).
+$demoted = @{}
+if ($null -ne $prev -and $null -ne $prev.demoted) {
+    foreach ($dp in $prev.demoted.PSObject.Properties) { $demoted[$dp.Name] = [string]$dp.Value }
+}
+$throttleOn = ($light -eq 'ORANGE' -or $light -eq 'RED')
+if ($null -ne $config.throttle_enable -and -not $config.throttle_enable) { $throttleOn = $false }
+if ($throttleOn) {
+    foreach ($pid_ in $treeOf.Keys) {
+        $key = [string]$pid_
+        try {
+            $proc = Get-Process -Id $pid_ -ErrorAction Stop
+            $orig = [string]$proc.PriorityClass
+            if ($orig -eq 'Normal' -or $orig -eq 'AboveNormal' -or $orig -eq 'High') {
+                $proc.PriorityClass = 'BelowNormal'
+                if (-not $demoted.ContainsKey($key)) { $demoted[$key] = $orig }
+            }
+        } catch { }
+    }
+} elseif ($light -eq 'GREEN') {
+    # self-healing restore: raise ANY BelowNormal agent-tree process, map or not.
+    # (a lost map must never leave sessions stuck at BelowNormal forever)
+    foreach ($pid_ in $treeOf.Keys) {
+        $key = [string]$pid_
+        try {
+            $proc = Get-Process -Id $pid_ -ErrorAction Stop
+            if ([string]$proc.PriorityClass -eq 'BelowNormal') {
+                $target = 'Normal'
+                if ($demoted.ContainsKey($key)) { $target = $demoted[$key] }
+                $proc.PriorityClass = $target
+            }
+        } catch { }
+    }
+    $demoted = @{}
+}
+# drop entries for dead pids so the map never grows unbounded
+foreach ($key in @($demoted.Keys)) {
+    if (-not $byId.ContainsKey([uint32]$key)) { $demoted.Remove($key) }
+}
+# live count of BelowNormal agent procs for display (never trust the map for UI)
+$demotedNow = 0
+try {
+    $prios = @{}
+    Get-Process | ForEach-Object {
+        try { $prios[[uint32]$_.Id] = [string]$_.PriorityClass } catch { }
+    }
+    foreach ($pid_ in $treeOf.Keys) {
+        if ($prios.ContainsKey($pid_) -and $prios[$pid_] -eq 'BelowNormal') { $demotedNow++ }
+    }
+} catch { }
+
+# ---------- heavy-slot cleanup (arbiter state written by sentinel-gate.py) ----------
+$slotsPath = Join-Path $dataDir 'slots.json'
+$activeSlots = @()
+if (Test-Path $slotsPath) {
+    try {
+        $sd = Get-Content $slotsPath -Raw | ConvertFrom-Json
+        $nowEpoch = [double](Get-Date -UFormat %s)
+        foreach ($sl in @($sd.slots)) {
+            if ($null -eq $sl) { continue }
+            $ttl = 15; if ($null -ne $sl.ttl_min) { $ttl = [double]$sl.ttl_min }
+            if (($nowEpoch - [double]$sl.ts) -gt $ttl * 60) { continue }
+            if (-not $byId.ContainsKey([uint32]$sl.pid)) { continue }
+            $activeSlots += $sl
+        }
+        if ($activeSlots.Count -ne @($sd.slots).Count) {
+            $tmp = "$slotsPath.tmp"
+            (@{ slots = $activeSlots } | ConvertTo-Json -Depth 3 -Compress) | Out-File $tmp -Encoding ascii
+            Move-Item -Force $tmp $slotsPath
+        }
+    } catch { }
+}
+
+# ---------- save state for next run ----------
+$stateProcs = @{}
+foreach ($p in $procs) {
+    $stateProcs[[string]$p.ProcessId] = @{
+        w = [long]$p.WriteTransferCount
+        c = [string]$p.CreationDate
+        n = $p.Name
+    }
+}
+$stateDrives = @{}
+foreach ($d in $disks) { $stateDrives[$d.drive] = $d.free_gb }
+$state = @{ ts = $nowStr; drives = $stateDrives; procs = $stateProcs; peaks = $peaks; demoted = $demoted }
+$tmp = "$statePath.tmp"
+($state | ConvertTo-Json -Depth 4 -Compress) | Out-File $tmp -Encoding ascii
+Move-Item -Force $tmp $statePath
+
 # ---------- status.json (atomic) ----------
 $statusJsonPath = Join-Path $dataDir 'status.json'
 $status = [ordered]@{
@@ -387,6 +462,8 @@ $status = [ordered]@{
     agent_groups = $groups
     agent_trees = @($trees | Select-Object -First 10)
     top_disk_writers_interval = $topWriters
+    heavy_slots = $activeSlots
+    throttle = [ordered]@{ active = $throttleOn; demoted_procs = $demotedNow }
 }
 $tmp = "$statusJsonPath.tmp"
 ($status | ConvertTo-Json -Depth 5) | Out-File $tmp -Encoding ascii
@@ -428,6 +505,18 @@ if ($topWriters.Count -gt 0) {
         $tag = if ($w.PSObject.Properties['agent_tree']) { " [$($w.agent_tree)]" } else { "" }
         [void]$md.Add("- $($w.name) pid=$($w.pid): $($w.mb) MB$tag")
     }
+}
+[void]$md.Add("")
+[void]$md.Add("## Arbiter")
+if ($activeSlots.Count -gt 0) {
+    foreach ($sl in $activeSlots) {
+        [void]$md.Add("- heavy slot held: pid $($sl.pid) repo=$($sl.repo) cmd=$($sl.cmd)")
+    }
+} else {
+    [void]$md.Add("- heavy slot: free")
+}
+if ($throttleOn) {
+    [void]$md.Add("- central throttle ACTIVE: $($demotedNow) agent processes at BelowNormal to BelowNormal (restored at GREEN)")
 }
 [void]$md.Add("")
 [void]$md.Add("## Guidance")

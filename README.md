@@ -62,6 +62,20 @@ schtasks /create /f /tn "ResourceSentinel" /sc minute /mo 1 /tr "conhost.exe --h
 | samples.csv | 60 秒生樣本 | 7 天滾動 |
 | events.log | 磁碟異動事件 | 2 MB 自動修剪 |
 
+## 中樞調控（v0.6）
+
+觀測之上，兩層主動調控，仍然零常駐、零自動殺：
+
+1. **重活槽位制（Claude Code）**：PreToolUse hook 攔截重量級指令
+   （build、安裝、全套測試，pattern 在 config.json 可調）。
+   全機同時只允許一個重活；橘燈起硬擋新重活、紅燈全擋。被擋的 session
+   會收到訊息自己改做輕量步驟稍後重試。槽位帶 15 分鐘 TTL，
+   佔槽進程死亡自動釋放，不會死鎖。
+2. **OS 優先權降級（管所有 agent）**：橘/紅燈時採集器把所有 agent
+   進程樹降到 BelowNormal，綠燈自動恢復。不管 agent 聽不聽話都有效，
+   桌面與遠端連線永遠搶得到 CPU。恢復採自癒式：凡 agent 樹內
+   BelowNormal 的進程在綠燈一律升回，名單遺失也不會卡死在低優先權。
+
 ## 設計原則
 
 - 零常駐：排程腳本跑完就退，猝死一次下一分鐘自動復原

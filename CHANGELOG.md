@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.0 - 2026-08-13
+
+- 中樞調控上線（Stan 核可：槽數 1、黃軟/橘紅硬擋）
+  - sentinel-gate.py：PreToolUse 攔重活申請槽位、PostToolUse 釋放；
+    紅燈全擋、橘燈擋新重活、槽被佔排隊；TTL 15 分鐘＋死進程自動釋放
+  - OS 優先權降級：橘/紅燈全 agent 樹降 BelowNormal、綠燈自癒式恢復
+    （不依賴名單，任何 BelowNormal 的 agent 進程綠燈一律升回）
+  - status.md/json 新增 Arbiter 區塊（槽位持有者、降級進程數）
+- 驗證：gate 五路徑（放行/紅擋/橘擋/佔槽擋/釋放）、紅燈實降 201 進程、
+  綠燈實測恢復 Normal
+
 ## 0.5.0 - 2026-08-13
 
 - 四層燈號 GREEN/YELLOW/ORANGE/RED（Stan 需求：RAM/CPU 百分比、磁碟絕對 GB）

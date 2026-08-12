@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0 - 2026-08-13
+
+- 四層燈號 GREEN/YELLOW/ORANGE/RED（Stan 需求：RAM/CPU 百分比、磁碟絕對 GB）
+  - RAM 75/85/92%、CPU 5分均 60/75/88%、C槽剩 50/35/20 GB，舊 config 自動遟移
+- hook/儀表板/Codex AGENTS.md/Cursor 貼文同步四層
+- 推上 GitHub public：https://github.com/stantheman0128/resource-sentinel
+
 ## 0.4.0 - 2026-08-13
 
 - Claude Code hook `sentinel-inject.py`（spec 第 3 步）：每輪注入一行狀態、黃/紅燈升級警告、

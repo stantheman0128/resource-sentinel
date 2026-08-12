@@ -8,7 +8,7 @@
   :root {
     --bg: #0f1115; --card: #181b22; --line: #262b36;
     --fg: #d7dce4; --dim: #8b93a1;
-    --green: #3fb950; --yellow: #d29922; --red: #f85149;
+    --green: #3fb950; --yellow: #d29922; --orange: #f0883e; --red: #f85149;
     --cpu: #58a6ff; --ram: #bc8cff; --gpu: #3fb950;
   }
   * { box-sizing: border-box; margin: 0; }
@@ -22,7 +22,8 @@
   .stamp { color: var(--dim); font-size: 12px; }
   .stale { color: var(--red); font-weight: 600; }
   .badge { padding: 2px 12px; border-radius: 12px; font-weight: 700; font-size: 13px; color: #0f1115; }
-  .b-GREEN { background: var(--green); } .b-YELLOW { background: var(--yellow); } .b-RED { background: var(--red); }
+  .b-GREEN { background: var(--green); } .b-YELLOW { background: var(--yellow); }
+  .b-ORANGE { background: var(--orange); } .b-RED { background: var(--red); }
   .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
   .card .k { color: var(--dim); font-size: 12px; }

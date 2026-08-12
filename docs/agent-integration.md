@@ -26,9 +26,10 @@ Cursor 的全域規則存在它自己的設定裡，沒有可靠的檔案路徑�
 ```
 Before running anything heavy (builds, installs, full test suites), read
 C:\Users\stans\.resource-sentinel\status.md. GREEN: proceed. YELLOW: run heavy
-commands with low priority and avoid parallel heavy work. RED: light operations
-only; tell the user the machine is overloaded. If the file is older than 5
-minutes, monitoring is down; say so and ignore its contents.
+commands with low priority and avoid parallel heavy work. ORANGE: defer new
+heavy tasks; if one must run, low priority and one at a time. RED: light
+operations only; tell the user the machine is overloaded. If the file is older
+than 5 minutes, monitoring is down; say so and ignore its contents.
 ```
 
 貼完之後 Cursor 的 session 就會在動手前自己去看告示板。

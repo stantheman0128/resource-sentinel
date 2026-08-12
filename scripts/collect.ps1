@@ -10,23 +10,34 @@ if (-not (Test-Path $dataDir)) { New-Item -ItemType Directory -Path $dataDir | O
 $configPath = Join-Path $dataDir 'config.json'
 if (-not (Test-Path $configPath)) {
     $defaults = [ordered]@{
-        ram_yellow_pct = 75
-        ram_red_pct    = 90
-        cpu_yellow_pct = 60
-        cpu_red_pct    = 85
-        disk_yellow_gb = 50
-        disk_red_gb    = 20
-        disk_event_gb  = 2      # abs free-space change per interval that triggers an event
-        system_drive   = 'C:'
-        agent_roots    = @('claude.exe', 'cursor.exe', 'codex.exe')
+        ram_yellow_pct  = 75
+        ram_orange_pct  = 85
+        ram_red_pct     = 92
+        cpu_yellow_pct  = 60
+        cpu_orange_pct  = 75
+        cpu_red_pct     = 88
+        disk_yellow_gb  = 50
+        disk_orange_gb  = 35
+        disk_red_gb     = 20
+        disk_event_gb   = 2      # abs free-space change per interval that triggers an event
+        system_drive    = 'C:'
+        agent_roots     = @('claude.exe', 'cursor.exe', 'codex.exe')
     }
     ($defaults | ConvertTo-Json) | Out-File $configPath -Encoding ascii
 }
 $config = Get-Content $configPath -Raw | ConvertFrom-Json
-if ($null -eq $config.disk_event_gb) {   # migrate v0.1 config
-    $config | Add-Member -NotePropertyName disk_event_gb -NotePropertyValue 2
-    ($config | ConvertTo-Json) | Out-File $configPath -Encoding ascii
+# migrate older configs: add any missing keys
+$migrations = @{
+    disk_event_gb = 2; ram_orange_pct = 85; cpu_orange_pct = 75; disk_orange_gb = 35
 }
+$migrated = $false
+foreach ($k in $migrations.Keys) {
+    if ($null -eq $config.$k) {
+        $config | Add-Member -NotePropertyName $k -NotePropertyValue $migrations[$k]
+        $migrated = $true
+    }
+}
+if ($migrated) { ($config | ConvertTo-Json) | Out-File $configPath -Encoding ascii }
 $cores = [Environment]::ProcessorCount
 
 # ---------- previous state (for io/disk deltas across runs) ----------
@@ -228,6 +239,86 @@ if ((Test-Path $eventsPath) -and (Get-Item $eventsPath).Length -gt 2MB) {
     Move-Item -Force $tmp $eventsPath
 }
 
+# ---------- session->repo attribution (sessions.json written by agent hooks) ----------
+$sessionsPath = Join-Path $dataDir 'sessions.json'
+$sessions = $null
+if (Test-Path $sessionsPath) {
+    try { $sessions = Get-Content $sessionsPath -Raw | ConvertFrom-Json } catch { $sessions = $null }
+}
+$repoOfTree = @{}
+if ($null -ne $sessions) {
+    foreach ($prop in $sessions.PSObject.Properties) {
+        $spid = [uint32]0
+        if ([uint32]::TryParse($prop.Name, [ref]$spid) -and $treeOf.ContainsKey($spid)) {
+            $repoOfTree[$treeOf[$spid]] = [string]$prop.Value.repo
+        }
+    }
+}
+foreach ($t in $trees) {
+    $lbl = "$($t.root)#$($t.pid)"
+    if ($repoOfTree.ContainsKey($lbl)) {
+        $t | Add-Member -NotePropertyName repo -NotePropertyValue $repoOfTree[$lbl] -Force
+    }
+}
+
+# ---------- per-repo peak ledger: track live peaks, finalize dead trees ----------
+$peaks = @{}
+if ($null -ne $prev -and $null -ne $prev.peaks) {
+    foreach ($pp in $prev.peaks.PSObject.Properties) {
+        $peaks[$pp.Name] = @{ repo = $pp.Value.repo; peak_mb = [double]$pp.Value.peak_mb }
+    }
+}
+$aliveLabels = @{}
+foreach ($t in $trees) {
+    $lbl = "$($t.root)#$($t.pid)"
+    $aliveLabels[$lbl] = $true
+    $repo = $null
+    if ($repoOfTree.ContainsKey($lbl)) { $repo = $repoOfTree[$lbl] }
+    elseif ($peaks.ContainsKey($lbl) -and $null -ne $peaks[$lbl].repo) { $repo = $peaks[$lbl].repo }
+    $pk = [double]$t.ram_mb
+    if ($peaks.ContainsKey($lbl) -and [double]$peaks[$lbl].peak_mb -gt $pk) { $pk = [double]$peaks[$lbl].peak_mb }
+    $peaks[$lbl] = @{ repo = $repo; peak_mb = $pk }
+}
+$historyPath = Join-Path $dataDir 'history.json'
+$histTable = @{}
+if (Test-Path $historyPath) {
+    try {
+        $h = Get-Content $historyPath -Raw | ConvertFrom-Json
+        foreach ($hp in $h.PSObject.Properties) { $histTable[$hp.Name] = $hp.Value }
+    } catch { }
+}
+$histChanged = $false
+foreach ($lbl in @($peaks.Keys)) {
+    if ($aliveLabels.ContainsKey($lbl)) { continue }
+    $entry = $peaks[$lbl]
+    $peaks.Remove($lbl)
+    if ($null -eq $entry.repo -or [double]$entry.peak_mb -lt 100) { continue }   # noise floor
+    $repo = [string]$entry.repo
+    $rec = @()
+    if ($histTable.ContainsKey($repo) -and $null -ne $histTable[$repo].recent) {
+        $rec = @($histTable[$repo].recent)
+    }
+    $rec += [PSCustomObject]@{ ts = $nowStr; peak_mb = [math]::Round([double]$entry.peak_mb, 0) }
+    if ($rec.Count -gt 20) { $rec = @($rec | Select-Object -Last 20) }
+    $sorted = @($rec | ForEach-Object { [double]$_.peak_mb } | Sort-Object)
+    $mid = [int][math]::Floor($sorted.Count / 2)
+    $typ = if ($sorted.Count % 2 -eq 1) { $sorted[$mid] }
+           else { [math]::Round(($sorted[$mid - 1] + $sorted[$mid]) / 2, 0) }
+    $oldPeak = 0.0
+    if ($histTable.ContainsKey($repo)) { $oldPeak = ($histTable[$repo].peak_ram_mb) -as [double] }
+    $histTable[$repo] = [PSCustomObject]@{
+        peak_ram_mb     = [math]::Round([math]::Max($oldPeak, [double]$entry.peak_mb), 0)
+        typical_peak_mb = $typ
+        recent          = $rec
+    }
+    $histChanged = $true
+}
+if ($histChanged) {
+    $tmp = "$historyPath.tmp"
+    ($histTable | ConvertTo-Json -Depth 4) | Out-File $tmp -Encoding ascii
+    Move-Item -Force $tmp $historyPath
+}
+
 # ---------- save state for next run ----------
 $stateProcs = @{}
 foreach ($p in $procs) {
@@ -239,7 +330,7 @@ foreach ($p in $procs) {
 }
 $stateDrives = @{}
 foreach ($d in $disks) { $stateDrives[$d.drive] = $d.free_gb }
-$state = @{ ts = $nowStr; drives = $stateDrives; procs = $stateProcs }
+$state = @{ ts = $nowStr; drives = $stateDrives; procs = $stateProcs; peaks = $peaks }
 $tmp = "$statePath.tmp"
 ($state | ConvertTo-Json -Depth 4 -Compress) | Out-File $tmp -Encoding ascii
 Move-Item -Force $tmp $statePath
@@ -273,10 +364,13 @@ $cpu5 = if ($recent.Count -gt 0) {
     [math]::Round(($recent | Measure-Object -Average).Average, 1)
 } else { $cpuTotal }
 
-# ---------- light ----------
+# ---------- light (4 levels; worst dimension wins) ----------
+# RAM/CPU judged in percent; disk judged in absolute free GB on the system drive.
 $light = 'GREEN'
 if ($ramUsedPct -ge $config.ram_yellow_pct -or $cpu5 -ge $config.cpu_yellow_pct -or
     $sysFreeGb -le $config.disk_yellow_gb) { $light = 'YELLOW' }
+if ($ramUsedPct -ge $config.ram_orange_pct -or $cpu5 -ge $config.cpu_orange_pct -or
+    $sysFreeGb -le $config.disk_orange_gb) { $light = 'ORANGE' }
 if ($ramUsedPct -ge $config.ram_red_pct -or $cpu5 -ge $config.cpu_red_pct -or
     $sysFreeGb -le $config.disk_red_gb) { $light = 'RED' }
 
@@ -339,7 +433,8 @@ if ($topWriters.Count -gt 0) {
 [void]$md.Add("## Guidance")
 switch ($light) {
     'GREEN'  { [void]$md.Add("Normal operation. Heavy tasks OK.") }
-    'YELLOW' { [void]$md.Add("Machine under load. Defer or slow down heavy tasks (builds, installs, test suites, new subagents). Run heavy commands with BelowNormal priority.") }
+    'YELLOW' { [void]$md.Add("Load elevated. Heavy tasks (builds, installs, test suites) should run with BelowNormal priority. Avoid launching parallel heavy work.") }
+    'ORANGE' { [void]$md.Add("Load tight. Defer new heavy tasks; finish what is running. Anything heavy that must run: BelowNormal priority, one at a time.") }
     'RED'    { [void]$md.Add("Machine critically loaded. Light operations only (reads, small edits). Do NOT start builds, installs, or new agent sessions until light clears.") }
 }
 $tmp = "$statusMdPath.tmp"

@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="60">
+<title>Resource Sentinel</title>
+<style>
+  :root {
+    --bg: #0f1115; --card: #181b22; --line: #262b36;
+    --fg: #d7dce4; --dim: #8b93a1;
+    --green: #3fb950; --yellow: #d29922; --red: #f85149;
+    --cpu: #58a6ff; --ram: #bc8cff; --gpu: #3fb950;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 14px/1.5 "Segoe UI", "Microsoft JhengHei", sans-serif;
+    padding: 20px; max-width: 1080px; margin: 0 auto;
+  }
+  header { display: flex; align-items: baseline; gap: 14px; margin-bottom: 16px; flex-wrap: wrap; }
+  h1 { font-size: 18px; font-weight: 600; }
+  .stamp { color: var(--dim); font-size: 12px; }
+  .stale { color: var(--red); font-weight: 600; }
+  .badge { padding: 2px 12px; border-radius: 12px; font-weight: 700; font-size: 13px; color: #0f1115; }
+  .b-GREEN { background: var(--green); } .b-YELLOW { background: var(--yellow); } .b-RED { background: var(--red); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 14px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; }
+  .card .k { color: var(--dim); font-size: 12px; }
+  .card .v { font-size: 24px; font-weight: 700; margin-top: 2px; }
+  .card .s { color: var(--dim); font-size: 12px; }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin-bottom: 14px; }
+  section h2 { font-size: 13px; color: var(--dim); font-weight: 600; margin-bottom: 10px; text-transform: uppercase; letter-spacing: .05em; }
+  canvas { width: 100%; height: 170px; display: block; }
+  .legend { display: flex; gap: 16px; font-size: 12px; color: var(--dim); margin-top: 6px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 4px; margin-right: 5px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th { text-align: left; color: var(--dim); font-weight: 600; padding: 4px 8px; border-bottom: 1px solid var(--line); }
+  td { padding: 5px 8px; border-bottom: 1px solid var(--line); }
+  tr:last-child td { border-bottom: none; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .warn { color: var(--yellow); } .crit { color: var(--red); }
+  .empty { color: var(--dim); font-size: 13px; }
+  .tag { background: var(--line); border-radius: 4px; padding: 1px 6px; font-size: 11px; color: var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Resource Sentinel</h1>
+  <span id="light" class="badge">--</span>
+  <span id="stamp" class="stamp">載入中…</span>
+</header>
+
+<div class="grid" id="tiles"></div>
+
+<section>
+  <h2>近 3 小時趨勢</h2>
+  <canvas id="chart" width="1020" height="170"></canvas>
+  <div class="legend">
+    <span><i class="dot" style="background:var(--cpu)"></i>CPU %</span>
+    <span><i class="dot" style="background:var(--ram)"></i>RAM %</span>
+    <span><i class="dot" style="background:var(--gpu)"></i>GPU %</span>
+  </div>
+</section>
+
+<section>
+  <h2>Agent 資源用量（進程樹）</h2>
+  <div id="agents"></div>
+</section>
+
+<section>
+  <h2>磁碟寫入排行（上一輪間隔）</h2>
+  <div id="writers"></div>
+</section>
+
+<section>
+  <h2>磁碟異動事件（±2 GB 以上才記錄）</h2>
+  <div id="events"></div>
+</section>
+
+<script src="data.js"></script>
+<script>
+const arr = x => Array.isArray(x) ? x : (x == null ? [] : [x]);
+const S = window.SENTINEL_STATUS || null;
+const samples = arr(window.SENTINEL_SAMPLES);
+const events = arr(window.SENTINEL_EVENTS);
+
+if (!S) {
+  document.getElementById('stamp').textContent = '讀不到 data.js — 採集器還沒跑過？';
+} else {
+  // header
+  const lightEl = document.getElementById('light');
+  lightEl.textContent = S.light;
+  lightEl.className = 'badge b-' + S.light;
+  const gen = new Date(S.generated_at.replace(' ', 'T'));
+  const ageMin = (Date.now() - gen.getTime()) / 60000;
+  const stampEl = document.getElementById('stamp');
+  stampEl.textContent = '更新於 ' + S.generated_at + (ageMin > 5 ? '（已過期 — 監控可能失效）' : '');
+  if (ageMin > 5) stampEl.classList.add('stale');
+
+  // tiles
+  const tiles = [];
+  tiles.push(['CPU', S.cpu_pct + '%', '5 分鐘均 ' + S.cpu_5min_avg + '%']);
+  tiles.push(['RAM', S.ram.used_pct + '%', S.ram.free_gb + ' GB 可用 / ' + S.ram.total_gb + ' GB']);
+  if (S.gpu && S.gpu.util_pct != null) {
+    tiles.push(['GPU', S.gpu.util_pct + '%', 'VRAM ' + S.gpu.vram_used_mb + '/' + (S.gpu.vram_total_mb || '?') + ' MB']);
+  }
+  for (const d of arr(S.disks)) {
+    if (d.total_gb < 1) continue;
+    tiles.push(['磁碟 ' + d.drive, d.free_gb + ' GB', '剩餘 / 共 ' + d.total_gb + ' GB']);
+  }
+  document.getElementById('tiles').innerHTML = tiles.map(t =>
+    `<div class="card"><div class="k">${t[0]}</div><div class="v">${t[1]}</div><div class="s">${t[2]}</div></div>`).join('');
+
+  // chart
+  const cv = document.getElementById('chart');
+  const ctx = cv.getContext('2d');
+  const pts = samples.map(s => {
+    const p = s.split(',');
+    return { t: p[0], cpu: +p[1], ram: +p[2], gpu: p[3] === '' || p[3] == null ? null : +p[3] };
+  });
+  const W = cv.width, H = cv.height, PAD = 28;
+  ctx.clearRect(0, 0, W, H);
+  ctx.strokeStyle = '#262b36'; ctx.fillStyle = '#8b93a1'; ctx.font = '10px sans-serif';
+  for (const yv of [0, 50, 100]) {
+    const y = H - PAD - (H - 2 * PAD) * yv / 100;
+    ctx.beginPath(); ctx.moveTo(PAD + 8, y); ctx.lineTo(W - 4, y); ctx.stroke();
+    ctx.fillText(yv, 4, y + 3);
+  }
+  function drawSeries(key, color) {
+    ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.beginPath();
+    let started = false;
+    pts.forEach((p, i) => {
+      if (p[key] == null || isNaN(p[key])) return;
+      const x = PAD + 8 + (W - PAD - 12) * (pts.length === 1 ? 0.5 : i / (pts.length - 1));
+      const y = H - PAD - (H - 2 * PAD) * Math.min(p[key], 100) / 100;
+      if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+    });
+    ctx.stroke();
+  }
+  if (pts.length) {
+    drawSeries('cpu', '#58a6ff');
+    drawSeries('ram', '#bc8cff');
+    drawSeries('gpu', '#3fb950');
+    ctx.fillText(pts[0].t.slice(11, 16), PAD + 8, H - 8);
+    ctx.fillText(pts[pts.length - 1].t.slice(11, 16), W - 44, H - 8);
+  } else {
+    ctx.fillText('樣本累積中…', W / 2 - 30, H / 2);
+  }
+
+  // agents
+  const groups = arr(S.agent_groups);
+  const trees = arr(S.agent_trees);
+  if (!groups.length) {
+    document.getElementById('agents').innerHTML = '<div class="empty">目前沒有偵測到 agent 進程</div>';
+  } else {
+    let h = '<table><tr><th>App</th><th class="num">RAM MB</th><th class="num">CPU %</th><th class="num">寫入 MB</th><th class="num">樹數</th></tr>';
+    for (const g of groups) {
+      const ramCls = g.total_ram_mb > 4000 ? ' class="num warn"' : ' class="num"';
+      h += `<tr><td>${g.app}</td><td${ramCls}>${g.total_ram_mb}</td><td class="num">${g.total_cpu_pct}</td><td class="num">${g.write_mb}</td><td class="num">${g.trees}</td></tr>`;
+    }
+    h += '</table>';
+    if (trees.length) {
+      h += '<div style="margin-top:8px" class="empty">最大樹：' + trees.slice(0, 4).map(t =>
+        `${t.root}#${t.pid} ${t.ram_mb}MB/${t.procs}procs`).join('　') + '</div>';
+    }
+    document.getElementById('agents').innerHTML = h;
+  }
+
+  // writers
+  const writers = arr(S.top_disk_writers_interval);
+  document.getElementById('writers').innerHTML = !writers.length
+    ? '<div class="empty">上一輪間隔沒有明顯寫入（&lt;1 MB）</div>'
+    : '<table><tr><th>進程</th><th class="num">寫入 MB</th><th>所屬 agent</th></tr>' +
+      writers.map(w => {
+        const cls = w.mb > 500 ? ' class="num crit"' : (w.mb > 100 ? ' class="num warn"' : ' class="num"');
+        return `<tr><td>${w.name} <span class="tag">pid ${w.pid}</span></td><td${cls}>${w.mb}</td><td>${w.agent_tree || '—'}</td></tr>`;
+      }).join('') + '</table>';
+
+  // events
+  document.getElementById('events').innerHTML = !events.length
+    ? '<div class="empty">尚無事件（好事）</div>'
+    : '<table><tr><th>時間</th><th>磁碟</th><th class="num">變動 GB</th><th>當下寫入前幾名</th></tr>' +
+      events.slice().reverse().map(e => {
+        const cls = e.delta_gb < 0 ? ' class="num crit"' : ' class="num"';
+        const tw = arr(e.top_writers).slice(0, 3).map(w => `${w.name} ${w.mb}MB`).join(', ');
+        return `<tr><td>${e.ts}</td><td>${e.drive}</td><td${cls}>${e.delta_gb > 0 ? '+' : ''}${e.delta_gb}</td><td>${tw || '—'}</td></tr>`;
+      }).join('') + '</table>';
+}
+</script>
+</body>
+</html>

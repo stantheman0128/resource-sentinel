@@ -346,4 +346,33 @@ $tmp = "$statusMdPath.tmp"
 ($md -join "`r`n") | Out-File $tmp -Encoding ascii
 Move-Item -Force $tmp $statusMdPath
 
+# ---------- dashboard data (data.js) + static page copy ----------
+$dataJsPath = Join-Path $dataDir 'data.js'
+$samplesTail = @($lines | Select-Object -Last 180)
+# manual JSON array build: PS 5.1 ConvertTo-Json collapses 1-element arrays
+$samplesJs = if ($samplesTail.Count -gt 0) {
+    '["' + ($samplesTail -join '","') + '"]'
+} else { '[]' }
+$evJs = '[]'
+if (Test-Path $eventsPath) {
+    $evLines = @(Get-Content $eventsPath | Select-Object -Last 20)
+    if ($evLines.Count -gt 0) { $evJs = '[' + ($evLines -join ',') + ']' }
+}
+$js = @(
+    'window.SENTINEL_STATUS=' + ($status | ConvertTo-Json -Depth 5 -Compress) + ';'
+    'window.SENTINEL_SAMPLES=' + $samplesJs + ';'
+    'window.SENTINEL_EVENTS=' + $evJs + ';'
+)
+$tmp = "$dataJsPath.tmp"
+($js -join "`n") | Out-File $tmp -Encoding ascii
+Move-Item -Force $tmp $dataJsPath
+
+$dashSrc = Join-Path (Split-Path $PSScriptRoot -Parent) 'dashboard\dashboard.html'
+$dashDst = Join-Path $dataDir 'dashboard.html'
+if ((Test-Path $dashSrc) -and (
+        -not (Test-Path $dashDst) -or
+        (Get-Item $dashSrc).LastWriteTime -gt (Get-Item $dashDst).LastWriteTime)) {
+    Copy-Item $dashSrc $dashDst -Force
+}
+
 Write-Output "OK light=$light cpu=$cpuTotal ram=$ramUsedPct gpu=$($gpu.util_pct) sysfree=$sysFreeGb trees=$($trees.Count) writers=$($topWriters.Count)"

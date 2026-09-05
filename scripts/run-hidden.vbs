@@ -3,4 +3,5 @@
 If WScript.Arguments.Count < 1 Then WScript.Quit 1
 Set sh = CreateObject("WScript.Shell")
 ps1 = WScript.Arguments(0)
-sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & ps1 & """", 0, True
+result = sh.Run("powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & ps1 & """", 0, True)
+WScript.Quit result

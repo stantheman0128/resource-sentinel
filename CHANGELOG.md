@@ -2,6 +2,10 @@
 
 ## Unreleased - 2026-09-05
 
+- Recover scheduled collection from delayed startup and hung collectors: always attempt
+  the first sample, bound each child to 45 seconds, preserve launcher exit codes,
+  and log sanitized failure types. Live scheduled task timeout is now two minutes.
+
 - Reduced the Commit admission headroom to 4 GiB and added boundary coverage.
 - Excluded Google Drive capacity from collection and dashboard cards.
 - Added a bounded :00/:30 collector runner and five-second publication alignment,

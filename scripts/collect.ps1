@@ -19,6 +19,12 @@ if (-not (Test-Path $configPath)) {
         disk_yellow_gb  = 50
         disk_orange_gb  = 35
         disk_red_gb     = 20
+        disk_queue_yellow = 2
+        disk_queue_orange = 4
+        disk_queue_red = 8
+        disk_latency_yellow_ms = 20
+        disk_latency_orange_ms = 50
+        disk_latency_red_ms = 100
         disk_event_gb   = 2      # abs free-space change per interval that triggers an event
         system_drive    = 'C:'
         agent_roots     = @('claude.exe', 'cursor.exe', 'codex.exe')
@@ -29,6 +35,20 @@ $config = Get-Content $configPath -Raw | ConvertFrom-Json
 # migrate older configs: add any missing keys
 $migrations = @{
     disk_event_gb = 2; ram_orange_pct = 85; cpu_orange_pct = 75; disk_orange_gb = 35
+    commit_yellow_pct = 75; commit_orange_pct = 85; commit_red_pct = 92
+    hysteresis_cpu_pct = 5; hysteresis_ram_pct = 3; hysteresis_commit_pct = 3
+    hysteresis_disk_gb = 5; hysteresis_recovery_samples = 2
+    hysteresis_disk_queue = 0.5; hysteresis_disk_latency_ms = 5
+    disk_queue_yellow = 2; disk_queue_orange = 4; disk_queue_red = 8
+    disk_latency_yellow_ms = 20; disk_latency_orange_ms = 50; disk_latency_red_ms = 100
+    local_allocatable_cpu = 8; local_allocatable_ram_gib = 48
+    local_commit_headroom_gib = 4; heavy_io_slots = 1
+    collection_interval_sec = 30
+    reservation_ttl_min = 120; queue_ttl_min = 30; reservation_grace_sec = 120
+    admission_status_stale_sec = 300; default_priority = 'P2'
+    orchestrator_enabled = $true; orchestrator_dispatch_limit = 2
+    local_worker_id = 'local-windows'; local_max_concurrency = 4
+    local_docker_ready = $false
 }
 $migrated = $false
 foreach ($k in $migrations.Keys) {
@@ -175,6 +195,7 @@ foreach ($root in $roots) {
     }
     $trees += [PSCustomObject]@{
         root = $root.Name; pid = $root.ProcessId
+        started_at = ([DateTimeOffset]([datetime]$root.CreationDate)).ToUnixTimeSeconds()
         ram_mb = [math]::Round($ramBytes / 1MB, 0)
         cpu_pct = [math]::Round($cpuPct, 1)
         write_mb = [math]::Round($ioBytes / 1MB, 1)
@@ -211,11 +232,49 @@ $os = Get-CimInstance Win32_OperatingSystem
 $ramTotalGb = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
 $ramFreeGb  = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
 $ramUsedPct = [math]::Round((1 - $os.FreePhysicalMemory / $os.TotalVisibleMemorySize) * 100, 1)
-$disks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
+$commitBytes = $null; $commitLimitBytes = $null; $pagefilePct = $null
+try { $commitBytes = (Get-Counter '\Memory\Committed Bytes').CounterSamples[0].CookedValue } catch { }
+try { $commitLimitBytes = (Get-Counter '\Memory\Commit Limit').CounterSamples[0].CookedValue } catch { }
+try { $pagefilePct = (Get-Counter '\Paging File(_Total)\% Usage').CounterSamples[0].CookedValue } catch { }
+$commitUsedGb = if ($null -ne $commitBytes) { [math]::Round($commitBytes / 1GB, 2) } else { $null }
+$commitLimitGb = if ($null -ne $commitLimitBytes) { [math]::Round($commitLimitBytes / 1GB, 2) } else { $null }
+$commitUsedPct = if ($null -ne $commitBytes -and $commitLimitBytes -gt 0) {
+    [math]::Round($commitBytes / $commitLimitBytes * 100, 1)
+} else { 0 }
+$pagefiles = @(Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue)
+$pagefileUsedGb = if ($pagefiles.Count -gt 0) {
+    [math]::Round((($pagefiles.CurrentUsage | Measure-Object -Sum).Sum) / 1024, 2)
+} else { $null }
+$memory = [ordered]@{
+    commit_used_gib = $commitUsedGb; commit_limit_gib = $commitLimitGb
+    commit_used_pct = $commitUsedPct; pagefile_used_gib = $pagefileUsedGb
+    pagefile_usage_pct = if ($null -ne $pagefilePct) { [math]::Round($pagefilePct, 1) } else { $null }
+}
+$diskPerf = [ordered]@{
+    active_pct = $null; queue_length = $null; read_mib_s = $null; write_mib_s = $null
+    read_latency_ms = $null; write_latency_ms = $null
+}
+try {
+    $dc = (Get-Counter '\PhysicalDisk(_Total)\% Disk Time','\PhysicalDisk(_Total)\Current Disk Queue Length','\PhysicalDisk(_Total)\Disk Read Bytes/sec','\PhysicalDisk(_Total)\Disk Write Bytes/sec','\PhysicalDisk(_Total)\Avg. Disk sec/Read','\PhysicalDisk(_Total)\Avg. Disk sec/Write').CounterSamples
+    foreach ($sample in $dc) {
+        $path = $sample.Path.ToLower(); $value = [double]$sample.CookedValue
+        if ($path -like '*% disk time') { $diskPerf.active_pct = [math]::Round($value, 1) }
+        elseif ($path -like '*current disk queue length') { $diskPerf.queue_length = [math]::Round($value, 2) }
+        elseif ($path -like '*disk read bytes/sec') { $diskPerf.read_mib_s = [math]::Round($value / 1MB, 2) }
+        elseif ($path -like '*disk write bytes/sec') { $diskPerf.write_mib_s = [math]::Round($value / 1MB, 2) }
+        elseif ($path -like '*avg. disk sec/read') { $diskPerf.read_latency_ms = [math]::Round($value * 1000, 2) }
+        elseif ($path -like '*avg. disk sec/write') { $diskPerf.write_latency_ms = [math]::Round($value * 1000, 2) }
+    }
+} catch { }
+# Google Drive is a virtual cloud mount, not independent local capacity.
+$disks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' |
+    Where-Object { $_.VolumeName -notmatch 'Google Drive' } | ForEach-Object {
     [PSCustomObject]@{
         drive = $_.DeviceID
         total_gb = [math]::Round($_.Size / 1GB, 1)
         free_gb  = [math]::Round($_.FreeSpace / 1GB, 1)
+        label = $_.VolumeName
+        is_virtual = ($_.VolumeName -match 'Google Drive')
     }
 })
 $sysDisk = $disks | Where-Object { $_.drive -eq $config.system_drive } | Select-Object -First 1
@@ -343,7 +402,7 @@ if ($lines.Count -gt 10200) {
 }
 $cutoff = $now.AddMinutes(-5)
 $recent = @()
-foreach ($ln in ($lines | Select-Object -Last 10)) {
+foreach ($ln in ($lines | Select-Object -Last 20)) {
     $parts = $ln.Split(',')
     if ($parts.Count -lt 2) { continue }
     try {
@@ -355,15 +414,56 @@ $cpu5 = if ($recent.Count -gt 0) {
     [math]::Round(($recent | Measure-Object -Average).Average, 1)
 } else { $cpuTotal }
 
-# ---------- light (4 levels; worst dimension wins) ----------
-# RAM/CPU judged in percent; disk judged in absolute free GB on the system drive.
-$light = 'GREEN'
+# ---------- light (4 levels; worst dimension wins + recovery hysteresis) ----------
+# RAM/CPU are judged in percent. Disk pressure uses both free space and the
+# physical-disk queue/latency counters. We intentionally do not gate on the
+# aggregate `% Disk Time` counter because Windows can report more than 100%
+# across multiple devices.
+$diskQueueNow = 0.0
+if ($null -ne $diskPerf.queue_length) { $diskQueueNow = [double]$diskPerf.queue_length }
+$diskLatencyNow = 0.0
+foreach ($candidate in @($diskPerf.read_latency_ms, $diskPerf.write_latency_ms)) {
+    if ($null -ne $candidate) { $diskLatencyNow = [math]::Max($diskLatencyNow, [double]$candidate) }
+}
+$rawLight = 'GREEN'
 if ($ramUsedPct -ge $config.ram_yellow_pct -or $cpu5 -ge $config.cpu_yellow_pct -or
-    $sysFreeGb -le $config.disk_yellow_gb) { $light = 'YELLOW' }
+    $commitUsedPct -ge $config.commit_yellow_pct -or
+    $sysFreeGb -le $config.disk_yellow_gb -or
+    $diskQueueNow -ge $config.disk_queue_yellow -or
+    $diskLatencyNow -ge $config.disk_latency_yellow_ms) { $rawLight = 'YELLOW' }
 if ($ramUsedPct -ge $config.ram_orange_pct -or $cpu5 -ge $config.cpu_orange_pct -or
-    $sysFreeGb -le $config.disk_orange_gb) { $light = 'ORANGE' }
+    $commitUsedPct -ge $config.commit_orange_pct -or
+    $sysFreeGb -le $config.disk_orange_gb -or
+    $diskQueueNow -ge $config.disk_queue_orange -or
+    $diskLatencyNow -ge $config.disk_latency_orange_ms) { $rawLight = 'ORANGE' }
 if ($ramUsedPct -ge $config.ram_red_pct -or $cpu5 -ge $config.cpu_red_pct -or
-    $sysFreeGb -le $config.disk_red_gb) { $light = 'RED' }
+    $commitUsedPct -ge $config.commit_red_pct -or
+    $sysFreeGb -le $config.disk_red_gb -or
+    $diskQueueNow -ge $config.disk_queue_red -or
+    $diskLatencyNow -ge $config.disk_latency_red_ms) { $rawLight = 'RED' }
+$light = $rawLight
+$recoveryStreak = 0
+$ranks = @{ GREEN = 0; YELLOW = 1; ORANGE = 2; RED = 3 }
+$previousLight = if ($null -ne $prev -and $null -ne $prev.light) { [string]$prev.light } else { $rawLight }
+if ($null -ne $prev -and $null -ne $prev.recovery_streak) { $recoveryStreak = [int]$prev.recovery_streak }
+if ($ranks[$previousLight] -gt $ranks[$rawLight]) {
+    $suffix = $previousLight.ToLower()
+    $ramExit = [double]$config.("ram_${suffix}_pct") - [double]$config.hysteresis_ram_pct
+    $cpuExit = [double]$config.("cpu_${suffix}_pct") - [double]$config.hysteresis_cpu_pct
+    $commitExit = [double]$config.("commit_${suffix}_pct") - [double]$config.hysteresis_commit_pct
+    $diskExit = [double]$config.("disk_${suffix}_gb") + [double]$config.hysteresis_disk_gb
+    $diskQueueExit = [double]$config.("disk_queue_${suffix}") - [double]$config.hysteresis_disk_queue
+    $diskLatencyExit = [double]$config.("disk_latency_${suffix}_ms") - [double]$config.hysteresis_disk_latency_ms
+    $belowExit = ($ramUsedPct -lt $ramExit -and $cpu5 -lt $cpuExit -and
+                  $commitUsedPct -lt $commitExit -and $sysFreeGb -gt $diskExit -and
+                  $diskQueueNow -lt $diskQueueExit -and $diskLatencyNow -lt $diskLatencyExit)
+    if ($belowExit) { $recoveryStreak++ } else { $recoveryStreak = 0 }
+    $recoverySamples = [math]::Ceiling([double]$config.hysteresis_recovery_samples * 60 / [double]$config.collection_interval_sec)
+    if ($recoveryStreak -lt $recoverySamples) { $light = $previousLight }
+    else { $light = $rawLight; $recoveryStreak = 0 }
+} else {
+    $recoveryStreak = 0
+}
 
 # ---------- telegram alert: sustained RED -> alert; recovery -> all-clear ----------
 $alertState = @{ streak = 0; last_ts = [double]0; active = $false }
@@ -378,6 +478,7 @@ $tg = $config.telegram
 if ($null -ne $tg -and $tg.enabled) {
     $nowEpochA = [double]((Get-Date).ToUniversalTime() - (Get-Date '1970-01-01')).TotalSeconds
     $redAfter = 5;   if ($null -ne $tg.red_after_samples) { $redAfter = [int]$tg.red_after_samples }
+    $redAfter = [math]::Ceiling($redAfter * 60 / [double]$config.collection_interval_sec)
     $cooldown = 60;  if ($null -ne $tg.cooldown_min) { $cooldown = [int]$tg.cooldown_min }
     $fire = ($alertState.streak -ge $redAfter -and
              ($nowEpochA - $alertState.last_ts) -gt $cooldown * 60)
@@ -580,24 +681,19 @@ try {
     }
 } catch { }
 
-# ---------- heavy-slot cleanup (arbiter state written by sentinel-gate.py) ----------
+# ---------- coordinator cleanup + backward-compatible reservation mirror ----------
 $slotsPath = Join-Path $dataDir 'slots.json'
 $activeSlots = @()
+try {
+    $ctl = Join-Path $PSScriptRoot 'sentinelctl.py'
+    & py $ctl --data-dir $dataDir cleanup --config-file $configPath | Out-Null
+} catch { }
 if (Test-Path $slotsPath) {
     try {
         $sd = Get-Content $slotsPath -Raw | ConvertFrom-Json
-        $nowEpoch = [double](Get-Date -UFormat %s)
         foreach ($sl in @($sd.slots)) {
             if ($null -eq $sl) { continue }
-            $ttl = 15; if ($null -ne $sl.ttl_min) { $ttl = [double]$sl.ttl_min }
-            if (($nowEpoch - [double]$sl.ts) -gt $ttl * 60) { continue }
-            if (-not $byId.ContainsKey([uint32]$sl.pid)) { continue }
             $activeSlots += $sl
-        }
-        if ($activeSlots.Count -ne @($sd.slots).Count) {
-            $tmp = "$slotsPath.tmp"
-            (@{ slots = $activeSlots } | ConvertTo-Json -Depth 3 -Compress) | Out-File $tmp -Encoding ascii
-            Move-Item -Force $tmp $slotsPath
         }
     } catch { }
 }
@@ -613,21 +709,30 @@ foreach ($p in $procs) {
 }
 $stateDrives = @{}
 foreach ($d in $disks) { $stateDrives[$d.drive] = $d.free_gb }
-$state = @{ ts = $nowStr; drives = $stateDrives; procs = $stateProcs; peaks = $peaks; demoted = $demoted; alert = $alertState; trims = $trims; disk_alerts = $diskAlerts }
+$state = @{ ts = $nowStr; drives = $stateDrives; procs = $stateProcs; peaks = $peaks; demoted = $demoted; alert = $alertState; trims = $trims; disk_alerts = $diskAlerts; light = $light; recovery_streak = $recoveryStreak }
 $tmp = "$statePath.tmp"
 ($state | ConvertTo-Json -Depth 4 -Compress) | Out-File $tmp -Encoding ascii
 Move-Item -Force $tmp $statePath
 
 # ---------- status.json (atomic) ----------
 $statusJsonPath = Join-Path $dataDir 'status.json'
+# Publish on a real five-second boundary; retain the measurement timestamp.
+$publishNow = Get-Date
+$publishTicks = 5 * [TimeSpan]::TicksPerSecond
+$publishDelay = $publishTicks - ($publishNow.Ticks % $publishTicks)
+Start-Sleep -Milliseconds ([int][math]::Ceiling($publishDelay / [TimeSpan]::TicksPerMillisecond))
+$publishedAt = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
 $status = [ordered]@{
-    generated_at = $nowStr
+    generated_at = $publishedAt
+    sampled_at = $nowStr
     light = $light
     cpu_pct = $cpuTotal
     cpu_5min_avg = $cpu5
     ram = [ordered]@{ total_gb = $ramTotalGb; free_gb = $ramFreeGb; used_pct = $ramUsedPct }
+    memory = $memory
     gpu = $gpu
     disks = $disks
+    disk_performance = $diskPerf
     agent_groups = $groups
     agent_trees = @($trees | Select-Object -First 10)
     top_disk_writers_interval = $topWriters
@@ -643,18 +748,22 @@ $statusMdPath = Join-Path $dataDir 'status.md'
 $md = New-Object System.Collections.ArrayList
 [void]$md.Add("# Resource Sentinel status")
 [void]$md.Add("")
-[void]$md.Add("Generated: $nowStr (stale if older than 5 minutes)")
+[void]$md.Add("Generated: $publishedAt (stale if older than 5 minutes)")
+[void]$md.Add("Sampled: $nowStr")
 [void]$md.Add("")
 [void]$md.Add("## Light: $light")
 [void]$md.Add("")
 [void]$md.Add("- CPU now: ${cpuTotal}% | 5-min avg: ${cpu5}%")
 [void]$md.Add("- RAM: ${ramUsedPct}% used (${ramFreeGb} GB free of ${ramTotalGb} GB)")
+[void]$md.Add("- Commit: $($memory.commit_used_gib)/$($memory.commit_limit_gib) GiB ($($memory.commit_used_pct)%) | pagefile used $($memory.pagefile_used_gib) GiB")
 if ($null -ne $gpu.util_pct) {
     [void]$md.Add("- GPU: $($gpu.util_pct)% | VRAM $($gpu.vram_used_mb)/$($gpu.vram_total_mb) MB")
 }
 foreach ($d in $disks) {
-    [void]$md.Add("- Disk $($d.drive) $($d.free_gb) GB free of $($d.total_gb) GB")
+    $virtual = if ($d.is_virtual) { ' (virtual)' } else { '' }
+    [void]$md.Add("- Disk $($d.drive)$virtual $($d.free_gb) GB free of $($d.total_gb) GB")
 }
+[void]$md.Add("- Physical disk now: $($diskPerf.active_pct)% active | queue $($diskPerf.queue_length) | latency R/W $($diskPerf.read_latency_ms)/$($diskPerf.write_latency_ms) ms | read $($diskPerf.read_mib_s) MiB/s | write $($diskPerf.write_mib_s) MiB/s")
 [void]$md.Add("")
 [void]$md.Add("## Agent usage (process trees)")
 [void]$md.Add("")
@@ -699,8 +808,42 @@ $tmp = "$statusMdPath.tmp"
 ($md -join "`r`n") | Out-File $tmp -Encoding ascii
 Move-Item -Force $tmp $statusMdPath
 
+# ---------- sync detected local agent sessions ----------
+try {
+    $detectedSessions = @($trees | ForEach-Object {
+        $sessionRepo = if ($_.PSObject.Properties['repo']) { [string]$_.repo } else { '' }
+        [PSCustomObject]@{
+            session_id = (
+                (($_.root -replace '\.exe$', '').ToLower()) + '-' + $_.pid + '-' +
+                [int64]([double]$_.started_at * 1000)
+            )
+            agent_kind = (($_.root -replace '\.exe$', '').ToLower())
+            owner_pid = [int]$_.pid
+            owner_started = [double]$_.started_at
+            repo = $sessionRepo
+            bound_worker_id = [string]$config.local_worker_id
+            capabilities = [ordered]@{ source = 'process-tree'; process_count = $_.procs }
+            ttl_sec = 180
+        }
+    })
+    $detectedSessionsPath = Join-Path $dataDir 'detected-sessions.json'
+    $detectedSessionsTmp = "$detectedSessionsPath.tmp"
+    (ConvertTo-Json -InputObject @($detectedSessions) -Depth 4) | Out-File $detectedSessionsTmp -Encoding utf8
+    Move-Item -Force $detectedSessionsTmp $detectedSessionsPath
+    $orchestratorCtlForSessions = Join-Path $PSScriptRoot 'orchestratorctl.py'
+    & py $orchestratorCtlForSessions --data-dir $dataDir sessions-sync --sessions $detectedSessionsPath | Out-Null
+} catch { }
+
 # ---------- dashboard data (data.js) + static page copy ----------
 $dataJsPath = Join-Path $dataDir 'data.js'
+$orchestratorSnapshot = @{}
+try {
+    $orchestratorCtlForDashboard = Join-Path $PSScriptRoot 'orchestratorctl.py'
+    $orchestratorRaw = & py $orchestratorCtlForDashboard --data-dir $dataDir snapshot
+    if ($LASTEXITCODE -eq 0 -and $orchestratorRaw) {
+        $orchestratorSnapshot = ($orchestratorRaw -join "`n") | ConvertFrom-Json
+    }
+} catch { $orchestratorSnapshot = @{} }
 $samplesTail = @($lines | Select-Object -Last 180)
 # manual JSON array build: PS 5.1 ConvertTo-Json collapses 1-element arrays
 $samplesJs = if ($samplesTail.Count -gt 0) {
@@ -715,10 +858,39 @@ $js = @(
     'window.SENTINEL_STATUS=' + ($status | ConvertTo-Json -Depth 5 -Compress) + ';'
     'window.SENTINEL_SAMPLES=' + $samplesJs + ';'
     'window.SENTINEL_EVENTS=' + $evJs + ';'
+    'window.SENTINEL_ORCHESTRATOR=' + ($orchestratorSnapshot | ConvertTo-Json -Depth 8 -Compress) + ';'
 )
 $tmp = "$dataJsPath.tmp"
 ($js -join "`n") | Out-File $tmp -Encoding ascii
 Move-Item -Force $tmp $dataJsPath
+
+# ---------- structured telemetry (SQLite; best effort) ----------
+try {
+    $ctl = Join-Path $PSScriptRoot 'sentinelctl.py'
+    & py $ctl --data-dir $dataDir sample --status-file $statusJsonPath | Out-Null
+} catch { }
+
+# Refresh the local worker in the heterogeneous maintainer.  ORANGE/RED becomes
+# CAPACITY_FULL, while current free RAM is kept as a second admission guard.
+try {
+    $maintainerCtl = Join-Path $PSScriptRoot 'maintainerctl.py'
+    & py $maintainerCtl --data-dir $dataDir sync-local --status-file $statusJsonPath --config-file $configPath | Out-Null
+} catch { }
+
+# Reconcile provider jobs and dispatch a bounded number of queued tasks.  The
+# persistent local adapter keeps lifecycle state across these one-shot runs.
+if ($config.orchestrator_enabled) {
+    try {
+        $orchestratorCtl = Join-Path $PSScriptRoot 'orchestratorctl.py'
+        $orchestratorOutput = & py $orchestratorCtl --data-dir $dataDir tick --limit ([int]$config.orchestrator_dispatch_limit)
+        if ($LASTEXITCODE -eq 0 -and $orchestratorOutput) {
+            $orchestratorPath = Join-Path $dataDir 'orchestrator-status.json'
+            $orchestratorTmp = "$orchestratorPath.tmp"
+            ($orchestratorOutput -join "`n") | Out-File $orchestratorTmp -Encoding utf8
+            Move-Item -Force $orchestratorTmp $orchestratorPath
+        }
+    } catch { }
+}
 
 $dashSrc = Join-Path (Split-Path $PSScriptRoot -Parent) 'dashboard\dashboard.html'
 $dashDst = Join-Path $dataDir 'dashboard.html'

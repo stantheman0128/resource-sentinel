@@ -1,5 +1,56 @@
 # Changelog
 
+## Unreleased - 2026-09-05
+
+- Reduced the Commit admission headroom to 4 GiB and added boundary coverage.
+- Excluded Google Drive capacity from collection and dashboard cards.
+- Added a bounded :00/:30 collector runner and five-second publication alignment,
+  preserving measurement timestamps separately from publication timestamps.
+- Added the roadmap for control coverage, a local scheduler, fair resource allocation,
+  live telemetry, and a unified cloud worker pool. These new systems remain planned,
+  not deployed or verified end to end.
+
+## 0.14.0 - 2026-08-28
+
+- Added a durable one-shot orchestrator with task/job/event ledgers, retries, dependencies,
+  cancellation, manual completion, agent-session heartbeats, and optional local verification tasks.
+- Added provider-neutral adapter contracts (`submit`, `status`, `cancel`, `collect_result`). The local
+  command adapter is the only ready/enabled bootstrap adapter; every unverified cloud provider uses a
+  truthful manual/disabled default instead of claiming UI access is an API.
+- Added atomic repo/base-SHA/path-scope workspace claims with heartbeat, state transition, TTL cleanup,
+  overlap protection for concurrent agents, and conservative Git worktree materialization.
+- Separated resource accounting into `SHARED_POOL` and `PER_EXECUTION`, with independent
+  `capacity_pool`, `max_concurrency`, `quota_domain`, and `failure_domain` semantics. WORKER and
+  explicitly handshaken SESSION tasks now spend the same reservations and recover expired leases.
+- Added compare-and-set dispatch leases, stale ROUTING recovery, explicit unknown-dispatch
+  resolution, retryable result collection, restart-safe idempotent local job IDs, and bounded output.
+- Added local process-tree RAM/CPU/I/O measurements and P50/P90/P95 execution profiles; disk
+  queue/latency now participate in the machine light with recovery hysteresis.
+- Local commands now receive a minimal environment plus explicit `env_refs`; PID cancellation checks
+  process creation identity, and the Claude hook recognizes the atomic wrapper without double booking.
+- Updated worker bootstrap data with conservative concurrency and explicit adapter readiness. Added
+  architecture and integration guidance: agent sessions are control endpoints, cloud workers are
+  disposable executions rather than permanent computers, and secrets stay in environment variables.
+
+## 0.13.0 - 2026-08-27
+
+- Added a provider-neutral `Maintainer` with a persistent worker registry.
+- Added atomic, memory-aware routing and reservations across local/cloud workers.
+- Added failure-domain accounting so shared cloud computers are not double counted.
+- Added capability, trust-domain, quota-state, and probe-freshness filtering.
+- Added `maintainerctl.py`, bootstrap empirical worker data, and routing tests.
+
+## 0.12.0 - 2026-08-25
+
+- 新增 SQLite coordinator：`BEGIN IMMEDIATE` 原子 admission、P0-P3 priority queue、
+  CPU/RAM/Commit/heavy-I/O reservation、PID+creation-time stale cleanup
+- Claude gate 改成 per-tool reservation；修正同 session 平行重指令共用/誤釋放槽位問題
+- Codex/Cursor 等無 hook agent 新增 `invoke-sentinel.ps1` reserve/run/finally-release wrapper
+- collector 新增 Commit、pagefile、實體磁碟 active/queue/throughput/latency 與 30 天 SQLite telemetry
+- GREEN/YELLOW/ORANGE/RED 加入 Commit pressure、recovery margin 與連續樣本 hysteresis
+- G: 標示為 Google Drive 虛擬磁碟；文件釐清 `WriteTransferCount` 不是實體磁碟 bytes
+- 新增 coordinator 單元測試與隔離的 PowerShell 5.1 end-to-end 驗證
+
 ## 0.11.0 - 2026-08-13
 
 - SSD 定位修正（Stan 釐清）：不進排程，專職突縮偵測

@@ -1,2 +1,8 @@
 dashboard/data.js
 dashboard/_verify.html
+__pycache__/
+*.py[cod]
+*.db
+*.db-shm
+*.db-wal
+Microsoft/

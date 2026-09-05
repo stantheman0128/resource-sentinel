@@ -2,7 +2,6 @@
 <html lang="zh-Hant">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="60">
 <title>Resource Sentinel</title>
 <style>
   :root {
@@ -69,7 +68,17 @@
 </section>
 
 <section>
-  <h2>磁碟寫入排行（上一輪間隔）</h2>
+  <h2>多 Agent / 環境調度</h2>
+  <div id="orchestration"></div>
+</section>
+
+<section>
+  <h2>Active reservations</h2>
+  <div id="reservations"></div>
+</section>
+
+<section>
+  <h2>進程寫入傳輸排行（上一輪間隔；不是實體磁碟 bytes）</h2>
   <div id="writers"></div>
 </section>
 
@@ -84,6 +93,12 @@ const arr = x => Array.isArray(x) ? x : (x == null ? [] : [x]);
 const S = window.SENTINEL_STATUS || null;
 const samples = arr(window.SENTINEL_SAMPLES);
 const events = arr(window.SENTINEL_EVENTS);
+const O = window.SENTINEL_ORCHESTRATOR || {};
+// Reload on wall-clock five-second boundaries to pick up the 30-second snapshots.
+setTimeout(() => location.reload(), 5000 - (Date.now() % 5000) + 250);
+const esc = value => String(value == null ? '' : value)
+  .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+  .replaceAll('"', '&quot;').replaceAll("'", '&#39;');
 
 if (!S) {
   document.getElementById('stamp').textContent = '讀不到 data.js — 採集器還沒跑過？';
@@ -96,18 +111,26 @@ if (!S) {
   const ageMin = (Date.now() - gen.getTime()) / 60000;
   const stampEl = document.getElementById('stamp');
   stampEl.textContent = '更新於 ' + S.generated_at + (ageMin > 5 ? '（已過期 — 監控可能失效）' : '');
+  if (S.sampled_at) stampEl.title = '實際採樣時間：' + S.sampled_at;
   if (ageMin > 5) stampEl.classList.add('stale');
 
   // tiles
   const tiles = [];
   tiles.push(['CPU', S.cpu_pct + '%', '5 分鐘均 ' + S.cpu_5min_avg + '%']);
   tiles.push(['RAM', S.ram.used_pct + '%', S.ram.free_gb + ' GB 可用 / ' + S.ram.total_gb + ' GB']);
+  if (S.memory && S.memory.commit_limit_gib != null) {
+    tiles.push(['Commit', S.memory.commit_used_pct + '%', S.memory.commit_used_gib + ' / ' + S.memory.commit_limit_gib + ' GiB']);
+  }
   if (S.gpu && S.gpu.util_pct != null) {
     tiles.push(['GPU', S.gpu.util_pct + '%', 'VRAM ' + S.gpu.vram_used_mb + '/' + (S.gpu.vram_total_mb || '?') + ' MB']);
   }
   for (const d of arr(S.disks)) {
-    if (d.total_gb < 1) continue;
-    tiles.push(['磁碟 ' + d.drive, d.free_gb + ' GB', '剩餘 / 共 ' + d.total_gb + ' GB']);
+    if (d.total_gb < 1 || /Google Drive/i.test(d.label || '')) continue;
+    tiles.push(['磁碟 ' + d.drive + (d.is_virtual ? '（虛擬）' : ''), d.free_gb + ' GB', '剩餘 / 共 ' + d.total_gb + ' GB']);
+  }
+  if (S.disk_performance && S.disk_performance.active_pct != null) {
+    const d = S.disk_performance;
+    tiles.push(['實體磁碟 I/O', d.active_pct + '%', 'queue ' + d.queue_length + ' · R/W ' + d.read_mib_s + '/' + d.write_mib_s + ' MiB/s']);
   }
   document.getElementById('tiles').innerHTML = tiles.map(t =>
     `<div class="card"><div class="k">${t[0]}</div><div class="v">${t[1]}</div><div class="s">${t[2]}</div></div>`).join('');
@@ -179,6 +202,60 @@ if (!S) {
     }
     document.getElementById('agents').innerHTML = h;
   }
+
+  // durable task/session/worker scheduler
+  const tasks = arr(O.tasks);
+  const sessions = arr(O.sessions);
+  const workers = arr(O.workers && O.workers.workers);
+  const profiles = arr(O.resource_profiles && O.resource_profiles.profiles);
+  let orchestration = '';
+  if (tasks.length) {
+    orchestration += '<div class="empty" style="margin-bottom:6px">Tasks</div>' +
+      '<table><tr><th>ID</th><th>State</th><th>Mode</th><th>Priority</th><th>Session / Worker</th></tr>' +
+      tasks.slice(0, 20).map(t => `<tr><td>${esc(t.id)}</td><td>${esc(t.state)}</td>` +
+        `<td>${esc(t.dispatch_mode || 'WORKER')}</td><td>${esc(t.priority)}</td>` +
+        `<td>${esc(t.selected_session_id || t.selected_worker_id || '—')}</td></tr>`).join('') + '</table>';
+  } else {
+    orchestration += '<div class="empty">目前沒有 orchestrator task</div>';
+  }
+  if (sessions.length) {
+    const visibleSessions = sessions.slice().sort((a, b) => Number(b.fresh) - Number(a.fresh)).slice(0, 20);
+    orchestration += '<div class="empty" style="margin:10px 0 6px">Agent sessions</div>' +
+      '<table><tr><th>Session</th><th>Agent</th><th>State</th><th>Bound worker</th><th>Pull</th><th>Fresh</th></tr>' +
+      visibleSessions.map(s => `<tr><td>${esc(s.id)}</td><td>${esc(s.agent_kind)}</td><td>${esc(s.state)}</td>` +
+        `<td>${esc(s.bound_worker_id || '—')}</td><td>${s.accepts_tasks ? 'enabled' : 'inventory'}</td>` +
+        `<td>${s.fresh ? 'yes' : 'no'}</td></tr>`).join('') + '</table>';
+  }
+  if (workers.length) {
+    orchestration += '<div class="empty" style="margin:10px 0 6px">Execution workers</div>' +
+      '<table><tr><th>Worker</th><th>State</th><th>Capacity</th><th class="num">RAM GiB</th><th>Adapter</th></tr>' +
+      workers.map(w => `<tr><td>${esc(w.id)}</td><td>${esc(w.state)}</td>` +
+        `<td>${esc(w.capacity_scope)} / ${esc(w.capacity_pool)}</td><td class="num">${esc(w.allocatable_ram_gib)}</td>` +
+        `<td>${esc((w.capabilities || {}).adapter || 'manual')} · ${((w.capabilities || {}).adapter_ready ? 'ready' : 'not ready')}</td></tr>`).join('') + '</table>';
+  }
+  if (profiles.length) {
+    orchestration += '<div class="empty" style="margin:10px 0 6px">Execution resource profiles</div>' +
+      '<table><tr><th>Signature</th><th>Worker</th><th class="num">Samples</th>' +
+      '<th class="num">Duration P95 s</th><th class="num">RAM P95 GiB</th></tr>' +
+      profiles.slice(0, 20).map(p => {
+        const metrics = p.metrics || {};
+        const duration = metrics.duration_seconds || {};
+        const ram = metrics.peak_working_set_gib || {};
+        return `<tr><td>${esc(p.execution_signature)}</td><td>${esc(p.worker_id)}</td>` +
+          `<td class="num">${esc(p.samples)}</td><td class="num">${duration.p95 == null ? '—' : Number(duration.p95).toFixed(3)}</td>` +
+          `<td class="num">${ram.p95 == null ? '—' : Number(ram.p95).toFixed(3)}</td></tr>`;
+      }).join('') + '</table>';
+  }
+  document.getElementById('orchestration').innerHTML = orchestration;
+
+  // reservations
+  const reservations = arr(S.heavy_slots);
+  document.getElementById('reservations').innerHTML = !reservations.length
+    ? '<div class="empty">目前沒有 active reservation</div>'
+    : '<table><tr><th>Repo</th><th>Class</th><th>Priority</th><th class="num">CPU</th><th class="num">RAM GiB</th><th class="num">I/O</th><th>Command</th></tr>' +
+      reservations.map(r => `<tr><td>${r.repo || '?'}</td><td>${r.resource_class || '?'}</td><td>${r.priority || '?'}</td>` +
+        `<td class="num">${r.cpu_units == null ? '?' : r.cpu_units}</td><td class="num">${r.ram_gib == null ? '?' : r.ram_gib}</td>` +
+        `<td class="num">${r.io_slots == null ? '?' : r.io_slots}</td><td>${r.cmd || '?'}</td></tr>`).join('') + '</table>';
 
   // writers
   const writers = arr(S.top_disk_writers_interval);

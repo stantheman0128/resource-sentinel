@@ -6,9 +6,16 @@ import json
 import os
 import sys
 import time
+import uuid
+from pathlib import Path
+
+PROJECT = Path(r"C:\Users\stans\Projects\resource-sentinel")
+if str(PROJECT) not in sys.path:
+    sys.path.insert(0, str(PROJECT))
+
+from sentinel.coordinator import Coordinator
 
 DATA = os.path.join(os.environ.get("USERPROFILE", ""), ".resource-sentinel")
-QUEUE = os.path.join(DATA, "queue.json")
 BLOCKS = os.path.join(DATA, "stop-blocks.json")
 WAITER = ("powershell -NoProfile -ExecutionPolicy Bypass -File "
           "\"C:\\Users\\stans\\Projects\\resource-sentinel\\scripts\\wait-slot.ps1\"")
@@ -25,7 +32,7 @@ def load(path):
 
 
 def save(path, obj):
-    tmp = path + ".tmp"
+    tmp = path + "." + str(os.getpid()) + "." + uuid.uuid4().hex + ".tmp"
     with open(tmp, "w", encoding="ascii") as f:
         json.dump(obj, f, ensure_ascii=True)
     os.replace(tmp, path)
@@ -46,34 +53,35 @@ def my_agent_pid():
     return os.getppid()
 
 
+def waiter_command(request_key):
+    return f"{WAITER} -RequestId {request_key}"
+
+
 def main():
     try:
         json.load(sys.stdin)
     except Exception:
         pass
 
-    qdoc = load(QUEUE)
-    if not qdoc or not qdoc.get("q"):
-        return  # 沒人排隊，正常結束
     me = my_agent_pid()
+    coordinator = Coordinator(DATA)
+    queued = coordinator.queued_for_owner(me)
+    if not queued:
+        return  # 沒人排隊，正常結束
+    request_key = str(queued[0].get("request_key") or "")
+    if not request_key:
+        return  # 無法精準指定請求時 fail open，不廣域取消。
     now = time.time()
-    entry = None
-    for e in qdoc["q"]:
-        if e.get("pid") == me and now - e.get("ts", 0) <= 600:
-            entry = e
-            break
-    if entry is None:
-        return  # 我不在佇列，正常結束
 
     blocks = load(BLOCKS) or {}
-    key = str(me)
+    key = f"{me}:{request_key}"
     n = int(blocks.get(key, {}).get("n", 0)) + 1
 
     if n > MAX_BLOCKS:
-        # 放棄：移出佇列別擋後面的人，讓 session 正常結束
-        qdoc["q"] = [e for e in qdoc["q"] if e.get("pid") != me]
-        save(QUEUE, qdoc)
+        # 只取消本次提醒的請求，不影響同 session 其他工作。
+        coordinator.cancel_queued(owner_pid=me, request_key=request_key)
         blocks.pop(key, None)
+        blocks.pop(str(me), None)  # 清掉舊版 owner 級計數。
         save(BLOCKS, blocks)
         return
 
@@ -90,7 +98,7 @@ def main():
             "現在執行 %s （Bash timeout 設 600000），它會等到輪到你才返回；"
             "返回後立刻重跑原本被擋的指令。若你決定放棄這個重活，"
             "直接向使用者說明放棄原因即可，第 %d 次之後就不會再攔你。"
-            % (n, MAX_BLOCKS, WAITER, MAX_BLOCKS)
+            % (n, MAX_BLOCKS, waiter_command(request_key), MAX_BLOCKS)
         ),
     }, ensure_ascii=False))
 

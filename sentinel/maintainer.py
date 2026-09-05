@@ -1,0 +1,622 @@
+"""Provider-neutral worker registry and capacity-aware task router.
+
+``failure_domain`` describes correlated failure only.  Capacity accounting is
+kept separately: a ``SHARED_POOL`` worker consumes a common RAM/CPU/disk pool,
+while a ``PER_EXECUTION`` worker represents a fresh VM/container for each job
+and is limited by per-job resources plus account concurrency.
+"""
+
+from __future__ import annotations
+
+import json
+import hashlib
+import os
+import re
+import sqlite3
+import time
+import uuid
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any
+
+
+ACTIVE_STATES = {"AVAILABLE", "BUSY"}
+AUTOMATION_RANK = {"AUTOMATABLE": 0, "PARTIAL": 1, "MANUAL": 2, "UNKNOWN": 3}
+PREFERENCES = {"LOCAL_REQUIRED", "LOCAL_PREFERRED", "CLOUD_OK", "CLOUD_PREFERRED"}
+CAPACITY_SCOPES = {"SHARED_POOL", "PER_EXECUTION"}
+SENSITIVE_KEY = re.compile(r"(?i)(token|password|passwd|secret|credential|api[_-]?key)")
+
+
+@dataclass(frozen=True)
+class Worker:
+    id: str
+    provider: str
+    failure_domain: str
+    capacity_scope: str = "SHARED_POOL"
+    capacity_pool: str = ""
+    max_concurrency: int = 1
+    quota_domain: str = ""
+    state: str = "UNKNOWN"
+    automation_level: str = "UNKNOWN"
+    os: str = "linux"
+    capacity_ram_gib: float = 0.0
+    allocatable_ram_gib: float = 0.0
+    visible_cpu: float | None = None
+    allocatable_cpu: float | None = None
+    disk_free_gib: float | None = None
+    allocatable_disk_gib: float | None = None
+    capabilities: dict[str, Any] = field(default_factory=dict)
+    trust_domain: str = "unknown"
+    source: str = "manual"
+    observed_at: float = 0.0
+    probe_expires_at: float = 0.0
+
+    def normalized(self) -> "Worker":
+        state = self.state.upper()
+        automation = self.automation_level.upper()
+        capacity_scope = self.capacity_scope.upper()
+        if automation not in AUTOMATION_RANK:
+            raise ValueError(f"unknown automation level: {automation}")
+        if capacity_scope not in CAPACITY_SCOPES:
+            raise ValueError(f"unknown capacity scope: {capacity_scope}")
+        if not self.id or not self.failure_domain:
+            raise ValueError("worker id and failure_domain are required")
+        if self.allocatable_ram_gib < 0 or self.capacity_ram_gib < self.allocatable_ram_gib:
+            raise ValueError("allocatable RAM must be between zero and capacity RAM")
+        if int(self.max_concurrency) < 1:
+            raise ValueError("max_concurrency must be positive")
+        capacity_pool = self.capacity_pool or self.failure_domain
+        return Worker(
+            id=self.id,
+            provider=self.provider or self.id,
+            failure_domain=self.failure_domain,
+            capacity_scope=capacity_scope,
+            capacity_pool=capacity_pool,
+            max_concurrency=int(self.max_concurrency),
+            quota_domain=self.quota_domain or capacity_pool,
+            state=state,
+            automation_level=automation,
+            os=self.os.lower(),
+            capacity_ram_gib=float(self.capacity_ram_gib),
+            allocatable_ram_gib=float(self.allocatable_ram_gib),
+            visible_cpu=None if self.visible_cpu is None else float(self.visible_cpu),
+            allocatable_cpu=None if self.allocatable_cpu is None else float(self.allocatable_cpu),
+            disk_free_gib=None if self.disk_free_gib is None else float(self.disk_free_gib),
+            allocatable_disk_gib=None if self.allocatable_disk_gib is None else float(self.allocatable_disk_gib),
+            capabilities=dict(self.capabilities),
+            trust_domain=self.trust_domain,
+            source=self.source,
+            observed_at=float(self.observed_at),
+            probe_expires_at=float(self.probe_expires_at),
+        )
+
+
+@dataclass(frozen=True)
+class Task:
+    id: str
+    ram_gib: float
+    cpu_units: float = 1.0
+    disk_gib: float = 0.0
+    os: str = "any"
+    docker: bool = False
+    browser: bool = False
+    hardware: bool = False
+    local_browser_state: bool = False
+    local_network: bool = False
+    persistent_environment: bool = False
+    execution_preference: str = "CLOUD_PREFERRED"
+    allowed_trust_domains: tuple[str, ...] = ()
+    allowed_worker_ids: tuple[str, ...] = ()
+    automated_only: bool = True
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def normalized(self) -> "Task":
+        preference = self.execution_preference.upper()
+        if preference not in PREFERENCES:
+            raise ValueError(f"unknown execution preference: {preference}")
+        if not self.id:
+            raise ValueError("task id is required")
+        if min(self.ram_gib, self.cpu_units, self.disk_gib) < 0:
+            raise ValueError("task resources cannot be negative")
+        return Task(
+            id=self.id,
+            ram_gib=float(self.ram_gib),
+            cpu_units=float(self.cpu_units),
+            disk_gib=float(self.disk_gib),
+            os=self.os.lower(),
+            docker=bool(self.docker),
+            browser=bool(self.browser),
+            hardware=bool(self.hardware),
+            local_browser_state=bool(self.local_browser_state),
+            local_network=bool(self.local_network),
+            persistent_environment=bool(self.persistent_environment),
+            execution_preference=preference,
+            allowed_trust_domains=tuple(self.allowed_trust_domains),
+            allowed_worker_ids=tuple(self.allowed_worker_ids),
+            automated_only=bool(self.automated_only),
+            metadata=dict(self.metadata),
+        )
+
+
+class Maintainer:
+    """Atomic registry, router, and cross-worker resource reservations."""
+
+    def __init__(self, data_dir: str | os.PathLike[str], *, db_path: str | os.PathLike[str] | None = None):
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.db_path = Path(db_path) if db_path else self.data_dir / "sentinel.db"
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=10000")
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+        return conn
+
+    @contextmanager
+    def _db(self):
+        conn = self._connect()
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    def _init_db(self) -> None:
+        with self._db() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS workers (
+                    id TEXT PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    failure_domain TEXT NOT NULL,
+                    capacity_scope TEXT NOT NULL DEFAULT 'SHARED_POOL',
+                    capacity_pool TEXT NOT NULL DEFAULT '',
+                    max_concurrency INTEGER NOT NULL DEFAULT 1,
+                    quota_domain TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL,
+                    automation_level TEXT NOT NULL,
+                    os TEXT NOT NULL,
+                    capacity_ram_gib REAL NOT NULL,
+                    allocatable_ram_gib REAL NOT NULL,
+                    visible_cpu REAL,
+                    allocatable_cpu REAL,
+                    disk_free_gib REAL,
+                    allocatable_disk_gib REAL,
+                    capabilities_json TEXT NOT NULL,
+                    trust_domain TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    observed_at REAL NOT NULL,
+                    probe_expires_at REAL NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_workers_domain ON workers(failure_domain);
+                CREATE TABLE IF NOT EXISTS worker_reservations (
+                    id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL UNIQUE,
+                    worker_id TEXT NOT NULL,
+                    failure_domain TEXT NOT NULL,
+                    capacity_scope TEXT NOT NULL DEFAULT 'SHARED_POOL',
+                    capacity_pool TEXT NOT NULL DEFAULT '',
+                    spec_hash TEXT NOT NULL DEFAULT '',
+                    ram_gib REAL NOT NULL,
+                    cpu_units REAL NOT NULL,
+                    disk_gib REAL NOT NULL,
+                    created_at REAL NOT NULL,
+                    heartbeat_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    metadata_json TEXT NOT NULL,
+                    FOREIGN KEY(worker_id) REFERENCES workers(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_worker_res_domain
+                    ON worker_reservations(failure_domain, expires_at);
+                CREATE TABLE IF NOT EXISTS routed_executions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    reservation_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    worker_id TEXT NOT NULL,
+                    failure_domain TEXT NOT NULL,
+                    capacity_scope TEXT NOT NULL DEFAULT 'SHARED_POOL',
+                    capacity_pool TEXT NOT NULL DEFAULT '',
+                    spec_hash TEXT NOT NULL DEFAULT '',
+                    ram_gib REAL NOT NULL,
+                    cpu_units REAL NOT NULL,
+                    disk_gib REAL NOT NULL,
+                    started_at REAL NOT NULL,
+                    ended_at REAL NOT NULL,
+                    outcome TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL
+                );
+                """
+            )
+            # Additive migrations keep existing live databases usable.
+            self._ensure_columns(conn, "workers", {
+                "capacity_scope": "TEXT NOT NULL DEFAULT 'SHARED_POOL'",
+                "capacity_pool": "TEXT NOT NULL DEFAULT ''",
+                "max_concurrency": "INTEGER NOT NULL DEFAULT 1",
+                "quota_domain": "TEXT NOT NULL DEFAULT ''",
+            })
+            self._ensure_columns(conn, "worker_reservations", {
+                "capacity_scope": "TEXT NOT NULL DEFAULT 'SHARED_POOL'",
+                "capacity_pool": "TEXT NOT NULL DEFAULT ''",
+                "spec_hash": "TEXT NOT NULL DEFAULT ''",
+            })
+            self._ensure_columns(conn, "routed_executions", {
+                "capacity_scope": "TEXT NOT NULL DEFAULT 'SHARED_POOL'",
+                "capacity_pool": "TEXT NOT NULL DEFAULT ''",
+                "spec_hash": "TEXT NOT NULL DEFAULT ''",
+            })
+            conn.execute("UPDATE workers SET capacity_pool=failure_domain WHERE capacity_pool='' OR capacity_pool IS NULL")
+            conn.execute("UPDATE workers SET quota_domain=capacity_pool WHERE quota_domain='' OR quota_domain IS NULL")
+            conn.execute("UPDATE worker_reservations SET capacity_pool=failure_domain WHERE capacity_pool='' OR capacity_pool IS NULL")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_worker_res_pool ON worker_reservations(capacity_pool, expires_at)")
+
+    @staticmethod
+    def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        for name, declaration in columns.items():
+            if name not in existing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+
+    def upsert_worker(self, worker: Worker, *, now: float | None = None) -> dict[str, Any]:
+        w = worker.normalized()
+        now = time.time() if now is None else now
+        observed = w.observed_at or now
+        expires = w.probe_expires_at or observed + 7 * 86400
+        values = asdict(w)
+        values.update(observed_at=observed, probe_expires_at=expires)
+        with self._db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """INSERT INTO workers
+                (id,provider,failure_domain,capacity_scope,capacity_pool,max_concurrency,quota_domain,
+                 state,automation_level,os,capacity_ram_gib,
+                 allocatable_ram_gib,visible_cpu,allocatable_cpu,disk_free_gib,
+                 allocatable_disk_gib,capabilities_json,trust_domain,source,observed_at,
+                 probe_expires_at,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(id) DO UPDATE SET
+                  provider=excluded.provider,failure_domain=excluded.failure_domain,
+                  capacity_scope=excluded.capacity_scope,capacity_pool=excluded.capacity_pool,
+                  max_concurrency=excluded.max_concurrency,quota_domain=excluded.quota_domain,
+                  state=excluded.state,automation_level=excluded.automation_level,os=excluded.os,
+                  capacity_ram_gib=excluded.capacity_ram_gib,
+                  allocatable_ram_gib=excluded.allocatable_ram_gib,
+                  visible_cpu=excluded.visible_cpu,allocatable_cpu=excluded.allocatable_cpu,
+                  disk_free_gib=excluded.disk_free_gib,
+                  allocatable_disk_gib=excluded.allocatable_disk_gib,
+                  capabilities_json=excluded.capabilities_json,trust_domain=excluded.trust_domain,
+                  source=excluded.source,observed_at=excluded.observed_at,
+                  probe_expires_at=excluded.probe_expires_at,updated_at=excluded.updated_at""",
+                (
+                    w.id, w.provider, w.failure_domain, w.capacity_scope, w.capacity_pool,
+                    w.max_concurrency, w.quota_domain, w.state, w.automation_level, w.os,
+                    w.capacity_ram_gib, w.allocatable_ram_gib, w.visible_cpu, w.allocatable_cpu,
+                    w.disk_free_gib, w.allocatable_disk_gib,
+                    json.dumps(w.capabilities, separators=(",", ":")), w.trust_domain, w.source,
+                    observed, expires, now,
+                ),
+            )
+            conn.execute("COMMIT")
+        return values
+
+    def import_workers(self, workers: list[dict[str, Any]], *, now: float | None = None) -> list[dict[str, Any]]:
+        return [self.upsert_worker(Worker(**item), now=now) for item in workers]
+
+    @staticmethod
+    def _decode_worker(row: sqlite3.Row, now: float) -> dict[str, Any]:
+        item = dict(row)
+        item["capabilities"] = json.loads(item.pop("capabilities_json") or "{}")
+        item["probe_fresh"] = float(item["probe_expires_at"]) > now
+        return item
+
+    def workers(self, *, now: float | None = None) -> list[dict[str, Any]]:
+        now = time.time() if now is None else now
+        with self._db() as conn:
+            return [self._decode_worker(row, now) for row in conn.execute("SELECT * FROM workers ORDER BY id")]
+
+    def get_worker(self, worker_id: str, *, now: float | None = None) -> dict[str, Any] | None:
+        now = time.time() if now is None else now
+        with self._db() as conn:
+            row = conn.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone()
+        return self._decode_worker(row, now) if row else None
+
+    def update_worker_state(self, worker_id: str, state: str, *, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        with self._db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute("UPDATE workers SET state=?,updated_at=? WHERE id=?", (state.upper(), now, worker_id))
+            conn.execute("COMMIT")
+        return cur.rowcount > 0
+
+    @staticmethod
+    def _fits(task: Task, worker: dict[str, Any], now: float) -> tuple[bool, str]:
+        if worker["state"] not in ACTIVE_STATES:
+            return False, f"state_{worker['state'].lower()}"
+        if float(worker["probe_expires_at"]) <= now:
+            return False, "probe_stale"
+        local = bool(worker["capabilities"].get("local"))
+        if task.automated_only:
+            if worker["capabilities"].get("enabled", True) is False:
+                return False, "worker_disabled"
+            if worker["automation_level"] != "AUTOMATABLE":
+                return False, "not_automatable"
+            adapter_ready = worker["capabilities"].get("adapter_ready")
+            if adapter_ready is None:
+                adapter_ready = local
+            if not bool(adapter_ready):
+                return False, "adapter_not_ready"
+        if task.allowed_worker_ids and worker["id"] not in task.allowed_worker_ids:
+            return False, "worker_allowlist"
+        if task.execution_preference == "LOCAL_REQUIRED" and not local:
+            return False, "local_required"
+        if task.os != "any" and worker["os"] != task.os:
+            return False, "os"
+        checks = {
+            "docker": task.docker,
+            "browser": task.browser,
+            "hardware": task.hardware,
+            "local_browser_state": task.local_browser_state,
+            "local_network": task.local_network,
+            "persistent_environment": task.persistent_environment,
+        }
+        for capability, required in checks.items():
+            if required and not bool(worker["capabilities"].get(capability)):
+                return False, capability
+        if task.allowed_trust_domains and worker["trust_domain"] not in task.allowed_trust_domains:
+            return False, "trust_domain"
+        return True, "fit"
+
+    @staticmethod
+    def _spec_hash(task: Task) -> str:
+        payload = json.dumps(asdict(task), sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _safe_metadata(value: Any, *, depth: int = 0) -> Any:
+        if depth > 4:
+            return "<truncated>"
+        if isinstance(value, dict):
+            return {
+                str(key): (
+                    "<redacted>" if SENSITIVE_KEY.search(str(key))
+                    else Maintainer._safe_metadata(item, depth=depth + 1)
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [Maintainer._safe_metadata(item, depth=depth + 1) for item in value[:100]]
+        if isinstance(value, str):
+            return value[:500]
+        if value is None or isinstance(value, (int, float, bool)):
+            return value
+        return f"<{type(value).__name__}>"
+
+    @staticmethod
+    def _pool_usage(
+        conn: sqlite3.Connection, worker: dict[str, Any]
+    ) -> dict[str, float | int]:
+        usage = conn.execute(
+            """SELECT COALESCE(SUM(ram_gib),0) ram,COALESCE(SUM(cpu_units),0) cpu,
+                      COALESCE(SUM(disk_gib),0) disk,COUNT(*) jobs
+               FROM worker_reservations WHERE capacity_pool=?""",
+            (worker["capacity_pool"],),
+        ).fetchone()
+        result: dict[str, float | int] = {
+            "ram": float(usage["ram"]), "cpu": float(usage["cpu"]),
+            "disk": float(usage["disk"]), "jobs": int(usage["jobs"]),
+        }
+        # Coordinator reservations are another entry point to this same local
+        # pool.  Counting them here prevents local agent commands and routed
+        # executions from independently spending the same headroom.
+        if bool(worker["capabilities"].get("local")):
+            has_table = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='reservations'"
+            ).fetchone()
+            if has_table:
+                direct = conn.execute(
+                    """SELECT COALESCE(SUM(ram_gib),0) ram,COALESCE(SUM(cpu_units),0) cpu,
+                              COALESCE(SUM(io_slots),0) io,COUNT(*) jobs FROM reservations"""
+                ).fetchone()
+                result["ram"] = float(result["ram"]) + float(direct["ram"])
+                result["cpu"] = float(result["cpu"]) + float(direct["cpu"])
+                result["jobs"] = int(result["jobs"]) + int(direct["jobs"])
+        return result
+
+    @staticmethod
+    def _quota_jobs(conn: sqlite3.Connection, quota_domain: str) -> int:
+        return int(conn.execute(
+            """SELECT COUNT(*)
+               FROM worker_reservations r
+               JOIN workers w ON w.id=r.worker_id
+               WHERE w.quota_domain=?""",
+            (quota_domain,),
+        ).fetchone()[0])
+
+    def route_and_reserve(self, task: Task, *, ttl_min: int = 120, now: float | None = None) -> dict[str, Any]:
+        t = task.normalized()
+        spec_hash = self._spec_hash(t)
+        now = time.time() if now is None else now
+        with self._db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._cleanup_locked(conn, now)
+            existing = conn.execute("SELECT * FROM worker_reservations WHERE task_id=?", (t.id,)).fetchone()
+            if existing:
+                if existing["spec_hash"] != spec_hash:
+                    conn.execute("COMMIT")
+                    return {
+                        "reserved": False, "reason": "task_spec_mismatch", "task_id": t.id,
+                        "reservation_id": existing["id"],
+                    }
+                conn.execute(
+                    "UPDATE worker_reservations SET heartbeat_at=?,expires_at=? WHERE id=?",
+                    (now, now + ttl_min * 60, existing["id"]),
+                )
+                conn.execute("COMMIT")
+                return {"reserved": True, "reused": True, **dict(existing)}
+
+            workers = [self._decode_worker(row, now) for row in conn.execute("SELECT * FROM workers")]
+            rejected: dict[str, str] = {}
+            candidates: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+            for worker in workers:
+                fits, reason = self._fits(t, worker, now)
+                if not fits:
+                    rejected[worker["id"]] = reason
+                    continue
+                usage = self._pool_usage(conn, worker)
+                if int(usage["jobs"]) >= int(worker["max_concurrency"]):
+                    rejected[worker["id"]] = "concurrency_capacity"
+                    continue
+                quota_jobs = self._quota_jobs(conn, worker["quota_domain"])
+                if quota_jobs >= int(worker["max_concurrency"]):
+                    rejected[worker["id"]] = "quota_concurrency"
+                    continue
+                shared = worker["capacity_scope"] == "SHARED_POOL"
+                accounted_ram = float(usage["ram"]) if shared else 0.0
+                accounted_cpu = float(usage["cpu"]) if shared else 0.0
+                accounted_disk = float(usage["disk"]) if shared else 0.0
+                if accounted_ram + t.ram_gib > float(worker["allocatable_ram_gib"]):
+                    rejected[worker["id"]] = "ram_capacity"
+                    continue
+                if worker["allocatable_cpu"] is not None and accounted_cpu + t.cpu_units > float(worker["allocatable_cpu"]):
+                    rejected[worker["id"]] = "cpu_capacity"
+                    continue
+                if worker["allocatable_disk_gib"] is not None and accounted_disk + t.disk_gib > float(worker["allocatable_disk_gib"]):
+                    rejected[worker["id"]] = "disk_capacity"
+                    continue
+                observed_free = worker["capabilities"].get("observed_free_ram_gib")
+                if observed_free is not None:
+                    headroom = float(worker["capabilities"].get("memory_headroom_gib") or 0)
+                    if t.ram_gib > max(0.0, float(observed_free) - headroom - accounted_ram):
+                        rejected[worker["id"]] = "observed_ram_headroom"
+                        continue
+                local = bool(worker["capabilities"].get("local"))
+                if t.execution_preference == "LOCAL_PREFERRED":
+                    preference_rank = 0 if local else 1
+                elif t.execution_preference in {"CLOUD_PREFERRED", "CLOUD_OK"}:
+                    preference_rank = 1 if local else 0
+                else:
+                    preference_rank = 0
+                ram_after = float(worker["allocatable_ram_gib"]) - accounted_ram - t.ram_gib
+                rank = (preference_rank, AUTOMATION_RANK[worker["automation_level"]], ram_after, worker["id"])
+                candidates.append((rank, worker))
+
+            if not candidates:
+                conn.execute("COMMIT")
+                return {"reserved": False, "reason": "no_compatible_worker", "rejected": rejected}
+
+            worker = min(candidates, key=lambda item: item[0])[1]
+            reservation_id = uuid.uuid4().hex
+            conn.execute(
+                """INSERT INTO worker_reservations
+                (id,task_id,worker_id,failure_domain,capacity_scope,capacity_pool,spec_hash,
+                 ram_gib,cpu_units,disk_gib,created_at,heartbeat_at,expires_at,metadata_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    reservation_id, t.id, worker["id"], worker["failure_domain"],
+                    worker["capacity_scope"], worker["capacity_pool"], spec_hash, t.ram_gib,
+                    t.cpu_units, t.disk_gib, now, now, now + ttl_min * 60,
+                    json.dumps(self._safe_metadata(t.metadata), separators=(",", ":")),
+                ),
+            )
+            conn.execute("COMMIT")
+        return {
+            "reserved": True,
+            "reused": False,
+            "reservation_id": reservation_id,
+            "task_id": t.id,
+            "worker_id": worker["id"],
+            "failure_domain": worker["failure_domain"],
+            "capacity_scope": worker["capacity_scope"],
+            "capacity_pool": worker["capacity_pool"],
+            "ram_gib": t.ram_gib,
+            "cpu_units": t.cpu_units,
+            "disk_gib": t.disk_gib,
+        }
+
+    def _cleanup_locked(self, conn: sqlite3.Connection, now: float) -> int:
+        rows = conn.execute("SELECT * FROM worker_reservations WHERE expires_at<=?", (now,)).fetchall()
+        for row in rows:
+            self._archive_locked(conn, row, now, "stale")
+        return len(rows)
+
+    @staticmethod
+    def _archive_locked(conn: sqlite3.Connection, row: sqlite3.Row, now: float, outcome: str) -> None:
+        conn.execute(
+            """INSERT INTO routed_executions
+            (reservation_id,task_id,worker_id,failure_domain,capacity_scope,capacity_pool,
+             spec_hash,ram_gib,cpu_units,disk_gib,started_at,ended_at,outcome,metadata_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                row["id"], row["task_id"], row["worker_id"], row["failure_domain"],
+                row["capacity_scope"], row["capacity_pool"], row["spec_hash"],
+                row["ram_gib"], row["cpu_units"], row["disk_gib"], row["created_at"], now,
+                outcome, row["metadata_json"],
+            ),
+        )
+        conn.execute("DELETE FROM worker_reservations WHERE id=?", (row["id"],))
+
+    def release(self, *, reservation_id: str = "", task_id: str = "", outcome: str = "success", now: float | None = None) -> int:
+        if not reservation_id and not task_id:
+            raise ValueError("reservation_id or task_id is required")
+        now = time.time() if now is None else now
+        with self._db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if reservation_id:
+                rows = conn.execute("SELECT * FROM worker_reservations WHERE id=?", (reservation_id,)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM worker_reservations WHERE task_id=?", (task_id,)).fetchall()
+            for row in rows:
+                self._archive_locked(conn, row, now, outcome)
+            conn.execute("COMMIT")
+        return len(rows)
+
+    def heartbeat(self, task_id: str, *, ttl_min: int = 120, now: float | None = None) -> bool:
+        now = time.time() if now is None else now
+        with self._db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "UPDATE worker_reservations SET heartbeat_at=?,expires_at=? WHERE task_id=?",
+                (now, now + ttl_min * 60, task_id),
+            )
+            conn.execute("COMMIT")
+        return cur.rowcount > 0
+
+    def snapshot(self, *, now: float | None = None) -> dict[str, Any]:
+        now = time.time() if now is None else now
+        with self._db() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._cleanup_locked(conn, now)
+            workers = [self._decode_worker(row, now) for row in conn.execute("SELECT * FROM workers ORDER BY id")]
+            reservations = [dict(row) for row in conn.execute("SELECT * FROM worker_reservations ORDER BY created_at")]
+            conn.execute("COMMIT")
+        by_domain: dict[str, dict[str, float]] = {}
+        by_pool: dict[str, dict[str, float]] = {}
+        by_quota: dict[str, dict[str, float | int]] = {}
+        for row in reservations:
+            usage = by_domain.setdefault(row["failure_domain"], {"ram_gib": 0.0, "cpu_units": 0.0, "disk_gib": 0.0})
+            usage["ram_gib"] += float(row["ram_gib"])
+            usage["cpu_units"] += float(row["cpu_units"])
+            usage["disk_gib"] += float(row["disk_gib"])
+            pool = by_pool.setdefault(row["capacity_pool"], {"ram_gib": 0.0, "cpu_units": 0.0, "disk_gib": 0.0})
+            pool["ram_gib"] += float(row["ram_gib"])
+            pool["cpu_units"] += float(row["cpu_units"])
+            pool["disk_gib"] += float(row["disk_gib"])
+            worker = next((item for item in workers if item["id"] == row["worker_id"]), None)
+            quota_name = str(worker["quota_domain"] if worker else row["worker_id"])
+            quota = by_quota.setdefault(
+                quota_name, {"jobs": 0, "ram_gib": 0.0, "cpu_units": 0.0, "disk_gib": 0.0}
+            )
+            quota["jobs"] = int(quota["jobs"]) + 1
+            quota["ram_gib"] = float(quota["ram_gib"]) + float(row["ram_gib"])
+            quota["cpu_units"] = float(quota["cpu_units"]) + float(row["cpu_units"])
+            quota["disk_gib"] = float(quota["disk_gib"]) + float(row["disk_gib"])
+        return {
+            "workers": workers, "reservations": reservations,
+            "usage_by_capacity_pool": by_pool,
+            "usage_by_failure_domain": by_domain,
+            "usage_by_quota_domain": by_quota,
+        }

@@ -6,7 +6,31 @@ $ErrorActionPreference = 'Stop'
 $dataDir = Join-Path $env:USERPROFILE '.resource-sentinel'
 if (-not (Test-Path $dataDir)) { New-Item -ItemType Directory -Path $dataDir | Out-Null }
 
+# Stage metadata contains no commands, paths from workloads, or raw provider output.
+$progressPath = Join-Path $dataDir 'collector-progress.json'
+$runStarted = (Get-Date).ToString('o')
+$runId = [guid]::NewGuid().ToString('N')
+$lastCompleted = $null
+try { $lastCompleted = (Get-Content $progressPath -Raw | ConvertFrom-Json).last_completed_at } catch { }
+$stageClock = [Diagnostics.Stopwatch]::StartNew()
+$stageDurations = @{}
+$currentStage = $null
+function Set-CollectorStage([string]$Stage) {
+    if ($currentStage) { $stageDurations[$currentStage] = $stageClock.ElapsedMilliseconds }
+    $script:currentStage = $Stage
+    $stageClock.Restart()
+    if ($Stage -eq 'complete') { $script:lastCompleted = (Get-Date).ToString('o') }
+    $progress = @{ run_id = $runId; pid = $PID; process_started_at = (Get-Process -Id $PID).StartTime.ToString('o');
+        started_at = $runStarted; stage = $Stage; updated_at = (Get-Date).ToString('o');
+        last_completed_at = $lastCompleted; durations_ms = $stageDurations }
+    try {
+        $progress | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath "$progressPath.tmp" -Encoding ascii
+        Move-Item -LiteralPath "$progressPath.tmp" -Destination $progressPath -Force
+    } catch { } # Diagnostics must not prevent publication.
+}
+
 # ---------- config ----------
+Set-CollectorStage 'config'
 $configPath = Join-Path $dataDir 'config.json'
 if (-not (Test-Path $configPath)) {
     $defaults = [ordered]@{
@@ -61,6 +85,7 @@ if ($migrated) { ($config | ConvertTo-Json) | Out-File $configPath -Encoding asc
 $cores = [Environment]::ProcessorCount
 
 # ---------- previous state (for io/disk deltas across runs) ----------
+Set-CollectorStage 'previous_state_for_io_disk_deltas_across_runs'
 $statePath = Join-Path $dataDir 'state.json'
 $prev = $null
 if (Test-Path $statePath) {
@@ -68,12 +93,14 @@ if (Test-Path $statePath) {
 }
 
 # ---------- process snapshot 1 (cpu baseline) ----------
+Set-CollectorStage 'process_snapshot_1_cpu_baseline'
 $snap1 = @{}
 Get-CimInstance Win32_Process |
     ForEach-Object { $snap1[$_.ProcessId] = $_.KernelModeTime + $_.UserModeTime }
 $t1 = Get-Date
 
 # ---------- total CPU (blocks ~1s = per-tree cpu delta window) ----------
+Set-CollectorStage 'total_cpu_blocks_1s_per_tree_cpu_delta_window'
 # NOTE: never use Win32_Processor.LoadPercentage (measured unreliable on this box).
 $cpuTotal = $null
 try {
@@ -82,10 +109,12 @@ try {
 } catch { $cpuTotal = $null }
 
 # ---------- GPU (nvidia-smi primary, perf counters fallback) ----------
+Set-CollectorStage 'gpu_nvidia_smi_primary_perf_counters_fallback'
 $gpu = [ordered]@{ util_pct = $null; vram_used_mb = $null; vram_total_mb = $null; source = 'none' }
 try {
-    $smi = & nvidia-smi --query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits 2>$null
-    if ($LASTEXITCODE -eq 0 -and $smi) {
+    . (Join-Path $PSScriptRoot 'bounded-query.ps1')
+    $smi = Invoke-BoundedQuery 'nvidia-smi.exe' '--query-gpu=utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits'
+    if ($smi) {
         $parts = ($smi | Select-Object -First 1).Split(',') | ForEach-Object { $_.Trim() }
         $gpu.util_pct      = [double]$parts[0]
         $gpu.vram_used_mb  = [double]$parts[1]
@@ -104,6 +133,7 @@ if ($gpu.source -eq 'none') {
 }
 
 # ---------- process snapshot 2 (trees + cpu + io) ----------
+Set-CollectorStage 'process_snapshot_2_trees_cpu_io'
 $procs = Get-CimInstance Win32_Process |
     Select-Object ProcessId, ParentProcessId, Name, WorkingSetSize,
                   KernelModeTime, UserModeTime, WriteTransferCount, CreationDate
@@ -134,6 +164,7 @@ if ($null -eq $cpuTotal) {
 }
 
 # ---------- disk-write attribution: delta vs previous run ----------
+Set-CollectorStage 'disk_write_attribution_delta_vs_previous_run'
 # WriteTransferCount is cumulative bytes written by the process since it started.
 # Delta across runs = bytes written in the interval. PID reuse guarded by CreationDate.
 $writeDelta = @{}   # pid -> bytes written since last run
@@ -149,6 +180,7 @@ if ($null -ne $prev -and $null -ne $prev.procs) {
 }
 
 # ---------- agent tree roots ----------
+Set-CollectorStage 'agent_tree_roots'
 $agentNames = @($config.agent_roots | ForEach-Object { $_.ToLower() })
 $roots = @()
 foreach ($p in $procs) {
@@ -164,6 +196,7 @@ foreach ($p in $procs) {
 }
 
 # ---------- aggregate trees (BFS, cycle-guarded); record pid->tree for attribution ----------
+Set-CollectorStage 'aggregate_trees_bfs_cycle_guarded_record_pid_tree_for_attribution'
 $treeOf = @{}
 $trees = @()
 foreach ($root in $roots) {
@@ -215,6 +248,7 @@ $groups = @($trees | Group-Object root | ForEach-Object {
 } | Sort-Object total_ram_mb -Descending)
 
 # ---------- top disk writers this interval (any process, not just agents) ----------
+Set-CollectorStage 'top_disk_writers_this_interval_any_process_not_just_agents'
 $topWriters = @()
 foreach ($pid_ in ($writeDelta.Keys | Sort-Object { $writeDelta[$_] } -Descending | Select-Object -First 8)) {
     $p = $byId[$pid_]
@@ -228,6 +262,7 @@ foreach ($pid_ in ($writeDelta.Keys | Sort-Object { $writeDelta[$_] } -Descendin
 $topWriters = @($topWriters | Where-Object { $_.mb -ge 1 })   # noise floor 1 MB
 
 # ---------- machine RAM + disks ----------
+Set-CollectorStage 'machine_ram_disks'
 $os = Get-CimInstance Win32_OperatingSystem
 $ramTotalGb = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
 $ramFreeGb  = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
@@ -281,6 +316,7 @@ $sysDisk = $disks | Where-Object { $_.drive -eq $config.system_drive } | Select-
 $sysFreeGb = if ($sysDisk) { $sysDisk.free_gb } else { 999 }
 
 # ---------- disk-change events ----------
+Set-CollectorStage 'disk_change_events'
 $eventsPath = Join-Path $dataDir 'events.log'
 $now = Get-Date
 $nowStr = $now.ToString('yyyy-MM-dd HH:mm:ss')
@@ -306,6 +342,7 @@ if ((Test-Path $eventsPath) -and (Get-Item $eventsPath).Length -gt 2MB) {
 }
 
 # ---------- session->repo attribution (sessions.json written by agent hooks) ----------
+Set-CollectorStage 'session_repo_attribution_sessions_json_written_by_agent_hooks'
 $sessionsPath = Join-Path $dataDir 'sessions.json'
 $sessions = $null
 if (Test-Path $sessionsPath) {
@@ -328,6 +365,7 @@ foreach ($t in $trees) {
 }
 
 # ---------- per-repo peak ledger: track live peaks, finalize dead trees ----------
+Set-CollectorStage 'per_repo_peak_ledger_track_live_peaks_finalize_dead_trees'
 $peaks = @{}
 if ($null -ne $prev -and $null -ne $prev.peaks) {
     foreach ($pp in $prev.peaks.PSObject.Properties) {
@@ -386,6 +424,7 @@ if ($histChanged) {
 }
 
 # ---------- samples.csv + 5-min cpu avg ----------
+Set-CollectorStage 'samples_csv_5_min_cpu_avg'
 $samplesPath = Join-Path $dataDir 'samples.csv'
 if (-not (Test-Path $samplesPath)) {
     'timestamp,cpu_pct,ram_used_pct,gpu_pct' | Out-File $samplesPath -Encoding ascii
@@ -415,6 +454,7 @@ $cpu5 = if ($recent.Count -gt 0) {
 } else { $cpuTotal }
 
 # ---------- light (4 levels; worst dimension wins + recovery hysteresis) ----------
+Set-CollectorStage 'light_4_levels_worst_dimension_wins_recovery_hysteresis'
 # RAM/CPU are judged in percent. Disk pressure uses both free space and the
 # physical-disk queue/latency counters. We intentionally do not gate on the
 # aggregate `% Disk Time` counter because Windows can report more than 100%
@@ -466,6 +506,7 @@ if ($ranks[$previousLight] -gt $ranks[$rawLight]) {
 }
 
 # ---------- telegram alert: sustained RED -> alert; recovery -> all-clear ----------
+Set-CollectorStage 'telegram_alert_sustained_red_alert_recovery_all_clear'
 $alertState = @{ streak = 0; last_ts = [double]0; active = $false }
 if ($null -ne $prev -and $null -ne $prev.alert) {
     $alertState.streak  = [int]$prev.alert.streak
@@ -524,6 +565,7 @@ if ($null -ne $tg -and $tg.enabled) {
 }
 
 # ---------- disk-shrink alert: sharp free-space drop -> telegram with suspects ----------
+Set-CollectorStage 'disk_shrink_alert_sharp_free_space_drop_telegram_with_suspects'
 $diskAlerts = @{}
 if ($null -ne $prev -and $null -ne $prev.disk_alerts) {
     foreach ($da in $prev.disk_alerts.PSObject.Properties) { $diskAlerts[$da.Name] = [double]$da.Value }
@@ -568,6 +610,7 @@ if ($null -ne $tg -and $tg.enabled -and $null -ne $prev -and $null -ne $prev.dri
 }
 
 # ---------- central throttle: demote agent trees to BelowNormal on ORANGE/RED ----------
+Set-CollectorStage 'central_throttle_demote_agent_trees_to_belownormal_on_orange_red'
 # Works on ANY agent process tree regardless of whether the agent reads status.md.
 # Never kills; only lowers CPU scheduling priority. Restores on GREEN (hysteresis).
 $demoted = @{}
@@ -631,6 +674,7 @@ if ($throttleOn) {
 }
 
 # ---------- RAM guard: trim working sets of fat agent procs when RAM tight ----------
+Set-CollectorStage 'ram_guard_trim_working_sets_of_fat_agent_procs_when_ram_tight'
 # Non-lethal: idle pages move to the pagefile, physical RAM frees immediately,
 # the process just slows down. Same pid not re-trimmed within 10 minutes.
 $trims = @{}
@@ -682,6 +726,7 @@ try {
 } catch { }
 
 # ---------- coordinator cleanup + backward-compatible reservation mirror ----------
+Set-CollectorStage 'coordinator_cleanup_backward_compatible_reservation_mirror'
 $slotsPath = Join-Path $dataDir 'slots.json'
 $activeSlots = @()
 try {
@@ -699,6 +744,7 @@ if (Test-Path $slotsPath) {
 }
 
 # ---------- save state for next run ----------
+Set-CollectorStage 'save_state_for_next_run'
 $stateProcs = @{}
 foreach ($p in $procs) {
     $stateProcs[[string]$p.ProcessId] = @{
@@ -715,6 +761,7 @@ $tmp = "$statePath.tmp"
 Move-Item -Force $tmp $statePath
 
 # ---------- status.json (atomic) ----------
+Set-CollectorStage 'status_json_atomic'
 $statusJsonPath = Join-Path $dataDir 'status.json'
 # Publish on a real five-second boundary; retain the measurement timestamp.
 $publishNow = Get-Date
@@ -744,6 +791,7 @@ $tmp = "$statusJsonPath.tmp"
 Move-Item -Force $tmp $statusJsonPath
 
 # ---------- status.md (atomic) ----------
+Set-CollectorStage 'status_md_atomic'
 $statusMdPath = Join-Path $dataDir 'status.md'
 $md = New-Object System.Collections.ArrayList
 [void]$md.Add("# Resource Sentinel status")
@@ -809,6 +857,7 @@ $tmp = "$statusMdPath.tmp"
 Move-Item -Force $tmp $statusMdPath
 
 # ---------- sync detected local agent sessions ----------
+Set-CollectorStage 'sync_detected_local_agent_sessions'
 try {
     $detectedSessions = @($trees | ForEach-Object {
         $sessionRepo = if ($_.PSObject.Properties['repo']) { [string]$_.repo } else { '' }
@@ -835,6 +884,7 @@ try {
 } catch { }
 
 # ---------- dashboard data (data.js) + static page copy ----------
+Set-CollectorStage 'dashboard_data_data_js_static_page_copy'
 $dataJsPath = Join-Path $dataDir 'data.js'
 $orchestratorSnapshot = @{}
 try {
@@ -865,6 +915,7 @@ $tmp = "$dataJsPath.tmp"
 Move-Item -Force $tmp $dataJsPath
 
 # ---------- structured telemetry (SQLite; best effort) ----------
+Set-CollectorStage 'structured_telemetry_sqlite_best_effort'
 try {
     $ctl = Join-Path $PSScriptRoot 'sentinelctl.py'
     & py $ctl --data-dir $dataDir sample --status-file $statusJsonPath | Out-Null
@@ -901,8 +952,10 @@ if ((Test-Path $dashSrc) -and (
 }
 
 # ---------- optional heartbeat ping (external dead-man switch) ----------
+Set-CollectorStage 'optional_heartbeat_ping_external_dead_man_switch'
 if ($null -ne $config.heartbeat_url -and $config.heartbeat_url) {
     try { Invoke-RestMethod -Uri $config.heartbeat_url -TimeoutSec 4 | Out-Null } catch { }
 }
 
+Set-CollectorStage 'complete'
 Write-Output "OK light=$light cpu=$cpuTotal ram=$ramUsedPct gpu=$($gpu.util_pct) sysfree=$sysFreeGb trees=$($trees.Count) writers=$($topWriters.Count)"

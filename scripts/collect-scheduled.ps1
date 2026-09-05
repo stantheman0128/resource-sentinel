@@ -32,14 +32,18 @@ try {
             } finally { $child.Dispose() }
         }
         catch {
+            $failureType = $_.Exception.GetType().Name
             $failureLog = Join-Path $env:USERPROFILE '.resource-sentinel\collector-errors.log'
             if ((Test-Path $failureLog) -and (Get-Item $failureLog).Length -gt 256KB) {
                 $tail = @(Get-Content $failureLog -Tail 100)
                 $tail | Set-Content $failureLog
             }
-            # Log error type and source line only; never raw command/output or secrets.
-            ('{0:o} {1} line={2}' -f (Get-Date), $_.Exception.GetType().Name,
-                $_.InvocationInfo.ScriptLineNumber) | Add-Content $failureLog
+            $stage = 'unknown'
+            try {
+                $progress = Get-Content (Join-Path $env:USERPROFILE '.resource-sentinel\collector-progress.json') -Raw | ConvertFrom-Json
+                if ($progress.stage -match '^[a-z0-9_]+$') { $stage = $progress.stage }
+            } catch { }
+            ('{0:o} {1} stage={2}' -f (Get-Date), $failureType, $stage) | Add-Content $failureLog
             throw
         }
     }

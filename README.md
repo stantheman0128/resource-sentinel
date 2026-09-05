@@ -82,6 +82,39 @@ schtasks /create /f /tn "ResourceSentinel" /sc minute /mo 1 /tr "conhost.exe --h
 
 ## 資料檔與保留策略
 
+### 採集故障與恢復
+
+採集 runner 每個 child 最多執行 45 秒；排程本身應設 2 分鐘上限。
+Watchdog 排程應設 4 分鐘上限，兩個排程均建議開啟 StartWhenAvailable。
+目前機器的設定已更新；重新安裝時須另外套用這些 Task Scheduler 設定。
+
+Watchdog 同時檢查採樣、狀態發布、data.js 更新與整輪完成時間，任一超過
+5 分鐘即視為不健康。自動恢復最多每 10 分鐘一次，連續失敗 3 次後改為
+每小時一次。只有四個時間都前進且保持新鮮，才回報恢復。
+
+手動執行相同的安全恢復流程：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\restart-sentinel.ps1
+```
+
+恢復會先等待 runner 釋放採集 mutex，再結束／啟動 ResourceSentinel 排程。
+若鎖超過 85 秒仍未釋放，或原 runner 消失但採集 child 仍活著，會明確失敗，
+避免孤兒程序、重疊採集或誤殺工作；不會清除 reservation、queue 或資料庫。
+這類故障需要檢查 collector-progress.json 的 PID 與啟動時間後再處理。
+
+collector-progress.json 保存目前階段、各階段耗時與最近整輪完成時間；
+collector-errors.log 保存 runner 失敗類型及最後階段；watchdog-events.log
+保存恢復結果，後兩者超過 256 KiB 時保留末 100 行。診斷不保存工作命令或原始輸出。
+GPU 的 nvidia-smi 查詢有 3 秒獨立上限，失敗後使用原有 fallback；其他系統
+查詢仍由整輪 45 秒上限保護。
+
+針對恢復與查詢逾時的隔離測試（不操作正式排程）：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tests\test_collector_recovery.ps1
+```
+
 | 檔案 | 內容 | 上限 |
 |---|---|---|
 | status.md / status.json | 當前狀態，每輪覆寫 | 不成長 |

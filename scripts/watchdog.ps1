@@ -2,7 +2,7 @@
 # Separate scheduled task, every 5 min. If status.json is stale: try to restart
 # the collector task; if still stale, send a Telegram alert (Chinese templates).
 # Never touches anything else. ASCII only.
-$ErrorActionPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'Stop'
 
 $dataDir = Join-Path $env:USERPROFILE '.resource-sentinel'
 $statusPath = Join-Path $dataDir 'status.json'
@@ -35,35 +35,66 @@ function Send-Tg([string]$text) {
     }
 }
 
-$age = Get-AgeMin
-if ($age -le 5) { exit 0 }   # collector healthy
-
-# stale: try to revive once
-schtasks /run /tn "ResourceSentinel" | Out-Null
-Start-Sleep -Seconds 75
-$age2 = Get-AgeMin
-
-# alert cooldown 60 min
-$wd = @{ last_alert = [double]0 }
+# A separate mutex also protects manual watchdog invocations and cooldown writes.
+. (Join-Path $PSScriptRoot 'collector-health.ps1')
+$lock = New-Object System.Threading.Mutex($false, 'Local\ResourceSentinelWatchdog')
+$held = $false
 try {
-    $j = Get-Content $wdStatePath -Raw | ConvertFrom-Json
-    if ($null -ne $j.last_alert) { $wd.last_alert = [double]$j.last_alert }
-} catch { }
-$nowE = [double]((Get-Date).ToUniversalTime() - (Get-Date '1970-01-01')).TotalSeconds
-$canAlert = ($nowE - $wd.last_alert) -gt 3600
-
-$tpl = Get-Content (Join-Path $PSScriptRoot 'messages.json') -Raw | ConvertFrom-Json
-if ($age2 -le 5) {
-    if ($canAlert -and $null -ne $tpl) {
-        Send-Tg $tpl.watchdog_revived.Replace('{age}', [string]$age)
-        $wd.last_alert = $nowE
+    try { $held = $lock.WaitOne(0) }
+    catch [System.Threading.AbandonedMutexException] { $held = $true }
+    if (-not $held) { exit 0 }
+    if ((Get-CollectorHealth $dataDir).Healthy) { exit 0 }
+    $wd = @{ last_alert = [double]0; last_restart = [double]0; failures = 0; outcome = 'unknown' }
+    try {
+        $saved = Get-Content $wdStatePath -Raw -ErrorAction Stop | ConvertFrom-Json
+        foreach ($key in @('last_alert', 'last_restart', 'failures', 'outcome')) {
+            if ($null -ne $saved.$key) { $wd[$key] = $saved.$key }
+        }
+    } catch { }
+    $nowE = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    # At most one attempt per 10 min; after 3 failures, back off to one per hour.
+    $cooldown = if ($wd.failures -ge 3) { 3600 } else { 600 }
+    if (($nowE - $wd.last_restart) -lt $cooldown) { exit 0 }
+    # Recheck immediately before initiating recovery.
+    if ((Get-CollectorHealth $dataDir).Healthy) { exit 0 }
+    $wd.last_restart = $nowE
+    $wd.outcome = 'attempting'
+    function Save-WatchdogState {
+        $wd | ConvertTo-Json -Compress | Set-Content -LiteralPath "$wdStatePath.tmp" -Encoding ascii -ErrorAction Stop
+        Move-Item -LiteralPath "$wdStatePath.tmp" -Destination $wdStatePath -Force -ErrorAction Stop
     }
-} else {
-    if ($canAlert -and $null -ne $tpl) {
-        Send-Tg $tpl.watchdog_dead.Replace('{age}', [string]$age2)
-        $wd.last_alert = $nowE
+    Save-WatchdogState
+    $age = Get-AgeMin
+    try {
+        $null = Restart-Collector $dataDir
+        $wd.outcome = 'recovered'
+        $wd.reason = 'verified'
+        $wd.failures = 0
+    } catch {
+        $wd.outcome = 'recovery_failed'
+        $reason = $_.Exception.Message
+        $knownReasons = @('CollectorRecoveryBusy', 'CollectorTaskDisabled', 'CollectorStopTimeout', 'CollectorStillActive', 'CollectorRecoveryUnverified')
+        $wd.reason = if ($knownReasons -contains $reason) { $reason } else { $_.Exception.GetType().Name }
+        $wd.failures = [int]$wd.failures + 1
     }
+    Save-WatchdogState
+    $logPath = Join-Path $dataDir 'watchdog-events.log'
+    if ((Test-Path $logPath) -and (Get-Item $logPath).Length -gt 256KB) {
+        $tail = @(Get-Content $logPath -Tail 100)
+        $tail | Set-Content $logPath
+    }
+    ('{0:o} outcome={1} failures={2} reason={3}' -f (Get-Date), $wd.outcome, $wd.failures, $wd.reason) | Add-Content $logPath
+    if (($nowE - $wd.last_alert) -gt 3600) {
+        $tpl = Get-Content (Join-Path $PSScriptRoot 'messages.json') -Raw | ConvertFrom-Json
+        $message = if ($wd.outcome -eq 'recovered') { $tpl.watchdog_revived } else { $tpl.watchdog_dead }
+        if ($message) {
+            Send-Tg $message.Replace('{age}', [string]$age)
+            $wd.last_alert = $nowE
+            Save-WatchdogState
+        }
+    }
+    if ($wd.outcome -ne 'recovered') { exit 1 }
+} finally {
+    if ($held) { $lock.ReleaseMutex() }
+    $lock.Dispose()
 }
-$tmp = "$wdStatePath.tmp"
-(@{ last_alert = $wd.last_alert } | ConvertTo-Json -Compress) | Out-File $tmp -Encoding ascii
-Move-Item -Force $tmp $wdStatePath

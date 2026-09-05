@@ -2,6 +2,12 @@
 
 ## Unreleased - 2026-09-05
 
+- Harden watchdog recovery with collector ownership checks, bounded stop/start,
+  four-timestamp verification, cooldown/backoff, and a shared manual restart command.
+- Record collector stages and durations without workload text; bound the optional
+  nvidia-smi probe to three seconds. Add isolated PowerShell recovery tests.
+- Live scheduler: watchdog timeout is four minutes; both tasks start when available.
+
 - Recover scheduled collection from delayed startup and hung collectors: always attempt
   the first sample, bound each child to 45 seconds, preserve launcher exit codes,
   and log sanitized failure types. Live scheduled task timeout is now two minutes.

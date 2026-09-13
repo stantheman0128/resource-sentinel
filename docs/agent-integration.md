@@ -3,6 +3,12 @@
 告示板路徑固定：`C:\Users\stans\.resource-sentinel\status.md`（機器可讀版 `status.json`）。
 任何能讀本機檔案的 agent 都能接入，不需要 MCP 或任何協定。
 
+**使用者授權豁免適用於所有接入 Resource Sentinel 的 agent，不限 Codex。**
+唯一共用規則來源是 [agent-policy.md](agent-policy.md)：採集器每輪將全文放進
+`status.md`，Claude 的提示 hook 也直接載入同一份文字。Cursor、Grok 及其他原本會
+讀取 Sentinel 狀態的 agent 因而使用相同規則；不需要為每個品牌建立不同的豁免邏輯。
+自然語言授權由 agent 理解後呼叫 CLI 登記，並非每個應用程式自動解析聊天內容。
+
 先分清兩個角色：agent session 是 Codex／Claude Code／Cursor 等控制端，負責理解任務、
 修改與回報；execution worker 是實際跑 command 或 provider job 的本機／雲端環境。
 session heartbeat 不能增加可用 RAM，worker probe 也不代表該 provider 能自動收任務。
@@ -10,6 +16,7 @@ session heartbeat 不能增加可用 RAM，worker probe 也不代表該 provider
 ## Claude Code / Claude Desktop（資源 admission 已自動接入）
 
 `~/.claude/settings.json` 的 UserPromptSubmit 掛了 `sentinel-inject.py`：
+安裝路徑下的三個 Sentinel hook 以薄 loader 執行本 repository 的同名檔，避免副本落後。
 
 - 每輪對話自動注入一行狀態（燈號、RAM、CPU、GPU、C 槽、本 repo 歷史峰值）
 - 黃燈追加降速建議、紅燈追加強制警告
@@ -32,6 +39,54 @@ wrapper 會排隊、原子取得 CPU/RAM/I/O reservation、執行命令，最後
 釋放。Claude hook 能精準辨識這個 wrapper，避免內外重複 reservation。
 `-ResourceClass AUTO` 仍是 bootstrap rule；`orchestratorctl.py profiles` 提供歷史 P50/P90/P95
 供後續調整顯式需求，但尚未自動改寫 task request。
+
+## 使用者授權的暫時豁免
+
+使用者在目前任務明確說「我給你最高權限，你可以不用理會 Resource Sentinel」
+（或同義授權）時，agent 可以直接啟用以下豁免，不需要再問一次。沒有這項授權時，
+不可因排隊、趕時間或紅燈自行啟用。這是同一 Windows 使用者下的操作約定，
+`--user-authorized` 是授權聲明，不是密碼、身分驗證或 Windows 管理員權限。
+
+多個任務共用 Codex／Cursor 桌面程序時，**優先用單次命令豁免**，避免影響其他任務：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File `
+  C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 `
+  -Command "npm run build" -Priority P2 `
+  -UserAuthorizedExemption -ExemptionMinutes 60 `
+  -ExemptionReason "User explicitly authorized this task to bypass Sentinel"
+```
+
+此模式以新建 wrapper 的 PID + 建立時間綁定它和子程序，命令完成（包含失敗）就撤銷。
+即使 wrapper 被強制結束而未執行 finally，根程序消失或期限到達也會失效。
+預設 60 分鐘，可指定 1–1440 分鐘；不會自動續期。任務仍有未完成的獨立命令時，
+可在原授權的任務／時間範圍內分別使用此模式；不要把一次授權延伸到其他任務。
+多次命令共享同一次授權的截止時間，後續只填剩餘分鐘數，不重置完整期限。
+
+對已有的、確認獨立的 session 或程序樹，可手動授權（PID 範例需替換成即時核對的值）：
+
+```powershell
+py C:\Users\stans\Projects\resource-sentinel\scripts\sentinelctl.py `
+  exemption-grant --pid 12345 --minutes 60 --user-authorized --reason "User authorized this process tree"
+py C:\Users\stans\Projects\resource-sentinel\scripts\sentinelctl.py exemption-list
+py C:\Users\stans\Projects\resource-sentinel\scripts\sentinelctl.py exemption-revoke --id RETURNED_ID
+```
+
+要先核對 PID、建立時間、程序用途和子樹範圍；不要把共享桌面 host／終端機根程序當成
+單一 task。無法隔離 task 時用前述命令模式。若使用者明確要求整個 App 豁免，才選其根程序。
+`exemption-list` 回傳 active／expired／revoked／process_exited、範圍、到期與授權原因；
+原因只寫簡短操作描述，勿存原始私人對話或憑證。
+
+有效豁免會略過本機 coordinator 的燈號、容量、佇列順序限制，但仍建立／釋放 reservation，
+保留工作與負載紀錄。採集器略過該子樹的 CPU／I/O 降優先序與 working-set trim，並恢復
+先前的降速；仍量測該子樹的使用量。現有程序的 CPU／I/O 豁免與撤銷在下一輪成功採集
+生效（正常約 30 秒；監控延遲時可能更久）；已啟動工作不會在到期後被強制終止。
+PID 重用、根程序退出、到期、撤銷都不會把授權轉移给另一個程序。新建子程序會在下次
+採集時納入。故障／讀取失敗不能產生新豁免。
+
+豁免不更動 Windows 權限、應用程式 sandbox、防毒或雲端配額；不跳過 orchestrator 的
+workspace claim、worker capability、provider quota 等檢查。`P0` 仍只是一般佇列優先級，
+不等於這項使用者豁免。
 
 ## 登記 agent session
 
@@ -71,6 +126,10 @@ commands with low priority and avoid parallel heavy work. ORANGE: defer new
 heavy tasks; if one must run, low priority and one at a time. RED: light
 operations only; tell the user the machine is overloaded. If the file is older
 than 5 minutes, monitoring is down; say so and ignore its contents.
+The shared user-authorized exemption policy in status.md applies to this agent
+too. Explicit user authorization may temporarily override Sentinel restrictions
+within the named task/process and deadline; register the grant via the documented
+wrapper/CLI. Do not self-authorize or apply it to unrelated tasks.
 ```
 
 貼完之後 Cursor 的 session 就會在動手前自己去看告示板。

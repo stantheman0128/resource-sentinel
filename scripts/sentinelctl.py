@@ -16,6 +16,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from sentinel.coordinator import Coordinator, ResourceRequest
+from sentinel.exemptions import Exemptions, process_chain
 
 
 def load_json(path: str) -> dict:
@@ -96,8 +97,37 @@ def main() -> int:
     sample = sub.add_parser("sample")
     sample.add_argument("--status-file", required=True)
 
+    grant = sub.add_parser("exemption-grant", help="Record explicit user authorization for one process tree")
+    grant.add_argument("--pid", type=int, required=True)
+    grant.add_argument("--minutes", type=float, default=60)
+    grant.add_argument("--reason", required=True)
+    grant.add_argument("--user-authorized", action="store_true", required=True)
+    revoke = sub.add_parser("exemption-revoke")
+    revoke.add_argument("--id", required=True)
+    sub.add_parser("exemption-list")
+    sub.add_parser("exemption-resolve")
+    check = sub.add_parser("exemption-check")
+    check.add_argument("--pid", type=int, required=True)
     sub.add_parser("snapshot")
     args = parser.parse_args()
+    if args.command.startswith("exemption-"):
+        exemptions = Exemptions(args.data_dir)
+        if args.command == "exemption-grant":
+            try:
+                result = exemptions.grant(args.pid, minutes=args.minutes, reason=args.reason, user_authorized=args.user_authorized)
+            except ValueError as exc:
+                parser.error(str(exc))
+        elif args.command == "exemption-revoke":
+            result = {"revoked": exemptions.revoke(args.id)}
+        elif args.command == "exemption-resolve":
+            result = exemptions.resolve()
+        elif args.command == "exemption-check":
+            chain = process_chain(args.pid)
+            result = exemptions.match(*chain[0]) if chain else None
+        else:
+            result = exemptions.rows(include_inactive=True)
+        print(json.dumps(result, separators=(",", ":")))
+        return 0
     coord = Coordinator(args.data_dir)
 
     if args.command == "admit":

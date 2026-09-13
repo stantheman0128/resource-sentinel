@@ -6,6 +6,13 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
+
+PROJECT = Path(r"C:\Users\stans\Projects\resource-sentinel")
+if str(PROJECT) not in sys.path:
+    sys.path.insert(0, str(PROJECT))
+from sentinel.exemptions import Exemptions, process_chain
+from sentinel.policy import agent_policy
 
 DATA = os.path.join(os.environ.get("USERPROFILE", ""), ".resource-sentinel")
 STATUS = os.path.join(DATA, "status.json")
@@ -73,6 +80,8 @@ def main():
     except Exception:
         inp = {}
     cwd = inp.get("cwd") or os.getcwd()
+    # Authorization policy applies even when telemetry is missing or stale.
+    print(agent_policy())
     if os.path.isdir(DATA):
         register_session(cwd)
 
@@ -111,6 +120,17 @@ def main():
     line = (f"[sentinel] {light}｜RAM {ram.get('used_pct')}%（剩 {ram.get('free_gb')}GB）"
             f"｜CPU5分均 {cpu5}%{gpu_part}{sys_free}{hist_part}")
     print(line)
+
+    try:
+        identity = process_chain(os.getpid())
+        exemption = Exemptions(DATA).match(*identity[0]) if identity else None
+    except Exception:
+        exemption = None
+    if exemption:
+        print(f"[sentinel] 使用者已授權此程序樹暫時豁免（{exemption['id']}）；"
+              f"有效至 {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(exemption['expires_at']))}。"
+              "負載仍持續記錄，此範圍內不受 Sentinel 排隊、降優先序與工作集回收限制。")
+        return
 
     if light == "YELLOW":
         print("[sentinel] 黃燈（吃緊）：重量級動作（build、安裝、跑整套測試）改用低優先權跑"

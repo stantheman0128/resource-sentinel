@@ -21,6 +21,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from sentinel.exemptions import Exemptions
+
 
 PRIORITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 CLASS_DEFAULTS = {
@@ -454,6 +456,16 @@ class Coordinator:
             if allowed and used_io + int(req.io_slots) > int(cfg["heavy_io_slots"]):
                 allowed, reason = False, "io_capacity"
 
+            # Explicit operator exemption bypasses load/order gates, but still
+            # reserves and records usage so non-exempt callers see the pressure.
+            exemption = None
+            try:
+                exemption = Exemptions(self.data_dir).match(req.owner_pid, req.owner_started, now=now)
+            except (OSError, sqlite3.Error):
+                pass  # unreadable exemption state never grants a bypass
+            if exemption:
+                allowed = True
+
             if allowed:
                 reservation_id = uuid.uuid4().hex
                 conn.execute(
@@ -471,6 +483,8 @@ class Coordinator:
                 )
                 conn.execute("DELETE FROM queue WHERE request_key=?", (req.request_key,))
                 result = {"allowed": True, "reservation_id": reservation_id, "reused": False, "request_key": req.request_key}
+                if exemption:
+                    result.update(reason="user_exemption", exemption_id=exemption["id"], exemption_expires_at=exemption["expires_at"])
             else:
                 result = {"allowed": False, "reason": reason, "position": position, "request_key": req.request_key}
             conn.execute("COMMIT")

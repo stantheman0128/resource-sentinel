@@ -42,6 +42,8 @@ orchestratorctl tick（跑完就退）
 
 ## 主要能力
 
+- 使用者明確授權的暫時程序樹豁免：略過本機排隊、CPU／I/O 降速與工作集回收，
+  仍記錄資源使用；支援期限、撤銷與單次命令自動收回。見 [授權用法](docs/agent-integration.md#使用者授權的暫時豁免)。
 - 綠、黃、橘、紅燈號：RAM、Commit、CPU 五分鐘均值、系統碟剩餘、實體磁碟
   queue/latency 取最嚴，下降時需連續兩輪通過 hysteresis
 - agent 進程樹用量：claude、cursor、codex 為根，往下彙總整棵樹

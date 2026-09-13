@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased - 2026-09-13
+
+- Publish one shared user-exemption policy for ALL Sentinel agents in status.md and
+  the prompt hook, including when telemetry is stale/missing. Installed Claude hooks
+  now load repository entrypoints directly, preventing stale copied integrations.
+- Add explicit user-authorized, expiring process-tree exemptions with grant/list/revoke,
+  creation-time checks and dedicated command-wrapper cleanup. Exempt work still reserves
+  capacity and is measured; normal callers retain the existing admission rules.
+- Collector skips exempt CPU/I/O demotion and working-set trim, restores prior demotion,
+  and publishes exemption identities. Document scope, expiry, and sampling latency.
+- Fix the wrapper's Windows PowerShell local-time epoch conversion so process identities
+  match Python on non-UTC hosts. Add isolated RED-load and process-policy tests.
+
 ## Unreleased - 2026-09-05
 
 - Harden watchdog recovery with collector ownership checks, bounded stop/start,

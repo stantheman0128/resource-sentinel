@@ -620,6 +620,23 @@ if ($null -ne $prev -and $null -ne $prev.demoted) {
 $throttleOn = ($light -eq 'ORANGE' -or $light -eq 'RED')
 if ($null -ne $config.throttle_enable -and -not $config.throttle_enable) { $throttleOn = $false }
 
+. (Join-Path $PSScriptRoot 'exemption-policy.ps1')
+$exemptProcesses = @{}
+if (Test-Path (Join-Path $dataDir 'exemptions.sqlite3')) {
+    try {
+        $resolvedExemptions = & py (Join-Path $PSScriptRoot 'sentinelctl.py') --data-dir $dataDir exemption-resolve
+        if ($LASTEXITCODE -eq 0) {
+            foreach ($row in @($resolvedExemptions | ConvertFrom-Json)) {
+                if ($null -ne $row) { $exemptProcesses[[string]$row.pid] = $row }
+            }
+        }
+    } catch { } # A failed exemption read leaves the normal guards enabled.
+}
+function Test-CurrentExemption($Process) {
+    $epochNow = ((Get-Date).ToUniversalTime() - [datetime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)).TotalSeconds
+    return Test-SentinelExemption $Process $exemptProcesses $epochNow
+}
+
 # native helpers: working-set trim (RAM relief) + per-process IO priority (SSD relief)
 if (-not ('SentinelNative' -as [type])) {
     try {
@@ -642,11 +659,20 @@ function Set-IoPriority($proc, [int]$level) {   # 33 = ProcessIoPriority; 1 Low,
     } catch { }
 }
 
+# Restore an already-demoted grant even while the machine is YELLOW/ORANGE/RED.
+foreach ($key in $exemptProcesses.Keys) {
+    try {
+        $proc = Get-Process -Id ([int]$key) -ErrorAction Stop
+        if (Test-CurrentExemption $proc) { Restore-SentinelExemptProcess $proc $demoted }
+    } catch { }
+}
+
 if ($throttleOn) {
     foreach ($pid_ in $treeOf.Keys) {
         $key = [string]$pid_
         try {
             $proc = Get-Process -Id $pid_ -ErrorAction Stop
+            if (Test-CurrentExemption $proc) { continue }
             $orig = [string]$proc.PriorityClass
             if ($orig -eq 'Normal' -or $orig -eq 'AboveNormal' -or $orig -eq 'High') {
                 $proc.PriorityClass = 'BelowNormal'
@@ -662,6 +688,7 @@ if ($throttleOn) {
         $key = [string]$pid_
         try {
             $proc = Get-Process -Id $pid_ -ErrorAction Stop
+            if (Test-CurrentExemption $proc) { continue }
             if ([string]$proc.PriorityClass -eq 'BelowNormal') {
                 $target = 'Normal'
                 if ($demoted.ContainsKey($key)) { $target = $demoted[$key] }
@@ -693,6 +720,7 @@ if ($ramUsedPct -ge $config.ram_orange_pct) {
         if ($trims.ContainsKey($key) -and ($nowEpochT - $trims[$key]) -lt 600) { continue }
         try {
             $proc = Get-Process -Id $pid_ -ErrorAction Stop
+            if (Test-CurrentExemption $proc) { continue }
             if ([SentinelNative]::EmptyWorkingSet($proc.Handle)) {
                 $trims[$key] = $nowEpochT
                 $trimCount++
@@ -785,6 +813,7 @@ $status = [ordered]@{
     top_disk_writers_interval = $topWriters
     heavy_slots = $activeSlots
     throttle = [ordered]@{ active = $throttleOn; demoted_procs = $demotedNow }
+    exemptions = @($exemptProcesses.Values)
 }
 $tmp = "$statusJsonPath.tmp"
 ($status | ConvertTo-Json -Depth 5) | Out-File $tmp -Encoding ascii
@@ -801,6 +830,10 @@ $md = New-Object System.Collections.ArrayList
 [void]$md.Add("")
 [void]$md.Add("## Light: $light")
 [void]$md.Add("")
+$sharedAgentPolicy = Join-Path (Split-Path $PSScriptRoot -Parent) 'docs/agent-policy.md'
+[void]$md.Add((Get-Content -LiteralPath $sharedAgentPolicy -Raw -Encoding UTF8).Trim())
+[void]$md.Add("")
+[void]$md.Add("## Measured resources")
 [void]$md.Add("- CPU now: ${cpuTotal}% | 5-min avg: ${cpu5}%")
 [void]$md.Add("- RAM: ${ramUsedPct}% used (${ramFreeGb} GB free of ${ramTotalGb} GB)")
 [void]$md.Add("- Commit: $($memory.commit_used_gib)/$($memory.commit_limit_gib) GiB ($($memory.commit_used_pct)%) | pagefile used $($memory.pagefile_used_gib) GiB")
@@ -846,6 +879,10 @@ if ($throttleOn) {
 }
 [void]$md.Add("")
 [void]$md.Add("## Guidance")
+[void]$md.Add("The shared user-authorized exemption policy above applies to ALL AGENTS and overrides the load guidance below within a registered grant's scope and expiry.")
+if ($exemptProcesses.Count -gt 0) {
+    [void]$md.Add("Exemption snapshot: $($exemptProcesses.Count) process identities; inspect status.json exemptions for IDs and expiry. Collector enforcement updates on the next successful sample.")
+}
 switch ($light) {
     'GREEN'  { [void]$md.Add("Normal operation. Heavy tasks OK.") }
     'YELLOW' { [void]$md.Add("Load elevated. Heavy tasks (builds, installs, test suites) should run with BelowNormal priority. Avoid launching parallel heavy work.") }

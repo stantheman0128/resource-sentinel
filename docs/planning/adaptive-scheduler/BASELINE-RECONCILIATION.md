@@ -1,7 +1,7 @@
 # P0 baseline reconciliation
 
-Date: 2026-09-19 (Asia/Taipei). Status: inventory/source reconciliation complete;
-baseline tests pending normal Sentinel admission. P0 is not yet a passed gate.
+Date: 2026-09-19 (Asia/Taipei). Status: P0 passed at 04:43:11; inventory/source
+reconciliation and unchanged baseline suites completed. P1 is not yet verified.
 
 ## Evidence and isolation
 
@@ -48,7 +48,7 @@ as permanent contracts because the local overlay is uncommitted.
 
 | Area | Verified live fact | Required follow-up |
 |---|---|---|
-| Missing dirty Maintainer | `Maintainer.route_and_reserve` consumes local v2 `admission_snapshot` and `admission_config`, validates freshness and invokes `resource_blockers`. `test_local_worker_uses_same_commit_guard` tests Commit 74/limit 77 and expects `commit_capacity`. | Source gap in plan §0 resolved. Baseline test result still required. |
+| Missing dirty Maintainer | `Maintainer.route_and_reserve` consumes local v2 `admission_snapshot` and `admission_config`, validates freshness and invokes `resource_blockers`. `test_local_worker_uses_same_commit_guard` tests Commit 74/limit 77 and expects `commit_capacity`. | Source gap in plan §0 resolved; unchanged baseline test passed. |
 | Shared ledger | Coordinator and Maintainer use the same `sentinel.db` and `BEGIN IMMEDIATE`, but compute capacity differently. | P2 common projection, preserving remote pool behavior. |
 | Local aliases | Coordinator filters routed demand by one configured worker ID; Maintainer filters routed rows by the selected capacity pool. | Same-host aliases can omit each other's routed demand. Canonical host/pool binding and race tests required. |
 | Grace/accounting | Coordinator stops counting pending CPU/RAM after grace; Maintainer counts active rows. | Active monotone demand floors, validated subtraction, common units/projection. |
@@ -79,11 +79,22 @@ the text snapshots. The harness records independent exit codes and leaves test
 expectations unchanged. Admission uses the live normal P2 wrapper with one CPU
 unit, 0.5 GiB RAM and zero heavy-I/O slots. A capacity wait is not a test pass/fail.
 
+Before execution, 68 allowlisted source/test/doc files were frozen in a separate
+local `baseline-root`; all 39 live-overlay hashes match the initial manifest.
+This avoids testing the independently developed disk fix as if it were baseline.
+Tests ran 04:41:52 through 04:43:11 after normal admission, without exemptions.
+
 | Command | Result |
 |---|---|
-| `py -m unittest tests.test_coordinator tests.test_pressure tests.test_exemptions tests.test_maintainer tests.test_hooks` | Pending admission |
-| `powershell -NoProfile -ExecutionPolicy Bypass -File tests/test_exemption_policy.ps1` | Pending |
-| `powershell -NoProfile -ExecutionPolicy Bypass -File tests/test_collector_recovery.ps1` | Pending |
+| `py -m unittest tests.test_coordinator tests.test_pressure tests.test_exemptions tests.test_maintainer tests.test_hooks` | PASS: 72 tests, 76.232 seconds, 0 failures/errors/skips; exit 0 |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File tests/test_exemption_policy.ps1` | PASS: 9 assertions and 3 script parse checks; exit 0 |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File tests/test_collector_recovery.ps1` | PASS: health, stale/partial/future/malformed data, bounded probe timeout, mocked scheduler recovery ordering and verification; exit 0 |
+
+PowerShell's redirected native stderr wraps unittest progress as NativeCommandError
+text; the Python process exit was 0 and unittest reported OK. This is not a test
+failure. No original baseline failure or environment skip was observed in these
+selected suites. Collector recovery's scheduler calls are deliberately mocked;
+this does not establish the new P1 Windows recovery capability.
 
 No Windows Job control/canary, full-suite success, A/B performance result or
 production integration is claimed. No new Job restriction exists to withdraw.
@@ -96,7 +107,8 @@ any dependency on unpublished live modules must be made explicit; do not silentl
 include the existing dirty baseline in an implementation commit or claim the clean
 branch reproduces the local-overlay test results.
 
-Next gate: finish unchanged baseline suites and record pass/fail/skip, then perform
-isolated S1/S2/S3 as P1. Production adaptive remains off. Disk-alert attribution
+Next gate: isolated S1/S2/S3 as P1. Official-API boundary clarifications are recorded
+in [P1-API-PREFLIGHT.md](P1-API-PREFLIGHT.md), without claiming capability success.
+Production adaptive remains off. Disk-alert attribution
 improvements requested separately are isolated in their own diff and tests; they
 do not change the adaptive plan or enable CPU control.

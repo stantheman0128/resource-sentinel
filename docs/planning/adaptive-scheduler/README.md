@@ -34,6 +34,23 @@
 這裡的「互動優先」是產品方向，不等於已存在可靠 foreground-task 偵測能力。
 GPT Pro 必須選擇可實作的識別方式與沒有識別資料時的預設行為。
 
+## 接入規則補充：單一受管理區段與共用政策入口
+
+使用者補充：另一個 session 已移除全域入口的舊重複段，保留正式受管理區段並前置。
+本輪核對主 Codex 的 `.codex/AGENTS.md`：start/end marker 各一個，
+區段本文與 `docs/agent-bootstrap.md` 相同（僅正規化 CRLF/LF 與區段首尾空白後比對），
+`docs/agent-policy.md` 政策入口連結出現一次。這不是其他 agent 入口已全面複查的聲明。
+
+後續實作應沿用此結構：`agent-bootstrap.md` 是受管理區段的來源；
+`C:/Users/stans/Projects/resource-sentinel/docs/agent-policy.md` 是正式共用政策入口。
+不要在各個 AGENTS/CLAUDE/GEMINI 等入口另外追加一份動態調度規則；若確有政策變更，
+應先修改 canonical source，再以冪等方式同步既有受管理區段，並測試不存在重複區段。
+runtime 調度細節應留在實作/設計文件，不要把所有控制器參數複製成全域 instructions。
+
+資源 v2／legacy fallback、58 GiB budget、兩項 4 GiB reserve、三豁免上限、
+授權期限、排隊與恢復要求都保留。使用者回報該次整併未改 Sentinel 程式或跨 agent
+共用政策；本輪僅核對現況並補充交接，也未改這些來源、入口或 runtime。
+
 ## 自我質疑後的暫定結論
 
 先解決 task 身分、量測與恢復責任，再選控制器。首版候選是 wrapper 啟動的獨立工作，

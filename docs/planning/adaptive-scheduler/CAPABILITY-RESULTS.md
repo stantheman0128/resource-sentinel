@@ -1,6 +1,7 @@
 # P1 capability evidence — 2026-09-19
 
-Status: **in progress; S1/S2/S3 are not verified. No capability allowlist exists.**
+Status: **P1 blocked by unsupported launch hosts; S1/S2/S3 are not verified.
+No capability allowlist exists.**
 P0 passed on the reconciled local baseline. Adaptive production remains off.
 This is an execution checkpoint, not a replacement plan.
 
@@ -27,7 +28,7 @@ must fail the probe. No existing production task may be modified.
 | `test_adaptive_job_capability.py` and `adaptive_cpu_worker.py` | Self-deadline, foreign-parent rejection, 10 create/cap/reopen/restore rounds, 30-second CPU windows | Not run |
 | `test_adaptive_launch_compatibility.py` and `adaptive_spawn_tree.py` | Fixed cmd/PS/pwsh/stdio/Unicode/exit cases, Ctrl+C, fast exit, surviving children, fixture collector subtree | Not run |
 | `test_adaptive_recovery_capability.py` and `adaptive_recovery_actor.py` | Eight formal fault points plus hang/wrapper-loss/grant-before-cap/audit-lock, 10 repetitions each | Not run |
-| `probe_adaptive_host.py`, `probe_adaptive_task_host.ps1` | Bounded read-only alternative host and owned task cleanup | Pending normal admission |
+| `probe_adaptive_host.py`, `probe_adaptive_task_host.ps1` | Bounded read-only alternative host and owned task cleanup | Executed; unsupported parent Job; task removed |
 
 Native tests require explicit opt-in and an isolated evidence directory. Ordinary
 discovery skips native cases; those skips cannot count as capability passes.
@@ -66,11 +67,47 @@ The follow-up disk/display suites are submitted as one sequential normal request
 (P2, 1 CPU unit, 0.5 GiB RAM, 0 heavy-I/O slots). No exemption or policy change is
 used. Private logs and manifests remain in `.local-adaptive/`.
 
+## Executed results and blocker
+
+Normal admission succeeded for the follow-up preflight at 05:32. The following
+commands ran on this Windows host, with native spike opt-in explicitly set to 0:
+
+| Command | Result |
+|---|---|
+| `py -m unittest discover -s tests/windows -p 'test_adaptive_*.py'` | Exit 0, unittest reports 13 tests and 12 skip records. Two pure command-length checks ran; native S1/S2 cases and S3 class setup were skipped. A class setup skip is counted differently from a test method, so these totals must not be interpreted as a Windows pass rate. |
+| `powershell -NoProfile -ExecutionPolicy Bypass -File tests/windows/probe_adaptive_task_host.ps1 -OutputDirectory .local-adaptive/p1` | Exit 2: `unsupported_parent_job_present`; 05:32:21–05:32:25 |
+
+Both the caller and task child produced valid 64-bit native observations. They
+matched Windows session and authentication LUID. Both reported `in_any_job=true`.
+The temporary task itself finished with exit 0; the outer probe correctly
+rejected its host candidacy. Task cleanup returned `removed_verified`, without
+needing Stop-ScheduledTask. Job/CPU control writes: **zero**. Production Scheduled
+Task modifications: **zero**. The task contained only read-only metadata queries.
+
+The two observed launch paths therefore cannot establish a known CPU denominator
+or satisfy the formal foreign-parent gate. No existing Windows CI workflow was
+found in the checked repository. A compatible independent host is an external
+prerequisite; adding a new service/VM/CI platform, allowing an unknown parent Job,
+using breakaway or parent spoofing is not a justified workaround for this gate.
+The native S1/S2/S3 matrix, Ctrl+C, cap effects, recovery timings, independent
+supervisor and A/B remain unverified. The active-mode gate has not passed.
+
+Private evidence: `.local-adaptive/p1-preflight-20260919-053219/` and its referenced
+nonce directory in `.local-adaptive/p1/`. Public results omit authentication
+identifiers and private process/session labels.
+
 ## Promotion and next action
 
-Finish the read-only task-host probe, record its actual child and cleanup result,
-then run only experiments supported by that host and their accurate resource
-requests. Do not run the saturated CPU experiment under a 1-CPU reservation.
-Keep P2–P6 promotion pending until the ordered P1 gate has evidence or a formal
-admission-only fallback decision is recorded. No new CPU restriction has been
-applied, so none has been represented as withdrawn by closing a handle.
+P0 is complete; P1 test-only implementation and the host rejection evidence are
+delivered. P1's exit gate failed, so ordered P2–P6 implementation/promotion is
+held. The existing admission-only behavior remains the operational fallback;
+this does not claim P2 common accounting has been delivered. Production adaptive
+remains off. No new CPU restriction was applied or represented as withdrawn by
+closing a handle.
+
+Next: supply a verified host outside an unknown parent Job and repeat the host
+probe first. Then, through normal admission on that host, set explicit native
+opt-in and an isolated evidence directory and run S1/S2/S3 in sequence. S1 on
+this topology needs the five-unit CPU estimate described above, not the one-unit
+preflight reservation. If no compatible host is available, retain these failure
+results and do not proceed to active control or weaken the formal plan.

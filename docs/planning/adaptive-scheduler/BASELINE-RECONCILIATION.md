@@ -112,3 +112,15 @@ in [P1-API-PREFLIGHT.md](P1-API-PREFLIGHT.md), without claiming capability succe
 Production adaptive remains off. Disk-alert attribution
 improvements requested separately are isolated in their own diff and tests; they
 do not change the adaptive plan or enable CPU control.
+
+Handoff update: P1 launch-host probing rejected both observed hosts because of
+unknown parent Job membership; see CAPABILITY-RESULTS.md for the actual failure
+and verified test-task removal. P2–P6 remain held at this gate. The separate disk
+patch passed its Windows fixtures and was committed without collector activation.
+The user's later exemption-visibility request was verified and applied locally as
+a display-only fix. Of the 39 baseline files, only attribution.py, dashboard.py
+and the dashboard Node test changed in protected main for that request; HTML and
+one new fixture test were also deliberately updated. Other captured files remain
+byte-identical. Runtime policy/configuration, Scheduled Tasks, leases and adaptive
+control were unchanged. See the new exemption-visibility work note for the exact
+commit/dependency and live-publication boundary.

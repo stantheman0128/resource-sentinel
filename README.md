@@ -1,5 +1,11 @@
 # Resource Sentinel
 
+## 動態 Agent 調度：GPT Pro 規劃交接
+
+請從 [規劃交接入口](docs/planning/adaptive-scheduler/README.md) 開始。
+內含自我質疑、程式現況文字快照、驗收契約與可直接貼給 GPT Pro 的提示。
+此分支只交接規劃資料，沒有啟用新控制器；根目錄程式與本機快照的版本差異見交接說明。
+
 讓本機所有 coding agent 開工前就知道電腦還剩多少資源，並以同一份 SQLite 帳本協調
 本機與異質 execution workers。沒有常駐調度 daemon；Task Scheduler 週期性執行短命的
 採集／reconciliation 程序，中斷後可從帳本恢復。

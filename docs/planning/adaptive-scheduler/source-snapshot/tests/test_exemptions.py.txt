@@ -1,0 +1,215 @@
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+from datetime import datetime
+from pathlib import Path
+from unittest.mock import patch
+
+from sentinel.coordinator import Coordinator, ResourceRequest
+from sentinel.exemptions import Exemptions
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+class ExemptionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.chains = {100: [(100, 10.0)], 200: [(200, 20.0), (100, 10.0)], 300: [(300, 30.0)]}
+        self.store = Exemptions(self.temp.name, chain=lambda pid: self.chains.get(pid, []))
+
+    def grant(self, **kwargs):
+        return self.store.grant(100, reason="test explicit authorization", user_authorized=True, now=1000, **kwargs)
+
+    def test_authorization_duration_and_identity_required(self):
+        with self.assertRaises(ValueError):
+            self.store.grant(100, reason="test")
+        for minutes in (0, -1, 1441, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                self.grant(minutes=minutes)
+        with self.assertRaises(ValueError):
+            self.store.grant(999, reason="test", user_authorized=True)
+
+    def test_three_lease_limit_idempotency_revoke_and_expiry(self):
+        store = Exemptions(self.temp.name, chain=lambda pid: [(pid, float(pid))])
+        grants = [store.grant(pid, reason="test", user_authorized=True, now=1000, minutes=1) for pid in (1,2,3)]
+        same = store.grant(1, reason="repeat", user_authorized=True, now=1001, minutes=60)
+        self.assertEqual(same["id"], grants[0]["id"])
+        self.assertEqual(same["expires_at"], 1060)
+        with self.assertRaisesRegex(ValueError, "exemption_limit_reached"):
+            store.grant(4, reason="test", user_authorized=True, now=1001)
+        # Unknown/exited roots must not allow overbooking the lease table.
+        with patch.object(store, "chain", side_effect=lambda pid: [(pid,float(pid))] if pid == 4 else []):
+            with self.assertRaisesRegex(ValueError, "exemption_limit_reached"):
+                store.grant(4, reason="test", user_authorized=True, now=1001)
+        store.revoke(grants[0]["id"], now=1002)
+        store.grant(4, reason="test", user_authorized=True, now=1003)
+        store.grant(5, reason="test", user_authorized=True, now=1060)
+
+    def test_concurrent_grants_cannot_exceed_three(self):
+        # Separate SQLite connections contend on the same store.
+        self.store._connect().close()
+        barrier = Barrier(8)
+        def attempt(pid):
+            store = Exemptions(self.temp.name, chain=lambda p: [(p,float(p))])
+            barrier.wait()
+            try:
+                return store.grant(pid, reason="test", user_authorized=True, now=1000)["id"]
+            except ValueError as exc:
+                self.assertIn("exemption_limit_reached",str(exc))
+                return None
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(attempt, range(1,9)))
+        self.assertEqual(sum(r is not None for r in results), 3)
+
+    def test_cli_fourth_grant_fails_without_creating_a_row(self):
+        store = Exemptions(self.temp.name, chain=lambda pid: [(pid,float(pid))])
+        for pid in (1,2,3):
+            store.grant(pid,reason="test",user_authorized=True)
+        result = subprocess.run([sys.executable,str(ROOT/'scripts/sentinelctl.py'),
+            '--data-dir',self.temp.name,'exemption-grant','--pid',str(os.getpid()),
+            '--reason','test','--user-authorized'],capture_output=True,text=True,timeout=5)
+        self.assertNotEqual(result.returncode,0)
+        self.assertIn('exemption_limit_reached',result.stderr)
+        self.assertEqual(len(store.rows()),3)
+
+    def test_tree_scope_expiration_revoke_and_pid_reuse(self):
+        row = self.grant(minutes=1)
+        self.assertIsNotNone(self.store.match(100, 10, now=1001))
+        self.assertIsNotNone(self.store.match(200, 20, now=1001))
+        self.assertIsNone(self.store.match(300, 30, now=1001))
+        self.assertIsNone(self.store.match(200, 21, now=1001))
+        self.assertIsNone(self.store.match(200, float("nan"), now=1001))
+        self.assertIsNone(self.store.match(200, 20, now=1060))
+        self.chains[100] = [(100, 99.0)]
+        self.assertIsNone(self.store.match(200, 20, now=1001))
+        self.chains[100] = [(100, 10.0)]
+        self.assertEqual(self.store.revoke(row["id"], now=1002), 1)
+        self.assertIsNone(self.store.match(200, 20, now=1003))
+        self.assertEqual(self.store.revoke(row["id"], now=1004), 0)
+
+    def test_red_stale_capacity_and_queue_bypass_still_reserves(self):
+        self.grant(minutes=1)
+        coord = Coordinator(self.temp.name, pid_identity=lambda pid: (True, {100: 10, 200: 20, 300: 30}[pid]))
+        red = {"generated_at": "2000-01-01 00:00:00", "light": "RED"}
+        other = ResourceRequest(300, 30, "other", "npm install")
+        own = ResourceRequest(200, 20, "own", "npm install")
+        with patch("sentinel.coordinator.Exemptions", return_value=self.store):
+            self.assertFalse(coord.admit(other, red, now=1001)["allowed"])
+            allowed = coord.admit(own, red, now=1001)
+            self.assertTrue(allowed["allowed"])
+            self.assertEqual(allowed["reason"], "user_exemption")
+            snapshot = coord.snapshot()
+            self.assertEqual(len(snapshot["reservations"]), 1)
+            self.assertEqual(len(snapshot["queue"]), 1)
+            coord.release(owner_pid=200, now=1002)
+            self.assertFalse(coord.admit(own, red, now=1060)["allowed"])
+
+    def test_queued_work_resumes_after_grant_then_revoke_blocks_next_work(self):
+        coord = Coordinator(self.temp.name, pid_identity=lambda pid: (True, 10))
+        request = ResourceRequest(100, 10, "repo", "npm install")
+        with patch("sentinel.coordinator.Exemptions", return_value=self.store):
+            denied = coord.admit(request, {}, now=1000)
+            self.assertFalse(denied["allowed"])
+            grant = self.grant()
+            self.assertTrue(coord.retry_queued(denied["request_key"], {}, now=1001)["allowed"])
+            self.store.revoke(grant["id"], now=1002)
+            coord.release(owner_pid=100, now=1003)
+            self.assertFalse(coord.admit(request, {}, now=1004)["allowed"])
+
+    def test_corrupt_exemption_database_does_not_bypass_normal_gate(self):
+        self.store.path.write_bytes(b"not a sqlite database")
+        coord = Coordinator(self.temp.name, pid_identity=lambda pid: (True, 10))
+        self.assertFalse(coord.admit(ResourceRequest(100, 10, "repo", "npm install"), {}, now=1000)["allowed"])
+
+    def test_snapshot_resolution_avoids_os_queries_and_preserves_scope(self):
+        self.grant()
+        nodes = [dict(pid=100, ppid=0, create_time=10),
+                 dict(pid=200, ppid=100, create_time=20),
+                 dict(pid=300, ppid=0, create_time=30),
+                 dict(pid=400, ppid=100, create_time=5)]
+        with patch.object(self.store, "chain", side_effect=AssertionError("OS lookup")), patch("sentinel.exemptions.time.time", return_value=1001):
+            self.assertEqual({r["pid"] for r in self.store.resolve(nodes)}, {100, 200})
+            nodes[0]["create_time"] = 99
+            self.assertEqual(self.store.resolve(nodes), [])
+            self.assertEqual(self.store.resolve([]), [])
+
+    def test_snapshot_expiry_revoke_cycles_and_invalid_identity(self):
+        grant = self.grant(minutes=1)
+        nodes = [dict(pid=100, ppid=0, create_time=10),
+                 dict(pid=200, ppid=300, create_time=20),
+                 dict(pid=300, ppid=200, create_time=20)]
+        with patch("sentinel.exemptions.time.time", return_value=1001):
+            self.assertEqual([r["pid"] for r in self.store.resolve(nodes)], [100])
+            for bad in (float("nan"), float("inf"), 0, -1):
+                with self.assertRaises(ValueError):
+                    self.store.resolve([dict(pid=100, ppid=0, create_time=bad)])
+            with self.assertRaises(ValueError):
+                self.store.resolve(nodes + [nodes[0]])
+        with patch("sentinel.exemptions.time.time", return_value=1060):
+            self.assertEqual(self.store.resolve(nodes), [])
+        self.store.revoke(grant["id"], now=1002)
+        with patch("sentinel.exemptions.time.time", return_value=1003):
+            self.assertEqual(self.store.resolve(nodes), [])
+
+    def test_snapshot_cli_rejects_stale_future_and_malformed_inputs(self):
+        self.store.grant(100, reason="test", user_authorized=True)
+        path = Path(self.temp.name) / "snapshot.json"
+        command = [sys.executable, str(ROOT / "scripts/sentinelctl.py"),
+                   "--data-dir", self.temp.name, "exemption-resolve", "--process-snapshot-file", str(path)]
+        for age, nodes, success in ((0, [dict(pid=100, ppid=0, create_time=10)], True),
+                                    (120, [], False), (-120, [], False), (0, None, False)):
+            path.write_text(json.dumps(dict(sampled_epoch=time.time()-age, processes=nodes)), encoding="utf-8-sig")
+            result = subprocess.run(command, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode == 0, success, result.stderr)
+            if success:
+                self.assertEqual([row["pid"] for row in json.loads(result.stdout)], [100])
+
+    def test_real_process_identity_and_resolve(self):
+        store = Exemptions(self.temp.name)
+        import psutil
+        row = store.grant(os.getpid(), reason="test only in temporary store", user_authorized=True)
+        self.assertEqual(store.match(os.getpid(), psutil.Process().create_time())["id"], row["id"])
+        self.assertIn(os.getpid(), [r["pid"] for r in store.resolve()])
+        store.revoke(row["id"])
+        self.assertEqual(store.resolve(), [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows wrapper integration")
+    def test_wrapper_red_bypass_failure_exit_and_cleanup(self):
+        data = Path(self.temp.name) / ".resource-sentinel"
+        data.mkdir()
+        (data / "status.json").write_text(json.dumps({"light": "RED", "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}))
+        env = dict(os.environ, USERPROFILE=self.temp.name)
+        base = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ROOT / "scripts/invoke-sentinel.ps1"),
+                "-Command", "exit /b 7", "-ResourceClass", "HEAVY", "-TimeoutSec", "1"]
+        denied = subprocess.run(base, env=env, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(denied.returncode, 7)
+        self.assertNotEqual(denied.returncode, 0)
+        allowed = subprocess.run(base + ["-UserAuthorizedExemption", "-ExemptionReason", "user-authorized feature test"],
+                                 env=env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(allowed.returncode, 7, allowed.stdout + allowed.stderr)
+        rows = Exemptions(data).rows(include_inactive=True)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["state"], "revoked")
+        self.assertEqual(Coordinator(data).snapshot()["reservations"], [])
+        # Inherit an existing grant through an arbitrary parent, without extending
+        # or revoking that parent's authorization when the command finishes.
+        store = Exemptions(data)
+        grant = store.grant(os.getpid(), reason="temporary-store inheritance test", user_authorized=True)
+        try:
+            inherited = subprocess.run(base, env=env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(inherited.returncode, 7, inherited.stdout + inherited.stderr)
+            self.assertEqual(len(store.rows()), 1)
+            self.assertEqual(store.rows()[0]["id"], grant["id"])
+        finally:
+            store.revoke(grant["id"])
+
+
+if __name__ == "__main__":
+    unittest.main()

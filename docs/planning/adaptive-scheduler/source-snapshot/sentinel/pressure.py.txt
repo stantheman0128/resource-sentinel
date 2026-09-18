@@ -1,0 +1,136 @@
+"""Resource-specific pressure reporting and admission for the opt-in v2 policy."""
+from __future__ import annotations
+
+import math
+import os
+
+LEVELS = ("NORMAL", "ATTENTION", "HIGH", "RESTRICTED", "CRITICAL")
+LABELS = ("正常", "注意", "高負載", "受限", "危急")
+
+
+def number(value):
+    try:
+        value = float(value)
+        return value if math.isfinite(value) and value >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def counters(status, config):
+    ram, memory, io = (status.get(k) or {} for k in ("ram", "memory", "disk_performance"))
+    disks = status.get("disks") or []
+    if isinstance(disks, dict):
+        disks = [disks]
+    drive = str(config.get("system_drive", "C:")).upper()
+    disk = next((d for d in disks if str(d.get("drive", "")).upper() == drive), {})
+    total, free = number(ram.get("total_gb")), number(ram.get("free_gb"))
+    used, limit = number(memory.get("commit_used_gib")), number(memory.get("commit_limit_gib"))
+    latency = [number(io.get(k)) for k in ("read_latency_ms", "write_latency_ms")]
+    return dict(cpu=number(status.get("cpu_5min_avg", status.get("cpu_pct"))),
+                ram=(100 * (total-free)/total if total and free is not None and free <= total else None),
+                ram_total=total, ram_free=free,
+                commit=(100*used/limit if limit and used is not None else None),
+                commit_used=used, commit_limit=limit, disk_space=number(disk.get("free_gb")),
+                disk_queue=number(io.get("queue_length")),
+                disk_latency=max(latency) if all(x is not None for x in latency) else None)
+
+
+def thresholds(config, prefix, unit, defaults):
+    values = [float(config.get(f"{prefix}_{name}{unit}", default))
+              for name, default in zip(("yellow", "orange", "red", "critical"), defaults)]
+    increasing = prefix != "disk"
+    if any(not math.isfinite(v) or v < 0 for v in values) or any(
+            (a >= b if increasing else a <= b) for a, b in zip(values, values[1:])):
+        raise ValueError(f"invalid {prefix} thresholds")
+    return values
+
+
+def validate_budgets(config):
+    for key, default, positive in [('local_allocatable_cpu',8,True), ('local_allocatable_ram_gib',48,True),
+                                    ('local_commit_headroom_gib',4,False), ('local_physical_headroom_gib',4,False),
+                                    ('heavy_io_slots',1,False)]:
+        value = number(config.get(key,default))
+        if value is None or (positive and value == 0) or (key == 'heavy_io_slots' and value != int(value)):
+            raise ValueError(f'invalid {key}')
+
+
+def describe(status, config, previous=None):
+    validate_budgets(config)
+    values = counters(status, config)
+    specs = [("cpu", "CPU", "cpu", "_pct", (60,75,85,97), "%", False),
+             ("ram", "RAM", "ram", "_pct", (75,85,90,97), "%", False),
+             ("commit", "Commit", "commit", "_pct", (75,85,92,97), "%", False),
+             ("disk_space", "Disk free", "disk", "_gb", (50,35,20,5), "GiB", True),
+             ("disk_queue", "Disk queue", "disk_queue", "", (2,4,8,16), "requests", False),
+             ("disk_latency", "Disk latency", "disk_latency", "_ms", (20,50,100,200), "ms", False)]
+    previous = (previous or {}).get("resources", {})
+    recovery = max(1, math.ceil(float(config.get("hysteresis_recovery_samples", 2))*60 /
+                                max(1, float(config.get("collection_interval_sec",30)))))
+    resources = {}
+    for key, label, prefix, unit, defaults, display_unit, descending in specs:
+        edges = thresholds(config, prefix, unit, defaults)
+        value = values[key]
+        rank = None if value is None else sum(value <= t if descending else value >= t for t in edges)
+        raw_rank, streak = rank, 0
+        old = previous.get(key) or {}
+        if rank is not None and old.get("rank") in range(5) and rank < old["rank"]:
+            streak = int(old.get("recovery_streak", 0)) + 1
+            if streak < recovery:
+                rank = old["rank"]
+            else:
+                streak = 0
+        resources[key] = dict(label=label, value=value, unit=display_unit, thresholds=edges,
+                              rank=rank, raw_rank=raw_rank, recovery_streak=streak,
+                              level="UNKNOWN" if rank is None else LEVELS[rank])
+    ranks = [r["rank"] for r in resources.values() if r["rank"] is not None]
+    worst = max(ranks, default=0)
+    unknown = [k for k,r in resources.items() if r["rank"] is None]
+    return dict(version=2, mode="resource-v2", level="UNKNOWN" if unknown and worst < 2 else LEVELS[worst], rank=worst,
+                resources=resources, unknown=unknown,
+                reasons=[k for k,r in resources.items() if r["rank"] is not None and r["rank"] >= 2])
+
+
+def blockers(request, status, config, *, pending_cpu=0, pending_ram=0, used_io=0):
+    """A color does not grant capacity. Preserve physical and commit headroom."""
+    try:
+        validate_budgets(config)
+    except ValueError:
+        return [dict(resource='policy', reason='policy_config_invalid', required=None, available=None)]
+    v = counters(status, config)
+    result = []
+    def unknown(key):
+        result.append(dict(resource=key, reason=f"{key}_unknown", required=None, available=None))
+    def capacity(key, required, available, reason=None):
+        available = max(0.0, available)
+        if required > available:
+            result.append(dict(resource=key, reason=reason or f"{key}_capacity",
+                               required=round(required,3), available=round(available,3)))
+    # Every command needs some CPU and memory, including IO-bound work.
+    cpu, ram = max(.05, float(request.cpu_units)), max(.05, float(request.ram_gib))
+    if v["cpu"] is None:
+        unknown("cpu")
+    else:
+        capacity("cpu", cpu, float(config.get("local_allocatable_cpu",8)) - v["cpu"]/100*(os.cpu_count() or 1) - pending_cpu)
+    if v["ram_total"] is None or v["ram_free"] is None or v["ram"] is None:
+        unknown("ram")
+    else:
+        capacity("ram", ram, min(v["ram_free"]-float(config.get("local_physical_headroom_gib",4)),
+                 float(config.get("local_allocatable_ram_gib",48))-(v["ram_total"]-v["ram_free"]))-pending_ram)
+    if not v["commit_limit"] or v["commit_used"] is None:
+        unknown("commit")
+    else:
+        capacity("commit", ram, v["commit_limit"]-v["commit_used"]-float(config.get("local_commit_headroom_gib",4))-pending_ram)
+    if v["disk_space"] is None:
+        unknown("disk_space")
+    else:
+        floor = float(config.get("disk_red_gb",20) if request.io_slots else config.get("disk_critical_gb",5))
+        if v["disk_space"] <= floor:
+            result.append(dict(resource="disk_space", reason="disk_space_capacity", required=floor, available=v["disk_space"]))
+    if request.io_slots:
+        for key, setting, default in [("disk_queue","disk_queue_red",8), ("disk_latency","disk_latency_red_ms",100)]:
+            if v[key] is None:
+                unknown(key)
+            elif v[key] >= float(config.get(setting,default)):
+                result.append(dict(resource=key, reason="io_pressure", observed=v[key], limit=float(config.get(setting,default))))
+        capacity("io", request.io_slots, int(config.get("heavy_io_slots",1))-used_io)
+    return result

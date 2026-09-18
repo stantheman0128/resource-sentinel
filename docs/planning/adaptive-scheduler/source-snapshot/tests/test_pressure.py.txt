@@ -1,0 +1,154 @@
+import tempfile
+import unittest
+from datetime import datetime
+from pathlib import Path
+from unittest.mock import patch
+from sentinel.pressure import describe, blockers, LEVELS
+from sentinel.coordinator import Coordinator, ResourceRequest
+from sentinel.maintainer import Maintainer, Task, Worker
+
+NOW = 2_000_000_000.
+CFG = dict(admission_policy="resource-v2", local_allocatable_cpu=8, local_allocatable_ram_gib=48,
+           local_commit_headroom_gib=4, heavy_io_slots=1)
+
+
+def snapshot(cpu=20, ram=24, commit=40, limit=96, free_disk=100, queue=0, latency=1):
+    return dict(generated_at=datetime.fromtimestamp(NOW).strftime('%Y-%m-%d %H:%M:%S'),
+                light="RED", cpu_5min_avg=cpu,
+                ram=dict(total_gb=64, free_gb=64-ram), memory=dict(commit_used_gib=commit, commit_limit_gib=limit),
+                disks=[dict(drive="C:",free_gb=free_disk)],
+                disk_performance=dict(queue_length=queue,read_latency_ms=latency,write_latency_ms=latency),
+                resource_policy=dict(mode="resource-v2"))
+
+
+def request(pid=100, cpu=.5, ram=.5, io=0, priority="P2"):
+    return ResourceRequest(pid, 1000, 'test', 'fixture', 'MEDIUM', priority, str(pid), cpu_units=cpu,ram_gib=ram,io_slots=io)
+
+
+class PressureTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.coord = Coordinator(Path(self.tmp.name), pid_identity=lambda pid:(True,1000))
+        cpus = patch('os.cpu_count', return_value=12)
+        cpus.start(); self.addCleanup(cpus.stop)
+
+    def admit(self, req=None, state=None, config=None):
+        return self.coord.admit(req or request(), state or snapshot(), config=config or CFG, now=NOW)
+
+    def test_five_levels_preserve_existing_thresholds(self):
+        levels = [describe(snapshot(cpu=v), {})['resources']['cpu']['level'] for v in [20,60,75,85,97]]
+        self.assertEqual(levels, list(LEVELS))
+
+    def test_each_resource_can_be_severe_independently(self):
+        result = describe(snapshot(commit=94), {})
+        self.assertEqual(result['resources']['cpu']['level'], 'NORMAL')
+        self.assertEqual(result['resources']['commit']['level'], 'CRITICAL')
+        self.assertEqual(result['reasons'], ['commit'])
+
+    def test_recovery_needs_four_samples_per_resource(self):
+        prior = describe(snapshot(cpu=97), {})
+        for _ in range(3):
+            prior = describe(snapshot(), {}, prior)
+            self.assertEqual(prior['resources']['cpu']['level'], 'CRITICAL')
+        self.assertEqual(describe(snapshot(), {}, prior)['resources']['cpu']['level'], 'NORMAL')
+
+    def test_invalid_threshold_order_fails(self):
+        with self.assertRaises(ValueError): describe(snapshot(), {'cpu_red_pct':50})
+
+    def test_invalid_capacity_config_cannot_open_gate(self):
+        result = self.admit(config={**CFG,'local_allocatable_cpu':float('inf')})
+        self.assertFalse(result['allowed'])
+        self.assertEqual(result['reason'],'policy_config_invalid')
+
+    def test_unknown_is_not_green_or_zero(self):
+        state = snapshot(); state['memory'] = {}
+        self.assertIn('commit', describe(state, {})['unknown'])
+        self.assertEqual(describe(state,{})['level'],'UNKNOWN')
+        result = self.admit(state=state)
+        self.assertFalse(result['allowed']); self.assertEqual(result['reason'],'commit_unknown')
+
+    def test_v2_does_not_block_solely_on_legacy_red(self):
+        self.assertTrue(self.admit()['allowed'])
+
+    def test_58_gib_budget_still_preserves_physical_and_commit_reserves(self):
+        cfg = {**CFG, 'local_allocatable_ram_gib':58, 'local_physical_headroom_gib':4}
+        self.assertEqual(blockers(request(ram=2),snapshot(ram=56),cfg), [])
+        self.assertIn('ram_capacity',[x['reason'] for x in blockers(request(ram=2.1),snapshot(ram=56),cfg)])
+        small = snapshot(ram=56); small['ram']=dict(total_gb=59,free_gb=3)
+        self.assertIn('ram_capacity',[x['reason'] for x in blockers(request(ram=.1),small,cfg)])
+        self.assertIn('commit_capacity',[x['reason'] for x in blockers(request(ram=1),snapshot(ram=50,commit=92),cfg)])
+
+    def test_legacy_behavior_is_available_for_rollback(self):
+        self.assertEqual(self.admit(config={'admission_policy':'legacy'})['reason'],'light_red')
+
+    def test_cpu_bound_job_waits_small_job_can_fit(self):
+        self.assertEqual(self.admit(request(cpu=4),snapshot(cpu=60))['reason'],'cpu_capacity')
+        result = self.admit(request(pid=200,cpu=.25),snapshot(cpu=60))
+        self.assertTrue(result['allowed'])
+        self.assertEqual(len(self.coord.snapshot()['queue']),1)
+
+    def test_feasible_requests_retain_priority_order(self):
+        self.admit(request(pid=100,cpu=4,priority='P0'), snapshot(cpu=60))
+        result = self.admit(request(pid=200,cpu=1), snapshot(cpu=20))
+        self.assertEqual(result['reason'],'queue_order')
+
+    def test_commit_headroom_is_still_required_at_red(self):
+        result = self.admit(state=snapshot(commit=74,limit=77))
+        self.assertEqual(result['reason'],'commit_capacity')
+        self.assertEqual(result['blockers'][0]['available'],0)
+
+    def test_commit_exact_boundary_and_reservations(self):
+        self.assertTrue(self.admit(request(ram=4),snapshot(commit=88,limit=96))['allowed'])
+        result = self.admit(request(pid=200),snapshot(commit=88,limit=96))
+        self.assertEqual(result['reason'],'commit_capacity')
+
+    def test_physical_ram_reserve_is_not_just_a_percentage(self):
+        result = self.admit(state=snapshot(ram=61), config={**CFG,'local_allocatable_ram_gib':64})
+        self.assertEqual(result['reason'],'ram_capacity')
+
+    def test_io_red_only_blocks_io_work(self):
+        state = snapshot(queue=10)
+        result = self.admit(request(io=1),state)
+        self.assertEqual(result['reason'],'io_pressure')
+        self.assertTrue(self.admit(request(pid=200,io=0),state)['allowed'])
+
+    def test_disk_space_restricted_vs_critical(self):
+        self.assertTrue(self.admit(state=snapshot(free_disk=15))['allowed'])
+        result = self.admit(request(pid=200,io=1),snapshot(free_disk=15))
+        self.assertEqual(result['reason'],'disk_space_capacity')
+        self.assertEqual(self.admit(request(pid=300),snapshot(free_disk=3))['reason'],'disk_space_capacity')
+
+    def test_unknown_io_blocks_io_work_only(self):
+        state = snapshot(); state['disk_performance'] = {}
+        self.assertTrue(self.admit(state=state)['allowed'])
+        self.assertEqual(self.admit(request(pid=200,io=1),state)['reason'],'disk_queue_unknown')
+
+    def test_stale_sample_and_future_publication_fail_closed(self):
+        state = snapshot(); state['sampled_at'] = '2000-01-01 00:00:00'
+        self.assertEqual(self.admit(state=state)['reason'],'status_stale')
+        state = snapshot(); state['generated_at'] = datetime.fromtimestamp(NOW+600).strftime('%Y-%m-%d %H:%M:%S')
+        self.assertEqual(self.admit(state=state)['reason'],'status_stale')
+
+    def test_missing_v2_publication_fails_closed(self):
+        state = snapshot(); state.pop('resource_policy')
+        self.assertEqual(self.admit(state=state)['reason'],'policy_snapshot_unavailable')
+
+    def test_nonfinite_or_zero_estimates_cannot_bypass_reservations(self):
+        for cpu in [float('nan'),float('inf'),0]:
+            with self.assertRaises(ValueError): request(cpu=cpu).normalized()
+
+    def test_local_worker_uses_same_commit_guard(self):
+        maintainer = Maintainer(Path(self.tmp.name))
+        maintainer.upsert_worker(Worker(id='local-windows',provider='local',failure_domain='host',capacity_pool='host',
+            state='AVAILABLE', automation_level='AUTOMATABLE', os='windows',capacity_ram_gib=64,
+            allocatable_ram_gib=48, allocatable_cpu=8, allocatable_disk_gib=80, max_concurrency=8,
+            capabilities={'local':True,'adapter_ready':True,'admission_policy':'resource-v2',
+                          'admission_snapshot':snapshot(commit=74,limit=77),'admission_config':CFG},
+            observed_at=NOW,probe_expires_at=NOW+300),now=NOW)
+        result = maintainer.route_and_reserve(Task('worker-test',ram_gib=.5,cpu_units=.5,execution_preference='LOCAL_REQUIRED'),now=NOW)
+        self.assertFalse(result['reserved'])
+        self.assertEqual(result['rejected']['local-windows'],'commit_capacity')
+
+
+if __name__ == '__main__': unittest.main()

@@ -1,0 +1,2 @@
+# Preserve source bytes so snapshot-manifest.json hashes also match Git blobs.
+* -text whitespace=trailing-space,space-before-tab,cr-at-eol

@@ -1,5 +1,5 @@
 # Resource Sentinel - collector v0.2
-# Single-shot: machine + GPU + agent trees + per-process disk-write attribution.
+# Single-shot: machine + GPU + agent trees + process I/O correlation.
 # Scheduling is external. ASCII only to avoid PS 5.1 BOM issues.
 $ErrorActionPreference = 'Stop'
 
@@ -92,6 +92,12 @@ if (Test-Path $statePath) {
     try { $prev = Get-Content $statePath -Raw | ConvertFrom-Json } catch { $prev = $null }
 }
 
+. (Join-Path $PSScriptRoot 'disk-attribution.ps1')
+$diskStatePath = Join-Path $dataDir 'disk-attribution-state.json'
+$diskAttributionState = $null; $diskCheckpointState = 'ok'
+try { $diskAttributionState = Read-DiskAttributionState $diskStatePath }
+catch { $diskCheckpointState = 'unavailable' } # Preserve existing unreadable evidence.
+
 # ---------- process snapshot 1 (cpu baseline) ----------
 Set-CollectorStage 'process_snapshot_1_cpu_baseline'
 $snap1 = @{}
@@ -165,8 +171,8 @@ if ($null -eq $cpuTotal) {
 
 # ---------- disk-write attribution: delta vs previous run ----------
 Set-CollectorStage 'disk_write_attribution_delta_vs_previous_run'
-# WriteTransferCount is cumulative bytes written by the process since it started.
-# Delta across runs = bytes written in the interval. PID reuse guarded by CreationDate.
+# WriteTransferCount is process I/O, not volume allocation or file attribution.
+# Never subtract it from free-space loss. PID reuse guarded by CreationDate.
 $writeDelta = @{}   # pid -> bytes written since last run
 if ($null -ne $prev -and $null -ne $prev.procs) {
     foreach ($p in $procs) {
@@ -276,7 +282,11 @@ $commitLimitGb = if ($null -ne $commitLimitBytes) { [math]::Round($commitLimitBy
 $commitUsedPct = if ($null -ne $commitBytes -and $commitLimitBytes -gt 0) {
     [math]::Round($commitBytes / $commitLimitBytes * 100, 1)
 } else { 0 }
-$pagefiles = @(Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue)
+$pagefileEnumerationState = 'ok'
+$pagefileEnumerationStartedAt = (Get-Date).ToUniversalTime().ToString('o')
+try { $pagefiles = @(Get-CimInstance Win32_PageFileUsage -ErrorAction Stop) }
+catch { $pagefiles = @(); $pagefileEnumerationState = 'unavailable' }
+$pagefileEnumerationCompletedAt = (Get-Date).ToUniversalTime().ToString('o')
 $pagefileUsedGb = if ($pagefiles.Count -gt 0) {
     [math]::Round((($pagefiles.CurrentUsage | Measure-Object -Sum).Sum) / 1024, 2)
 } else { $null }
@@ -302,16 +312,20 @@ try {
     }
 } catch { }
 # Google Drive is a virtual cloud mount, not independent local capacity.
+$diskQueryStartedAt = (Get-Date).ToUniversalTime().ToString('o')
 $disks = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' |
     Where-Object { $_.VolumeName -notmatch 'Google Drive' } | ForEach-Object {
     [PSCustomObject]@{
         drive = $_.DeviceID
         total_gb = [math]::Round($_.Size / 1GB, 1)
         free_gb  = [math]::Round($_.FreeSpace / 1GB, 1)
+        free_bytes = [long]$_.FreeSpace
+        volume_serial = [string]$_.VolumeSerialNumber
         label = $_.VolumeName
         is_virtual = ($_.VolumeName -match 'Google Drive')
     }
 })
+$diskObservedAt = (Get-Date).ToUniversalTime().ToString('o')
 $sysDisk = $disks | Where-Object { $_.drive -eq $config.system_drive } | Select-Object -First 1
 $sysFreeGb = if ($sysDisk) { $sysDisk.free_gb } else { 999 }
 
@@ -320,20 +334,38 @@ Set-CollectorStage 'disk_change_events'
 $eventsPath = Join-Path $dataDir 'events.log'
 $now = Get-Date
 $nowStr = $now.ToString('yyyy-MM-dd HH:mm:ss')
-if ($null -ne $prev -and $null -ne $prev.drives) {
-    foreach ($d in $disks) {
-        $oldFree = $prev.drives.($d.drive)
-        if ($null -eq $oldFree) { continue }
-        $delta = [math]::Round($d.free_gb - [double]$oldFree, 2)
-        if ([math]::Abs($delta) -ge [double]$config.disk_event_gb) {
-            $evt = [ordered]@{
-                ts = $nowStr; type = 'disk_delta'; drive = $d.drive
-                delta_gb = $delta; free_gb = $d.free_gb
-                top_writers = $topWriters
-            }
-            ($evt | ConvertTo-Json -Depth 4 -Compress) | Add-Content $eventsPath -Encoding ascii
+$pageProbe = [PSCustomObject]@{ state = 'unavailable'; pagefiles = @() }
+try {
+    # Bounded metadata-only probe. No recursive scan and no workload process access.
+    $pageInput = Join-Path $dataDir 'disk-pagefile-probe-input.json'
+    @{ enumeration_state = $pagefileEnumerationState; pagefiles = @($pagefiles | Select-Object Name, AllocatedBaseSize, CurrentUsage) } |
+        ConvertTo-Json -Depth 4 -Compress | Set-Content -LiteralPath $pageInput -Encoding utf8
+    $pageScript = Join-Path $PSScriptRoot 'disk-attribution.ps1'
+    $pageOutput = Invoke-BoundedQuery 'powershell.exe' "-NoProfile -ExecutionPolicy Bypass -File `"$pageScript`" -ProbeInputPath `"$pageInput`"" 3000
+    if ($pageOutput) { $pageProbe = $pageOutput | ConvertFrom-Json }
+} catch { }
+$diskSample = [PSCustomObject]@{ observed_at = $diskObservedAt; completed_at = (Get-Date).ToUniversalTime().ToString('o')
+    disk_query_started_at = $diskQueryStartedAt; disk_query_completed_at = $diskObservedAt
+    pagefile_enumeration_started_at = $pagefileEnumerationStartedAt; pagefile_enumeration_completed_at = $pagefileEnumerationCompletedAt
+    disks = $disks; pagefiles = @($pageProbe.pagefiles); probe_state = $pageProbe.state
+    io_correlation = [PSCustomObject]@{ state = 'correlation_only'; source = 'Win32_Process.WriteTransferCount'
+        before_at = $prev.io_sampled_at; after_at = $t2.ToUniversalTime().ToString('o')
+        volume = 'unknown'; file = 'unknown'; exited_processes = 'not_observed'; top_writers = $topWriters } }
+$diskAlertGiB = 5; if ($null -ne $config.disk_alert_gb) { $diskAlertGiB = [double]$config.disk_alert_gb }
+if ($null -ne $diskAttributionState) {
+    try {
+        $diskAttributionState = Update-DiskAttribution $diskAttributionState $diskSample ([double]$config.disk_event_gb) $diskAlertGiB
+        # Persist before notification and every later optional collector stage. A
+        # timeout must not replay an old free-space baseline as another new event.
+        Save-DiskAttributionState $diskStatePath $diskAttributionState
+        foreach ($evt in @($diskAttributionState.events | Where-Object { $_.ledger_state -eq 'pending' })) {
+            $evt.ledger_state = 'attempting'
+            Save-DiskAttributionState $diskStatePath $diskAttributionState
+            (ConvertTo-DiskEventJson $evt) | Add-Content -LiteralPath $eventsPath -Encoding ascii
+            $evt.ledger_state = 'written'
+            Save-DiskAttributionState $diskStatePath $diskAttributionState
         }
-    }
+    } catch { $diskAttributionState = $null; $diskCheckpointState = 'unavailable' }
 }
 if ((Test-Path $eventsPath) -and (Get-Item $eventsPath).Length -gt 2MB) {
     $keep = Get-Content $eventsPath | Select-Object -Last 1000
@@ -564,30 +596,21 @@ if ($null -ne $tg -and $tg.enabled) {
     }
 }
 
-# ---------- disk-shrink alert: sharp free-space drop -> telegram with suspects ----------
-Set-CollectorStage 'disk_shrink_alert_sharp_free_space_drop_telegram_with_suspects'
+# ---------- disk-shrink alert: measured interval and explicit attribution gaps ----------
+Set-CollectorStage 'disk_shrink_alert_measured_allocation_and_correlation'
 $diskAlerts = @{}
 if ($null -ne $prev -and $null -ne $prev.disk_alerts) {
     foreach ($da in $prev.disk_alerts.PSObject.Properties) { $diskAlerts[$da.Name] = [double]$da.Value }
 }
-if ($null -ne $tg -and $tg.enabled -and $null -ne $prev -and $null -ne $prev.drives) {
-    $shrinkGb = 5; if ($null -ne $config.disk_alert_gb) { $shrinkGb = [double]$config.disk_alert_gb }
-    $nowEpochD = [double]((Get-Date).ToUniversalTime() - (Get-Date '1970-01-01')).TotalSeconds
-    foreach ($d in $disks) {
-        $oldFree = $prev.drives.($d.drive)
-        if ($null -eq $oldFree) { continue }
-        $delta = [math]::Round($d.free_gb - [double]$oldFree, 1)
-        if ($delta -gt -$shrinkGb) { continue }
-        $lastA = 0; if ($diskAlerts.ContainsKey($d.drive)) { $lastA = $diskAlerts[$d.drive] }
-        if (($nowEpochD - $lastA) -lt 1800) { continue }   # 30 min cooldown per drive
+if ($null -ne $tg -and $tg.enabled -and $null -ne $diskAttributionState) {
+    try {
+    $diskCandidates = @(Get-DiskAlertCandidates $diskAttributionState)
+    Save-DiskAttributionState $diskStatePath $diskAttributionState
+    foreach ($diskEvent in $diskCandidates) {
         $tpl2 = $null
         try { $tpl2 = Get-Content (Join-Path $PSScriptRoot 'messages.json') -Raw | ConvertFrom-Json } catch { }
         if ($null -eq $tpl2) { continue }
-        $sus = @($topWriters | Select-Object -First 3 | ForEach-Object { "$($_.name) $($_.mb)MB" }) -join ', '
-        if (-not $sus) { $sus = '(no obvious writer this interval)' }
-        $msg2 = $tpl2.disk_shrink.Replace('{drive}', $d.drive).
-            Replace('{delta}', [string][math]::Abs($delta)).
-            Replace('{free}', [string]$d.free_gb).Replace('{writers}', $sus)
+        $msg2 = Format-DiskShrinkAlert $diskEvent $tpl2.disk_shrink
         $token2 = $null; $chat2 = $null
         try {
             foreach ($ln in (Get-Content $tg.env_path)) {
@@ -597,16 +620,23 @@ if ($null -ne $tg -and $tg.enabled -and $null -ne $prev -and $null -ne $prev.dri
         } catch { }
         if ($null -ne $tg.chat_id) { $chat2 = [string]$tg.chat_id }
         if ($token2 -and $chat2) {
+            $diskEvent.notification_state = 'attempting'
+            $diskEvent.notification_attempted_at = (Get-Date).ToUniversalTime().ToString('o')
+            Save-DiskAttributionState $diskStatePath $diskAttributionState
             try {
                 $body2 = "chat_id=$chat2&text=" + [uri]::EscapeDataString($msg2)
-                Invoke-RestMethod -Uri "https://api.telegram.org/bot$token2/sendMessage" `
+                $response2 = Invoke-RestMethod -Uri "https://api.telegram.org/bot$token2/sendMessage" `
                     -Method Post -TimeoutSec 5 `
                     -ContentType 'application/x-www-form-urlencoded; charset=utf-8' `
-                    -Body ([System.Text.Encoding]::UTF8.GetBytes($body2)) | Out-Null
-                $diskAlerts[$d.drive] = $nowEpochD
-            } catch { }
+                    -Body ([System.Text.Encoding]::UTF8.GetBytes($body2))
+                if ($response2.ok -ne $true) { throw 'DeliveryNotConfirmed' }
+                $diskEvent.notification_state = 'sent'
+                $diskEvent.notification_sent_at = (Get-Date).ToUniversalTime().ToString('o')
+            } catch { $diskEvent.notification_state = 'unknown_delivery' }
+            Save-DiskAttributionState $diskStatePath $diskAttributionState
         }
     }
+    } catch { $diskCheckpointState = 'unavailable' } # No send follows a failed preflight save.
 }
 
 # ---------- central throttle: demote agent trees to BelowNormal on ORANGE/RED ----------
@@ -784,6 +814,7 @@ foreach ($p in $procs) {
 $stateDrives = @{}
 foreach ($d in $disks) { $stateDrives[$d.drive] = $d.free_gb }
 $state = @{ ts = $nowStr; drives = $stateDrives; procs = $stateProcs; peaks = $peaks; demoted = $demoted; alert = $alertState; trims = $trims; disk_alerts = $diskAlerts; light = $light; recovery_streak = $recoveryStreak }
+$state.io_sampled_at = $t2.ToUniversalTime().ToString('o')
 $tmp = "$statePath.tmp"
 ($state | ConvertTo-Json -Depth 4 -Compress) | Out-File $tmp -Encoding ascii
 Move-Item -Force $tmp $statePath
@@ -808,6 +839,10 @@ $status = [ordered]@{
     gpu = $gpu
     disks = $disks
     disk_performance = $diskPerf
+    disk_attribution = [ordered]@{ state = $(if ($diskCheckpointState -eq 'ok') { $pageProbe.state } else { 'unavailable' })
+        checkpoint_state = $diskCheckpointState; observed_at = $diskSample.observed_at
+        completed_at = $diskSample.completed_at; pagefiles = $diskSample.pagefiles
+        events = @($diskAttributionState.events | Select-Object -Last 8) }
     agent_groups = $groups
     agent_trees = @($trees | Select-Object -First 10)
     top_disk_writers_interval = $topWriters
@@ -816,7 +851,7 @@ $status = [ordered]@{
     exemptions = @($exemptProcesses.Values)
 }
 $tmp = "$statusJsonPath.tmp"
-($status | ConvertTo-Json -Depth 5) | Out-File $tmp -Encoding ascii
+($status | ConvertTo-Json -Depth 8) | Out-File $tmp -Encoding ascii
 Move-Item -Force $tmp $statusJsonPath
 
 # ---------- status.md (atomic) ----------

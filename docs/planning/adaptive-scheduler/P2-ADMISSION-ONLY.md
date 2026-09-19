@@ -216,10 +216,26 @@ first normal-admission attempt waited 1,800 seconds and returned
 `allowed=false`, `reason=timeout`, `last_reason=commit_capacity`, `cancelled=1`.
 The requested 0.75 GiB never fit; the last available value was 0.01 GiB after
 the mandatory reserve. No test in that attempt executed. The wrapper cancelled
-only its own queued request on timeout; this was not user abandonment. Clean
-candidate execution remains outstanding pending normal capacity (or a separately
-authorized, scoped user exemption). The 264-test result above must not be
-described as a completed clean-candidate run or a native promotion gate.
+only its own queued request on timeout; this was not user abandonment. At that
+checkpoint, clean-candidate execution remained outstanding. The 264-test result
+above is the protected-overlay run, not the clean-candidate result or a native
+promotion gate.
+
+The same candidate and unchanged 1 CPU / 0.75 GiB / 0 IO estimates were then
+requeued through normal admission. On 2026-09-19 at approximately 21:08 local
+time, admission succeeded and **242 tests passed in 10.322 seconds**, zero
+failures/errors/skips. No exemption was granted or used. The ten candidate
+source/test blobs were verified to match committed `fb9a682`; only the evidence
+document advanced afterward. The command is the portable-module command above,
+without the unpublished dashboard overlay tests.
+
+Final read-only verification found zero remaining reservations for all eleven
+exact test-admission IDs and no row for the timed-out request. Maintained hotfix
+source hashes, production config and canonical bootstrap bytes were unchanged;
+main HEAD remained `0b2f378`. No CPU limit was applied in this continuation. The
+read-only desktop child had independently verified natural exit. The optional
+exemption question became unnecessary when normal admission succeeded; it does
+not authorize a later lease for already-completed work.
 
 The production native verifier remains unavailable. Positive fixture evidence,
 including concurrent claim/cancel coverage, does not establish a Windows launch

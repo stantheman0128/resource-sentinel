@@ -22,8 +22,10 @@ authorize this cancellation. PREPARED, claimed, launched, uncertain, foreign,
 closed-context and mismatched allocations remain outside this path.
 
 Before providing the store's scoped evidence, cancellation irreversibly seals
-submission, payload verification and credential export and destroys the private
-token/key. The context lock retains exclusive custody through SQLite completion;
+submission, payload verification and credential export and drops the private
+launch token and payload-validation key. The separate query-only IPC key can
+remain available for terminal readback until context close; it grants no launch
+authority. The context lock retains exclusive custody through SQLite completion;
 it is not a kernel mutex or a general cross-process launch fence. Native identity
 queries happen before the writer transaction. Python objects are trusted runtime
 implementation, not a security boundary against hostile code in the same process.
@@ -33,8 +35,10 @@ hash) and direct allocation. The store revalidates the authoritative allocation
 and recomputes that digest under the writer lock before archiving/releasing it.
 This closes the gap between native preflight and commit even if an inconsistent
 writer changes ownership, request data or claim flags without advancing the
-lifecycle revision. Only heartbeat and allocation deadline refreshes are omitted
+lifecycle revision. Heartbeat and allocation deadline refreshes are omitted
 from that digest; neither establishes termination or invalidates unused custody.
+The later [IPC query dependency](P3-IPC-QUERY.md) also excludes the raw query-only
+key, while retaining the admission binding hash that incorporates that key.
 
 Failure or lost acknowledgement never unseals the context. An exact retry can
 reconcile cancellation with the same target. Terminal replay verifies destroyed

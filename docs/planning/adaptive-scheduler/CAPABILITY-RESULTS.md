@@ -99,11 +99,13 @@ identifiers and private process/session labels.
 ## Promotion and next action
 
 P0 is complete; P1 test-only implementation and the host rejection evidence are
-delivered. P1's exit gate failed, so ordered P2–P6 implementation/promotion is
-held. The existing admission-only behavior remains the operational fallback;
-this does not claim P2 common accounting has been delivered. Production adaptive
-remains off. No new CPU restriction was applied or represented as withdrawn by
-closing a handle.
+delivered. P1's native exit gate has not passed. The earlier blanket hold on all
+P2 work was too broad: formal sections 2.1, 10/P1 and 13.4 explicitly permit the
+independent admission/lifecycle/shared-accounting deliverable A. That safe P2-A
+work is now being implemented and verified in the isolated implementation tree.
+Native enrollment and P3–P6 promotion remain gated; L1 evidence does not satisfy
+them. Production adaptive remains off. No new CPU restriction was applied or
+represented as withdrawn by closing a handle.
 
 Next: supply a verified host outside an unknown parent Job and repeat the host
 probe first. Then, through normal admission on that host, set explicit native
@@ -111,3 +113,39 @@ opt-in and an isolated evidence directory and run S1/S2/S3 in sequence. S1 on
 this topology needs the five-unit CPU estimate described above, not the one-unit
 preflight reservation. If no compatible host is available, retain these failure
 results and do not proceed to active control or weaken the formal plan.
+
+## Resume: read-only desktop candidate, 2026-09-19
+
+`probe_adaptive_desktop.py` inspects only its own process and the actual
+`GetShellWindow` owner, holding query/synchronize handles while checking full
+creation FILETIME, image, token, session and Job membership twice. It publishes
+comparison results rather than private SID/logon identifiers. No arbitrary PID,
+dispatch or process-control operation exists in this preflight.
+
+The first native attempt returned unknown (`GetTokenInformationSize_20`, error
+24). The fixed-size DWORD token classes now use their documented four-byte
+query buffer; variable-size queries reject changed result lengths. All 17 pure
+preflight tests pass. A second native observation is valid: the existing system
+Explorer is unelevated medium integrity, belongs to the same user/logon/session,
+and is outside a Job. The admitted caller remains inside a Job. This result is
+only `candidate_desktop_not_launch_verified`, not an allowance for ordinary
+wrapper hosts or evidence of CPU/recovery capability. Both attempts performed
+zero dispatches and zero control writes. Private evidence is retained under
+`.local-adaptive/resume-host/`.
+
+The actual desktop shell view's automation interface was then tested once,
+through normal admission, using only a fixed read-only self probe. All 52 pure
+desktop probe tests passed before dispatch. COM returned success, but the child
+did not reach the verified READY/ACK path. Its private diagnostic reports
+`unsupported_self_identity` and `in_any_job=true`. This self-report does not
+establish independently verified launch success; the outer result correctly
+remains `launch_outcome_unknown`. A subsequent query-only OpenProcess check for
+the exact test PID returned error 87 (absent); nothing was killed or retried.
+
+Thus this third explored host path also fails to establish the required
+outside-foreign-Job child. No Job was created, no CPU control was written, and
+no production Task or launch entry changed. The code remains a test-host probe,
+with no breakaway, parent spoofing or production fallback. Detailed sanitized
+evidence is in [DESKTOP-HOST-PROBE-RESULTS.md](DESKTOP-HOST-PROBE-RESULTS.md).
+P1 native gates, P3–P6 promotion, real cap effects and recovery remain unverified;
+the safe P2-A work continues independently under the formal fallback.

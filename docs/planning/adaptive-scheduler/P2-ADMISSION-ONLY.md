@@ -144,3 +144,99 @@ The native desktop preflight has separate capability evidence in
   cannot claim an execution-bound allocation through signature guessing.
 - Active control, monitoring overhead and A/B gates are not established by
   these tests. Default mode remains off.
+
+## 2026-09-19 continuation: locality and prelaunch closure
+
+The admission-hook interruption was resolved first in `56fc1e6`; its separate
+evidence is in `docs/work/admission-hook-hotfix-20260919.md`. Adaptive work then
+resumed only in the implementation worktree. The maintained main checkout did
+not receive these adaptive changes.
+
+The shared projection, Maintainer, Coordinator, lifecycle registration and
+Orchestrator now use the same local/remote/unknown resolver. Constructors capture
+the actual host identity before transactions; a worker's embedded admission
+config cannot override that ledger identity. Canonical-only local workers must
+pass the same physical and Commit guard as explicitly local workers. Conflicting
+identity is unknown and cannot dispatch. Remote capacity semantics remain separate.
+The static `Coordinator._config(...)` interface is retained for the existing
+dashboard caller; its test-injected host binding is not a request-supplied field.
+
+Prelaunch cancellation requires exact caller/revision and trusted positive
+never-started evidence with a launch fence. Terminal closure seals launch,
+invalidates the token and archives/releases the exact bound allocation in one
+transaction. A post-claim cancellation only persists `cancel_requested_at` for
+reconciliation: it preserves the in-flight state and capacity. `START_FAILED`
+also accepts proven setup failures from RESERVED/PREPARED or a held prelaunch
+attempt, with the same fence and never-executed proof; this clarifies the state
+entry points without allowing uncertain launch outcomes to release anything.
+Nested closure never releases its parent allocation. The additive nullable
+column migration remains serialized and rejects unknown schema versions.
+
+The first combined continuation run executed 204 tests: 203 passed and one
+Orchestrator lease-expiry fixture failed. The original failing test was then run
+unchanged against a clean export of committed `05e20f8`; it failed identically
+(`codex-fail`, `no_matching_task`, 1 test, 0.086 seconds). The fixture requested two
+simultaneous same-host jobs while both aliases advertised max_concurrency=1;
+committed shared-pool accounting already rejected the second. This is recorded
+as a reproduced baseline fixture mismatch, not a new implementation regression.
+The correction supplies two slots for that two-job fixture while preserving its
+original expiry/release assertions, with a separate one-slot denial regression.
+
+Independent review found and closed two additional existing integration gaps:
+
+- Orchestrator now preserves and validates explicit Commit bytes and IO slots,
+  including zero, through worker dispatch and session pull. Malformed persisted
+  estimates become BLOCKED before reservation/dispatch. This covers valid JSON
+  with invalid estimates, not arbitrary database JSON corruption recovery.
+- Worker registry updates cannot change locality while any reservation references
+  the worker, including expired/bound rows. The check shares BEGIN IMMEDIATE with
+  reservation creation; matching metadata refreshes remain possible. Unknown or
+  orphaned registry records cannot be relabelled remote to omit their demand.
+  Actual allocation release unlocks a later locality change.
+
+The final protected-live-baseline continuation run passed **264 tests** in
+10.545 seconds, zero failures/errors/skips. Its command included the portable
+modules below plus `tests.test_dashboard_observability`, which still belongs to
+the protected unpublished overlay. This is not a clean-checkout dashboard claim.
+
+```text
+py -m unittest tests.test_adaptive_prelaunch tests.test_adaptive_lifecycle tests.test_adaptive_accounting tests.test_adaptive_maintainer tests.test_adaptive_coordinator tests.test_adaptive_contracts tests.test_adaptive_query tests.test_maintainer tests.test_coordinator tests.test_orchestrator
+```
+
+Environment remains Windows 11 build 26340 / Python 3.13.3, using normal P2
+admission (1 CPU unit, 0.75 GiB RAM, 0 IO slots) and isolated fixture stores.
+`SENTINEL_ADAPTIVE_WINDOWS_SPIKES=0` was explicit. No native control was invoked.
+Coordinator publication uses only five task-owned hunks against its protected
+before copy; its unrelated freshness, legacy routed IO and collector-sample
+changes remain unstaged. The private before copy, patch and hash manifest live
+under `.local-adaptive/` and are not committed.
+
+A clean export of exactly the staged candidate was prepared separately. Its
+first normal-admission attempt waited 1,800 seconds and returned
+`allowed=false`, `reason=timeout`, `last_reason=commit_capacity`, `cancelled=1`.
+The requested 0.75 GiB never fit; the last available value was 0.01 GiB after
+the mandatory reserve. No test in that attempt executed. The wrapper cancelled
+only its own queued request on timeout; this was not user abandonment. Clean
+candidate execution remains outstanding pending normal capacity (or a separately
+authorized, scoped user exemption). The 264-test result above must not be
+described as a completed clean-candidate run or a native promotion gate.
+
+The production native verifier remains unavailable. Positive fixture evidence,
+including concurrent claim/cancel coverage, does not establish a Windows launch
+fence or native race recovery. Trusted session/principal resolution, real
+admission-to-registration/claim wiring, native heartbeat/reconciliation and the
+P3 guardian/actuator remain outstanding. P1 is still blocked by an unknown
+inherited Job and missing continuous reservation-floor coverage for the long
+native suite; see `CAPABILITY-RESULTS.md`. P2-A admission-only remains the delivery
+boundary, with P3–P6 promotion blocked and adaptive off.
+
+A read-only follow-up checked the desktop diagnostic's executable selection.
+The child target was the absolute sibling `pythonw.exe` interpreter, and its
+held-handle image-path comparison succeeded; the outer controller's use of `py`
+does not mean child dispatch used a launcher. The currently installed file has
+a valid PSF signature and version 3.13.3, consistent with the official
+[pythonw project](https://github.com/python/cpython/blob/v3.13.3/PCbuild/pythonw.vcxproj)
+and [direct Py_Main entry](https://github.com/python/cpython/blob/v3.13.3/PC/WinMain.c).
+No execution-time binary hash was saved, and static byte absence is not a full
+behavior proof. This narrows the launcher hypothesis without identifying the
+Job assigner or satisfying the host gate. No additional probe/control ran.

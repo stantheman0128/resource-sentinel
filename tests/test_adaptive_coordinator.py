@@ -1,4 +1,5 @@
 """Admission-only integration: no OS controls, real isolated SQLite transactions."""
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -11,6 +12,7 @@ from unittest.mock import patch
 
 from sentinel.coordinator import Coordinator, ResourceRequest, _default_pid_identity
 from sentinel.adaptive.store import SchemaVersionError
+from sentinel.maintainer import Maintainer, Task, Worker
 
 
 NOW = 2_000_000_000.0
@@ -72,6 +74,55 @@ class AdaptiveCoordinatorTests(unittest.TestCase):
         self.assertEqual(saved["ram_gib"], 1)
         self.assertEqual(saved["commit_bytes"], 5 << 30)
         self.assertEqual(self.admit(request(200), status(commit=87))["reason"], "commit_capacity")
+
+    def canonical_local_route(self):
+        """Default constructors share a host even when config has no host ID."""
+        maintainer = Maintainer(self.directory)
+        self.assertEqual(maintainer.local_host_id, self.coordinator.local_host_id)
+        caps = dict(canonical_host_id=maintainer.local_host_id, adapter_ready=True,
+                    admission_policy="resource-v2", admission_config=dict(CONFIG),
+                    admission_snapshot=status(used_ram=56))
+        maintainer.upsert_worker(Worker(
+            id="canonical-local", provider="local", failure_domain="host", capacity_pool="local-pool",
+            state="AVAILABLE", automation_level="AUTOMATABLE", max_concurrency=8,
+            capacity_ram_gib=64, allocatable_ram_gib=58, allocatable_cpu=8,
+            capabilities=caps, observed_at=NOW, probe_expires_at=NOW+3600), now=NOW)
+        routed = maintainer.route_and_reserve(
+            Task("existing-local", ram_gib=2, cpu_units=.5, io_slots=0,
+                 allowed_worker_ids=("canonical-local",), execution_preference="CLOUD_OK"), now=NOW)
+        self.assertTrue(routed["reserved"], routed)
+        return maintainer, caps
+
+    def test_default_host_binding_counts_canonical_only_local_route(self):
+        self.canonical_local_route()
+        self.assertNotIn("local_host_id", CONFIG)
+        result = self.admit(state=status(used_ram=56))
+        self.assertFalse(result["allowed"])
+        self.assertEqual(result["reason"], "ram_capacity")
+
+    def test_dashboard_style_config_call_retains_static_api_and_host_binding(self):
+        with patch("sentinel.coordinator.local_host_identity", return_value="read-only-host"):
+            config = Coordinator._config({**CONFIG, "local_host_id": "worker-supplied-host"})
+        self.assertEqual(config["local_host_id"], "read-only-host")
+
+    def test_default_host_binding_holds_conflicting_route_on_both_entry_points(self):
+        maintainer, caps = self.canonical_local_route()
+        caps["local"] = False
+        with maintainer._db() as conn:
+            conn.execute("UPDATE workers SET capabilities_json=? WHERE id='canonical-local'", (json.dumps(caps),))
+        direct = self.admit(state=status(used_ram=56))
+        self.assertFalse(direct["allowed"])
+        self.assertEqual(direct["reason"], "local_scope_unknown")
+        routed = maintainer.route_and_reserve(
+            Task("next-local", ram_gib=.5, cpu_units=.5, io_slots=0,
+                 allowed_worker_ids=("canonical-local",), execution_preference="CLOUD_OK"), now=NOW)
+        self.assertFalse(routed["reserved"])
+        self.assertEqual(routed["rejected"]["canonical-local"], "local_scope_unknown")
+        # A request cannot relabel the ledger host to hide the conflicting row.
+        changed_config = {**CONFIG, "local_host_id": "different-host"}
+        changed = self.coordinator.admit(request(200), status(used_ram=56), config=changed_config, now=NOW)
+        self.assertFalse(changed["allowed"])
+        self.assertEqual(changed["reason"], "local_scope_unknown")
 
     def test_queued_retry_preserves_explicit_commit_bytes(self):
         req = request(ram=1, commit_bytes=5 << 30)

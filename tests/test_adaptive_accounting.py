@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 from sentinel.accounting import (
     AccountingError, GIB, frame_from_fast_frame, frame_from_status,
-    project_local_capacity, resolve_allocation_source,
+    project_local_capacity, resolve_allocation_source, resolve_worker_locality,
     shared_admission_blockers, update_demand_floor,
 )
 
@@ -224,6 +224,55 @@ class AccountingTests(unittest.TestCase):
         insert(self.conn, "worker_reservations", id="wrong", worker_id="wrong", cpu_units=1, ram_gib=2)
         result = self.projection(config={**CONFIG, "local_host_id": "this"})
         self.assertIn("local_scope_unknown", [x["reason"] for x in result["errors"]])
+
+    def test_locality_resolver_distinguishes_absent_conflicting_and_remote_assertions(self):
+        config = {**CONFIG, "local_host_id": "this-host"}
+        cases = (
+            ({"local": True}, "local"),
+            ({"local": False}, "remote"),
+            ({"canonical_host_id": "this-host"}, "local"),
+            ({"canonical_host_id": "other-host"}, "remote"),
+            ({"local": False, "canonical_host_id": "this-host"}, "unknown"),
+            ({"local": True, "canonical_host_id": "other-host"}, "unknown"),
+            ({"local": False, "canonical_host_id": "other-host"}, "remote"),
+            ({}, "unknown"),
+            ({"local": 0}, "unknown"),
+            ({"local": 1, "canonical_host_id": "this-host"}, "unknown"),
+            ({"local": "false"}, "unknown"),
+            ({"local": False, "canonical_host_id": 123}, "unknown"),
+            ({"local": False, "canonical_host_id": ""}, "unknown"),
+            ([], "unknown"),
+        )
+        for caps, expected in cases:
+            with self.subTest(caps=caps):
+                self.assertEqual(resolve_worker_locality(caps, config), expected)
+
+    def test_canonical_only_local_reservations_count_and_remote_reservations_do_not(self):
+        config = {**CONFIG, "local_host_id": "this-host"}
+        for name, host, local in (("canonical-local", "this-host", None),
+                                  ("canonical-remote", "other-host", None),
+                                  ("legacy-remote", None, False)):
+            caps = {}
+            if host is not None:
+                caps["canonical_host_id"] = host
+            if local is not None:
+                caps["local"] = local
+            insert(self.conn, "workers", id=name, capabilities_json=json.dumps(caps))
+            insert(self.conn, "worker_reservations", id=name, worker_id=name, cpu_units=1, ram_gib=6)
+        result = self.projection(config=config)
+        self.assertEqual(result["errors"], [])
+        self.assertEqual(result["projected"]["physical_bytes"], 56*GIB)
+        self.assertEqual(len(result["allocations"]), 1)
+        denied = shared_admission_blockers(self.conn, request(physical=3), slow_frame(), config)
+        self.assertIn("ram_capacity", [item["reason"] for item in denied])
+
+    def test_false_local_flag_cannot_hide_same_host_reservation(self):
+        insert(self.conn, "workers", id="conflict", capabilities_json=json.dumps(
+            dict(local=False, canonical_host_id="this-host")))
+        insert(self.conn, "worker_reservations", id="conflict", worker_id="conflict", cpu_units=1, ram_gib=6)
+        result = self.projection(config={**CONFIG, "local_host_id": "this-host"})
+        self.assertEqual(result["projected"]["physical_bytes"], 56*GIB)
+        self.assertIn("local_scope_unknown", [item["reason"] for item in result["errors"]])
 
     def test_shared_pages_incomplete_membership_and_overlap_never_deduct(self):
         direct(self.conn)

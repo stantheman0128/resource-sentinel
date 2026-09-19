@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 import re
 import sqlite3
@@ -34,6 +35,21 @@ TASK_STATES = {
     "QUEUED", "ROUTING", "WAITING_CAPACITY", "RESERVED", "SUBMITTED", "RUNNING",
     "AWAITING_MANUAL", "ASSIGNED", "VERIFYING", "DONE", "FAILED", "RETRYABLE", "BLOCKED", "CANCELLED",
 }
+
+
+def _explicit_capacity_estimates(requirements: dict[str, Any]) -> tuple[int | None, int]:
+    """Preserve explicit byte/slot estimates without truthiness or coercion.
+
+    Missing Commit retains the existing RAM-based estimate. An explicit unknown,
+    Boolean, fractional value, or out-of-range SQLite integer is not that default.
+    """
+    if not isinstance(requirements, dict):
+        raise ValueError("requirements must be an object")
+    for name in ("commit_bytes", "io_slots"):
+        if name in requirements and (type(requirements[name]) is not int or
+                                     not 0 <= requirements[name] <= (1 << 63) - 1):
+            raise ValueError(f"requirements.{name} must be a nonnegative SQLite integer")
+    return requirements.get("commit_bytes"), requirements.get("io_slots", 1)
 
 
 @dataclass(frozen=True)
@@ -91,8 +107,9 @@ class TaskSpec:
                 requirements[name] = float(requirements[name])
             except (TypeError, ValueError) as exc:
                 raise ValueError(f"requirements.{name} must be numeric") from exc
-            if requirements[name] < 0:
-                raise ValueError(f"requirements.{name} cannot be negative")
+            if not math.isfinite(requirements[name]) or requirements[name] < 0:
+                raise ValueError(f"requirements.{name} must be finite and nonnegative")
+        _explicit_capacity_estimates(requirements)
         normalized_scope_set = set()
         for path_scope in self.path_scopes:
             if not path_scope:
@@ -627,9 +644,14 @@ class Orchestrator:
                 continue
             if not self._acquire_dispatch_lease(task["id"], now=now):
                 continue
-            placement_task = self._placement(
-                task, allowed_worker_ids=(worker_id,), automated_only=False
-            )
+            try:
+                placement_task = self._placement(
+                    task, allowed_worker_ids=(worker_id,), automated_only=False
+                )
+            except (TypeError, ValueError, OverflowError):
+                self._set_task_state(task["id"], "BLOCKED", last_error="invalid_requirements",
+                    message="Invalid resource estimates; no capacity reserved", now=now)
+                continue
             placement = self.maintainer.route_and_reserve(placement_task, now=now)
             if not placement.get("reserved"):
                 self._set_task_state(
@@ -842,12 +864,14 @@ class Orchestrator:
             conn.execute("COMMIT")
         return bool(cur.rowcount)
 
-    @staticmethod
-    def _adapter_name(worker: dict[str, Any]) -> str:
+    def _adapter_name(self, worker: dict[str, Any]) -> str:
+        locality = self.maintainer.worker_locality(worker)
+        if locality == "unknown":
+            raise ValueError("local_scope_unknown")
         configured = str((worker.get("capabilities") or {}).get("adapter") or "")
         if configured:
             return configured
-        if (worker.get("capabilities") or {}).get("local"):
+        if locality == "local":
             return "local"
         provider = str(worker.get("provider") or "").lower()
         worker_id = str(worker.get("id") or "").lower()
@@ -867,11 +891,14 @@ class Orchestrator:
         automated_only: bool | None = None,
     ) -> PlacementTask:
         req = task["requirements"]
+        commit_bytes, io_slots = _explicit_capacity_estimates(req)
         return PlacementTask(
             id=task["id"],
-            ram_gib=float(req.get("ram_gib") or 1),
-            cpu_units=float(req.get("cpu_units") or 1),
-            disk_gib=float(req.get("disk_gib") or 0),
+            ram_gib=float(req.get("ram_gib", 1)),
+            cpu_units=float(req.get("cpu_units", 1)),
+            disk_gib=float(req.get("disk_gib", 0)),
+            commit_bytes=commit_bytes,
+            io_slots=io_slots,
             os=str(req.get("os") or "any"),
             docker=bool(req.get("docker")),
             browser=bool(req.get("browser")),
@@ -890,7 +917,7 @@ class Orchestrator:
                 if automated_only is None else bool(automated_only)
             ),
             metadata={"priority": task["priority"], "repo": task["repo"]},
-        )
+        ).normalized()
 
     @staticmethod
     def _adapter_payload(task: dict[str, Any], job_id: str) -> dict[str, Any]:
@@ -916,14 +943,15 @@ class Orchestrator:
                 payload[name] = metadata[name]
         return payload
 
-    @staticmethod
     def _prepare_workspace(
-        task: dict[str, Any], worker: dict[str, Any], plan: dict[str, Any]
+        self, task: dict[str, Any], worker: dict[str, Any], plan: dict[str, Any]
     ) -> dict[str, Any]:
+        locality = self.maintainer.worker_locality(worker)
+        if locality == "unknown":
+            raise ValueError("local_scope_unknown")
         if not plan:
             return {}
-        local = bool((worker.get("capabilities") or {}).get("local"))
-        if not local:
+        if locality == "remote":
             # Remote adapters receive the immutable base/branch/path contract
             # and are responsible for provider-side checkout isolation.
             return {**plan, "mode": "provider-managed", "ready": False}
@@ -998,7 +1026,13 @@ class Orchestrator:
 
         if not self._acquire_dispatch_lease(task_id, now=now):
             return {"dispatched": False, "reason": "dispatch_raced", "task_id": task_id}
-        placement = self.maintainer.route_and_reserve(self._placement(task), now=now)
+        try:
+            placement_task = self._placement(task)
+        except (TypeError, ValueError, OverflowError):
+            self._set_task_state(task_id, "BLOCKED", last_error="invalid_requirements",
+                message="Invalid resource estimates; no capacity reserved", now=now)
+            return {"dispatched": False, "reason": "invalid_requirements", "task_id": task_id}
+        placement = self.maintainer.route_and_reserve(placement_task, now=now)
         if not placement.get("reserved"):
             self._set_task_state(
                 task_id, "WAITING_CAPACITY", message="No worker currently fits",

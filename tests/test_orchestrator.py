@@ -1,8 +1,10 @@
+import json
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from sentinel.adapters import LocalCommandAdapter, ManualAdapter
@@ -174,6 +176,113 @@ class OrchestratorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "(?i)(different|conflict|mismatch)"):
             orch.submit_task(TaskSpec(id="same-id", prompt="changed prompt"), now=NOW + 2)
 
+    def test_dispatch_preserves_explicit_commit_and_io_estimates_in_reservation(self):
+        self.add_worker(make_worker("fake-worker"))
+        orch = self.orchestrator({"fake": FakeAdapter()})
+        requested_commit = 3 * (1 << 30) + 17
+        orch.submit_task(TaskSpec(id="explicit-worker-estimates", prompt="fixture workload",
+            allowed_worker_ids=("fake-worker",),
+            requirements={"ram_gib": 1, "commit_bytes": requested_commit, "io_slots": 0}), now=NOW)
+        dispatched = orch.dispatch_one("explicit-worker-estimates", now=NOW)
+        self.assertTrue(dispatched["dispatched"], dispatched)
+        reservations = self.maintainer.snapshot(now=NOW)["reservations"]
+        self.assertEqual(len(reservations), 1)
+        self.assertEqual(reservations[0]["commit_bytes"], requested_commit)
+        self.assertEqual(reservations[0]["io_slots"], 0)
+        self.assertEqual(reservations[0]["physical_bytes"], 1 << 30)
+
+    def test_session_pull_preserves_explicit_commit_and_io_estimates_in_reservation(self):
+        self.add_worker(make_worker("local-estimates", local=True))
+        orch = self.orchestrator({})
+        orch.register_session("estimates-session", agent_kind="codex", owner_pid=123,
+            owner_started=1, bound_worker_id="local-estimates", now=NOW)
+        requested_commit = 5 * (1 << 30) + 19
+        orch.submit_task(TaskSpec(id="explicit-session-estimates", prompt="fixture workload",
+            dispatch_mode="SESSION", allowed_worker_ids=("local-estimates",),
+            requirements={"ram_gib": 2, "commit_bytes": requested_commit, "io_slots": 2}), now=NOW)
+        assigned = orch.session_pull("estimates-session", now=NOW + 1)
+        self.assertTrue(assigned["assigned"], assigned)
+        reservations = self.maintainer.snapshot(now=NOW + 1)["reservations"]
+        self.assertEqual(len(reservations), 1)
+        self.assertEqual(reservations[0]["commit_bytes"], requested_commit)
+        self.assertEqual(reservations[0]["io_slots"], 2)
+        self.assertEqual(reservations[0]["physical_bytes"], 2 * (1 << 30))
+
+    def test_explicit_zero_estimates_do_not_become_truthy_defaults(self):
+        self.add_worker(make_worker("fake-worker"))
+        orch = self.orchestrator({"fake": FakeAdapter()})
+        orch.submit_task(TaskSpec(id="zero-estimates", prompt="fixture with explicit zero estimates",
+            allowed_worker_ids=("fake-worker",), requirements={
+                "ram_gib": 0, "cpu_units": 0, "disk_gib": 0, "commit_bytes": 0, "io_slots": 0,
+            }), now=NOW)
+        dispatched = orch.dispatch_one("zero-estimates", now=NOW)
+        self.assertTrue(dispatched["dispatched"], dispatched)
+        reservation = self.maintainer.snapshot(now=NOW)["reservations"][0]
+        for field in ("ram_gib", "cpu_units", "disk_gib", "physical_bytes", "commit_bytes", "io_slots"):
+            self.assertEqual(reservation[field], 0, field)
+
+    def test_missing_commit_and_io_estimates_keep_legacy_defaults(self):
+        self.add_worker(make_worker("fake-worker"))
+        orch = self.orchestrator({"fake": FakeAdapter()})
+        orch.submit_task(TaskSpec(id="legacy-estimates", prompt="fixture workload",
+            allowed_worker_ids=("fake-worker",), requirements={"ram_gib": 2}), now=NOW)
+        dispatched = orch.dispatch_one("legacy-estimates", now=NOW)
+        self.assertTrue(dispatched["dispatched"], dispatched)
+        reservation = self.maintainer.snapshot(now=NOW)["reservations"][0]
+        self.assertEqual(reservation["commit_bytes"], 2 * (1 << 30))
+        self.assertEqual(reservation["io_slots"], 1)
+
+    def test_malformed_explicit_estimates_are_rejected_before_task_persistence(self):
+        orch = self.orchestrator({})
+        for name in ("commit_bytes", "io_slots"):
+            for value in (-1, 1.5, "2", True, False, None, float("nan"), float("inf"), 1 << 63):
+                with self.subTest(name=name, value=value):
+                    with self.assertRaisesRegex(ValueError, f"requirements.{name}"):
+                        orch.submit_task(TaskSpec(id="invalid-estimates", prompt="fixture workload",
+                            requirements={name: value}), now=NOW)
+        self.assertEqual(orch.list_tasks(), [])
+        self.assertEqual(self.maintainer.snapshot(now=NOW)["reservations"], [])
+
+    def test_nonfinite_memory_cpu_disk_estimates_are_rejected_before_persistence(self):
+        orch = self.orchestrator({})
+        for name in ("ram_gib", "cpu_units", "disk_gib"):
+            for value in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(name=name, value=value):
+                    with self.assertRaisesRegex(ValueError, f"requirements.{name}"):
+                        orch.submit_task(TaskSpec(id="nonfinite-estimates", prompt="fixture workload",
+                            requirements={name: value}), now=NOW)
+        self.assertEqual(orch.list_tasks(), [])
+
+    def test_persisted_malformed_estimates_block_both_entry_points_without_reserving(self):
+        self.add_worker(make_worker("local-invalid", local=True))
+        adapter = FakeAdapter()
+        orch = self.orchestrator({"fake": adapter})
+        orch.register_session("invalid-estimates-session", agent_kind="codex", owner_pid=123,
+            owner_started=1, bound_worker_id="local-invalid", now=NOW)
+        malformed = ({"commit_bytes": "1000"}, {"io_slots": None},
+                     {"io_slots": True}, {"commit_bytes": -1},
+                     {"cpu_units": float("nan")}, {"ram_gib": None}, [])
+        for mode in ("WORKER", "SESSION"):
+            for index, requirements in enumerate(malformed):
+                with self.subTest(mode=mode, requirements=requirements):
+                    task_id = f"invalid-persisted-{mode.lower()}-{index}"
+                    orch.submit_task(TaskSpec(id=task_id, prompt="fixture workload", dispatch_mode=mode,
+                        allowed_worker_ids=("local-invalid",)), now=NOW)
+                    with orch._db() as conn:
+                        conn.execute("UPDATE orchestrator_tasks SET requirements_json=? WHERE id=?",
+                            (json.dumps(requirements), task_id))
+                    if mode == "WORKER":
+                        result = orch.dispatch_one(task_id, now=NOW)
+                        self.assertEqual(result["reason"], "invalid_requirements")
+                    else:
+                        self.assertFalse(orch.session_pull("invalid-estimates-session", now=NOW)["assigned"])
+                    task = orch.get_task(task_id)
+                    self.assertEqual(task["state"], "BLOCKED")
+                    self.assertEqual(task["last_error"], "invalid_requirements")
+                    self.assertEqual(task["attempts"], 0)
+                    self.assertEqual(self.maintainer.snapshot(now=NOW)["reservations"], [])
+                    self.assertEqual(adapter.jobs, {})
+
     def test_concurrent_dispatch_one_submits_the_same_task_exactly_once(self):
         self.add_worker(make_worker("fake-worker"))
         adapter = CountingBlockingAdapter()
@@ -246,6 +355,51 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(task["state"], "DONE", task)
         self.assertIn("sentinel-local-ok", task["result"]["stdout"])
         self.assertEqual(self.maintainer.snapshot(now=NOW + 1)["reservations"], [])
+
+    def test_canonical_only_local_worker_dispatches_through_local_adapter(self):
+        worker = make_worker("canonical-local", adapter="", local=True)
+        caps = {key: value for key, value in worker.capabilities.items() if key != "local"}
+        caps["canonical_host_id"] = self.maintainer.local_host_id
+        self.add_worker(replace(worker, capabilities=caps))
+        adapter = FakeAdapter()
+        orch = self.orchestrator({"local": adapter})
+        spec = TaskSpec(id="canonical-dispatch", prompt="isolated adapter fixture",
+                        execution_preference="LOCAL_REQUIRED", allowed_worker_ids=(worker.id,))
+        orch.submit_task(spec, now=NOW)
+        result = orch.dispatch_one(spec.id, now=NOW)
+        self.assertTrue(result["dispatched"], result)
+        self.assertIn(f"external-{spec.id}", adapter.jobs)
+
+    def test_canonical_local_workspace_uses_same_host_context_as_routing(self):
+        orch = self.orchestrator({})
+        worker = {"id": "canonical-local", "provider": "local",
+                  "capabilities": {"canonical_host_id": self.maintainer.local_host_id}}
+        workspace = orch._prepare_workspace(
+            {"metadata": {"workspace_mode": "claim-only"}}, worker, {"branch": "fixture"})
+        self.assertEqual(workspace["mode"], "claim-only")
+        self.assertTrue(workspace["ready"])
+        self.assertEqual(orch._adapter_name(worker), "local")
+
+    def test_unknown_scope_cannot_choose_an_adapter_or_skip_workspace_checks(self):
+        orch = self.orchestrator({})
+        for caps in ({"adapter": "fake"},
+                     {"local": False, "canonical_host_id": self.maintainer.local_host_id, "adapter": "fake"}):
+            worker = {"id": "unknown", "provider": "github", "capabilities": caps}
+            with self.subTest(caps=caps):
+                with self.assertRaisesRegex(ValueError, "local_scope_unknown"):
+                    orch._adapter_name(worker)
+                with self.assertRaisesRegex(ValueError, "local_scope_unknown"):
+                    orch._prepare_workspace({"metadata": {}}, worker, {})
+
+    def test_remote_host_config_does_not_make_remote_workspace_local(self):
+        orch = self.orchestrator({})
+        worker = {"id": "remote", "provider": "github", "capabilities": {
+            "local": False, "canonical_host_id": "other-host",
+            "admission_config": {"local_host_id": "other-host"}}}
+        self.assertEqual(orch._adapter_name(worker), "github_actions")
+        workspace = orch._prepare_workspace({"metadata": {}}, worker, {"branch": "fixture"})
+        self.assertEqual(workspace["mode"], "provider-managed")
+        self.assertFalse(workspace["ready"])
 
     def test_manual_adapter_waits_without_holding_capacity_or_workspace(self):
         # The adapter is callable, so routing may reserve it; the adapter's
@@ -538,8 +692,10 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(self.maintainer.snapshot(now=NOW + 2)["reservations"], [])
 
     def test_expired_session_assignments_requeue_or_fail_and_release_leases(self):
-        self.add_worker(make_worker("local-retry", local=True))
-        self.add_worker(make_worker("local-fail", local=True))
+        # Both aliases share one host. This expiry test needs two simultaneous
+        # assignments, so its isolated fixture must explicitly have two slots.
+        self.add_worker(replace(make_worker("local-retry", local=True), max_concurrency=2))
+        self.add_worker(replace(make_worker("local-fail", local=True), max_concurrency=2))
         orch = self.orchestrator({})
         cases = (
             ("retry", "local-retry", 2, "RETRYABLE"),
@@ -575,6 +731,26 @@ class OrchestratorTests(unittest.TestCase):
             self.assertEqual(orch.get_task(task_id)["last_error"], "session_lease_expired")
         self.assertEqual(self.maintainer.snapshot(now=NOW + 602)["reservations"], [])
         self.assertEqual(self.claims.snapshot(now=NOW + 602)["active"], [])
+
+    def test_local_session_aliases_cannot_multiply_single_host_concurrency(self):
+        self.add_worker(make_worker("local-first", local=True))
+        self.add_worker(make_worker("local-second", local=True))
+        orch = self.orchestrator({})
+        for suffix in ("first", "second"):
+            worker_id = f"local-{suffix}"
+            session_id = f"codex-{suffix}"
+            orch.register_session(session_id, agent_kind="codex", owner_pid=123,
+                owner_started=1, bound_worker_id=worker_id, now=NOW)
+            orch.submit_task(TaskSpec(id=f"alias-{suffix}", prompt="fixture workload",
+                dispatch_mode="SESSION", allowed_worker_ids=(worker_id,)), now=NOW)
+        self.assertTrue(orch.session_pull("codex-first", now=NOW + 1)["assigned"])
+        second = orch.session_pull("codex-second", now=NOW + 1)
+        self.assertFalse(second["assigned"], second)
+        self.assertEqual(orch.get_task("alias-second")["state"], "WAITING_CAPACITY")
+        self.assertEqual(len(self.maintainer.snapshot(now=NOW + 1)["reservations"]), 1)
+        event = next(event for event in orch.snapshot()["events"]
+            if event["task_id"] == "alias-second" and event["event_type"] == "STATE_WAITING_CAPACITY")
+        self.assertEqual(json.loads(event["data_json"])["rejected"]["local-second"], "concurrency_capacity")
 
     def test_unknown_dispatch_requires_resolution_before_retry_can_be_requeued(self):
         self.add_worker(make_worker("fake-worker"))

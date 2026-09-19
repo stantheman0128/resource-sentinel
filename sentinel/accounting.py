@@ -1,6 +1,6 @@
 """One conservative local-capacity projection for direct and routed admission.
 
-All inputs are already collected snapshots.  These functions perform bounded
+Projection inputs are already collected snapshots. Projection functions perform bounded
 SQLite reads/updates on the caller's transaction; none query processes, invoke
 IPC, read files, commit, or acquire a second lock.  Missing attribution adds the
 entire allocation to machine usage.  It never creates capacity.
@@ -8,7 +8,9 @@ entire allocation to machine usage.  It never creates capacity.
 from __future__ import annotations
 
 import json
+import hashlib
 import math
+import socket
 import sqlite3
 from collections.abc import Mapping
 from datetime import datetime
@@ -25,6 +27,15 @@ ACTIVE_STATES = frozenset({"NEW", "QUEUED", "RESERVED", "PREPARED", "LAUNCHING",
 
 class AccountingError(ValueError):
     """A ledger invariant failed; admission must hold."""
+
+
+def local_host_identity() -> str:
+    """Bind callers to one host before entering accounting transactions.
+
+    This is an alias-independent host binding, not an authentication token.
+    Callers capture it outside the projection's bounded SQLite transaction.
+    """
+    return "host-" + hashlib.sha256(socket.gethostname().casefold().encode("utf-8")).hexdigest()
 
 
 def _mapping(value):
@@ -184,6 +195,34 @@ def _supported_runtime(conn, *, required=True):
     return runtime
 
 
+def resolve_worker_locality(capabilities, config):
+    """Resolve local/remote/unknown identically for routing and accounting.
+
+    A matching canonical host can establish locality when the legacy flag is
+    absent. Contradictory assertions cannot establish either capacity scope.
+    An explicit remote flag remains compatible with unbound cloud registries.
+    The config is the caller's host context, not the worker row's own claim.
+    """
+    if not isinstance(capabilities, Mapping) or not isinstance(config, Mapping):
+        return "unknown"
+    local = capabilities.get("local")
+    host = capabilities.get("canonical_host_id")
+    expected = config.get("local_host_id", config.get("canonical_host_id"))
+    if local is not None and not isinstance(local, bool):
+        return "unknown"
+    if any(value is not None and (not isinstance(value, str) or not value.strip())
+           for value in (host, expected)):
+        return "unknown"
+    if local is True:
+        return "unknown" if expected and host and expected != host else "local"
+    if local is False:
+        return "unknown" if host and expected and host == expected else "remote"
+    if host and expected:
+        return "local" if host == expected else "remote"
+    # A missing locality assertion is not evidence of a remote allocation.
+    return "unknown"
+
+
 def _worker_scope(worker, config):
     if worker is None:
         return "unknown"
@@ -194,18 +233,7 @@ def _worker_scope(worker, config):
         caps = json.loads(raw)
     except (ValueError, RecursionError):
         return "unknown"
-    if not isinstance(caps, dict):
-        return "unknown"
-    local, host = caps.get("local"), caps.get("canonical_host_id")
-    expected = config.get("local_host_id", config.get("canonical_host_id"))
-    if local is True:
-        return "unknown" if expected and host and expected != host else "local"
-    if local is False:
-        return "unknown" if host and expected and host == expected else "remote"
-    if host and expected:
-        return "local" if host == expected else "remote"
-    # A missing locality assertion is not evidence of a remote allocation.
-    return "unknown"
+    return resolve_worker_locality(caps, config)
 
 
 def _demand(row, *, routed=False):

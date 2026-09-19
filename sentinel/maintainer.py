@@ -13,7 +13,6 @@ import hashlib
 import math
 import os
 import re
-import socket
 import sqlite3
 import time
 import uuid
@@ -21,7 +20,9 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
-from sentinel.accounting import frame_from_status, shared_admission_blockers
+from sentinel.accounting import (
+    frame_from_status, local_host_identity, resolve_worker_locality, shared_admission_blockers,
+)
 from sentinel.adaptive.store import (
     allocation_is_bound, check_schema_version, hold_bound_allocation,
     hold_expired_allocations, migrate_schema,
@@ -33,16 +34,6 @@ AUTOMATION_RANK = {"AUTOMATABLE": 0, "PARTIAL": 1, "MANUAL": 2, "UNKNOWN": 3}
 PREFERENCES = {"LOCAL_REQUIRED", "LOCAL_PREFERRED", "CLOUD_OK", "CLOUD_PREFERRED"}
 CAPACITY_SCOPES = {"SHARED_POOL", "PER_EXECUTION"}
 SENSITIVE_KEY = re.compile(r"(?i)(token|password|passwd|secret|credential|api[_-]?key)")
-
-
-def local_host_identity() -> str:
-    """Local-sync binding, not a caller-supplied worker alias or a security token.
-
-    A shared ledger belongs to one host. The OS hostname binds aliases on that
-    host without publishing the hostname itself. Unbound legacy aliases are
-    still counted conservatively by common accounting.
-    """
-    return "host-" + hashlib.sha256(socket.gethostname().casefold().encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -169,7 +160,11 @@ class Task:
 class Maintainer:
     """Atomic registry, router, and cross-worker resource reservations."""
 
-    def __init__(self, data_dir: str | os.PathLike[str], *, db_path: str | os.PathLike[str] | None = None):
+    def __init__(self, data_dir: str | os.PathLike[str], *, db_path: str | os.PathLike[str] | None = None,
+                 local_host_id: str | None = None):
+        self.local_host_id = local_host_identity() if local_host_id is None else local_host_id
+        if not isinstance(self.local_host_id, str) or not self.local_host_id.strip():
+            raise ValueError("local_host_id must be a nonempty string")
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = Path(db_path) if db_path else self.data_dir / "sentinel.db"
@@ -289,6 +284,7 @@ class Maintainer:
             conn.execute("UPDATE workers SET quota_domain=capacity_pool WHERE quota_domain='' OR quota_domain IS NULL")
             conn.execute("UPDATE worker_reservations SET capacity_pool=failure_domain WHERE capacity_pool='' OR capacity_pool IS NULL")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_worker_res_pool ON worker_reservations(capacity_pool, expires_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_worker_res_worker ON worker_reservations(worker_id)")
 
     @staticmethod
     def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
@@ -306,6 +302,29 @@ class Maintainer:
         values.update(observed_at=observed, probe_expires_at=expires)
         with self._db() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            if conn.execute("SELECT 1 FROM worker_reservations WHERE worker_id=? LIMIT 1", (w.id,)).fetchone():
+                # Locality is part of active allocation accounting. A registry
+                # refresh cannot turn running local demand into a remote pool,
+                # nor resolve uncertain demand by relabelling its worker. This
+                # shares the writer lock with reservation creation and includes
+                # expired/bound rows: only actual release unlocks a new scope.
+                previous = conn.execute("SELECT capabilities_json FROM workers WHERE id=?", (w.id,)).fetchone()
+                try:
+                    previous_caps = json.loads(previous["capabilities_json"]) if previous else None
+                except (TypeError, ValueError, RecursionError):
+                    previous_caps = None
+                context = {"local_host_id": self.local_host_id}
+                old_scope = resolve_worker_locality(previous_caps, context)
+                new_scope = resolve_worker_locality(w.capabilities, context)
+
+                def binding(caps):
+                    if not isinstance(caps, dict):
+                        return None
+                    return json.dumps({key: caps[key] for key in ("local", "canonical_host_id") if key in caps},
+                                      sort_keys=True, separators=(",", ":"))
+
+                if old_scope != new_scope or (old_scope == "unknown" and binding(previous_caps) != binding(w.capabilities)):
+                    raise ValueError("worker_locality_change_with_active_reservations")
             conn.execute(
                 """INSERT INTO workers
                 (id,provider,failure_domain,capacity_scope,capacity_pool,max_concurrency,quota_domain,
@@ -368,13 +387,23 @@ class Maintainer:
             conn.execute("COMMIT")
         return cur.rowcount > 0
 
-    @staticmethod
-    def _fits(task: Task, worker: dict[str, Any], now: float) -> tuple[bool, str]:
+    def worker_locality(self, worker: dict[str, Any]) -> str:
+        """Use the ledger host's identity, never a remote worker's own config."""
+        return resolve_worker_locality(worker.get("capabilities"), {"local_host_id": self.local_host_id})
+
+    def _admission_config(self, worker: dict[str, Any]) -> dict[str, Any]:
+        config = worker["capabilities"].get("admission_config") or {}
+        return {**config, "local_host_id": self.local_host_id}
+
+    def _fits(self, task: Task, worker: dict[str, Any], now: float) -> tuple[bool, str]:
         if worker["state"] not in ACTIVE_STATES:
             return False, f"state_{worker['state'].lower()}"
         if float(worker["probe_expires_at"]) <= now:
             return False, "probe_stale"
-        local = bool(worker["capabilities"].get("local"))
+        scope = self.worker_locality(worker)
+        if scope == "unknown":
+            return False, "local_scope_unknown"
+        local = scope == "local"
         if task.automated_only:
             if worker["capabilities"].get("enabled", True) is False:
                 return False, "worker_disabled"
@@ -437,11 +466,11 @@ class Maintainer:
             return value
         return f"<{type(value).__name__}>"
 
-    @staticmethod
     def _pool_usage(
-        conn: sqlite3.Connection, worker: dict[str, Any]
+        self, conn: sqlite3.Connection, worker: dict[str, Any]
     ) -> dict[str, float | int]:
-        local = bool(worker["capabilities"].get("local"))
+        config = {"local_host_id": self.local_host_id}
+        local = self.worker_locality(worker) != "remote"
         usage = conn.execute(
             """SELECT COALESCE(SUM(ram_gib),0) ram,COALESCE(SUM(cpu_units),0) cpu,
                       COALESCE(SUM(disk_gib),0) disk,COUNT(*) jobs
@@ -463,8 +492,8 @@ class Maintainer:
             ):
                 try:
                     capabilities = json.loads(reservation["capabilities_json"])
-                    include = not isinstance(capabilities, dict) or capabilities.get("local") is not False
-                except (TypeError, ValueError):
+                    include = resolve_worker_locality(capabilities, config) != "remote"
+                except (TypeError, ValueError, RecursionError):
                     include = True
                 if include:
                     result["ram"] += float(reservation["ram_gib"])
@@ -510,8 +539,8 @@ class Maintainer:
         local_frames = {}
         for observed_worker in self.workers(now=now):
             caps = observed_worker["capabilities"]
-            if caps.get("local") and caps.get("admission_policy") == "resource-v2":
-                config = caps.get("admission_config") or {}
+            if self.worker_locality(observed_worker) == "local" and caps.get("admission_policy") == "resource-v2":
+                config = self._admission_config(observed_worker)
                 snapshot = caps.get("admission_snapshot") or {}
                 local_frames[observed_worker["id"]] = (
                     snapshot, config,
@@ -560,13 +589,11 @@ class Maintainer:
                 accounted_cpu = float(usage["cpu"]) if shared else 0.0
                 accounted_disk = float(usage["disk"]) if shared else 0.0
                 caps = worker["capabilities"]
-                local_v2 = bool(caps.get("local")) and caps.get("admission_policy") == "resource-v2"
+                local = self.worker_locality(worker) == "local"
+                local_v2 = local and caps.get("admission_policy") == "resource-v2"
                 if local_v2:
-                    snapshot, config = caps.get("admission_snapshot") or {}, caps.get("admission_config") or {}
-                    expected_host = config.get("local_host_id", config.get("canonical_host_id"))
-                    if expected_host and caps.get("canonical_host_id") and expected_host != caps["canonical_host_id"]:
-                        rejected[worker["id"]] = "local_scope_unknown"
-                        continue
+                    config = self._admission_config(worker)
+                    snapshot = caps.get("admission_snapshot") or {}
                     captured = local_frames.get(worker["id"])
                     if captured is None or captured[:2] != (snapshot, config):
                         rejected[worker["id"]] = "revision_conflict"
@@ -590,7 +617,6 @@ class Maintainer:
                     if t.ram_gib > max(0.0, float(observed_free) - headroom - accounted_ram):
                         rejected[worker["id"]] = "observed_ram_headroom"
                         continue
-                local = bool(worker["capabilities"].get("local"))
                 if t.execution_preference == "LOCAL_PREFERRED":
                     preference_rank = 0 if local else 1
                 elif t.execution_preference in {"CLOUD_PREFERRED", "CLOUD_OK"}:

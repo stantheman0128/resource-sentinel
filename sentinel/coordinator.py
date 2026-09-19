@@ -25,7 +25,7 @@ from typing import Any, Callable
 from sentinel.exemptions import Exemptions
 from sentinel.command_classification import classify_command
 from sentinel.stop_reminders import claim_reminder
-from sentinel.accounting import frame_from_status, shared_admission_blockers
+from sentinel.accounting import frame_from_status, local_host_identity, shared_admission_blockers
 from sentinel.adaptive.store import allocation_is_bound, check_schema_version, hold_expired_allocations, migrate_schema
 
 
@@ -164,7 +164,11 @@ class Coordinator:
         *,
         db_path: str | os.PathLike[str] | None = None,
         pid_identity: Callable[[int], tuple[bool | None, float]] | None = None,
+        local_host_id: str | None = None,
     ) -> None:
+        self.local_host_id = local_host_identity() if local_host_id is None else local_host_id
+        if not isinstance(self.local_host_id, str) or not self.local_host_id.strip():
+            raise ValueError("local_host_id must be a nonempty string")
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = Path(db_path) if db_path else self.data_dir / "sentinel.db"
@@ -280,8 +284,11 @@ class Coordinator:
             migrate_schema(conn)
 
     @staticmethod
-    def _config(config: dict[str, Any] | None) -> dict[str, Any]:
+    def _config(config: dict[str, Any] | None, *, local_host_id: str | None = None) -> dict[str, Any]:
         cfg = dict(config or {})
+        # All local entry points bind to this ledger host, independently of
+        # caller/worker config that may describe a different machine.
+        cfg["local_host_id"] = local_host_identity() if local_host_id is None else local_host_id
         cfg.setdefault("local_allocatable_cpu", 8.0)
         cfg.setdefault("local_allocatable_ram_gib", 48.0)
         cfg.setdefault("local_commit_headroom_gib", 4.0)
@@ -412,7 +419,7 @@ class Coordinator:
         now: float | None = None,
     ) -> dict[str, Any]:
         req = request.normalized()
-        cfg = self._config(config)
+        cfg = self._config(config, local_host_id=self.local_host_id)
         now = time.time() if now is None else now
         v2 = cfg.get("admission_policy") == "resource-v2"
         frame = frame_from_status(status, cfg, now=now, logical_processors=os.cpu_count() or 1) if v2 else None
@@ -689,7 +696,7 @@ class Coordinator:
             return [dict(row) for row in rows]
 
     def cleanup(self, *, config: dict[str, Any] | None = None, now: float | None = None) -> list[str]:
-        cfg = self._config(config)
+        cfg = self._config(config, local_host_id=self.local_host_id)
         now = time.time() if now is None else now
         observations = self._cleanup_observations()
         with self._db() as conn:

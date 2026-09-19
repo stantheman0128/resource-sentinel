@@ -247,10 +247,11 @@ class AdaptiveCoordinatorTests(unittest.TestCase):
 
     def test_legacy_release_reports_only_released_unbound_rows(self):
         bound = self.admit(request(tool="bound"))
-        self.mark_bound(bound["reservation_id"])
-        # Legacy admission remains available; its cleanup cannot remove bound.
+        # Both reservations predate the managed binding. Legacy release must
+        # still finish ordinary work while retaining the managed allocation.
         ordinary = self.coordinator.admit(request(command="other", tool="ordinary"), status(), now=NOW)
         self.assertTrue(ordinary["allowed"])
+        self.mark_bound(bound["reservation_id"])
         self.assertEqual(self.coordinator.release(owner_pid=100, now=NOW+1), 1)
         self.assertEqual(self.coordinator.snapshot()["reservations"][0]["id"], bound["reservation_id"])
         self.assertEqual(self.coordinator.release(owner_pid=100, tool_use_id="bound", now=NOW+2), 0)
@@ -271,10 +272,14 @@ class AdaptiveCoordinatorTests(unittest.TestCase):
         self.mark_bound(admitted["reservation_id"])
         with closing(sqlite3.connect(self.coordinator.db_path)) as conn, conn:
             conn.execute("UPDATE reservations SET tool_use_id='' WHERE id=?", (admitted["reservation_id"],))
+        before = self.coordinator.snapshot()["reservations"]
         other = self.coordinator.admit(request(tool="different-tool"), status(), now=NOW+1)
-        self.assertTrue(other["allowed"])
-        self.assertFalse(other["reused"])
-        self.assertNotEqual(other["reservation_id"], admitted["reservation_id"])
+        self.assertFalse(other["allowed"])
+        self.assertEqual(other["reason"], "managed_lifecycle_requires_resource_v2")
+        # Orphan managed evidence is neither handoff authority nor permission
+        # to create a second allocation through legacy accounting.
+        self.assertEqual(self.coordinator.snapshot()["reservations"], before)
+        self.assertEqual(len(before), 1)
 
     def test_unknown_identity_holds_but_positive_death_releases_legacy(self):
         admitted = self.admit()

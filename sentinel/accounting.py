@@ -581,13 +581,18 @@ def _request_demand(request):
     return _demand(values)
 
 
-def shared_admission_blockers(conn, request, frame, config, *, exempt=False):
+def shared_admission_blockers(conn, request, frame, config, *, exempt=False, already_reserved=False):
     """The common non-exempt resource gates, retaining legacy diagnostic names.
 
     ``exempt`` is an already verified authority result, never a request field.
     It bypasses load, telemetry availability and barrier checks only; invalid
     requests, schema, locality and allocation bindings stay closed.  A bypass
     does not change projection's unknown measurements into free capacity.
+
+    ``already_reserved`` is internal replay authority: the caller must verify
+    an exact existing local unbound reservation and matching spec in this same
+    transaction. Its demand is already in the projection, but all current
+    budget, barrier, telemetry and original-request I/O gates still apply.
     """
     projection = project_local_capacity(conn, frame, config)
     result = list(projection["errors"])
@@ -619,10 +624,11 @@ def shared_admission_blockers(conn, request, frame, config, *, exempt=False):
         if projected is None or budget is None:
             result.append(_error(key, key + "_unknown"))
             continue
-        available = max(0, budget - projected)
-        if demand[resource] > available:
+        available = budget if already_reserved is True else max(0, budget - projected)
+        required = projected if already_reserved is True else demand[resource]
+        if required > available:
             scale = GIB if resource in {"physical_bytes", "commit_bytes"} else 1
-            result.append(dict(resource=key, reason=key + "_capacity", required=round(demand[resource] / scale, 6),
+            result.append(dict(resource=key, reason=key + "_capacity", required=round(required / scale, 6),
                                available=round(available / scale, 6),
                                request_exceeds_host_budget=demand[resource] > budget))
     disk = _mapping(frame).get("disk") or {}

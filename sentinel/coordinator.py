@@ -41,6 +41,41 @@ CLASS_DEFAULTS = {
 }
 
 
+def legacy_lifecycle_blocker(conn: sqlite3.Connection) -> str | None:
+    """Keep legacy projections away from retained managed capacity.
+
+    This compatibility check shares the caller's writer transaction. A legacy
+    caller has no trustworthy v2 frame/config for interpreting lifetime floors
+    or control barriers; exemptions cannot supply that missing evidence.
+    """
+    if not conn.in_transaction:
+        raise RuntimeError("transaction_required")
+    try:
+        if not check_schema_version(conn):
+            return "managed_lifecycle_unavailable"
+        runtime = conn.execute(
+            "SELECT mode,admission_barrier FROM adaptive_runtime WHERE singleton=1"
+        ).fetchone()
+        if runtime is None or runtime["mode"] not in {"off", "shadow", "canary", "limited"}:
+            return "managed_lifecycle_unavailable"
+        if runtime["admission_barrier"] != "NONE":
+            return "managed_lifecycle_requires_resource_v2"
+        if conn.execute("""SELECT 1 FROM managed_executions
+            WHERE state IS NULL OR state NOT IN
+                ('FINISHED','CANCELLED_BEFORE_START','START_FAILED') LIMIT 1""").fetchone():
+            return "managed_lifecycle_requires_resource_v2"
+        for table in ("reservations", "worker_reservations"):
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                # Include orphan/terminal bindings: neither missing registry
+                # evidence nor an inconsistent terminal row releases capacity.
+                if conn.execute(f"""SELECT 1 FROM {table} WHERE execution_id IS NOT NULL
+                    OR lifecycle_managed IS NULL OR lifecycle_managed<>0 LIMIT 1""").fetchone():
+                    return "managed_lifecycle_requires_resource_v2"
+    except (sqlite3.Error, RuntimeError):
+        return "managed_lifecycle_unavailable"
+    return None
+
+
 @dataclass(frozen=True)
 class ResourceRequest:
     owner_pid: int
@@ -475,6 +510,7 @@ class Coordinator:
         with self._db() as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._cleanup_locked(conn, now, cfg, observations)
+            legacy_blocker = legacy_lifecycle_blocker(conn) if not v2 else None
             if managed is not None:
                 replay = retry_managed_admission(conn, managed, local_context=cfg)
                 if replay is not None:
@@ -493,6 +529,10 @@ class Coordinator:
                 if allocation_is_bound(conn, "direct", existing["id"]):
                     conn.execute("COMMIT")
                     return {"allowed": False, "reason": "managed_reservation_requires_exact_claim",
+                            "request_key": req.request_key, "reservation_id": existing["id"]}
+                if legacy_blocker:
+                    conn.execute("COMMIT")
+                    return {"allowed": False, "reason": legacy_blocker,
                             "request_key": req.request_key, "reservation_id": existing["id"]}
                 if existing["spec_hash"] != req.spec_hash:
                     conn.execute("COMMIT")
@@ -513,7 +553,7 @@ class Coordinator:
             ).fetchall()
             handoff = next((row for row in handoffs
                             if not allocation_is_bound(conn, "direct", row["id"])), None)
-            if managed is None and handoff and handoff["spec_hash"] == req.spec_hash:
+            if managed is None and not legacy_blocker and handoff and handoff["spec_hash"] == req.spec_hash:
                 conn.execute("UPDATE reservations SET tool_use_id=?,heartbeat_at=? WHERE id=?", (req.tool_use_id, now, handoff["id"]))
                 conn.execute("COMMIT")
                 self._mirror()
@@ -570,7 +610,9 @@ class Coordinator:
                 allowed = False
                 reason = "queue_order"
 
-            if not v2:
+            if legacy_blocker:
+                allowed, reason = False, legacy_blocker
+            elif not v2:
                 active = conn.execute("SELECT * FROM reservations").fetchall()
                 grace = float(cfg["reservation_grace_sec"])
                 pending_cpu = sum(float(r["cpu_units"]) for r in active if now - float(r["created_at"]) <= grace)
@@ -615,7 +657,7 @@ class Coordinator:
 
             # Explicit operator exemption bypasses load/order gates, but still
             # reserves and records usage so non-exempt callers see the pressure.
-            if exemption and (not v2 or not details):
+            if exemption and not legacy_blocker and (not v2 or not details):
                 allowed = True
 
             if allowed:
@@ -661,13 +703,18 @@ class Coordinator:
             row = conn.execute("SELECT * FROM queue WHERE request_key=?", (request_key,)).fetchone()
         if row is None:
             with self._db() as conn:
-                conn.execute("BEGIN")
+                conn.execute("BEGIN IMMEDIATE")
                 active = conn.execute("SELECT id FROM reservations WHERE request_key=?", (request_key,)).fetchone()
                 bound = bool(active and allocation_is_bound(conn, "direct", active["id"]))
+                legacy_blocker = (legacy_lifecycle_blocker(conn)
+                                  if (config or {}).get("admission_policy") != "resource-v2" else None)
                 conn.execute("COMMIT")
             if active:
                 if bound:
                     return {"allowed": False, "reason": "managed_reservation_requires_exact_claim",
+                            "reservation_id": active["id"], "request_key": request_key}
+                if legacy_blocker:
+                    return {"allowed": False, "reason": legacy_blocker,
                             "reservation_id": active["id"], "request_key": request_key}
                 return {"allowed": True, "reservation_id": active["id"], "reused": True, "request_key": request_key}
             return {"allowed": False, "reason": "request_missing", "request_key": request_key}
@@ -684,8 +731,13 @@ class Coordinator:
         if result.get("allowed"):
             with self._db() as conn:
                 conn.execute("BEGIN IMMEDIATE")
+                legacy_blocker = (legacy_lifecycle_blocker(conn)
+                                  if (config or {}).get("admission_policy") != "resource-v2" else None)
                 if allocation_is_bound(conn, "direct", result["reservation_id"]):
                     result = {"allowed": False, "reason": "managed_reservation_requires_exact_claim",
+                              "reservation_id": result["reservation_id"], "request_key": request_key}
+                elif legacy_blocker:
+                    result = {"allowed": False, "reason": legacy_blocker,
                               "reservation_id": result["reservation_id"], "request_key": request_key}
                 else:
                     conn.execute("UPDATE reservations SET tool_use_id='' WHERE id=?", (result["reservation_id"],))

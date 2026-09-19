@@ -27,6 +27,7 @@ from sentinel.adaptive.store import (
     allocation_is_bound, check_schema_version, hold_bound_allocation,
     hold_expired_allocations, migrate_schema,
 )
+from sentinel.coordinator import legacy_lifecycle_blocker
 
 
 ACTIVE_STATES = {"AVAILABLE", "BUSY"}
@@ -520,6 +521,20 @@ class Maintainer:
         return result
 
     @staticmethod
+    def _reservation_resources_match(row: sqlite3.Row, task: Task) -> bool:
+        # The hash binds the requested spec, not the mutable ledger columns.
+        # Null compatibility must match accounting._demand's effective values.
+        if (row["cpu_units"], row["ram_gib"], row["disk_gib"]) != (task.cpu_units, task.ram_gib, task.disk_gib):
+            return False
+        physical = math.ceil(task.ram_gib * 2**30)
+        commit = physical if task.commit_bytes is None else task.commit_bytes
+        return (
+            (physical if row["physical_bytes"] is None else row["physical_bytes"]) == physical
+            and (physical if row["commit_bytes"] is None else row["commit_bytes"]) == commit
+            and (1 if row["io_slots"] is None else row["io_slots"]) == task.io_slots
+        )
+
+    @staticmethod
     def _quota_jobs(conn: sqlite3.Connection, quota_domain: str) -> int:
         return int(conn.execute(
             """SELECT COUNT(*)
@@ -540,15 +555,17 @@ class Maintainer:
         for observed_worker in self.workers(now=now):
             caps = observed_worker["capabilities"]
             if self.worker_locality(observed_worker) == "local" and caps.get("admission_policy") == "resource-v2":
-                config = self._admission_config(observed_worker)
-                snapshot = caps.get("admission_snapshot") or {}
-                local_frames[observed_worker["id"]] = (
-                    snapshot, config,
-                    frame_from_status(snapshot, config, now=now, logical_processors=logical_processors),
-                )
+                try:
+                    config = self._admission_config(observed_worker)
+                    snapshot = caps.get("admission_snapshot") or {}
+                    frame = frame_from_status(snapshot, config, now=now, logical_processors=logical_processors)
+                except (TypeError, ValueError, OverflowError):
+                    continue  # malformed evidence cannot supply a replay frame
+                local_frames[observed_worker["id"]] = (snapshot, config, frame)
         with self._db() as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._cleanup_locked(conn, now)
+            legacy_blocker = legacy_lifecycle_blocker(conn)
             existing = conn.execute("SELECT * FROM worker_reservations WHERE task_id=?", (t.id,)).fetchone()
             if existing:
                 if allocation_is_bound(conn, "routed", existing["id"]):
@@ -561,6 +578,38 @@ class Maintainer:
                         "reserved": False, "reason": "task_spec_mismatch", "task_id": t.id,
                         "reservation_id": existing["id"],
                     }
+                if legacy_blocker:
+                    source = conn.execute("SELECT * FROM workers WHERE id=?", (existing["worker_id"],)).fetchone()
+                    source = self._decode_worker(source, now) if source is not None else None
+                    if source is None or self.worker_locality(source) == "unknown" or (self.worker_locality(source) == "local" and
+                            source["capabilities"].get("admission_policy") != "resource-v2"):
+                        conn.execute("COMMIT")
+                        return {"reserved": False, "reason": legacy_blocker, "task_id": t.id,
+                                "reservation_id": existing["id"]}
+                    if self.worker_locality(source) == "local":
+                        caps = source["capabilities"]
+                        raw_config = caps.get("admission_config")
+                        snapshot = caps.get("admission_snapshot")
+                        reason = None
+                        if not self._reservation_resources_match(existing, t):
+                            reason = "reservation_resource_mismatch"
+                        elif not isinstance(raw_config, dict) or raw_config.get("admission_policy") != "resource-v2":
+                            reason = "policy_config_invalid"
+                        elif not isinstance(snapshot, dict) or not snapshot:
+                            reason = "policy_snapshot_unavailable"
+                        else:
+                            config = self._admission_config(source)
+                            captured = local_frames.get(source["id"])
+                            if captured is None or captured[:2] != (snapshot, config):
+                                reason = "revision_conflict"
+                            else:
+                                reasons = shared_admission_blockers(conn, t, captured[2], config, already_reserved=True)
+                                if reasons:
+                                    reason = reasons[0]["reason"]
+                        if reason:
+                            conn.execute("COMMIT")
+                            return {"reserved": False, "reason": reason, "task_id": t.id,
+                                    "reservation_id": existing["id"]}
                 conn.execute(
                     "UPDATE worker_reservations SET heartbeat_at=?,expires_at=? WHERE id=?",
                     (now, now + ttl_min * 60, existing["id"]),
@@ -575,6 +624,10 @@ class Maintainer:
                 fits, reason = self._fits(t, worker, now)
                 if not fits:
                     rejected[worker["id"]] = reason
+                    continue
+                if (legacy_blocker and self.worker_locality(worker) == "local" and
+                        worker["capabilities"].get("admission_policy") != "resource-v2"):
+                    rejected[worker["id"]] = legacy_blocker
                     continue
                 usage = self._pool_usage(conn, worker)
                 if int(usage["jobs"]) >= int(worker["max_concurrency"]):

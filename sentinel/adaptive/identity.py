@@ -25,6 +25,39 @@ class IdentityUnavailable(RuntimeError):
         super().__init__(reason)
 
 
+def _retain_cleanup(error, owner):
+    """Retain ownership on a failure without replacing its original reason."""
+    pending = getattr(error, "_identity_handle_cleanup", ())
+    if not any(item is owner for item in pending):
+        error._identity_handle_cleanup = (*pending, owner)
+
+
+def retry_identity_cleanup(error: BaseException) -> None:
+    """Retry handles retained by a failed identity operation, never its source.
+
+    A failed close leaves its owner attached to the original exception. Callers
+    retaining that failure can retry cleanup; successful earlier closes are
+    idempotent. This grants neither identity nor authority to an unverified handle.
+    """
+    for owner in getattr(error, "_identity_handle_cleanup", ()):
+        owner.close()
+    error._identity_handle_cleanup = ()
+
+
+class _DuplicateCleanup:
+    """Own only the duplicate while its identity is still being verified."""
+
+    def __init__(self, backend, handle):
+        self._backend, self._handle = backend, handle
+        self._lock = threading.Lock()
+
+    def close(self):
+        with self._lock:
+            if self._handle is not None:
+                self._backend.close(self._handle)
+                self._handle = None
+
+
 _DWORD = C.c_uint32
 _HANDLE = C.c_void_p
 _BOOL = C.c_int32
@@ -65,6 +98,9 @@ class _WindowsBackend:
         self.kernel = k = C.WinDLL("kernel32", use_last_error=True)
         self.security = a = C.WinDLL("advapi32", use_last_error=True)
         _bind(k, "OpenProcess", _HANDLE, _DWORD, _BOOL, _DWORD)
+        _bind(k, "GetCurrentProcess", _HANDLE)
+        _bind(k, "DuplicateHandle", _BOOL, _HANDLE, _HANDLE, _HANDLE,
+              C.POINTER(_HANDLE), _DWORD, _BOOL, _DWORD)
         _bind(k, "GetProcessId", _DWORD, _HANDLE)
         _bind(k, "GetProcessTimes", _BOOL, _HANDLE, *([C.POINTER(_FileTime)] * 4))
         _bind(k, "WaitForSingleObject", _DWORD, _HANDLE, _DWORD)
@@ -80,6 +116,17 @@ class _WindowsBackend:
         handle = self.kernel.OpenProcess(_PROCESS_ACCESS, False, pid)
         _check(handle, "process_open_unavailable")
         return handle
+
+    def duplicate_process(self, source_handle):
+        copied = _HANDLE()
+        current = self.kernel.GetCurrentProcess()
+        # Options zero is essential: neither SAME_ACCESS nor CLOSE_SOURCE.
+        # The borrowed source stays owned by the caller on success and failure.
+        _check(self.kernel.DuplicateHandle(current, source_handle, current,
+                                           C.byref(copied), _PROCESS_ACCESS, False, 0),
+               "process_duplicate_unavailable")
+        _check(copied.value, "process_duplicate_unavailable")
+        return copied.value
 
     def close(self, handle):
         _check(self.kernel.CloseHandle(handle), "process_handle_close_failed")
@@ -199,6 +246,47 @@ class VerifiedProcess:
     def current(cls):
         return cls._open(os.getpid())
 
+    @classmethod
+    def duplicate_from_handle(cls, source_handle: int, *, expected_pid: int,
+                              expected_logon_id: str):
+        """Verify a borrowed process handle without reopening a reusable PID.
+
+        The caller must keep the original real handle open and prevent concurrent
+        close/reuse until duplication completes. Only a new noninheritable,
+        limited-right duplicate is owned here. Expected fields are consistency
+        checks, not proof of creation provenance or allocation ownership. A
+        signaled process may still be identified; no liveness is inferred.
+
+        On failure the original is untouched. If closing the duplicate also
+        fails, retain the original exception and call retry_identity_cleanup
+        when cleanup can be retried; no unverified VerifiedProcess is returned.
+        """
+        if (type(source_handle) is not int or
+                not 0 < source_handle < 1 << (8 * C.sizeof(C.c_void_p) - 1)):
+            raise ValueError("invalid_borrowed_process_handle")
+        if type(expected_pid) is not int or not 0 < expected_pid <= 0xFFFFFFFF:
+            raise ValueError("invalid_expected_pid")
+        match = _LOGON_SID.fullmatch(expected_logon_id) if isinstance(expected_logon_id, str) else None
+        if match is None or any(int(value) > 0xFFFFFFFF for value in match.groups()):
+            raise ValueError("invalid_expected_logon_id")
+        backend = _backend()
+        handle = backend.duplicate_process(source_handle)
+        owner = _DuplicateCleanup(backend, handle)
+        try:
+            observed = backend.identity(handle)
+            if (observed.pid != expected_pid or
+                    observed.logon_id != expected_logon_id):
+                raise IdentityUnavailable("identity_mismatch")
+            result = cls(backend, handle, observed)
+            owner._handle = None  # ownership transfers only after verification
+            return result
+        except BaseException as error:
+            try:
+                owner.close()
+            except BaseException:
+                _retain_cleanup(error, owner)
+            raise
+
     def observe(self) -> IdentityObservation:
         with self._lock:
             if self._handle is None:
@@ -236,7 +324,11 @@ class VerifiedProcess:
     def close(self):
         with self._lock:
             if self._handle is not None:
-                self._backend.close(self._handle)
+                try:
+                    self._backend.close(self._handle)
+                except BaseException as error:
+                    _retain_cleanup(error, self)
+                    raise
                 self._handle = None
 
     def __enter__(self):

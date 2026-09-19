@@ -2,8 +2,8 @@
 
 Run only through normal Sentinel admission, with both
 SENTINEL_ADAPTIVE_WINDOWS_SPIKES=1 and SENTINEL_ADAPTIVE_SPIKE_DIR pointing to
-an isolated evidence directory. No production wrapper/runtime is imported or
-changed. Skips mean NOT VERIFIED, not a supported host. This file also supplies
+an isolated evidence directory. No production wrapper or runtime configuration
+is loaded or changed. Skips mean NOT VERIFIED, not a supported host. This file also supplies
 the test-only Base64 launch host used by a generated thin PowerShell fixture.
 The continuous-admission provider is unavailable; native setup and direct
 fixture launch/console entry points fail closed before any native operation.

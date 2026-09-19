@@ -342,6 +342,7 @@ class _LogonSecurity:
 class ProcessHandle:
     def __init__(self, handle, pid):
         self.handle, self.pid = handle, int(pid)
+        self._identity_cleanup = []
 
     @classmethod
     def open(cls, pid, expected_created_filetime_100ns=None, terminate=False):
@@ -373,6 +374,26 @@ class ProcessHandle:
                                         C.byref(kernel), C.byref(user)), "GetProcessTimes")
         birth = (created.dwHighDateTime << 32) | created.dwLowDateTime
         return {"pid": self.pid, "created_filetime_100ns": str(birth)}
+
+    def full_identity(self, *, expected_logon_id):
+        """Query the retained original object, including after a natural exit.
+
+        The existing two-field identity() format remains diagnostic-compatible.
+        This full identity is still not enrollment or launch-claim authority.
+        """
+        from sentinel.adaptive.identity import VerifiedProcess
+
+        try:
+            verified = VerifiedProcess.duplicate_from_handle(
+                self.handle, expected_pid=self.pid, expected_logon_id=expected_logon_id)
+            observed = verified.identity
+            verified.close()
+            return observed
+        except BaseException as error:
+            # The enclosing LaunchOutcomeUnknown retains this original owner.
+            # Its existing close() path also retries any failed duplicate close.
+            self._identity_cleanup.append(error)
+            raise
 
     def parent_pid(self):
         # Test-only evidence: parent PID is not parent identity. Hold/compare a
@@ -406,6 +427,11 @@ class ProcessHandle:
         return int(result.value)
 
     def close(self):
+        from sentinel.adaptive.identity import retry_identity_cleanup
+
+        for error in self._identity_cleanup:
+            retry_identity_cleanup(error)
+        self._identity_cleanup.clear()
         if self.handle:
             _check(_api()[0].CloseHandle(self.handle), "CloseHandle(process)")
             self.handle = None
@@ -638,7 +664,7 @@ def launch_in_job(job, application, command_line, *, cwd=None,
         process = ProcessHandle(info.hProcess, info.dwProcessId)
         k.CloseHandle(info.hThread)
         try:
-            process.identity()
+            process.full_identity(expected_logon_id=job.logon_sid)
             if not process.is_in_job(job):
                 raise RuntimeError("created process is not in expected Job")
         except BaseException as exc:

@@ -379,6 +379,11 @@ class RecoveryCapability(unittest.TestCase):
             self.assertFalse(list(case.glob("*-error.json")), "unexpected fixture actor failure")
             result["result"] = "passed"
         except BaseException as error:
+            if isinstance(error, win.LaunchOutcomeUnknown):
+                # Creation happened once; retain its original handle even when
+                # post-create identity verification prevented normal assignment.
+                root = error.process
+                handles.append(root)
             failure = error
             result["error"] = {"type": type(error).__name__, "reason": str(error)[:300]}
         finally:
@@ -453,7 +458,13 @@ class RecoveryCapability(unittest.TestCase):
                 if failure is None:
                     failure = AssertionError("fixture restore/empty/actor-exit verification incomplete")
             for handle in handles:
-                handle.close()
+                try:
+                    handle.close()
+                except BaseException as error:
+                    result["cleanup_error"] = type(error).__name__
+                    result["result"] = "failed"
+                    if failure is None:
+                        failure = error
             if job is not None:
                 job.close()
             for stream in streams:

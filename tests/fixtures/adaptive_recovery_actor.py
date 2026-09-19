@@ -7,6 +7,7 @@ planned production IPC, authority, or recovery implementation.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -20,7 +21,7 @@ REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 
 from tests.windows.adaptive_win32 import (  # noqa: E402
-    NamedMutex, OwnedJob, ProcessHandle, current_identity, launch_in_job,
+    LaunchOutcomeUnknown, NamedMutex, OwnedJob, ProcessHandle, current_identity, launch_in_job,
     require_supported_host, interrupt_time_100ns,
 )
 from tests.windows.adaptive_admission import (  # noqa: E402
@@ -140,13 +141,19 @@ def compare_restore(job: OwnedJob, case: Path, config: dict) -> dict:
             "result": "RESTORED"}
 
 
-def fixture_store(case: Path) -> sqlite3.Connection:
+@contextmanager
+def fixture_store(case: Path):
     connection = sqlite3.connect(case / "fixture.sqlite3", timeout=0.1)
-    connection.execute("CREATE TABLE IF NOT EXISTS allocation (id TEXT PRIMARY KEY, state TEXT)")
-    connection.execute("CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, state TEXT, expires INTEGER)")
-    connection.execute("INSERT OR IGNORE INTO allocation VALUES ('own', 'held')")
-    connection.commit()
-    return connection
+    try:
+        connection.execute("CREATE TABLE IF NOT EXISTS allocation (id TEXT PRIMARY KEY, state TEXT)")
+        connection.execute("CREATE TABLE IF NOT EXISTS grants (id TEXT PRIMARY KEY, state TEXT, expires INTEGER)")
+        connection.execute("INSERT OR IGNORE INTO allocation VALUES ('own', 'held')")
+        connection.commit()
+        # sqlite's context manages a transaction, not the connection lifetime.
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 def worker(case: Path, config: dict) -> int:
@@ -205,7 +212,28 @@ def wrapper(case: Path, config: dict) -> int:
     # It deliberately retains its own backup handle until the injected crash.
     command = subprocess.list2cmdline([sys.executable, str(Path(__file__).resolve()),
                                       "worker", str(case)])
-    process = launch_in_job(job, sys.executable, command)
+    try:
+        process = launch_in_job(job, sys.executable, command)
+    except LaunchOutcomeUnknown as error:
+        # Never retry a created command. Retain both owners if cleanup fails;
+        # handle closure alone proves neither Job emptiness nor cap restoration.
+        error.fixture_job = job
+        for operation, cleanup in (
+            ("stop_marker", lambda: (case / "stop").touch(exist_ok=True)),
+            ("natural_exit_wait", lambda: error.process.wait(10)),
+            ("process_close", error.process.close),
+            ("job_close", job.close),
+        ):
+            try:
+                observed = cleanup()
+                if operation == "natural_exit_wait" and observed is not True:
+                    error.add_note("fixture_unknown_launch_cleanup_failed:natural_exit_unverified")
+                    break  # keep both handles on the carrier for reconciliation
+            except BaseException:
+                error.add_note("fixture_unknown_launch_cleanup_failed:" + operation)
+                if operation == "natural_exit_wait":
+                    break
+        raise
     mark(case, "wrapper-ready", identity=current_identity(), root=process.identity())
     if not wait_file(case / "wrapper-exit-now", 20):
         return 125

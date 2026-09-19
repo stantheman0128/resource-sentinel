@@ -5,6 +5,8 @@ import hashlib
 import hmac
 import json
 import os
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -44,6 +46,10 @@ class FakeCurrentProcess:
 
 class ManagedAdmissionContextTests(unittest.TestCase):
     def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.db_path = Path(temporary.name) / "sentinel.db"
+        self.db_path.touch()
         self.process = FakeCurrentProcess()
         current = patch("sentinel.adaptive.admission.VerifiedProcess.current",
                         return_value=self.process)
@@ -183,40 +189,51 @@ class ManagedAdmissionContextTests(unittest.TestCase):
         context = self.create()
         inspected = context.snapshot()
         context.snapshot()
-        first, is_first = context.begin_submission()
+        first, is_first = context.begin_submission(db_path=self.db_path)
         self.assertEqual(first, inspected)
         self.assertTrue(is_first)
-        second, is_second_first = context.begin_submission()
+        second, is_second_first = context.begin_submission(db_path=self.db_path)
         self.assertEqual(second, inspected)
         self.assertFalse(is_second_first)
 
     def test_parallel_submissions_have_exactly_one_first_attempt(self):
         context = self.create()
         with ThreadPoolExecutor(max_workers=4) as pool:
-            submissions = list(pool.map(lambda _: context.begin_submission(), range(16)))
+            submissions = list(pool.map(lambda _: context.begin_submission(db_path=self.db_path), range(16)))
         self.assertEqual(sum(first for _, first in submissions), 1)
         self.assertTrue(all(snapshot == context.snapshot() for snapshot, _ in submissions))
 
     def test_failed_identity_check_does_not_consume_first_submission_or_expose_claim(self):
         context = self.create()
         with patch("sentinel.adaptive.admission.os.getpid", return_value=IDENTITY.pid + 1):
-            for operation in (context.begin_submission, context.launch_claim_token):
+            for operation in (lambda: context.begin_submission(db_path=self.db_path), context.launch_claim_token):
                 with self.assertRaisesRegex(ManagedAdmissionUnavailable, "not_current_process"):
                     operation()
-        self.assertTrue(context.begin_submission()[1])
+        self.assertTrue(context.begin_submission(db_path=self.db_path)[1])
         context = self.create()
         self.process.observed = IdentityObservation(IDENTITY, IdentityStatus.UNKNOWN, "query_failed")
         with self.assertRaisesRegex(ManagedAdmissionUnavailable, "wrapper_identity_not_alive"):
-            context.begin_submission()
+            context.begin_submission(db_path=self.db_path)
         self.process.observed = IdentityObservation(IDENTITY, IdentityStatus.ALIVE)
-        self.assertTrue(context.begin_submission()[1])
+        self.assertTrue(context.begin_submission(db_path=self.db_path)[1])
 
     def test_closed_context_cannot_consume_submission(self):
         context = self.create()
         context.close()
         with self.assertRaisesRegex(ManagedAdmissionUnavailable, "managed_admission_closed"):
-            context.begin_submission()
+            context.begin_submission(db_path=self.db_path)
         self.assertFalse(context._submitted)
+
+    def test_submission_pins_canonical_ledger_before_outcome_and_rejects_other_ledger(self):
+        context = self.create()
+        other = self.db_path.with_name("other.db")
+        other.touch()
+        self.assertTrue(context.begin_submission(db_path=self.db_path)[1])
+        self.assertEqual(context._admission_db_path, self.db_path.resolve())
+        with self.assertRaisesRegex(ManagedAdmissionUnavailable, "managed_admission_ledger_mismatch"):
+            context.begin_submission(db_path=other)
+        self.assertFalse(context.begin_submission(db_path=self.db_path.parent / "." / self.db_path.name)[1])
+        self.assertEqual(context._admission_db_path, self.db_path.resolve())
 
     def test_metadata_and_resource_request_are_frozen_and_payload_is_not_retained(self):
         context = self.create()

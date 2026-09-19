@@ -41,6 +41,36 @@ class SchemaVersionError(LifecycleError):
     pass
 
 
+def prelaunch_record_hash(row: Mapping[str, Any], *, claim_token_hash: str,
+                          allocation: Mapping[str, Any]) -> str:
+    """Bind a native prelaunch observation to immutable ledger contents.
+
+    This digest is not launch authority. The evidence provider must retain the
+    current native identity and irrevocably seal an unexported launch credential.
+    Heartbeats and the allocation deadline may advance without changing custody.
+    Everything else is rechecked under the writer transaction before release.
+    """
+    if (not isinstance(claim_token_hash, str) or len(claim_token_hash) != 64 or
+            any(c not in "0123456789abcdef" for c in claim_token_hash)):
+        raise LifecycleError("invalid_prelaunch_record")
+    try:
+        record = dict(row)
+        source = dict(allocation)
+        record.pop("heartbeat_at", None)
+        record["claim_token_hash"] = claim_token_hash
+        source.pop("heartbeat_at", None)
+        source.pop("expires_at", None)
+        encoded = json.dumps({"domain": "sentinel-prelaunch-record-v1",
+                              "record": record, "allocation": source},
+                             sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=True, allow_nan=False).encode("ascii")
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        raise LifecycleError("invalid_prelaunch_record") from None
+    if len(encoded) > 65536:
+        raise LifecycleError("invalid_prelaunch_record")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _has_table(conn: sqlite3.Connection, name: str) -> bool:
     return conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)).fetchone() is not None
 
@@ -244,7 +274,8 @@ class LifecycleEvidence:
     decision. A never-started proof must also fence every launcher until the
     terminal CAS commits; an empty Job or missing root alone cannot prove it.
     launch_failed/user_code_started are tri-state observations, not caller
-    assertions. P2 does not supply such a production implementation.
+    assertions. The current-process unexported-credential cancellation provider
+    is deliberately narrower than a native Job lifecycle provider.
     """
     operation: str
     execution_id: str
@@ -264,6 +295,7 @@ class LifecycleEvidence:
     parent_membership: bool = False
     user_code_started: bool | None = None
     launch_failed: bool | None = None
+    prelaunch_record_hash: str | None = None
 
     def __post_init__(self):
         if self.operation not in {"register", "prepare", "claim", "bind_root", "root_exited", "finalize", "cancel", "start_failed"}:
@@ -293,6 +325,11 @@ class LifecycleEvidence:
         for name in ("user_code_started", "launch_failed"):
             if getattr(self, name) is not None and type(getattr(self, name)) is not bool:
                 raise ValueError("invalid_evidence_boolean")
+        if self.prelaunch_record_hash is not None:
+            if (self.operation != "cancel" or not isinstance(self.prelaunch_record_hash, str) or
+                    len(self.prelaunch_record_hash) != 64 or
+                    any(c not in "0123456789abcdef" for c in self.prelaunch_record_hash)):
+                raise ValueError("invalid_prelaunch_record_hash")
 
 
 def _unavailable_evidence_provider(operation: str, record: Mapping[str, Any],
@@ -758,6 +795,19 @@ class LifecycleStore:
                 row = self._get(conn, execution_id)
                 self._require_revision(row, expected_revision)
                 self._caller(row, caller)
+                if proof.prelaunch_record_hash is not None:
+                    try:
+                        source = validate_active_allocation(
+                            conn, execution_id, local_context=self._local_context)
+                    except AccountingError as error:
+                        raise LifecycleError(str(error)) from error
+                    if source["allocation_kind"] != "direct":
+                        raise LifecycleError("prelaunch_record_changed")
+                    actual_hash = prelaunch_record_hash(
+                        row, claim_token_hash=row["claim_token_hash"],
+                        allocation=source["allocation"])
+                    if not hmac.compare_digest(actual_hash, proof.prelaunch_record_hash):
+                        raise LifecycleError("prelaunch_record_changed")
                 if not prelaunch:
                     if row["cancel_requested_at"] is None:
                         row = self._cas(conn, execution_id, expected_revision, {"cancel_requested_at": now})

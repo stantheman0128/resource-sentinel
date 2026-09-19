@@ -473,7 +473,7 @@ class Coordinator:
         from sentinel.adaptive.admission import ManagedAdmission
         if type(context) is not ManagedAdmission:
             raise TypeError("managed_admission_context_required")
-        snapshot, first_submission = context.begin_submission()
+        snapshot, first_submission = context.begin_submission(db_path=self.db_path)
         return self._admit(snapshot.request, status, config=config, now=now,
                            managed=snapshot, first_submission=first_submission)
 

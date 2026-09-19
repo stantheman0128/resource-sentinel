@@ -1,6 +1,7 @@
 """L1 ledger races; synthetic native evidence does not establish Windows gates."""
 from dataclasses import replace
 import unittest
+from tests.fixtures.adaptive_evidence import fixture_evidence_provider
 
 from sentinel.adaptive.contracts import AllocationKind
 from sentinel.adaptive.store import LifecycleError
@@ -50,7 +51,7 @@ class AllocationTransitionTests(unittest.TestCase):
         for kind in (AllocationKind.DIRECT, AllocationKind.ROUTED):
             for sql, reason in corruptions:
                 with self.subTest(kind=kind, corruption=reason):
-                    self.store.verifier = self.verifier
+                    self.store.evidence_provider = fixture_evidence_provider(self.verifier)
                     spec, registered = self.registered(self.spec(kind=kind))
                     self.store.mark_prepared(spec.execution_id, caller=fixtures.WRAPPER, expected_revision=0)
                     table = "reservations" if kind is AllocationKind.DIRECT else "worker_reservations"
@@ -59,7 +60,7 @@ class AllocationTransitionTests(unittest.TestCase):
                         if operation == "claim":
                             self.connection().execute(sql.format(table=table), (spec.reservation.id,))
                         return evidence
-                    self.store.verifier = corrupt
+                    self.store.evidence_provider = fixture_evidence_provider(corrupt)
                     with self.assertRaisesRegex(LifecycleError, reason):
                         self.claim(spec, registered)
                     row = self.store.query(spec.execution_id)

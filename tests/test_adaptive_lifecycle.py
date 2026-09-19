@@ -8,6 +8,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from tests.fixtures.adaptive_evidence import fixture_evidence_provider
 import uuid
 
 from sentinel.adaptive.contracts import (
@@ -58,7 +59,7 @@ class AdaptiveLifecycleTests(unittest.TestCase):
         Maintainer(self.directory)
         self.db = self.directory / "sentinel.db"
         self.verifier = SyntheticVerifier()
-        self.store = LifecycleStore(self.db, verifier=self.verifier)
+        self.store = LifecycleStore(self.db, evidence_provider=fixture_evidence_provider(self.verifier))
 
     def connection(self):
         conn = sqlite3.connect(self.db, timeout=3, isolation_level=None)
@@ -267,7 +268,7 @@ class AdaptiveLifecycleTests(unittest.TestCase):
             if operation == "claim":
                 self.connection().execute("UPDATE managed_executions SET state_revision=state_revision+1 WHERE execution_id=?", (spec.execution_id,))
             return result
-        self.store.verifier = mutate_during_verification
+        self.store.evidence_provider = fixture_evidence_provider(mutate_during_verification)
         with self.assertRaisesRegex(LifecycleError, "revision_conflict"):
             self.store.claim_launch(spec.execution_id, caller=WRAPPER, expected_revision=1,
                 claim_token=registered["claim_token"], spec_hash=spec.spec_hash, guardian_epoch="fixture-guardian")
@@ -401,7 +402,7 @@ class AdaptiveLifecycleTests(unittest.TestCase):
             finally:
                 conn.close()
             return base_verifier(operation, record, caller)
-        self.store.verifier = verifier
+        self.store.evidence_provider = fixture_evidence_provider(verifier)
         self.running()
 
     def test_orphan_binding_and_legacy_release_remain_conservative(self):

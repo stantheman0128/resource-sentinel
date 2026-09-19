@@ -12,6 +12,7 @@ import sqlite3
 import tempfile
 from threading import Barrier
 import unittest
+from tests.fixtures.adaptive_evidence import fixture_evidence_provider
 from unittest.mock import patch
 
 from sentinel.adaptive.admission import ManagedAdmission, ManagedAdmissionUnavailable
@@ -119,7 +120,7 @@ class ManagedAdmissionTests(unittest.TestCase):
                 guardian_epoch="synthetic-guardian", job_name="Local\\ResourceSentinel.Test.synthetic",
                 original_cpu_disabled=True, durable_manifest=True, legacy_exclusion=True,
                 active_process_count=0, process_ids=())
-        store = LifecycleStore(self.coordinator.db_path, verifier=verifier)
+        store = LifecycleStore(self.coordinator.db_path, evidence_provider=fixture_evidence_provider(verifier))
         prepared = store.mark_prepared(result["execution_id"], caller=snapshot.wrapper_identity, expected_revision=0)
         args = dict(caller=snapshot.wrapper_identity, claim_token=context.launch_claim_token(),
                     spec_hash=snapshot.spec_hash, guardian_epoch="synthetic-guardian",
@@ -328,7 +329,7 @@ class ManagedAdmissionTests(unittest.TestCase):
         def verifier(operation, row, caller):
             return LifecycleEvidence(operation, row["execution_id"], row["state_revision"], "synthetic", caller,
                                      launch_sealed=True, user_code_started=False)
-        store = LifecycleStore(self.coordinator.db_path, verifier=verifier)
+        store = LifecycleStore(self.coordinator.db_path, evidence_provider=fixture_evidence_provider(verifier))
         done = store.cancel_before_start(result["execution_id"], caller=context.snapshot().wrapper_identity,
                                          expected_revision=0, now=NOW + 1)
         self.assertEqual(done["state"], "CANCELLED_BEFORE_START")

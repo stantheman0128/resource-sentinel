@@ -1,8 +1,9 @@
 """Additive, fail-closed lifecycle ledger. No process launch or OS control.
 
-Native evidence is deliberately unavailable by default. P2's injected verifier
-is an L1 test seam, not an assertion supplied by a CLI caller. A later guardian
-must implement and validate that boundary before active enrollment is possible.
+Native evidence is deliberately unavailable by default. An evidence provider
+must retain its verified handles and launch fences through transaction completion.
+L1 tests explicitly inject a fixture scope; no bare evidence assertion from a
+CLI or verifier callback is adapted into production lifecycle authority.
 """
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ from pathlib import Path
 import secrets
 import sqlite3
 import time
-from typing import Callable, Mapping, Any
+from typing import Callable, ContextManager, Mapping, Any
 
 from sentinel.accounting import (
     AccountingError, local_host_identity, resolve_worker_locality,
@@ -294,7 +295,8 @@ class LifecycleEvidence:
                 raise ValueError("invalid_evidence_boolean")
 
 
-def _unavailable_verifier(operation: str, record: Mapping[str, Any], caller: ProcessIdentity) -> LifecycleEvidence:
+def _unavailable_evidence_provider(operation: str, record: Mapping[str, Any],
+                                   caller: ProcessIdentity) -> ContextManager[LifecycleEvidence]:
     raise LifecycleError("native_lifecycle_evidence_unavailable")
 
 
@@ -401,10 +403,11 @@ def commit_managed_admission(conn: sqlite3.Connection, admission, reservation_id
 
 
 class LifecycleStore:
-    def __init__(self, db_path: str | Path, *, verifier: Callable[[str, Mapping[str, Any], ProcessIdentity], LifecycleEvidence] | None = None,
+    def __init__(self, db_path: str | Path, *, evidence_provider: Callable[[str, Mapping[str, Any], ProcessIdentity], ContextManager[LifecycleEvidence]] | None = None,
                  local_host_id: str | None = None):
         self.db_path = Path(db_path)
-        self.verifier = verifier or _unavailable_verifier
+        self.evidence_provider = (_unavailable_evidence_provider
+                                  if evidence_provider is None else evidence_provider)
         # Capture the actual host once before acquiring any SQLite transaction.
         # Injection is a deterministic fixture seam, not a worker-supplied claim.
         self.local_host_id = local_host_identity() if local_host_id is None else local_host_id
@@ -417,12 +420,21 @@ class LifecycleStore:
     @contextmanager
     def _connection(self):
         conn = sqlite3.connect(self.db_path, timeout=5, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys=ON")
         try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys=ON")
             yield conn
-        finally:
-            conn.close()
+        except BaseException as primary:
+            try:
+                conn.close()
+            except BaseException:
+                primary.add_note("lifecycle_connection_cleanup_failed")
+            raise
+        else:
+            try:
+                conn.close()
+            except BaseException:
+                raise LifecycleError("lifecycle_connection_cleanup_failed") from None
 
     @contextmanager
     def _transaction(self):
@@ -432,8 +444,11 @@ class LifecycleStore:
                 _check_version(conn)
                 yield conn
                 conn.commit()
-            except BaseException:
-                conn.rollback()
+            except BaseException as primary:
+                try:
+                    conn.rollback()
+                except BaseException:
+                    primary.add_note("lifecycle_transaction_rollback_failed")
                 raise
 
     @staticmethod
@@ -458,14 +473,47 @@ class LifecycleStore:
                 str(caller.created_filetime_100ns) != row["wrapper_created_filetime_100ns"] or caller.logon_id != row["logon_id"]):
             raise LifecycleError("caller_identity_mismatch")
 
-    def _proof(self, operation: str, row: Mapping[str, Any], caller: ProcessIdentity) -> LifecycleEvidence:
+    @contextmanager
+    def _evidence_scope(self, operation: str, row: Mapping[str, Any], caller: ProcessIdentity):
+        """Verify before SQLite; retain evidence authority through commit/rollback.
+
+        The trusted provider acquires and validates native resources in enter,
+        keeping them owned until exit. Enter must unwind partial acquisition on
+        failure, as with every context manager. Returned data is not itself a
+        fence. Acquire policy then Job mutation locks where required, followed
+        by this scope's nested SQLite transaction. Waiting for a DB lock does
+        not refresh evidence: the provider's ownership/fence must keep the
+        proof valid throughout that wait and transaction. Never call this
+        inside a transaction or let provider cleanup
+        suppress or replace a transaction/body error. Cleanup failure after a
+        successful commit is reported, but cannot undo the committed operation.
+        """
         self._caller(row, caller)
-        evidence = self.verifier(operation, self._public(row), caller)
-        if (not isinstance(evidence, LifecycleEvidence) or evidence.operation != operation or
-                evidence.execution_id != row["execution_id"] or evidence.state_revision != row["state_revision"] or
-                evidence.caller != caller or not isinstance(evidence.observation_id, str) or not evidence.observation_id):
-            raise LifecycleError("invalid_lifecycle_evidence")
-        return evidence
+        scope = self.evidence_provider(operation, self._public(row), caller)
+        enter = getattr(type(scope), "__enter__", None)
+        leave = getattr(type(scope), "__exit__", None)
+        if not callable(enter) or not callable(leave):
+            raise LifecycleError("invalid_lifecycle_evidence_scope")
+        evidence = enter(scope)
+        try:
+            if (not isinstance(evidence, LifecycleEvidence) or evidence.operation != operation or
+                    evidence.execution_id != row["execution_id"] or evidence.state_revision != row["state_revision"] or
+                    evidence.caller != caller or not isinstance(evidence.observation_id, str) or not evidence.observation_id):
+                raise LifecycleError("invalid_lifecycle_evidence")
+            yield evidence
+        except BaseException as primary:
+            try:
+                # Ignore __exit__'s suppression request. Evidence cleanup has
+                # no authority to convert a failed decision into a success.
+                leave(scope, type(primary), primary, primary.__traceback__)
+            except BaseException:
+                primary.add_note("lifecycle_evidence_cleanup_failed")
+            raise
+        else:
+            try:
+                leave(scope, None, None, None)
+            except BaseException:
+                raise LifecycleError("lifecycle_evidence_cleanup_failed") from None
 
     @staticmethod
     def _cas(conn: sqlite3.Connection, execution_id: str, revision: int, updates: Mapping[str, Any]) -> sqlite3.Row:
@@ -499,99 +547,99 @@ class LifecycleStore:
         row = _registration_row(spec, now)
         # Every attempt authenticates caller, including retries; a public spec is
         # not evidence that the process/session or parent membership is real.
-        proof = self._proof("register", row, caller)
-        raw_token = secrets.token_urlsafe(32)
-        row["claim_token_hash"] = hashlib.sha256(raw_token.encode("ascii")).hexdigest()
-        with self._transaction() as conn:
-            previous = conn.execute("SELECT * FROM managed_executions WHERE execution_id=?", (spec.execution_id,)).fetchone()
-            if previous is not None:
-                immutable = [key for key in row if key not in {"created_at", "heartbeat_at", "state", "state_revision", "claim_token_hash"} and not key.startswith("floor_")]
-                if any(previous[key] != row[key] for key in immutable):
-                    raise LifecycleError("execution_spec_mismatch")
-                if previous["state"] not in TERMINAL_STATES:
-                    self._require_allocation(conn, spec.execution_id)
-                return {**self._public(previous), "claim_token": None, "registered": False}
-            if kind == "parent":
-                parent = self._get(conn, spec.parent_execution_id)
-                if parent["logon_id"] != row["logon_id"] or parent["state"] not in {"RUNNING", "DRAINING"} or not proof.parent_membership:
-                    raise LifecycleError("parent_membership_unverified")
-                ancestor = parent
-                visited = {spec.execution_id}
-                for _ in range(128):
-                    if ancestor["execution_id"] in visited:
-                        raise LifecycleError("parent_cycle")
-                    visited.add(ancestor["execution_id"])
-                    if ancestor["logon_id"] != row["logon_id"] or ancestor["state"] not in {"RUNNING", "DRAINING"}:
+        with self._evidence_scope("register", row, caller) as proof:
+            raw_token = secrets.token_urlsafe(32)
+            row["claim_token_hash"] = hashlib.sha256(raw_token.encode("ascii")).hexdigest()
+            with self._transaction() as conn:
+                previous = conn.execute("SELECT * FROM managed_executions WHERE execution_id=?", (spec.execution_id,)).fetchone()
+                if previous is not None:
+                    immutable = [key for key in row if key not in {"created_at", "heartbeat_at", "state", "state_revision", "claim_token_hash"} and not key.startswith("floor_")]
+                    if any(previous[key] != row[key] for key in immutable):
+                        raise LifecycleError("execution_spec_mismatch")
+                    if previous["state"] not in TERMINAL_STATES:
+                        self._require_allocation(conn, spec.execution_id)
+                    return {**self._public(previous), "claim_token": None, "registered": False}
+                if kind == "parent":
+                    parent = self._get(conn, spec.parent_execution_id)
+                    if parent["logon_id"] != row["logon_id"] or parent["state"] not in {"RUNNING", "DRAINING"} or not proof.parent_membership:
                         raise LifecycleError("parent_membership_unverified")
-                    if ancestor["allocation_kind"] != "parent":
-                        break
-                    ancestor = self._get(conn, ancestor["parent_execution_id"])
+                    ancestor = parent
+                    visited = {spec.execution_id}
+                    for _ in range(128):
+                        if ancestor["execution_id"] in visited:
+                            raise LifecycleError("parent_cycle")
+                        visited.add(ancestor["execution_id"])
+                        if ancestor["logon_id"] != row["logon_id"] or ancestor["state"] not in {"RUNNING", "DRAINING"}:
+                            raise LifecycleError("parent_membership_unverified")
+                        if ancestor["allocation_kind"] != "parent":
+                            break
+                        ancestor = self._get(conn, ancestor["parent_execution_id"])
+                    else:
+                        raise LifecycleError("parent_depth_exceeded")
+                    if any(row["requested_" + resource] > parent["requested_" + resource] for resource in spec.requested.to_dict()):
+                        raise LifecycleError("nested_budget_upgrade_required")
                 else:
-                    raise LifecycleError("parent_depth_exceeded")
-                if any(row["requested_" + resource] > parent["requested_" + resource] for resource in spec.requested.to_dict()):
-                    raise LifecycleError("nested_budget_upgrade_required")
-            else:
-                table = _TABLES[kind]
-                if not _has_table(conn, table):
-                    raise LifecycleError("allocation_not_found")
-                allocation = conn.execute(f"SELECT * FROM {table} WHERE id=?", (spec.reservation.id,)).fetchone()
-                if allocation is None:
-                    raise LifecycleError("allocation_not_found")
-                if allocation_is_bound(conn, kind, spec.reservation.id):
-                    raise LifecycleError("allocation_already_bound")
-                if allocation["spec_hash"] != spec.spec_hash:
-                    raise LifecycleError("reservation_spec_mismatch")
-                if allocation["expires_at"] <= now:
-                    raise LifecycleError("reservation_expired")
-                physical = allocation["physical_bytes"]
-                physical = int(float(allocation["ram_gib"]) * (1 << 30)) if physical is None else physical
-                commit = allocation["commit_bytes"] if allocation["commit_bytes"] is not None else physical
-                io = allocation["io_slots"] if allocation["io_slots"] is not None else 1
-                if (allocation["cpu_units"], physical, commit, io) != (spec.requested.cpu_units, spec.requested.physical_bytes, spec.requested.commit_bytes, spec.requested.io_slots):
-                    raise LifecycleError("reservation_resource_mismatch")
-                if kind == "routed":
-                    if allocation["task_id"] != spec.task_id:
-                        raise LifecycleError("allocation_task_mismatch")
-                    worker = conn.execute("SELECT capabilities_json FROM workers WHERE id=?", (allocation["worker_id"],)).fetchone()
-                    try:
-                        capabilities = json.loads(worker[0]) if worker is not None else None
-                    except (TypeError, ValueError):
-                        capabilities = None
-                    if resolve_worker_locality(capabilities, self._local_context) != "local":
-                        raise LifecycleError("nonlocal_allocation")
-                conn.execute(f"UPDATE {table} SET execution_id=?,lifecycle_managed=1,physical_bytes=?,commit_bytes=? WHERE id=?",
-                             (spec.execution_id, physical, commit, spec.reservation.id))
-            names = ",".join(row)
-            conn.execute(f"INSERT INTO managed_executions({names}) VALUES({','.join('?' for _ in row)})", tuple(row.values()))
-            self._require_allocation(conn, spec.execution_id)
-            _bump_registry(conn)
-            return {**self._public(self._get(conn, spec.execution_id)), "claim_token": raw_token, "registered": True}
+                    table = _TABLES[kind]
+                    if not _has_table(conn, table):
+                        raise LifecycleError("allocation_not_found")
+                    allocation = conn.execute(f"SELECT * FROM {table} WHERE id=?", (spec.reservation.id,)).fetchone()
+                    if allocation is None:
+                        raise LifecycleError("allocation_not_found")
+                    if allocation_is_bound(conn, kind, spec.reservation.id):
+                        raise LifecycleError("allocation_already_bound")
+                    if allocation["spec_hash"] != spec.spec_hash:
+                        raise LifecycleError("reservation_spec_mismatch")
+                    if allocation["expires_at"] <= now:
+                        raise LifecycleError("reservation_expired")
+                    physical = allocation["physical_bytes"]
+                    physical = int(float(allocation["ram_gib"]) * (1 << 30)) if physical is None else physical
+                    commit = allocation["commit_bytes"] if allocation["commit_bytes"] is not None else physical
+                    io = allocation["io_slots"] if allocation["io_slots"] is not None else 1
+                    if (allocation["cpu_units"], physical, commit, io) != (spec.requested.cpu_units, spec.requested.physical_bytes, spec.requested.commit_bytes, spec.requested.io_slots):
+                        raise LifecycleError("reservation_resource_mismatch")
+                    if kind == "routed":
+                        if allocation["task_id"] != spec.task_id:
+                            raise LifecycleError("allocation_task_mismatch")
+                        worker = conn.execute("SELECT capabilities_json FROM workers WHERE id=?", (allocation["worker_id"],)).fetchone()
+                        try:
+                            capabilities = json.loads(worker[0]) if worker is not None else None
+                        except (TypeError, ValueError):
+                            capabilities = None
+                        if resolve_worker_locality(capabilities, self._local_context) != "local":
+                            raise LifecycleError("nonlocal_allocation")
+                    conn.execute(f"UPDATE {table} SET execution_id=?,lifecycle_managed=1,physical_bytes=?,commit_bytes=? WHERE id=?",
+                                 (spec.execution_id, physical, commit, spec.reservation.id))
+                names = ",".join(row)
+                conn.execute(f"INSERT INTO managed_executions({names}) VALUES({','.join('?' for _ in row)})", tuple(row.values()))
+                self._require_allocation(conn, spec.execution_id)
+                _bump_registry(conn)
+                return {**self._public(self._get(conn, spec.execution_id)), "claim_token": raw_token, "registered": True}
 
     def mark_prepared(self, execution_id: str, *, caller: ProcessIdentity, expected_revision: int) -> dict[str, Any]:
         snapshot = self.query(execution_id)
         self._require_revision(snapshot, expected_revision)
-        proof = self._proof("prepare", snapshot, caller)
-        if (not proof.guardian_epoch or not proof.job_name or not proof.original_cpu_disabled or
-                not proof.durable_manifest or not proof.legacy_exclusion or type(proof.active_process_count) is not int or
-                proof.active_process_count != 0 or proof.process_ids != ()):
-            raise LifecycleError("job_preparation_unverified")
-        with self._transaction() as conn:
-            row = self._get(conn, execution_id)
-            self._require_revision(row, expected_revision)
-            if row["state"] != "RESERVED" or row["allocation_kind"] == "parent":
-                raise LifecycleError("invalid_lifecycle_transition")
-            self._require_allocation(conn, execution_id)
-            enrolled = conn.execute("""SELECT count(*) FROM managed_executions
-                WHERE allocation_kind IN ('direct','routed') AND job_name IS NOT NULL
-                  AND state NOT IN ('FINISHED','CANCELLED_BEFORE_START','START_FAILED')""").fetchone()[0]
-            if enrolled >= MAX_ENROLLED_JOBS:
-                raise LifecycleError("managed_job_limit_reached")
-            runtime = conn.execute("SELECT * FROM adaptive_runtime WHERE singleton=1").fetchone()
-            if runtime["active_logon_id"] not in {"", row["logon_id"]} or runtime["guardian_epoch"] not in {"", proof.guardian_epoch}:
-                raise LifecycleError("guardian_identity_mismatch")
-            conn.execute("UPDATE adaptive_runtime SET active_logon_id=?,guardian_epoch=? WHERE singleton=1", (row["logon_id"], proof.guardian_epoch))
-            return self._public(self._cas(conn, execution_id, expected_revision, {"state": "PREPARED", "job_name": proof.job_name,
-                                "guardian_epoch": proof.guardian_epoch, "coverage": "job_contained"}))
+        with self._evidence_scope("prepare", snapshot, caller) as proof:
+            if (not proof.guardian_epoch or not proof.job_name or not proof.original_cpu_disabled or
+                    not proof.durable_manifest or not proof.legacy_exclusion or type(proof.active_process_count) is not int or
+                    proof.active_process_count != 0 or proof.process_ids != ()):
+                raise LifecycleError("job_preparation_unverified")
+            with self._transaction() as conn:
+                row = self._get(conn, execution_id)
+                self._require_revision(row, expected_revision)
+                if row["state"] != "RESERVED" or row["allocation_kind"] == "parent":
+                    raise LifecycleError("invalid_lifecycle_transition")
+                self._require_allocation(conn, execution_id)
+                enrolled = conn.execute("""SELECT count(*) FROM managed_executions
+                    WHERE allocation_kind IN ('direct','routed') AND job_name IS NOT NULL
+                      AND state NOT IN ('FINISHED','CANCELLED_BEFORE_START','START_FAILED')""").fetchone()[0]
+                if enrolled >= MAX_ENROLLED_JOBS:
+                    raise LifecycleError("managed_job_limit_reached")
+                runtime = conn.execute("SELECT * FROM adaptive_runtime WHERE singleton=1").fetchone()
+                if runtime["active_logon_id"] not in {"", row["logon_id"]} or runtime["guardian_epoch"] not in {"", proof.guardian_epoch}:
+                    raise LifecycleError("guardian_identity_mismatch")
+                conn.execute("UPDATE adaptive_runtime SET active_logon_id=?,guardian_epoch=? WHERE singleton=1", (row["logon_id"], proof.guardian_epoch))
+                return self._public(self._cas(conn, execution_id, expected_revision, {"state": "PREPARED", "job_name": proof.job_name,
+                                    "guardian_epoch": proof.guardian_epoch, "coverage": "job_contained"}))
 
     def claim_launch(self, execution_id: str, *, caller: ProcessIdentity, claim_token: str, spec_hash: str, guardian_epoch: str, expected_revision: int) -> dict[str, Any]:
         if not isinstance(claim_token, str) or not 32 <= len(claim_token) <= 128 or not claim_token.isascii():
@@ -610,33 +658,33 @@ class LifecycleStore:
             if token_row["claim_consumed"]:
                 return {**self._public(token_row), "launch_authorized": False, "duplicate": True}
         self._require_revision(snapshot, expected_revision)
-        proof = self._proof("claim", snapshot, caller)
-        if proof.guardian_epoch != guardian_epoch or not guardian_epoch:
-            raise LifecycleError("guardian_identity_mismatch")
-        with self._transaction() as conn:
-            row = self._get(conn, execution_id)
-            self._caller(row, caller)
-            if not hmac.compare_digest(row["claim_token_hash"], token_hash) or row["spec_hash"] != spec_hash:
-                raise LifecycleError("claim_binding_mismatch")
-            if row["guardian_epoch"] != guardian_epoch:
+        with self._evidence_scope("claim", snapshot, caller) as proof:
+            if proof.guardian_epoch != guardian_epoch or not guardian_epoch:
                 raise LifecycleError("guardian_identity_mismatch")
-            if row["claim_consumed"]:
-                return {**self._public(row), "launch_authorized": False, "duplicate": True}
-            self._require_revision(row, expected_revision)
-            if row["state"] != "PREPARED" or row["launch_sealed"]:
-                raise LifecycleError("invalid_lifecycle_transition")
-            runtime = conn.execute("SELECT guardian_epoch,admission_barrier FROM adaptive_runtime WHERE singleton=1").fetchone()
-            if runtime[0] != guardian_epoch or runtime[1] != "NONE":
-                raise LifecycleError("launch_barrier_active")
-            self._require_allocation(conn, execution_id)
-            updated = self._cas(conn, execution_id, expected_revision, {"state": "LAUNCHING", "claim_consumed": 1, "launch_in_flight": 1})
-            return {**self._public(updated), "launch_authorized": True, "duplicate": False}
+            with self._transaction() as conn:
+                row = self._get(conn, execution_id)
+                self._caller(row, caller)
+                if not hmac.compare_digest(row["claim_token_hash"], token_hash) or row["spec_hash"] != spec_hash:
+                    raise LifecycleError("claim_binding_mismatch")
+                if row["guardian_epoch"] != guardian_epoch:
+                    raise LifecycleError("guardian_identity_mismatch")
+                if row["claim_consumed"]:
+                    return {**self._public(row), "launch_authorized": False, "duplicate": True}
+                self._require_revision(row, expected_revision)
+                if row["state"] != "PREPARED" or row["launch_sealed"]:
+                    raise LifecycleError("invalid_lifecycle_transition")
+                runtime = conn.execute("SELECT guardian_epoch,admission_barrier FROM adaptive_runtime WHERE singleton=1").fetchone()
+                if runtime[0] != guardian_epoch or runtime[1] != "NONE":
+                    raise LifecycleError("launch_barrier_active")
+                self._require_allocation(conn, execution_id)
+                updated = self._cas(conn, execution_id, expected_revision, {"state": "LAUNCHING", "claim_consumed": 1, "launch_in_flight": 1})
+                return {**self._public(updated), "launch_authorized": True, "duplicate": False}
 
     @staticmethod
     def _require_never_started(row: Mapping[str, Any], proof: LifecycleEvidence) -> None:
         """A trusted launch fence plus positive evidence, never absence alone.
 
-        The verifier retains the launch fence through the caller's transaction.
+        The evidence provider retains its launch fence through the transaction.
         CAS then invalidates the claim durably. For a subspan there is no own Job
         to empty: sealing this child's launch must not close its parent's Job.
         """
@@ -701,23 +749,23 @@ class LifecycleStore:
             return {**snapshot, "cancelled": True, "reason": "cancelled_before_start"}
         if snapshot["state"] in TERMINAL_STATES:
             raise LifecycleError("invalid_lifecycle_transition")
-        proof = self._proof("cancel", snapshot, caller)
-        prelaunch = (snapshot["state"] in {"RESERVED", "PREPARED"} and
-                     not snapshot["claim_consumed"] and not snapshot["launch_in_flight"])
-        if prelaunch:
-            self._require_never_started(snapshot, proof)
-        with self._transaction() as conn:
-            row = self._get(conn, execution_id)
-            self._require_revision(row, expected_revision)
-            self._caller(row, caller)
-            if not prelaunch:
-                if row["cancel_requested_at"] is None:
-                    row = self._cas(conn, execution_id, expected_revision, {"cancel_requested_at": now})
-                return {**self._public(row), "cancelled": False, "reason": "cancel_pending_reconciliation"}
-            self._require_never_started(row, proof)
-            done = self._finish_before_start(conn, row, expected_revision=expected_revision,
-                                            state="CANCELLED_BEFORE_START", now=now)
-            return {**done, "cancelled": True, "reason": "cancelled_before_start"}
+        with self._evidence_scope("cancel", snapshot, caller) as proof:
+            prelaunch = (snapshot["state"] in {"RESERVED", "PREPARED"} and
+                         not snapshot["claim_consumed"] and not snapshot["launch_in_flight"])
+            if prelaunch:
+                self._require_never_started(snapshot, proof)
+            with self._transaction() as conn:
+                row = self._get(conn, execution_id)
+                self._require_revision(row, expected_revision)
+                self._caller(row, caller)
+                if not prelaunch:
+                    if row["cancel_requested_at"] is None:
+                        row = self._cas(conn, execution_id, expected_revision, {"cancel_requested_at": now})
+                    return {**self._public(row), "cancelled": False, "reason": "cancel_pending_reconciliation"}
+                self._require_never_started(row, proof)
+                done = self._finish_before_start(conn, row, expected_revision=expected_revision,
+                                                state="CANCELLED_BEFORE_START", now=now)
+                return {**done, "cancelled": True, "reason": "cancelled_before_start"}
 
     def mark_start_failed(self, execution_id: str, *, caller: ProcessIdentity,
                           expected_revision: int, now: float | None = None) -> dict[str, Any]:
@@ -736,48 +784,48 @@ class LifecycleStore:
             return snapshot
         if snapshot["state"] not in {"RESERVED", "PREPARED", "LAUNCHING", "START_UNKNOWN", "UNCERTAIN_HOLD"}:
             raise LifecycleError("invalid_lifecycle_transition")
-        proof = self._proof("start_failed", snapshot, caller)
-        if proof.launch_failed is not True:
-            raise LifecycleError("launch_failure_unverified")
-        self._require_never_started(snapshot, proof)
-        with self._transaction() as conn:
-            row = self._get(conn, execution_id)
-            self._require_revision(row, expected_revision)
-            self._caller(row, caller)
-            self._require_never_started(row, proof)
-            return self._finish_before_start(conn, row, expected_revision=expected_revision,
-                                             state="START_FAILED", now=now)
+        with self._evidence_scope("start_failed", snapshot, caller) as proof:
+            if proof.launch_failed is not True:
+                raise LifecycleError("launch_failure_unverified")
+            self._require_never_started(snapshot, proof)
+            with self._transaction() as conn:
+                row = self._get(conn, execution_id)
+                self._require_revision(row, expected_revision)
+                self._caller(row, caller)
+                self._require_never_started(row, proof)
+                return self._finish_before_start(conn, row, expected_revision=expected_revision,
+                                                 state="START_FAILED", now=now)
 
     def bind_root(self, execution_id: str, *, caller: ProcessIdentity, expected_revision: int) -> dict[str, Any]:
         snapshot = self.query(execution_id)
         self._require_revision(snapshot, expected_revision)
-        proof = self._proof("bind_root", snapshot, caller)
-        if (not isinstance(proof.root, ProcessIdentity) or proof.root.logon_id != caller.logon_id or
-                proof.guardian_epoch != snapshot["guardian_epoch"] or proof.job_name != snapshot["job_name"] or not proof.launch_sealed):
-            raise LifecycleError("root_binding_unverified")
-        with self._transaction() as conn:
-            row = self._get(conn, execution_id)
-            self._require_revision(row, expected_revision)
-            if row["state"] not in {"LAUNCHING", "START_UNKNOWN"} or not row["launch_in_flight"]:
-                raise LifecycleError("invalid_lifecycle_transition")
-            return self._public(self._cas(conn, execution_id, expected_revision, {"state": "RUNNING", "root_pid": proof.root.pid,
-                "root_created_filetime_100ns": str(proof.root.created_filetime_100ns), "launch_in_flight": 0, "launch_sealed": 1}))
+        with self._evidence_scope("bind_root", snapshot, caller) as proof:
+            if (not isinstance(proof.root, ProcessIdentity) or proof.root.logon_id != caller.logon_id or
+                    proof.guardian_epoch != snapshot["guardian_epoch"] or proof.job_name != snapshot["job_name"] or not proof.launch_sealed):
+                raise LifecycleError("root_binding_unverified")
+            with self._transaction() as conn:
+                row = self._get(conn, execution_id)
+                self._require_revision(row, expected_revision)
+                if row["state"] not in {"LAUNCHING", "START_UNKNOWN"} or not row["launch_in_flight"]:
+                    raise LifecycleError("invalid_lifecycle_transition")
+                return self._public(self._cas(conn, execution_id, expected_revision, {"state": "RUNNING", "root_pid": proof.root.pid,
+                    "root_created_filetime_100ns": str(proof.root.created_filetime_100ns), "launch_in_flight": 0, "launch_sealed": 1}))
 
     def mark_root_exited(self, execution_id: str, *, caller: ProcessIdentity, expected_revision: int, exit_code: int) -> dict[str, Any]:
         if type(exit_code) is not int or not -(1 << 31) <= exit_code < (1 << 32):
             raise ValueError("invalid_exit_code")
         snapshot = self.query(execution_id)
         self._require_revision(snapshot, expected_revision)
-        proof = self._proof("root_exited", snapshot, caller)
-        if (not proof.root_exited or proof.root is None or proof.root.pid != snapshot["root_pid"] or
-                str(proof.root.created_filetime_100ns) != snapshot["root_created_filetime_100ns"] or proof.root.logon_id != snapshot["logon_id"]):
-            raise LifecycleError("root_exit_unverified")
-        with self._transaction() as conn:
-            row = self._get(conn, execution_id)
-            self._require_revision(row, expected_revision)
-            if row["state"] not in {"RUNNING", "UNCERTAIN_HOLD"}:
-                raise LifecycleError("invalid_lifecycle_transition")
-            return self._public(self._cas(conn, execution_id, expected_revision, {"state": "DRAINING", "root_outcome": str(exit_code)}))
+        with self._evidence_scope("root_exited", snapshot, caller) as proof:
+            if (not proof.root_exited or proof.root is None or proof.root.pid != snapshot["root_pid"] or
+                    str(proof.root.created_filetime_100ns) != snapshot["root_created_filetime_100ns"] or proof.root.logon_id != snapshot["logon_id"]):
+                raise LifecycleError("root_exit_unverified")
+            with self._transaction() as conn:
+                row = self._get(conn, execution_id)
+                self._require_revision(row, expected_revision)
+                if row["state"] not in {"RUNNING", "UNCERTAIN_HOLD"}:
+                    raise LifecycleError("invalid_lifecycle_transition")
+                return self._public(self._cas(conn, execution_id, expected_revision, {"state": "DRAINING", "root_outcome": str(exit_code)}))
 
     def hold(self, execution_id: str, *, expected_revision: int, reason: str) -> dict[str, Any]:
         if reason not in {"identity_unknown", "heartbeat_lost", "reservation_expired", "launch_ack_lost", "recovery_unverified"}:
@@ -798,31 +846,31 @@ class LifecycleStore:
             # Replaying an already committed result makes no OS/ledger change;
             # the original named Job may no longer exist after verified empty.
             return snapshot
-        proof = self._proof("finalize", snapshot, caller)
-        if (snapshot["allocation_kind"] == "parent" or not snapshot["job_name"] or proof.job_name != snapshot["job_name"] or
-                proof.guardian_epoch != snapshot["guardian_epoch"] or type(proof.active_process_count) is not int or proof.active_process_count != 0 or
-                proof.process_ids != () or not proof.launch_sealed):
-            raise LifecycleError("job_empty_unverified")
-        now = time.time() if now is None else now
-        if not math.isfinite(now):
-            raise ValueError("invalid_time")
-        with self._transaction() as conn:
-            row = self._get(conn, execution_id)
-            self._require_revision(row, expected_revision)
-            if row["state"] in TERMINAL_STATES:
-                return self._public(row)
-            if row["state"] not in {"RUNNING", "DRAINING", "START_UNKNOWN", "UNCERTAIN_HOLD"} or not proof.launch_sealed:
-                raise LifecycleError("invalid_lifecycle_transition")
-            # Parent positive-empty proof closes all nested subspans atomically.
-            descendants = conn.execute("""WITH RECURSIVE descendants(execution_id) AS (
-                SELECT execution_id FROM managed_executions WHERE parent_execution_id=?
-                UNION SELECT m.execution_id FROM managed_executions m JOIN descendants d ON m.parent_execution_id=d.execution_id)
-                SELECT execution_id FROM descendants""", (execution_id,)).fetchall()
-            for child in descendants:
-                conn.execute("UPDATE managed_executions SET state='FINISHED',state_revision=state_revision+1,finished_at=?,launch_sealed=1,launch_in_flight=0 WHERE execution_id=? AND state NOT IN ('FINISHED','CANCELLED_BEFORE_START','START_FAILED')", (now, child[0]))
-            self._archive_allocation(conn, row, now)
-            return self._public(self._cas(conn, execution_id, expected_revision, {"state": "FINISHED", "finished_at": now,
-                "launch_sealed": 1, "launch_in_flight": 0}))
+        with self._evidence_scope("finalize", snapshot, caller) as proof:
+            if (snapshot["allocation_kind"] == "parent" or not snapshot["job_name"] or proof.job_name != snapshot["job_name"] or
+                    proof.guardian_epoch != snapshot["guardian_epoch"] or type(proof.active_process_count) is not int or proof.active_process_count != 0 or
+                    proof.process_ids != () or not proof.launch_sealed):
+                raise LifecycleError("job_empty_unverified")
+            now = time.time() if now is None else now
+            if not math.isfinite(now):
+                raise ValueError("invalid_time")
+            with self._transaction() as conn:
+                row = self._get(conn, execution_id)
+                self._require_revision(row, expected_revision)
+                if row["state"] in TERMINAL_STATES:
+                    return self._public(row)
+                if row["state"] not in {"RUNNING", "DRAINING", "START_UNKNOWN", "UNCERTAIN_HOLD"} or not proof.launch_sealed:
+                    raise LifecycleError("invalid_lifecycle_transition")
+                # Parent positive-empty proof closes all nested subspans atomically.
+                descendants = conn.execute("""WITH RECURSIVE descendants(execution_id) AS (
+                    SELECT execution_id FROM managed_executions WHERE parent_execution_id=?
+                    UNION SELECT m.execution_id FROM managed_executions m JOIN descendants d ON m.parent_execution_id=d.execution_id)
+                    SELECT execution_id FROM descendants""", (execution_id,)).fetchall()
+                for child in descendants:
+                    conn.execute("UPDATE managed_executions SET state='FINISHED',state_revision=state_revision+1,finished_at=?,launch_sealed=1,launch_in_flight=0 WHERE execution_id=? AND state NOT IN ('FINISHED','CANCELLED_BEFORE_START','START_FAILED')", (now, child[0]))
+                self._archive_allocation(conn, row, now)
+                return self._public(self._cas(conn, execution_id, expected_revision, {"state": "FINISHED", "finished_at": now,
+                    "launch_sealed": 1, "launch_in_flight": 0}))
 
     @staticmethod
     def _archive_allocation(conn: sqlite3.Connection, row: Mapping[str, Any], now: float,

@@ -5,6 +5,7 @@ import json
 import sqlite3
 import threading
 import unittest
+from tests.fixtures.adaptive_evidence import fixture_evidence_provider
 from unittest.mock import patch
 
 from sentinel.adaptive.contracts import AllocationKind
@@ -43,7 +44,7 @@ class AdaptivePrelaunchTests(unittest.TestCase):
     def setUp(self):
         fixtures.AdaptiveLifecycleTests.setUp(self)
         self.verifier = PrelaunchVerifier()
-        self.store.verifier = self.verifier
+        self.store.evidence_provider = fixture_evidence_provider(self.verifier)
 
     def prepared(self, spec=None):
         spec, registered = self.registered(spec)
@@ -220,7 +221,7 @@ class AdaptivePrelaunchTests(unittest.TestCase):
                     if operation in {"claim", "cancel"}:
                         start.wait(timeout=5)
                     return proof
-                contender = LifecycleStore(self.db, verifier=rendezvous)
+                contender = LifecycleStore(self.db, evidence_provider=fixture_evidence_provider(rendezvous))
                 def invoke(operation):
                     try:
                         if operation == "claim":
@@ -383,7 +384,7 @@ class AdaptivePrelaunchTests(unittest.TestCase):
             if operation == "start_failed":
                 self.store.hold(spec.execution_id, expected_revision=row["state_revision"], reason="launch_ack_lost")
             return proof
-        self.store.verifier = change_revision
+        self.store.evidence_provider = fixture_evidence_provider(change_revision)
         with self.assertRaisesRegex(LifecycleError, "revision_conflict"):
             self.fail(spec, row["state_revision"])
         self.assertEqual(self.store.query(spec.execution_id)["state"], "START_UNKNOWN")
@@ -452,13 +453,13 @@ class AdaptivePrelaunchTests(unittest.TestCase):
             finally:
                 conn.close()
             return verifier(operation, record, caller)
-        self.store.verifier = assert_unlocked
+        self.store.evidence_provider = fixture_evidence_provider(assert_unlocked)
         for operation in (self.cancel, self.fail):
             spec, _ = self.registered()
             operation(spec, 0)
 
     def test_routed_registration_accepts_canonical_local_without_legacy_flag(self):
-        store = LifecycleStore(self.db, verifier=self.verifier, local_host_id="fixture-host")
+        store = LifecycleStore(self.db, evidence_provider=fixture_evidence_provider(self.verifier), local_host_id="fixture-host")
         spec = self.spec(kind=AllocationKind.ROUTED)
         self.allocate(spec)
         self.connection().execute("UPDATE workers SET capabilities_json=?",
@@ -469,7 +470,7 @@ class AdaptivePrelaunchTests(unittest.TestCase):
         self.assertEqual(self.allocation(spec)["execution_id"], spec.execution_id)
 
     def test_routed_registration_rejects_conflicting_or_remote_locality(self):
-        store = LifecycleStore(self.db, verifier=self.verifier, local_host_id="fixture-host")
+        store = LifecycleStore(self.db, evidence_provider=fixture_evidence_provider(self.verifier), local_host_id="fixture-host")
         spec = self.spec(kind=AllocationKind.ROUTED)
         self.allocate(spec)
         before = self.allocation(spec)
@@ -493,7 +494,7 @@ class AdaptivePrelaunchTests(unittest.TestCase):
                 conn.close()
             return "fixture-host"
         with patch("sentinel.adaptive.store.local_host_identity", side_effect=host_identity) as observe:
-            store = LifecycleStore(self.db, verifier=self.verifier)
+            store = LifecycleStore(self.db, evidence_provider=fixture_evidence_provider(self.verifier))
             spec = self.spec(kind=AllocationKind.ROUTED)
             self.allocate(spec)
             self.connection().execute("UPDATE workers SET capabilities_json=?",

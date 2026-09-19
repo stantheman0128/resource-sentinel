@@ -305,7 +305,10 @@ def validate_active_allocation(conn, execution_id, *, local_context):
     row, allocation = source["execution"], source["allocation"]
     if row.get("state") in TERMINAL_STATES:
         raise AccountingError("execution_terminal")
-    if allocation.get("spec_hash") != row.get("spec_hash"):
+    managed_hash = allocation.get("managed_spec_hash")
+    if bool(managed_hash) != bool(row.get("admission_binding_hash")):
+        raise AccountingError("allocation_binding_mismatch")
+    if (managed_hash if managed_hash is not None else allocation.get("spec_hash")) != row.get("spec_hash"):
         raise AccountingError("allocation_spec_mismatch")
     routed = source["allocation_kind"] == "routed"
     if routed:

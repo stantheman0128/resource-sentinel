@@ -22,7 +22,7 @@ from sentinel.accounting import (
     AccountingError, local_host_identity, resolve_worker_locality,
     validate_active_allocation,
 )
-from .contracts import ExecutionSpec, ProcessIdentity, MAX_ENROLLED_JOBS
+from .contracts import AllocationKind, ExecutionSpec, ProcessIdentity, ReservationRef, MAX_ENROLLED_JOBS
 
 SCHEMA_VERSION = 1
 TERMINAL_STATES = frozenset({"FINISHED", "CANCELLED_BEFORE_START", "START_FAILED"})
@@ -81,17 +81,37 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
             present = _columns(conn, table)
             additions = {"execution_id": "TEXT", "lifecycle_managed": "INTEGER NOT NULL DEFAULT 0",
                          "physical_bytes": "INTEGER", "commit_bytes": "INTEGER"}
+            if table == "reservations":
+                additions["managed_spec_hash"] = "TEXT"
             if table == "worker_reservations":
                 additions["io_slots"] = "INTEGER"
             for name, sql_type in additions.items():
                 if name not in present:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
             conn.execute(f"CREATE UNIQUE INDEX IF NOT EXISTS idx_{table}_execution ON {table}(execution_id) WHERE execution_id IS NOT NULL")
+        if _has_table(conn, "reservations") and "tool_use_id" in _columns(conn, "reservations"):
+            # The discriminator survives queue deletion: even an older binary
+            # retrying a cancelled/expired managed intent cannot INSERT a legacy
+            # allocation. Native metadata must be supplied in the same INSERT.
+            for trigger, event in (("managed_direct_insert_guard", "INSERT"),
+                    ("managed_direct_update_guard", "UPDATE OF tool_use_id,lifecycle_managed,execution_id,managed_spec_hash")):
+                conn.execute(f"""CREATE TRIGGER IF NOT EXISTS {trigger}
+                    BEFORE {event} ON reservations
+                    WHEN substr(NEW.tool_use_id,1,11)='managed-v1:' AND (
+                        NEW.lifecycle_managed IS NOT 1 OR NEW.execution_id IS NULL OR
+                        NEW.execution_id != substr(NEW.tool_use_id,12) OR
+                        length(NEW.managed_spec_hash) IS NOT 64)
+                    BEGIN SELECT RAISE(ABORT,'managed_admission_context_required'); END""")
         # Queue and reservation projections share the explicit Commit request.
         # Keep the column check under this same writer lock: concurrent legacy
         # constructors must not both observe a missing column before ALTER.
-        if _has_table(conn, "queue") and "commit_bytes" not in _columns(conn, "queue"):
-            conn.execute("ALTER TABLE queue ADD COLUMN commit_bytes INTEGER")
+        if _has_table(conn, "queue"):
+            present = _columns(conn, "queue")
+            for name, sql_type in {"commit_bytes": "INTEGER", "managed_execution_id": "TEXT",
+                                   "managed_binding_hash": "TEXT"}.items():
+                if name not in present:
+                    conn.execute(f"ALTER TABLE queue ADD COLUMN {name} {sql_type}")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_queue_managed_execution ON queue(managed_execution_id) WHERE managed_execution_id IS NOT NULL")
         if not existing:
             conn.execute("""CREATE TABLE adaptive_runtime (
                 singleton INTEGER PRIMARY KEY CHECK(singleton=1),
@@ -142,6 +162,8 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_managed_parent ON managed_executions(parent_execution_id)")
         if "cancel_requested_at" not in _columns(conn, "managed_executions"):
             conn.execute("ALTER TABLE managed_executions ADD COLUMN cancel_requested_at REAL")
+        if "admission_binding_hash" not in _columns(conn, "managed_executions"):
+            conn.execute("ALTER TABLE managed_executions ADD COLUMN admission_binding_hash TEXT")
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -276,6 +298,108 @@ def _unavailable_verifier(operation: str, record: Mapping[str, Any], caller: Pro
     raise LifecycleError("native_lifecycle_evidence_unavailable")
 
 
+def _registration_row(spec: ExecutionSpec, now: float) -> dict[str, Any]:
+    kind = spec.reservation.kind.value
+    row = {"execution_id": spec.execution_id, "task_id": spec.task_id, "session_id": spec.session_id,
+           "principal_id": spec.principal_id, "logon_id": spec.wrapper_identity.logon_id,
+           "allocation_kind": kind, "reservation_id": spec.reservation.id if kind != "parent" else None,
+           "parent_execution_id": spec.parent_execution_id, "spec_hash": spec.spec_hash,
+           "wrapper_pid": spec.wrapper_identity.pid, "wrapper_created_filetime_100ns": str(spec.wrapper_identity.created_filetime_100ns),
+           "role": spec.role.value, "priority": spec.priority.value, "state": "RESERVED", "state_revision": 0,
+           "created_at": now, "heartbeat_at": now}
+    for name, value in spec.requested.to_dict().items():
+        row["requested_" + name] = value
+        row["floor_" + name] = value
+    return row
+
+
+def _admitted_row(admission, reservation_id: str, now: float) -> dict[str, Any]:
+    # Internal transaction boundary, never a deserialized CLI authority.
+    from .admission import ManagedAdmissionSnapshot
+    if not isinstance(admission, ManagedAdmissionSnapshot):
+        raise LifecycleError("managed_admission_context_required")
+    spec = ExecutionSpec(admission.execution_id, admission.task_id, admission.session_id,
+        admission.principal_id, ReservationRef(AllocationKind.DIRECT, reservation_id), None,
+        admission.spec_hash, admission.role, admission.priority, admission.requested, admission.wrapper_identity)
+    row = _registration_row(spec, now)
+    row.update(admission_binding_hash=admission.binding_hash, claim_token_hash=admission.claim_token_hash)
+    return row
+
+
+def _admission_result(row: Mapping[str, Any], request_key: str, *, reused: bool) -> dict[str, Any]:
+    # Capacity approval is separate from the later one-use Job launch claim.
+    allowed = row["state"] in {"RESERVED", "PREPARED", "LAUNCHING", "RUNNING", "DRAINING"}
+    result = dict(allowed=allowed, reservation_id=row["reservation_id"], request_key=request_key,
+                  execution_id=row["execution_id"], state=row["state"], state_revision=row["state_revision"],
+                  reused=reused, launch_authorized=False)
+    if not allowed:
+        result["reason"] = "managed_execution_terminal" if row["state"] in TERMINAL_STATES else "managed_execution_held"
+    return result
+
+
+def retry_managed_admission(conn: sqlite3.Connection, admission, *, local_context) -> dict[str, Any] | None:
+    """Replay an exact self-owned admission; never mint a token or renew a lease."""
+    if not conn.in_transaction:
+        raise LifecycleError("transaction_required")
+    _check_version(conn)
+    row = conn.execute("SELECT * FROM managed_executions WHERE execution_id=?", (admission.execution_id,)).fetchone()
+    if row is None:
+        return None
+    expected = _admitted_row(admission, row["reservation_id"], row["created_at"])
+    mutable = {"state", "state_revision", "heartbeat_at"}
+    # Verified prelaunch closure deliberately destroys the launch credential.
+    # Its immutable admission digest still binds the original context/secret;
+    # returning the terminal outcome must not require restoring that credential.
+    if (row["state"] in {"CANCELLED_BEFORE_START", "START_FAILED"} and row["claim_token_hash"] == "" and
+            row["claim_consumed"] == 1 and row["launch_sealed"] == 1 and row["launch_in_flight"] == 0):
+        mutable.add("claim_token_hash")
+    if any(row[key] != value for key, value in expected.items() if key not in mutable and not key.startswith("floor_")):
+        raise LifecycleError("managed_admission_binding_mismatch")
+    if row["state"] not in TERMINAL_STATES:
+        try:
+            source = validate_active_allocation(conn, row["execution_id"], local_context=local_context)
+        except AccountingError as error:
+            raise LifecycleError(str(error)) from error
+        allocation = source["allocation"]
+        if allocation["request_key"] != admission.request.request_key or allocation["spec_hash"] != admission.request.spec_hash:
+            raise LifecycleError("managed_admission_binding_mismatch")
+    return _admission_result(row, admission.request.request_key, reused=True)
+
+
+def commit_managed_admission(conn: sqlite3.Connection, admission, reservation_id: str, *, now: float, local_context) -> dict[str, Any]:
+    """Bind a new direct reservation inside its admission transaction.
+
+    The self-wrapper context is authenticated before acquiring the transaction.
+    No native calls, migration, IPC or second connection is performed here.
+    """
+    if not conn.in_transaction:
+        raise LifecycleError("transaction_required")
+    _check_version(conn)
+    allocation = conn.execute("SELECT * FROM reservations WHERE id=?", (reservation_id,)).fetchone()
+    if (allocation is None or allocation["execution_id"] != admission.execution_id or
+            allocation["lifecycle_managed"] != 1 or allocation["managed_spec_hash"] != admission.spec_hash or
+            allocation["request_key"] != admission.request.request_key or
+            allocation["spec_hash"] != admission.request.spec_hash or
+            allocation["owner_pid"] != admission.wrapper_identity.pid or
+            allocation["owner_started"] != admission.request.owner_started):
+        raise LifecycleError("managed_admission_binding_mismatch")
+    row = _admitted_row(admission, reservation_id, now)
+    names = ",".join(row)
+    conn.execute(f"INSERT INTO managed_executions({names}) VALUES({','.join('?' for _ in row)})", tuple(row.values()))
+    changed = conn.execute("""UPDATE reservations SET execution_id=?,lifecycle_managed=1,
+        physical_bytes=?,commit_bytes=?,managed_spec_hash=? WHERE id=? AND execution_id=? AND lifecycle_managed=1 AND managed_spec_hash=?""",
+        (admission.execution_id, admission.requested.physical_bytes, admission.requested.commit_bytes,
+         admission.spec_hash, reservation_id, admission.execution_id, admission.spec_hash)).rowcount
+    if changed != 1:
+        raise LifecycleError("managed_admission_binding_mismatch")
+    try:
+        validate_active_allocation(conn, admission.execution_id, local_context=local_context)
+    except AccountingError as error:
+        raise LifecycleError(str(error)) from error
+    _bump_registry(conn)
+    return _admission_result(row, admission.request.request_key, reused=False)
+
+
 class LifecycleStore:
     def __init__(self, db_path: str | Path, *, verifier: Callable[[str, Mapping[str, Any], ProcessIdentity], LifecycleEvidence] | None = None,
                  local_host_id: str | None = None):
@@ -372,16 +496,7 @@ class LifecycleStore:
         if not math.isfinite(now):
             raise ValueError("invalid_time")
         kind = spec.reservation.kind.value
-        row = {"execution_id": spec.execution_id, "task_id": spec.task_id, "session_id": spec.session_id,
-               "principal_id": spec.principal_id, "logon_id": spec.wrapper_identity.logon_id,
-               "allocation_kind": kind, "reservation_id": spec.reservation.id if kind != "parent" else None,
-               "parent_execution_id": spec.parent_execution_id, "spec_hash": spec.spec_hash,
-               "wrapper_pid": spec.wrapper_identity.pid, "wrapper_created_filetime_100ns": str(spec.wrapper_identity.created_filetime_100ns),
-               "role": spec.role.value, "priority": spec.priority.value, "state": "RESERVED", "state_revision": 0,
-               "created_at": now, "heartbeat_at": now}
-        for name, value in spec.requested.to_dict().items():
-            row["requested_" + name] = value
-            row["floor_" + name] = value
+        row = _registration_row(spec, now)
         # Every attempt authenticates caller, including retries; a public spec is
         # not evidence that the process/session or parent membership is real.
         proof = self._proof("register", row, caller)

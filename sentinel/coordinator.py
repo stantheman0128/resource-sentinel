@@ -26,7 +26,10 @@ from sentinel.exemptions import Exemptions
 from sentinel.command_classification import classify_command
 from sentinel.stop_reminders import claim_reminder
 from sentinel.accounting import frame_from_status, local_host_identity, shared_admission_blockers
-from sentinel.adaptive.store import allocation_is_bound, check_schema_version, hold_expired_allocations, migrate_schema
+from sentinel.adaptive.store import (
+    allocation_is_bound, check_schema_version, commit_managed_admission,
+    hold_expired_allocations, migrate_schema, retry_managed_admission,
+)
 
 
 PRIORITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
@@ -345,6 +348,12 @@ class Coordinator:
                 removed.append(row["id"])
         queue_cutoff = now - float(config["queue_ttl_min"]) * 60
         for row in conn.execute("SELECT * FROM queue").fetchall():
+            # A managed queue intent has not reserved or launched anything.
+            # Its activity TTL is independent of an uncertain legacy PID lookup;
+            # expiring it never releases an execution's retained allocation.
+            if row["managed_execution_id"] is not None and float(row["heartbeat_at"]) < queue_cutoff:
+                conn.execute("DELETE FROM queue WHERE request_key=?", (row["request_key"],))
+                continue
             alive, started = observations.get(self._observation_key("queue", row), (None, 0.0))
             if alive is None:
                 continue
@@ -411,17 +420,45 @@ class Coordinator:
         return float(row["cpu"]), float(row["ram"])
 
     def admit(
+        self, request: ResourceRequest, status: dict[str, Any], *,
+        config: dict[str, Any] | None = None, now: float | None = None,
+    ) -> dict[str, Any]:
+        return self._admit(request, status, config=config, now=now)
+
+    def admit_managed(
+        self, context, status: dict[str, Any], *,
+        config: dict[str, Any] | None = None, now: float | None = None,
+    ) -> dict[str, Any]:
+        """Reserve and bind a self-wrapper atomically; never authorize launch.
+
+        The in-process context retains native self identity and its original
+        launch token. JSON identity/snapshots and legacy reservations are not
+        adoption authority. Native validation happens before the DB transaction.
+        """
+        from sentinel.adaptive.admission import ManagedAdmission
+        if type(context) is not ManagedAdmission:
+            raise TypeError("managed_admission_context_required")
+        snapshot, first_submission = context.begin_submission()
+        return self._admit(snapshot.request, status, config=config, now=now,
+                           managed=snapshot, first_submission=first_submission)
+
+    def _admit(
         self,
         request: ResourceRequest,
         status: dict[str, Any],
         *,
         config: dict[str, Any] | None = None,
         now: float | None = None,
+        managed=None,
+        first_submission: bool = True,
     ) -> dict[str, Any]:
         req = request.normalized()
         cfg = self._config(config, local_host_id=self.local_host_id)
         now = time.time() if now is None else now
         v2 = cfg.get("admission_policy") == "resource-v2"
+        if managed is not None and (not v2 or cfg.get("local_allocatable_ram_gib") != 58 or
+                cfg.get("local_physical_headroom_gib", 4) != 4 or cfg["local_commit_headroom_gib"] != 4):
+            return {"allowed": False, "reason": "managed_policy_mismatch", "request_key": req.request_key}
         frame = frame_from_status(status, cfg, now=now, logical_processors=os.cpu_count() or 1) if v2 else None
         metrics = ({"fresh": frame["fresh"], "light": status.get("light", "UNKNOWN")}
                    if v2 else self._status_metrics(status, cfg, now))
@@ -438,8 +475,21 @@ class Coordinator:
         with self._db() as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._cleanup_locked(conn, now, cfg, observations)
+            if managed is not None:
+                replay = retry_managed_admission(conn, managed, local_context=cfg)
+                if replay is not None:
+                    conn.execute("COMMIT")
+                    return replay
+            queued_existing = conn.execute("SELECT * FROM queue WHERE request_key=?", (req.request_key,)).fetchone()
+            if managed is None and queued_existing and queued_existing["managed_execution_id"] is not None:
+                conn.execute("COMMIT")
+                return {"allowed": False, "reason": "managed_request_requires_context", "request_key": req.request_key}
             existing = conn.execute("SELECT * FROM reservations WHERE request_key=?", (req.request_key,)).fetchone()
             if existing:
+                if managed is not None:
+                    conn.execute("COMMIT")
+                    return {"allowed": False, "reason": "legacy_reservation_cannot_be_adopted",
+                            "request_key": req.request_key}
                 if allocation_is_bound(conn, "direct", existing["id"]):
                     conn.execute("COMMIT")
                     return {"allowed": False, "reason": "managed_reservation_requires_exact_claim",
@@ -463,28 +513,37 @@ class Coordinator:
             ).fetchall()
             handoff = next((row for row in handoffs
                             if not allocation_is_bound(conn, "direct", row["id"])), None)
-            if handoff and handoff["spec_hash"] == req.spec_hash:
+            if managed is None and handoff and handoff["spec_hash"] == req.spec_hash:
                 conn.execute("UPDATE reservations SET tool_use_id=?,heartbeat_at=? WHERE id=?", (req.tool_use_id, now, handoff["id"]))
                 conn.execute("COMMIT")
                 self._mirror()
                 return {"allowed": True, "reservation_id": handoff["id"], "reused": True, "request_key": handoff["request_key"]}
 
-            queued_existing = conn.execute(
-                "SELECT spec_hash FROM queue WHERE request_key=?", (req.request_key,)
-            ).fetchone()
-            if queued_existing and queued_existing["spec_hash"] != req.spec_hash:
+            queue_hash = "managed-v1:" + managed.binding_hash if managed is not None else req.spec_hash
+            immutable_queue = {"owner_pid": req.owner_pid, "owner_started": req.owner_started,
+                "tool_use_id": req.tool_use_id, "repo": req.repo, "command_signature": req.command_signature,
+                "command_text": "", "resource_class": req.resource_class, "priority": req.priority,
+                "priority_rank": PRIORITY_RANK[req.priority], "cpu_units": req.cpu_units,
+                "ram_gib": req.ram_gib, "io_slots": req.io_slots, "commit_bytes": req.commit_bytes}
+            if queued_existing and (queued_existing["spec_hash"] != queue_hash or
+                    (managed is not None and (queued_existing["managed_execution_id"] != managed.execution_id or
+                                              queued_existing["managed_binding_hash"] != managed.binding_hash or
+                                              any(queued_existing[key] != value for key, value in immutable_queue.items())))):
                 conn.execute("COMMIT")
                 return {
                     "allowed": False, "reason": "request_spec_mismatch",
                     "request_key": req.request_key,
                 }
+            if managed is not None and not first_submission and queued_existing is None:
+                conn.execute("COMMIT")
+                return {"allowed": False, "reason": "managed_request_missing", "request_key": req.request_key}
 
             conn.execute(
                 """INSERT INTO queue
                 (request_key,owner_pid,owner_started,tool_use_id,repo,command_signature,command_text,
                  resource_class,priority,priority_rank,cpu_units,ram_gib,io_slots,queued_at,heartbeat_at,
-                 spec_hash,commit_bytes)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 spec_hash,commit_bytes,managed_execution_id,managed_binding_hash)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(request_key) DO UPDATE SET heartbeat_at=excluded.heartbeat_at,
                   tool_use_id=excluded.tool_use_id,priority=excluded.priority,
                   priority_rank=excluded.priority_rank""",
@@ -492,7 +551,9 @@ class Coordinator:
                     req.request_key, req.owner_pid, req.owner_started, req.tool_use_id, req.repo,
                     req.command_signature, redact_command(req.command), req.resource_class, req.priority,
                     PRIORITY_RANK[req.priority], req.cpu_units, req.ram_gib, req.io_slots, now, now,
-                    req.spec_hash, req.commit_bytes,
+                    queue_hash, req.commit_bytes,
+                    managed.execution_id if managed is not None else None,
+                    managed.binding_hash if managed is not None else None,
                 ),
             )
             ordered = conn.execute("SELECT request_key FROM queue ORDER BY priority_rank,queued_at,request_key").fetchall()
@@ -563,17 +624,21 @@ class Coordinator:
                     """INSERT INTO reservations
                     (id,request_key,owner_pid,owner_started,tool_use_id,repo,command_signature,command_text,
                      resource_class,priority,priority_rank,cpu_units,ram_gib,io_slots,created_at,
-                     heartbeat_at,expires_at,spec_hash,commit_bytes)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     heartbeat_at,expires_at,spec_hash,commit_bytes,execution_id,lifecycle_managed,managed_spec_hash)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         reservation_id, req.request_key, req.owner_pid, req.owner_started, req.tool_use_id,
                         req.repo, req.command_signature, redact_command(req.command), req.resource_class, req.priority,
                         PRIORITY_RANK[req.priority], req.cpu_units, req.ram_gib, req.io_slots, now, now,
                         now + float(cfg["reservation_ttl_min"]) * 60, req.spec_hash, req.commit_bytes,
+                        managed.execution_id if managed is not None else None, 1 if managed is not None else 0,
+                        managed.spec_hash if managed is not None else None,
                     ),
                 )
                 conn.execute("DELETE FROM queue WHERE request_key=?", (req.request_key,))
                 result = {"allowed": True, "reservation_id": reservation_id, "reused": False, "request_key": req.request_key}
+                if managed is not None:
+                    result = commit_managed_admission(conn, managed, reservation_id, now=now, local_context=cfg)
                 if exemption:
                     result.update(reason="user_exemption", exemption_id=exemption["id"], exemption_expires_at=exemption["expires_at"])
             else:
@@ -606,6 +671,8 @@ class Coordinator:
                             "reservation_id": active["id"], "request_key": request_key}
                 return {"allowed": True, "reservation_id": active["id"], "reused": True, "request_key": request_key}
             return {"allowed": False, "reason": "request_missing", "request_key": request_key}
+        if row["managed_execution_id"] is not None:
+            return {"allowed": False, "reason": "managed_request_requires_context", "request_key": request_key}
         request = ResourceRequest(
             owner_pid=row["owner_pid"], owner_started=row["owner_started"], repo=row["repo"],
             command=row["command_text"], resource_class=row["resource_class"], priority=row["priority"],

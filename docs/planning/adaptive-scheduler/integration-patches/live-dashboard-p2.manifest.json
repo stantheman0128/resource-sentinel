@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "patch": "live-dashboard-p2.patch",
+  "patch_sha256": "dcfd65f22e97b01797f502bf8e4021227e806e41d7991d2b67f559f8057a4343",
+  "encoding": "UTF-8, LF-normalized patch",
+  "applies_to": "Only the separately protected live baseline matching the before hashes; not a clean Git HEAD.",
+  "required_sources": [
+    "sentinel/lease_display.py",
+    "sentinel/accounting.py",
+    "sentinel/adaptive/contracts.py",
+    "sentinel/adaptive/store.py",
+    "P2 Coordinator and Maintainer shared-accounting integrations"
+  ],
+  "runtime_activation": false,
+  "tests_executed_by_generator": false,
+  "files": [
+    {
+      "path": "sentinel/dashboard.py",
+      "protected_before_reference": ".local-adaptive/resume-display/dashboard-before.py",
+      "before_file_sha256": "2341dd513bd00c92f4a1c95e2ee2ca7a231788a419152bc1de784a5c088c2e28",
+      "after_file_sha256": "acfeadb70f8e6f2ffa55537eac0af216c222c5e4a09ea07003419556b95582bb",
+      "before_utf8_lf_sha256": "2341dd513bd00c92f4a1c95e2ee2ca7a231788a419152bc1de784a5c088c2e28",
+      "after_utf8_lf_sha256": "acfeadb70f8e6f2ffa55537eac0af216c222c5e4a09ea07003419556b95582bb"
+    },
+    {
+      "path": "sentinel/attribution.py",
+      "protected_before_reference": ".local-adaptive/resume-display/attribution-before.py",
+      "before_file_sha256": "ae40c1968ee19ef7344cab255b1bafd87241eb4fb8528a014ec42071e4159ab4",
+      "after_file_sha256": "0d7daa1cad7e7bf85cdd079df6325050821f862887463ada2bf115fbc48b1fda",
+      "before_utf8_lf_sha256": "ae40c1968ee19ef7344cab255b1bafd87241eb4fb8528a014ec42071e4159ab4",
+      "after_utf8_lf_sha256": "0d7daa1cad7e7bf85cdd079df6325050821f862887463ada2bf115fbc48b1fda"
+    },
+    {
+      "path": "tests/test_dashboard_observability.py",
+      "protected_before_reference": ".local-adaptive/resume-display/test-dashboard-observability-before-identity-fix.py",
+      "before_file_sha256": "b98ff4a9bff0b0448e7825d77d8957cd8b9b50f161fa5770a7ebf3503827453d",
+      "after_file_sha256": "6ecc8f26c1cb10ebf629acb2a3606dd9731c0972171bf3abcf3daf19d611fb49",
+      "before_utf8_lf_sha256": "b98ff4a9bff0b0448e7825d77d8957cd8b9b50f161fa5770a7ebf3503827453d",
+      "after_utf8_lf_sha256": "6ecc8f26c1cb10ebf629acb2a3606dd9731c0972171bf3abcf3daf19d611fb49"
+    }
+  ]
+}

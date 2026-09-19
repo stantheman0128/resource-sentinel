@@ -1,6 +1,11 @@
 # GPT Pro 規劃交接：Agent 動態資源調度
 
-日期：2026-09-19。狀態：**只交接規劃，沒有實作或啟用新控制器。**
+日期：2026-09-19。狀態：**正式計畫已入庫，分階段實作進行中；production adaptive 維持 off。**
+
+目前交接入口是 [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md)、
+[P0 對齊結果](BASELINE-RECONCILIATION.md)、[Windows capability 證據](CAPABILITY-RESULTS.md)
+與 [P2 admission-only 實作紀錄](P2-ADMISSION-ONLY.md)。
+以下「只做規劃」及 GPT Pro 提示是原規劃階段的歷史背景，不限制後續已授權的實作。
 
 使用者要求：先自行嚴格質疑方案，把資料放入 repo；由使用者交給 GPT Pro
 完成 plan，再交回 Codex 實作。本包不代表使用者已選定控制演算法、常駐服務或參數。
@@ -20,8 +25,9 @@
 `0b2f37819a2d4f68299fbec3fe619a4d05ba4749`。
 本機另有未提交的 resource-v2、collector recovery、58 GiB 政策、三豁免上限及介面修改。
 規劃分支只新增文件與選定原始碼的文字快照，**沒有把上述 runtime 修改合併到 master**。
-因此規劃本機下一階段時，選定檔案應以快照為準；根目錄同名程式可能仍是舊版。
-快照不是完整可執行 checkout；其他相依項目需讀 repo，不能用它宣稱測試通過。
+目前實作以 P0 核對的本機 live working tree 為待對齊基準；快照僅供歷史比對，
+不得批次複製回 source。根目錄同名程式可能仍是舊版。快照不是完整可執行 checkout；
+其他相依項目需讀 repo，不能用它宣稱測試通過。
 
 ## 使用者真正想要的效果
 

@@ -1,0 +1,529 @@
+--- a/sentinel/dashboard.py
++++ b/sentinel/dashboard.py
+@@ -3,6 +3,7 @@
+ 
+ import json
+ import math
++import os
+ import sqlite3
+ import time
+ from contextlib import contextmanager
+@@ -14,6 +15,8 @@
+ from sentinel.exemptions import MAX_CONCURRENT_EXEMPTIONS
+ from sentinel.pressure import blockers
+ from sentinel.attribution import clean_metadata, claude_session_metadata
++from sentinel.lease_display import exemption_leases as _display_exemption_leases
++from sentinel.accounting import GIB, frame_from_status, project_local_capacity, shared_admission_blockers
+ 
+ MAX_ROWS = 500
+ 
+@@ -70,6 +73,13 @@
+     return {key: row[key] for key in ('cpu_units', 'ram_gib', 'io_slots')}
+ 
+ 
++def accounting_requirements(row):
++    # Nullable fields in an older ledger retain the accounting module's RAM
++    # fallback. A recorded independent Commit request must not be collapsed.
++    return dict(requirements(row), physical_bytes=row.get('physical_bytes'),
++                commit_bytes=row.get('commit_bytes'))
++
++
+ def task_view(row, state):
+     # A basename is useful without exposing paths, commands or user-provided text.
+     name = str(row['repo']).replace('\\', '/').rstrip('/').split('/')[-1][:80]
+@@ -80,39 +90,61 @@
+ 
+ def admission(data_dir, status, config, nodes, now):
+     cfg = Coordinator._config(config)
+-    metrics = Coordinator._status_metrics(status, cfg, now)
++    v2 = cfg.get('admission_policy') == 'resource-v2'
++    # Capture every OS input before opening the one read-only ledger snapshot.
++    frame = frame_from_status(status, cfg, now=now, logical_processors=os.cpu_count() or 1) if v2 else None
++    metrics = {'fresh': frame['fresh']} if v2 else Coordinator._status_metrics(status, cfg, now)
+     if not status.get('sampled_at'):
+         metrics['fresh'] = False  # publication alone cannot establish measurement health
++    projection = None
+     with read_db(Path(data_dir) / 'sentinel.db') as conn:
+         reservations = bounded_rows(conn, 'SELECT * FROM reservations ORDER BY created_at')
+         queued = bounded_rows(conn, 'SELECT * FROM queue ORDER BY priority_rank,queued_at,request_key')
+-        routed_cpu, routed_ram, routed_io = Coordinator._routed_local_pending(conn, cfg, now)
+-    active, waiting, reservation_views = [], [], []
+-    for row in reservations:
+-        state = identity_state(row, nodes)
+-        if row['expires_at'] <= now:
+-            state = 'expired'
+-        item = task_view(row, state)
+-        item['expires_at'] = row['expires_at']
+-        reservation_views.append(item)
+-        if state not in ('owner_exited', 'expired'):
+-            active.append(row)
+-    eligible_queue = []
+-    for row in queued:
+-        state = identity_state(row, nodes)
+-        if row['heartbeat_at'] < now - float(cfg['queue_ttl_min']) * 60:
+-            state = 'heartbeat_stale'
+-        item = task_view(row, state)
+-        item.update(queued_at=row['queued_at'], retry_state='awaiting_wrapper_retry' if state == 'observed' else state)
+-        waiting.append(item)
+-        if state not in ('owner_exited', 'heartbeat_stale'):
+-            eligible_queue.append(row)
+-    grace = float(cfg['reservation_grace_sec'])
+-    pending_cpu = routed_cpu + sum(r['cpu_units'] for r in active if now-r['created_at'] <= grace)
+-    pending_ram = routed_ram + sum(r['ram_gib'] for r in active if now-r['created_at'] <= grace)
+-    used_io = routed_io + sum(r['io_slots'] for r in active)
+-    details = {r['request_key']: blockers(SimpleNamespace(**requirements(r)), status, cfg,
+-               pending_cpu=pending_cpu, pending_ram=pending_ram, used_io=used_io) for r in eligible_queue}
++        active, waiting, reservation_views = [], [], []
++        for row in reservations:
++            state = identity_state(row, nodes)
++            if row['expires_at'] <= now:
++                state = 'expired'
++            item = task_view(row, state)
++            item['expires_at'] = row['expires_at']
++            reservation_views.append(item)
++            if state not in ('owner_exited', 'expired'):
++                active.append(row)
++        eligible_queue = []
++        for row in queued:
++            state = identity_state(row, nodes)
++            if row['heartbeat_at'] < now - float(cfg['queue_ttl_min']) * 60:
++                state = 'heartbeat_stale'
++            item = task_view(row, state)
++            item.update(queued_at=row['queued_at'], retry_state='awaiting_wrapper_retry' if state == 'observed' else state)
++            waiting.append(item)
++            if state not in ('owner_exited', 'heartbeat_stale'):
++                eligible_queue.append(row)
++        if v2:
++            # Read the same allocation/floor/locality contract as real admission.
++            # Display identities, age, TTL and grace never remove ledger demand.
++            projection = project_local_capacity(conn, frame, cfg)
++            demands = [allocation['demand'] for allocation in projection['allocations']]
++            if any(error['resource'] == 'ledger' for error in projection['errors']):
++                pending_cpu = pending_ram = used_io = None  # a partial ledger sum is not capacity
++            else:
++                pending_cpu = sum(demand['cpu_units'] for demand in demands)
++                pending_ram = sum(demand['physical_bytes'] for demand in demands) / GIB
++                used_io = sum(demand['io_slots'] for demand in demands)
++            details = {r['request_key']: shared_admission_blockers(
++                conn, accounting_requirements(r), frame, cfg) for r in eligible_queue}
++        else:
++            # Preserve the older preview's grace/pool behavior for legacy mode.
++            routed_cpu, routed_ram, routed_io = Coordinator._routed_local_pending(conn, cfg, now)
++            grace = float(cfg['reservation_grace_sec'])
++            pending_cpu = routed_cpu + sum(r['cpu_units'] for r in active if now-r['created_at'] <= grace)
++            pending_ram = routed_ram + sum(r['ram_gib'] for r in active if now-r['created_at'] <= grace)
++            used_io = routed_io + sum(r['io_slots'] for r in active)
++    if not v2:
++        # Legacy pressure helpers may read CPU count; keep them outside the DB
++        # transaction just as before this v2-only accounting integration.
++        details = {r['request_key']: blockers(SimpleNamespace(**requirements(r)), status, cfg,
++                   pending_cpu=pending_cpu, pending_ram=pending_ram, used_io=used_io) for r in eligible_queue}
+     first_feasible = next((r['request_key'] for r in eligible_queue if not details[r['request_key']]), None)
+     policy_ready = cfg.get('admission_policy') == 'resource-v2' and (status.get('resource_policy') or {}).get('mode') == 'resource-v2'
+     for item in waiting:
+@@ -139,7 +171,8 @@
+         else:
+             reason = 'awaiting_wrapper_retry'
+         item['reason'] = reason
+-    return dict(state='stale' if not metrics['fresh'] else 'unknown' if nodes is None or not policy_ready else 'ok',
++    return dict(state='stale' if not metrics['fresh'] else 'unknown' if nodes is None or not policy_ready or
++                (projection is not None and projection['errors']) else 'ok',
+                 observed_at=now, sampled_at=status.get('sampled_at'), policy=cfg.get('admission_policy', 'legacy'),
+                 preview_only=True, exemption_override_evaluated=False, reservations=reservation_views, waiting=waiting,
+                 pending=dict(cpu_units=pending_cpu, ram_gib=pending_ram, io_slots=used_io),
+@@ -150,36 +183,10 @@
+ 
+ 
+ def exemption_leases(data_dir, nodes, now):
+-    path = Path(data_dir) / 'exemptions.sqlite3'
+-    if not path.exists():
+-        return dict(state='ok', occupied=0, limit=MAX_CONCURRENT_EXEMPTIONS, next_expiry=None, leases=[])
+-    with read_db(path) as conn:
+-        # Active leases plus recent history, without the private authorization reason.
+-        columns = {r[1] for r in conn.execute('PRAGMA table_info(exemptions)')}
+-        metadata_column = 'owner_metadata' if 'owner_metadata' in columns else "'{}' AS owner_metadata"
+-        rows = bounded_rows(conn, f'''SELECT id,root_pid,root_started,created_at,expires_at,revoked_at,{metadata_column}
+-            FROM exemptions WHERE (revoked_at IS NULL AND expires_at>?) OR created_at>?
+-            ORDER BY created_at DESC''', (now, now-86400))
+-    metadata_lookups = 0
+-    for row in rows:
+-        try:
+-            metadata = clean_metadata(json.loads(row.pop('owner_metadata')))
+-        except (ValueError, TypeError):
+-            metadata = {}
+-        row['occupies_slot'] = row['revoked_at'] is None and row['expires_at'] > now
+-        # Existing recorded metadata stays authoritative. Enrich only occupied
+-        # slots, after closing the read transaction; never scan historical PIDs.
+-        if not metadata and row['occupies_slot'] and metadata_lookups < MAX_CONCURRENT_EXEMPTIONS:
+-            metadata_lookups += 1
+-            metadata = claude_session_metadata(row['root_pid'], row['root_started'])
+-        row.update(metadata)
+-        row.setdefault('attribution_source', 'unrecorded')
+-        row['state'] = ('revoked' if row['revoked_at'] is not None else 'expired' if row['expires_at'] <= now else
+-                        'identity_unknown' if nodes is None else 'active' if
+-                        abs(nodes.get(row['root_pid'], -1)-row['root_started']) < .01 else 'process_exited')
+-    occupied = [r for r in rows if r['occupies_slot']]
+-    return dict(state='ok' if nodes is not None or not occupied else 'unknown', occupied=len(occupied),
+-                limit=MAX_CONCURRENT_EXEMPTIONS, next_expiry=min((r['expires_at'] for r in occupied), default=None), leases=rows)
++    # Local integration keeps the existing grant policy and patchable resolver.
++    return _display_exemption_leases(data_dir, nodes, now,
++                                    limit=MAX_CONCURRENT_EXEMPTIONS,
++                                    metadata_resolver=claude_session_metadata)
+ 
+ 
+ def members(tree):
+--- a/sentinel/attribution.py
++++ b/sentinel/attribution.py
+@@ -2,161 +2,15 @@
+ from __future__ import annotations
+ 
+ import os
+-import json
+-import math
+ import sqlite3
+-import stat
+ import time
+-from contextlib import contextmanager
+ from pathlib import Path
+ 
+-FIELDS = ('session_name', 'session_id', 'agent', 'project', 'attribution_source')
+-MAX_SESSION_REGISTRY_BYTES = 16 * 1024
+-FILETIME_UNIX_EPOCH = 116444736000000000
+-
+-
+-def clean_metadata(value):
+-    if not isinstance(value, dict):
+-        return {}
+-    result = {}
+-    for key in FIELDS:
+-        text = value.get(key)
+-        if not isinstance(text, str):
+-            continue
+-        text = ' '.join(text.split())
+-        if key == 'project':
+-            text = text.replace('\\', '/').rstrip('/').split('/')[-1]
+-        if text:
+-            result[key] = text[:160]
+-    return result
+-
+-
+-def legacy_psutil_epoch(filetime):
+-    """Reproduce psutil 7's stored double, without an identity tolerance.
+-
+-    Its Windows _to_unix_time subtracts the epoch as an integer, casts that
+-    difference to double, then divides by 10,000,000. Changing that order can
+-    change the result. This compatibility value is for display lookup only;
+-    full native FILETIME still has to match the registry exactly.
+-    """
+-    return float(filetime - FILETIME_UNIX_EPOCH) / 10000000.0
+-
+-
+-@contextmanager
+-def native_process_identity(pid):
+-    """Hold one query-only Windows process handle across metadata validation.
+-
+-    The yielded callable rechecks that same handle. No process enumeration,
+-    psutil fallback, command line, environment, or process mutation is used.
+-    """
+-    if os.name != 'nt':
+-        yield lambda: None
+-        return
+-    import ctypes
+-    from ctypes import wintypes
+-
+-    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+-    kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+-    kernel.OpenProcess.restype = wintypes.HANDLE
+-    kernel.GetProcessId.argtypes = (wintypes.HANDLE,)
+-    kernel.GetProcessId.restype = wintypes.DWORD
+-    kernel.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
+-    kernel.GetProcessTimes.restype = wintypes.BOOL
+-    kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+-    kernel.WaitForSingleObject.restype = wintypes.DWORD
+-    kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+-    kernel.CloseHandle.restype = wintypes.BOOL
+-    handle = kernel.OpenProcess(0x1000 | 0x100000, False, pid)  # QUERY_LIMITED_INFORMATION | SYNCHRONIZE
+-    if not handle:
+-        yield lambda: None
+-        return
+-    try:
+-        def identity():
+-            # WAIT_TIMEOUT at timeout=0 means still alive, including processes
+-            # whose eventual exit code happens to equal STILL_ACTIVE (259).
+-            if kernel.WaitForSingleObject(handle, 0) != 258 or kernel.GetProcessId(handle) != pid:
+-                return None
+-            created, exited, system, user = (wintypes.FILETIME() for _ in range(4))
+-            if not kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+-                                          ctypes.byref(system), ctypes.byref(user)):
+-                return None
+-            return (created.dwHighDateTime << 32) | created.dwLowDateTime
+-        yield identity
+-    finally:
+-        kernel.CloseHandle(handle)
+-
+-
+-def _registry_filetime(value):
+-    if isinstance(value, str) and value.isascii() and value.isdecimal() and len(value) <= 20:
+-        value = int(value)
+-    if type(value) is not int or not FILETIME_UNIX_EPOCH < value < 2**64:
+-        return None
+-    return value
+-
+-
+-def _read_claude_registry(home, pid):
+-    # The PID is already a bounded integer. Never use a registry field as a
+-    # filename or search other sessions when this exact file is unavailable.
+-    home = Path(home).resolve(strict=True)
+-    directory = home / 'sessions'
+-    path = directory / f'{pid}.json'
+-    if directory.resolve(strict=True) != directory or path.resolve(strict=True) != path:
+-        return None  # reject observable symlink / junction redirection
+-    # This local display lookup is not a hostile same-user filesystem sandbox;
+-    # a concurrently replaced directory can still race these path checks.
+-    info = path.lstat()
+-    if (not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SESSION_REGISTRY_BYTES or
+-            getattr(info, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+-        return None
+-    with path.open('rb') as stream:
+-        raw = stream.read(MAX_SESSION_REGISTRY_BYTES + 1)
+-    if len(raw) > MAX_SESSION_REGISTRY_BYTES:
+-        return None
+-    def unique_keys(pairs):
+-        result = {}
+-        for key, value in pairs:
+-            if key in result:
+-                raise ValueError('duplicate registry field')
+-            result[key] = value
+-        return result
+-    value = json.loads(raw, object_pairs_hook=unique_keys)
+-    return value if isinstance(value, dict) else None
+-
+-
+-def claude_session_metadata(pid, started, *, home=None, process_identity=None):
+-    """Read-only labels for one occupied legacy lease with no recorded labels.
+-
+-    Registry PID and full creation FILETIME must match a held native handle;
+-    the legacy lease timestamp must also exactly match psutil's conversion.
+-    Failure returns no attribution and never changes the lease or its state.
+-    """
+-    if (type(pid) is not int or not 0 < pid <= 0xffffffff or isinstance(started, bool) or
+-            not isinstance(started, (int, float)) or not math.isfinite(started) or started <= 0):
+-        return {}
+-    process_identity = native_process_identity if process_identity is None else process_identity
+-    home = Path.home() / '.claude' if home is None else home
+-    try:
+-        with process_identity(pid) as identity:
+-            native = identity()
+-            if _registry_filetime(native) is None or started != legacy_psutil_epoch(native):
+-                return {}
+-            record = _read_claude_registry(home, pid)
+-            if (not record or type(record.get('pid')) is not int or record['pid'] != pid or
+-                    _registry_filetime(record.get('procStart')) != native):
+-                return {}
+-            if (not isinstance(record.get('sessionId'), str) or not record['sessionId'].strip() or
+-                    len(record['sessionId']) > 160 or not isinstance(record.get('name'), str) or
+-                    not record['name'].strip() or len(record['name']) > 1000):
+-                return {}
+-            metadata = clean_metadata(dict(session_name=record['name'], session_id=record['sessionId'],
+-                                           agent='Claude', project=record.get('cwd'),
+-                                           attribution_source='claude_session_registry'))
+-            # Keep the handle alive until all file reads are done, and reject
+-            # exit during the observation. The display can still go stale later.
+-            return metadata if identity() == native else {}
+-    except (OSError, ValueError, TypeError, OverflowError, RecursionError):
+-        return {}
+-
++from sentinel.lease_display import (
++    FIELDS, MAX_SESSION_REGISTRY_BYTES, FILETIME_UNIX_EPOCH,
++    clean_metadata, legacy_psutil_epoch, native_process_identity,
++    _registry_filetime, _read_claude_registry, claude_session_metadata,
++)
+ 
+ def codex_name(session_id, home):
+     """Exact ID lookup only: no transcript scan, PID guessing or writable connection."""
+--- a/tests/test_dashboard_observability.py
++++ b/tests/test_dashboard_observability.py
+@@ -2,14 +2,16 @@
+ import sqlite3
+ import tempfile
+ import unittest
++import uuid
+ from datetime import datetime
+-from contextlib import closing
++from contextlib import closing, contextmanager
+ from pathlib import Path
+ from unittest.mock import patch
+ 
+ from sentinel.coordinator import Coordinator, ResourceRequest
+ from sentinel.dashboard import snapshot
+ from sentinel.exemptions import Exemptions
++from sentinel.maintainer import Maintainer, Worker
+ 
+ 
+ class DashboardObservabilityTests(unittest.TestCase):
+@@ -43,6 +45,22 @@
+     def queue(self, req):
+         return self.coordinator.admit(req, {}, config=self.config, now=self.now)
+ 
++    def routed(self, entries, *, aged=False):
++        """Synthetic allocations using the actual schema and explicit locality."""
++        maintainer = Maintainer(self.path)
++        for worker_id, local, cpu, ram in entries:
++            caps = {} if local is None else {'local': local}
++            maintainer.upsert_worker(Worker(worker_id, 'fixture', 'fixture-domain',
++                capacity_pool='pool-' + worker_id, capabilities=caps), now=self.now)
++            with closing(sqlite3.connect(self.path/'sentinel.db', isolation_level=None)) as db:
++                db.execute('''INSERT INTO worker_reservations
++                    (id,task_id,worker_id,failure_domain,capacity_scope,capacity_pool,
++                     cpu_units,ram_gib,disk_gib,created_at,heartbeat_at,expires_at,metadata_json,io_slots)
++                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
++                    ('r-' + worker_id, 't-' + worker_id, worker_id, 'fixture-domain',
++                     'SHARED_POOL', 'pool-' + worker_id, cpu, ram, 0.,
++                     self.now-1000 if aged else self.now, self.now, self.now+50, '{}', 1))
++
+     def test_empty_is_known_and_missing_db_unknown(self):
+         observed = self.observe()
+         self.assertEqual(observed['admission']['counts']['waiting'],0)
+@@ -102,14 +120,120 @@
+         self.assertEqual(observed['waiting'][0]['blockers'][0]['available'],6)
+ 
+     def test_routed_pending_uses_same_local_pool(self):
+-        with closing(sqlite3.connect(self.path/'sentinel.db', isolation_level=None)) as db:
+-            db.execute('CREATE TABLE worker_reservations (worker_id TEXT,created_at REAL,expires_at REAL,cpu_units REAL,ram_gib REAL)')
+-            db.executemany('INSERT INTO worker_reservations VALUES (?,?,?,?,?)',[
+-                ('local-windows',self.now,self.now+50,2,5),('remote',self.now,self.now+50,20,50)])
++        self.routed([('local-windows', True, 2, 5), ('remote', False, 20, 50)])
+         self.queue(self.request(1,ram=10))
+         observed = self.observe()['admission']
+         self.assertEqual(observed['pending'],dict(cpu_units=2,ram_gib=5,io_slots=1))
+         self.assertEqual(observed['waiting'][0]['blockers'][0]['available'],9)
++
++    def test_shared_preview_retains_expired_bound_floor_and_aged_local_aliases(self):
++        from sentinel.adaptive.contracts import (
++            AllocationKind, ExecutionSpec, Priority, ProcessIdentity, ReservationRef, ResourceDemand, Role,
++        )
++        from sentinel.adaptive.store import LifecycleEvidence, LifecycleStore
++        gib = 1 << 30
++        req = self.request(1, cpu=1, ram=2).normalized()
++        grant = self.coordinator.admit(req, self.status, config=self.config, now=self.now)
++        self.assertTrue(grant['allowed'])
++        caller = ProcessIdentity(1, 134342000123456789, 'fixture-logon')
++        spec = ExecutionSpec(execution_id=str(uuid.uuid4()), task_id='fixture-task', session_id='fixture-session',
++            principal_id='fixture-principal', reservation=ReservationRef(AllocationKind.DIRECT, grant['reservation_id']),
++            parent_execution_id=None, spec_hash=req.spec_hash, role=Role.BACKGROUND, priority=Priority.P2,
++            requested=ResourceDemand(1., 2*gib, 2*gib, 0), wrapper_identity=caller)
++        store = LifecycleStore(self.path/'sentinel.db', verifier=lambda operation, row, who:
++            LifecycleEvidence(operation, row['execution_id'], row['state_revision'], 'fixture-only', who))
++        store.prepare_registration(spec, caller=caller, now=self.now)
++        self.routed([('local-alias-a', True, 1, 3), ('local-alias-b', True, 1, 2),
++                     ('remote-alias', False, 20, 50)], aged=True)
++        with closing(sqlite3.connect(self.path/'sentinel.db', isolation_level=None)) as db:
++            db.execute('UPDATE reservations SET created_at=?,expires_at=? WHERE id=?',
++                       (self.now-1000, self.now-1, grant['reservation_id']))
++            db.execute('UPDATE managed_executions SET floor_physical_bytes=?,floor_commit_bytes=? WHERE execution_id=?',
++                       (4*gib, 4*gib, spec.execution_id))
++        actual = self.coordinator.admit(self.request(2,cpu=9,ram=6),self.status,config=self.config,now=self.now)
++        self.assertFalse(actual['allowed'])
++        before = (self.path/'sentinel.db').read_bytes()
++        # The display snapshot omits the bound owner. That does not erase demand.
++        nodes = dict(sampled_epoch=self.now, processes=[dict(pid=2,ppid=0,create_time=100.)])
++        result = self.observe(nodes=nodes)['admission']
++        self.assertEqual(result['pending'], dict(cpu_units=3,ram_gib=9,io_slots=2))
++        self.assertEqual(result['reservations'][0]['state'], 'expired')
++        units = {'cpu':'logical_cpu_units','ram':'GiB','commit':'GiB','io':'slots'}
++        self.assertEqual(result['waiting'][0]['blockers'],
++                         [dict(reason, unit=units[reason['resource']]) for reason in actual['blockers']])
++        self.assertTrue(next(reason for reason in result['waiting'][0]['blockers'] if reason['resource']=='cpu')['request_exceeds_host_budget'])
++        self.assertEqual(next(reason for reason in result['waiting'][0]['blockers'] if reason['resource']=='ram')['available'], 5)
++        self.assertEqual(before, (self.path/'sentinel.db').read_bytes())
++
++    def test_missing_routed_locality_holds_preview_instead_of_inventing_capacity(self):
++        self.routed([('unknown-locality', None, 1, 2)])
++        actual = self.coordinator.admit(self.request(),self.status,config=self.config,now=self.now)
++        before = (self.path/'sentinel.db').read_bytes()
++        result = self.observe()['admission']
++        self.assertEqual(result['state'], 'unknown')
++        self.assertEqual(result['pending'], dict(cpu_units=None,ram_gib=None,io_slots=None))
++        self.assertEqual(result['waiting'][0]['reason'], 'local_scope_unknown')
++        self.assertEqual(result['waiting'][0]['reason'], actual['reason'])
++        self.assertEqual(before, (self.path/'sentinel.db').read_bytes())
++
++    def test_preview_preserves_independent_commit_request_in_queue(self):
++        request = ResourceRequest(1,100.,'fixture-project','fixture-command',
++            cpu_units=1,ram_gib=1,io_slots=0,commit_bytes=37*(1 << 30))
++        actual = self.coordinator.admit(request,self.status,config=self.config,now=self.now)
++        self.assertFalse(actual['allowed'])
++        before = (self.path/'sentinel.db').read_bytes()
++        result = self.observe()['admission']['waiting'][0]
++        self.assertEqual(result['reason'], 'commit_capacity')
++        self.assertEqual(result['blockers'], [dict(reason, unit='GiB') for reason in actual['blockers']])
++        self.assertEqual(result['blockers'][0]['required'], 37)
++        self.assertEqual(result['blockers'][0]['available'], 36)
++        self.assertEqual(before, (self.path/'sentinel.db').read_bytes())
++
++    def test_shared_preview_collects_os_input_before_one_readonly_transaction(self):
++        import sentinel.dashboard as dashboard
++        self.queue(self.request())
++        original_reader = dashboard.read_db
++        original_blockers = dashboard.shared_admission_blockers
++        connections, in_read = [], False
++        @contextmanager
++        def checked_reader(path):
++            nonlocal in_read
++            with original_reader(path) as conn:
++                in_read = True
++                connections.append(conn)
++                try:
++                    yield conn
++                finally:
++                    in_read = False
++        def logical_count():
++            self.assertFalse(in_read, 'No OS reads inside a ledger transaction')
++            return 12
++        def checked_blockers(conn, *args, **kwargs):
++            self.assertTrue(in_read)
++            self.assertIs(conn, connections[0])
++            self.assertTrue(conn.in_transaction)
++            with self.assertRaises(sqlite3.OperationalError):
++                conn.execute('UPDATE reservations SET heartbeat_at=heartbeat_at')
++            return original_blockers(conn, *args, **kwargs)
++        before = (self.path/'sentinel.db').read_bytes()
++        with patch.object(dashboard, 'read_db', checked_reader), \
++                patch.object(dashboard.os, 'cpu_count', logical_count), \
++                patch.object(dashboard, 'shared_admission_blockers', checked_blockers):
++            result = dashboard.admission(self.path, self.status, self.config, {1:100.}, self.now)
++        self.assertEqual(len(connections), 1)
++        self.assertEqual(result['state'], 'ok')
++        self.assertEqual(before, (self.path/'sentinel.db').read_bytes())
++
++    def test_legacy_preview_keeps_grace_behavior_outside_shared_accounting(self):
++        self.coordinator.admit(self.request(),self.status,config=self.config,now=self.now)
++        with closing(sqlite3.connect(self.path/'sentinel.db', isolation_level=None)) as db:
++            db.execute('UPDATE reservations SET created_at=?', (self.now-1000,))
++        self.config['admission_policy'] = 'legacy'
++        with patch('sentinel.dashboard.project_local_capacity', side_effect=AssertionError('v2 only')), \
++                patch('sentinel.dashboard.shared_admission_blockers', side_effect=AssertionError('v2 only')):
++            result = self.observe()['admission']
++        self.assertEqual(result['pending'], dict(cpu_units=0,ram_gib=0,io_slots=0))
++        self.assertEqual(result['policy'], 'legacy')
+ 
+     def test_expired_and_reused_owners_flagged_not_active(self):
+         self.coordinator.admit(self.request(1),self.status,config=self.config,now=self.now)
+@@ -130,7 +254,7 @@
+         result = self.observe()['exemptions']
+         self.assertEqual(result['occupied'],1)
+         self.assertEqual(result['limit'],3)
+-        self.assertEqual(result['leases'][0]['state'],'process_exited')
++        self.assertEqual(result['leases'][0]['state'],'identity_mismatch')
+         self.assertTrue(result['leases'][0]['occupies_slot'])
+         self.assertNotIn('PRIVATE AUTH',json.dumps(result))
+         self.now += 60
+@@ -145,7 +269,7 @@
+         row = result['leases'][0]
+         self.assertEqual(row['session_name'],'修復監控')
+         self.assertEqual(row['project'],'project')
+-        self.assertEqual(row['state'],'process_exited')
++        self.assertEqual(row['state'],'identity_unknown')
+         self.assertNotIn('PRIVATE AUTH',json.dumps(result))
+ 
+     def test_legacy_lease_database_read_without_migration_or_guessed_title(self):

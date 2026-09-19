@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import math
+import re
 from pathlib import Path
 import secrets
 import sqlite3
@@ -230,6 +231,10 @@ def migrate_schema(conn: sqlite3.Connection, *, in_transaction: bool = False) ->
             # Old rows deliberately stay NULL: constructing a store must not
             # mint a new cross-process credential for an existing execution.
             conn.execute("ALTER TABLE managed_executions ADD COLUMN ipc_auth_key BLOB")
+        if "job_nonce" not in _columns(conn, "managed_executions"):
+            # No nonce is manufactured for a legacy provider's existing Job.
+            # New native owners must register a fresh scope before OS creation.
+            conn.execute("ALTER TABLE managed_executions ADD COLUMN job_nonce TEXT")
         migrate_writer_fence(conn)
         if not in_transaction:
             conn.commit()
@@ -315,6 +320,11 @@ class LifecycleEvidence:
     assertions. The current-process unexported-credential cancellation provider
     is deliberately narrower than a native Job lifecycle provider.
 
+    job_creation_never_attempted is an in-process creation fence observation,
+    never inferred from a missing object. For cancellation, that capability is
+    irrevocably sealed through the terminal CAS; it cannot be reconstructed
+    from a manifest or returned by any owner that has attempted native Create.
+
     For finalization, current_cpu_disabled is a current native Query result,
     not the original state. recovery_manifest_settled verifies the durable
     manifest for this exact execution/nonce/Job has no unresolved intent or
@@ -343,9 +353,11 @@ class LifecycleEvidence:
     prelaunch_record_hash: str | None = None
     current_cpu_disabled: bool = False
     recovery_manifest_settled: bool = False
+    job_nonce: str | None = None
+    job_creation_never_attempted: bool = False
 
     def __post_init__(self):
-        if self.operation not in {"register", "prepare", "claim", "bind_root", "root_exited", "finalize", "cancel", "start_failed"}:
+        if self.operation not in {"register", "register_scope", "prepare", "claim", "bind_root", "root_exited", "finalize", "cancel", "start_failed"}:
             raise ValueError("invalid_evidence_operation")
         for name in ("execution_id", "observation_id"):
             value = getattr(self, name)
@@ -359,6 +371,8 @@ class LifecycleEvidence:
             raise ValueError("invalid_evidence_epoch")
         if self.job_name is not None and (not isinstance(self.job_name, str) or not 1 <= len(self.job_name) <= 256):
             raise ValueError("invalid_evidence_job")
+        if self.job_nonce is not None and (not isinstance(self.job_nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", self.job_nonce)):
+            raise ValueError("invalid_evidence_job_nonce")
         if self.active_process_count is not None and (type(self.active_process_count) is not int or not 0 <= self.active_process_count < 1 << 32):
             raise ValueError("invalid_evidence_process_count")
         if self.process_ids is not None:
@@ -367,7 +381,7 @@ class LifecycleEvidence:
                     len(set(self.process_ids)) != len(self.process_ids)):
                 raise ValueError("invalid_evidence_process_list")
         for name in ("launch_sealed", "original_cpu_disabled", "durable_manifest", "legacy_exclusion", "root_exited", "parent_membership",
-                     "current_cpu_disabled", "recovery_manifest_settled"):
+                     "current_cpu_disabled", "recovery_manifest_settled", "job_creation_never_attempted"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError("invalid_evidence_boolean")
         for name in ("user_code_started", "launch_failed"):
@@ -796,6 +810,15 @@ class LifecycleStore:
                     evidence.execution_id != row["execution_id"] or evidence.state_revision != row["state_revision"] or
                     evidence.caller != caller or not isinstance(evidence.observation_id, str) or not evidence.observation_id):
                 raise LifecycleError("invalid_lifecycle_evidence")
+            if "job_nonce" in row.keys() and row["job_nonce"] is not None and (
+                    evidence.job_nonce != row["job_nonce"] or evidence.job_name != row["job_name"] or
+                    evidence.guardian_epoch != row["guardian_epoch"]):
+                raise LifecycleError("job_scope_evidence_mismatch")
+            if operation != "register_scope" and evidence.job_nonce is not None and (
+                    "job_nonce" not in row.keys() or row["job_nonce"] is None):
+                # A new native provider cannot silently fall into the older
+                # nonce-less synthetic seam and skip pre-Create registration.
+                raise LifecycleError("job_scope_not_registered")
             yield evidence
         except BaseException as primary:
             try:
@@ -911,13 +934,92 @@ class LifecycleStore:
                 _bump_registry(conn)
                 return {**self._public(self._get(conn, spec.execution_id)), "claim_token": raw_token, "registered": True}
 
+    def register_job_scope(self, execution_id: str, *, caller: ProcessIdentity,
+                           expected_revision: int, guardian_epoch: str,
+                           job_name: str, job_nonce: str) -> dict[str, Any]:
+        """Persist one native creation responsibility before creating any Job.
+
+        The trusted owner already holds this store's POLICY scope and retains
+        it through manifest persistence and native creation. A successful call
+        records planned identity only: it grants no launch, control, containment
+        or host-admission permission. It does not write a second allocation.
+
+        Register exactly once. A repeated/uncertain call must reconcile this
+        existing attempt, never recreate an object or remint its nonce. The
+        caller's per-Job mutex identity must derive from this persisted scope.
+        Native owners cannot use the older synthetic-provider preparation path
+        in place of this step; production evidence remains unavailable by
+        default. No durable record reconstructs a lost never-created capability.
+        """
+        from .policy import PolicyError
+
+        try:
+            parsed_execution = UUID(execution_id) if isinstance(execution_id, str) else None
+            canonical_execution = (parsed_execution is not None and parsed_execution.int != 0 and
+                                   str(parsed_execution) == execution_id)
+        except (ValueError, AttributeError):
+            canonical_execution = False
+        if not canonical_execution:
+            raise LifecycleError("invalid_job_scope")
+        if (not isinstance(job_nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", job_nonce) or
+                not isinstance(guardian_epoch, str) or not 1 <= len(guardian_epoch) <= 128 or
+                any(ord(char) < 32 for char in guardian_epoch)):
+            raise LifecycleError("invalid_job_scope")
+        if not isinstance(job_name, str) or job_name not in {
+                f"Local\\ResourceSentinel.Job.{execution_id}.{job_nonce}",
+                f"Local\\ResourceSentinel.Test.Job.{job_nonce}"}:
+            raise LifecycleError("invalid_job_scope")
+        try:
+            guard = self._policy.assert_held()
+        except PolicyError as error:
+            raise LifecycleError(str(error)) from error
+        snapshot = self.query(execution_id)
+        self._require_revision(snapshot, expected_revision)
+        self._caller(snapshot, caller)
+        if guard.binding.logon_id != caller.logon_id:
+            raise LifecycleError("policy_logon_mismatch")
+        with self._evidence_scope("register_scope", snapshot, caller) as proof:
+            if (proof.job_name != job_name or proof.job_nonce != job_nonce or
+                    proof.guardian_epoch != guardian_epoch or not proof.job_creation_never_attempted or
+                    proof.root is not None or proof.active_process_count is not None or proof.process_ids is not None):
+                raise LifecycleError("job_scope_registration_unverified")
+            # Evidence is bounded and acquired outside SQLite. Both the same
+            # POLICY ownership and the native creation fence survive this CAS.
+            self._policy.assert_held(guard)
+            with self._transaction() as conn:
+                runtime = self._policy.revalidate(conn, guard)
+                row = self._get(conn, execution_id)
+                self._require_revision(row, expected_revision)
+                self._caller(row, caller)
+                if (row["state"] != "RESERVED" or row["allocation_kind"] == "parent" or
+                        row["coverage"] != "unmanaged" or row["claim_consumed"] or row["launch_sealed"] or
+                        row["launch_in_flight"] or row["root_pid"] is not None or row["root_outcome"] is not None):
+                    raise LifecycleError("invalid_lifecycle_transition")
+                if row["job_name"] is not None or row["job_nonce"] is not None or row["guardian_epoch"]:
+                    raise LifecycleError("job_scope_already_registered")
+                if runtime["admission_barrier"] != "NONE":
+                    raise LifecycleError("launch_barrier_active")
+                if (runtime["active_logon_id"] not in {"", row["logon_id"]} or
+                        runtime["guardian_epoch"] not in {"", guardian_epoch}):
+                    raise LifecycleError("guardian_identity_mismatch")
+                self._require_allocation(conn, execution_id)
+                enrolled = conn.execute("""SELECT count(*) FROM managed_executions
+                    WHERE allocation_kind IN ('direct','routed') AND job_name IS NOT NULL
+                      AND state NOT IN ('FINISHED','CANCELLED_BEFORE_START','START_FAILED')""").fetchone()[0]
+                if enrolled >= MAX_ENROLLED_JOBS:
+                    raise LifecycleError("managed_job_limit_reached")
+                conn.execute("UPDATE adaptive_runtime SET active_logon_id=?,guardian_epoch=? WHERE singleton=1",
+                             (row["logon_id"], guardian_epoch))
+                return self._public(self._cas(conn, execution_id, expected_revision,
+                    {"job_name": job_name, "job_nonce": job_nonce, "guardian_epoch": guardian_epoch}))
+
     def mark_prepared(self, execution_id: str, *, caller: ProcessIdentity, expected_revision: int) -> dict[str, Any]:
         snapshot = self.query(execution_id)
         self._require_revision(snapshot, expected_revision)
         with self._evidence_scope("prepare", snapshot, caller) as proof:
             if (not proof.guardian_epoch or not proof.job_name or not proof.original_cpu_disabled or
                     not proof.durable_manifest or not proof.legacy_exclusion or type(proof.active_process_count) is not int or
-                    proof.active_process_count != 0 or proof.process_ids != ()):
+                    proof.active_process_count != 0 or proof.process_ids != () or proof.job_creation_never_attempted):
                 raise LifecycleError("job_preparation_unverified")
             with self._transaction() as conn:
                 row = self._get(conn, execution_id)
@@ -927,9 +1029,13 @@ class LifecycleStore:
                 self._require_allocation(conn, execution_id)
                 enrolled = conn.execute("""SELECT count(*) FROM managed_executions
                     WHERE allocation_kind IN ('direct','routed') AND job_name IS NOT NULL
-                      AND state NOT IN ('FINISHED','CANCELLED_BEFORE_START','START_FAILED')""").fetchone()[0]
+                      AND execution_id!=?
+                      AND state NOT IN ('FINISHED','CANCELLED_BEFORE_START','START_FAILED')""", (execution_id,)).fetchone()[0]
                 if enrolled >= MAX_ENROLLED_JOBS:
                     raise LifecycleError("managed_job_limit_reached")
+                if row["job_nonce"] is not None and (row["job_name"] != proof.job_name or
+                        row["job_nonce"] != proof.job_nonce or row["guardian_epoch"] != proof.guardian_epoch):
+                    raise LifecycleError("job_scope_evidence_mismatch")
                 runtime = conn.execute("SELECT * FROM adaptive_runtime WHERE singleton=1").fetchone()
                 if runtime["active_logon_id"] not in {"", row["logon_id"]} or runtime["guardian_epoch"] not in {"", proof.guardian_epoch}:
                     raise LifecycleError("guardian_identity_mismatch")
@@ -1103,12 +1209,27 @@ class LifecycleStore:
                 proof.guardian_epoch != row["guardian_epoch"] or proof.job_name != row["job_name"]):
             raise LifecycleError("never_started_unverified")
         if row["job_name"] is not None:
-            if (not row["guardian_epoch"] or type(proof.active_process_count) is not int or
+            if proof.job_creation_never_attempted:
+                # A planned name is not an empty native Job. Only the same
+                # owner, having irreversibly fenced creation before its first
+                # attempt, may take this no-query path. Lost ownership, failed
+                # Create or Open-not-found cannot reproduce this capability.
+                if (row["job_nonce"] is None or row["state"] != "RESERVED" or
+                        row["claim_consumed"] or row["launch_in_flight"] or
+                        proof.active_process_count is not None or proof.process_ids is not None or
+                        not proof.recovery_manifest_settled):
+                    raise LifecycleError("never_started_unverified")
+            elif (not row["guardian_epoch"] or type(proof.active_process_count) is not int or
                     proof.active_process_count != 0 or proof.process_ids != ()):
                 raise LifecycleError("never_started_unverified")
+            elif row["job_nonce"] is not None and (
+                    not proof.current_cpu_disabled or not proof.recovery_manifest_settled):
+                raise LifecycleError("restore_unverified")
         elif proof.active_process_count is not None or proof.process_ids is not None:
             # No Job exists for RESERVED/subspan records. Do not accept an
             # invented empty Job query or use the running parent's counts.
+            raise LifecycleError("never_started_unverified")
+        elif proof.job_creation_never_attempted:
             raise LifecycleError("never_started_unverified")
         if row["allocation_kind"] == "parent" and not proof.parent_membership:
             raise LifecycleError("parent_membership_unverified")

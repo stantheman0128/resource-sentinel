@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import os
 import re
+import threading
 from uuid import UUID, uuid4
 
 from .contracts import IdentityStatus
@@ -85,6 +86,22 @@ class PolicyCoordinator:
     def __init__(self, store, provider=None):
         self.store = store
         self.provider = NativePolicyProvider() if provider is None else provider
+        self._held = threading.local()
+
+    def current_guard(self):
+        """Return only this coordinator's current-thread validated ownership.
+
+        This is a trusted in-process borrowing seam, not a serialized lease or
+        a native query. An abandoned, released or uncertain scope confers no
+        authority; callers must still revalidate this nonce in their DB CAS.
+        """
+        return getattr(self._held, "guard", None)
+
+    def assert_held(self, guard=None):
+        current = self.current_guard()
+        if current is None or (guard is not None and current is not guard):
+            raise PolicyError("policy_scope_not_held")
+        return current
 
     def current_logon(self):
         value = self.provider.current_logon()
@@ -174,6 +191,8 @@ class PolicyCoordinator:
 
     @contextmanager
     def hold(self, guard):
+        if self.current_guard() is not None:
+            raise PolicyError("policy_scope_nested")
         scope = self.provider.hold(guard.binding, timeout_ms=250)
         enter, leave = getattr(type(scope), "__enter__", None), getattr(type(scope), "__exit__", None)
         if not callable(enter) or not callable(leave):
@@ -201,15 +220,21 @@ class PolicyCoordinator:
                 self.record_recovery_hold(guard)
                 safe_to_clear = True
                 raise PolicyError("policy_mutex_abandoned")
+            self._held.guard = guard
             yield guard
             safe_to_clear = True
         except BaseException as primary:
             notes = tuple(getattr(primary, "__notes__", ()))
+            # The yield body (including nested evidence cleanup) is over.
+            # Never expose borrowing authority during native release/cleanup.
+            self._held.guard = None
             try:
                 suppressed = leave(scope, type(primary), primary, primary.__traceback__)
             except BaseException:
                 primary.add_note("policy_scope_cleanup_failed")
                 raise primary
+            finally:
+                self._held.guard = None
             if suppressed or tuple(getattr(primary, "__notes__", ())) != notes:
                 primary.add_note("policy_scope_cleanup_unverified")
             elif safe_to_clear or (guard.clean_rejection and not notes):
@@ -221,5 +246,9 @@ class PolicyCoordinator:
         else:
             # The production provider returns only after ReleaseMutex and
             # handle cleanup succeeded. Cleanup failure retains the exact nonce.
-            leave(scope, None, None, None)
+            self._held.guard = None
+            try:
+                leave(scope, None, None, None)
+            finally:
+                self._held.guard = None
             self._clear(guard)

@@ -5,7 +5,7 @@ import json
 import sqlite3
 import threading
 import unittest
-from tests.fixtures.adaptive_evidence import fixture_evidence_provider
+from tests.fixtures.adaptive_evidence import FixturePolicyProvider, fixture_evidence_provider
 from unittest.mock import patch
 
 from sentinel.adaptive.contracts import AllocationKind
@@ -221,7 +221,8 @@ class AdaptivePrelaunchTests(unittest.TestCase):
                     if operation in {"claim", "cancel"}:
                         start.wait(timeout=5)
                     return proof
-                contender = LifecycleStore(self.db, evidence_provider=fixture_evidence_provider(rendezvous))
+                contender = LifecycleStore(self.db, evidence_provider=fixture_evidence_provider(rendezvous),
+                                           policy_provider=FixturePolicyProvider(fixtures.WRAPPER.logon_id))
                 def invoke(operation):
                     try:
                         if operation == "claim":

@@ -41,44 +41,80 @@ class AllocationTransitionTests(unittest.TestCase):
         row = self.store.query(spec.execution_id)
         self.assertEqual((row["state"], row["state_revision"], row["job_name"]), ("RESERVED", 0, None))
 
-    def test_allocation_change_during_claim_verification_cannot_authorize_launch(self):
-        corruptions = (
-            ("DELETE FROM {table} WHERE id=?", "allocation_missing"),
-            ("UPDATE {table} SET lifecycle_managed=0 WHERE id=?", "allocation_binding_mismatch"),
-            ("UPDATE {table} SET cpu_units=cpu_units+1 WHERE id=?", "allocation_binding_mismatch"),
-            ("UPDATE {table} SET spec_hash='changed' WHERE id=?", "allocation_spec_mismatch"),
-        )
-        for kind in (AllocationKind.DIRECT, AllocationKind.ROUTED):
-            for sql, reason in corruptions:
-                with self.subTest(kind=kind, corruption=reason):
-                    self.store.evidence_provider = fixture_evidence_provider(self.verifier)
-                    spec, registered = self.registered(self.spec(kind=kind))
-                    self.store.mark_prepared(spec.execution_id, caller=fixtures.WRAPPER, expected_revision=0)
-                    table = "reservations" if kind is AllocationKind.DIRECT else "worker_reservations"
-                    def corrupt(operation, record, caller):
-                        evidence = self.verifier(operation, record, caller)
-                        if operation == "claim":
-                            self.connection().execute(sql.format(table=table), (spec.reservation.id,))
-                        return evidence
-                    self.store.evidence_provider = fixture_evidence_provider(corrupt)
-                    with self.assertRaisesRegex(LifecycleError, reason):
-                        self.claim(spec, registered)
-                    row = self.store.query(spec.execution_id)
-                    self.assertEqual((row["state"], row["state_revision"], row["claim_consumed"], row["launch_in_flight"]),
-                                     ("PREPARED", 1, 0, 0))
+    def assert_policy_uncertainty_retained(self):
+        runtime = self.connection().execute(
+            "SELECT policy_entry_nonce FROM adaptive_runtime WHERE singleton=1").fetchone()
+        self.assertIsNotNone(runtime["policy_entry_nonce"])
 
-    def test_routed_task_or_host_change_after_prepare_denies_claim(self):
-        for change, reason in (
-            ("UPDATE worker_reservations SET task_id='other'", "allocation_task_mismatch"),
-            ("UPDATE workers SET capabilities_json='{\"local\":false}'", "nonlocal_allocation"),
-        ):
-            with self.subTest(reason=reason):
-                spec, registered = self.registered(self.spec(kind=AllocationKind.ROUTED))
-                self.store.mark_prepared(spec.execution_id, caller=fixtures.WRAPPER, expected_revision=0)
-                self.connection().execute(change)
-                with self.assertRaisesRegex(LifecycleError, reason):
-                    self.claim(spec, registered)
-                self.assertEqual(self.store.query(spec.execution_id)["claim_consumed"], 0)
+    def assert_allocation_change_denies_claim(self, kind, sql, reason):
+        # Each caller is a separate test: uncertain native entry intentionally
+        # retains its nonce and must not be reset merely to run another case.
+        spec, registered = self.registered(self.spec(kind=kind))
+        self.store.mark_prepared(spec.execution_id, caller=fixtures.WRAPPER, expected_revision=0)
+        table = "reservations" if kind is AllocationKind.DIRECT else "worker_reservations"
+
+        def corrupt(operation, record, caller):
+            evidence = self.verifier(operation, record, caller)
+            if operation == "claim":
+                self.connection().execute(sql.format(table=table), (spec.reservation.id,))
+            return evidence
+
+        self.store.evidence_provider = fixture_evidence_provider(corrupt)
+        with self.assertRaisesRegex(LifecycleError, reason):
+            self.claim(spec, registered)
+        row = self.store.query(spec.execution_id)
+        self.assertEqual((row["state"], row["state_revision"], row["claim_consumed"], row["launch_in_flight"]),
+                         ("PREPARED", 1, 0, 0))
+        self.assert_policy_uncertainty_retained()
+
+    def test_direct_allocation_deleted_during_claim_denies_launch(self):
+        self.assert_allocation_change_denies_claim(
+            AllocationKind.DIRECT, "DELETE FROM {table} WHERE id=?", "allocation_missing")
+
+    def test_direct_managed_flag_changed_during_claim_denies_launch(self):
+        self.assert_allocation_change_denies_claim(
+            AllocationKind.DIRECT, "UPDATE {table} SET lifecycle_managed=0 WHERE id=?", "allocation_binding_mismatch")
+
+    def test_direct_cpu_changed_during_claim_denies_launch(self):
+        self.assert_allocation_change_denies_claim(
+            AllocationKind.DIRECT, "UPDATE {table} SET cpu_units=cpu_units+1 WHERE id=?", "allocation_binding_mismatch")
+
+    def test_direct_spec_changed_during_claim_denies_launch(self):
+        self.assert_allocation_change_denies_claim(
+            AllocationKind.DIRECT, "UPDATE {table} SET spec_hash='changed' WHERE id=?", "allocation_spec_mismatch")
+
+    def test_routed_allocation_deleted_during_claim_denies_launch(self):
+        self.assert_allocation_change_denies_claim(
+            AllocationKind.ROUTED, "DELETE FROM {table} WHERE id=?", "allocation_missing")
+
+    def test_routed_managed_flag_changed_during_claim_denies_launch(self):
+        self.assert_allocation_change_denies_claim(
+            AllocationKind.ROUTED, "UPDATE {table} SET lifecycle_managed=0 WHERE id=?", "allocation_binding_mismatch")
+
+    def test_routed_cpu_changed_during_claim_denies_launch(self):
+        self.assert_allocation_change_denies_claim(
+            AllocationKind.ROUTED, "UPDATE {table} SET cpu_units=cpu_units+1 WHERE id=?", "allocation_binding_mismatch")
+
+    def test_routed_spec_changed_during_claim_denies_launch(self):
+        self.assert_allocation_change_denies_claim(
+            AllocationKind.ROUTED, "UPDATE {table} SET spec_hash='changed' WHERE id=?", "allocation_spec_mismatch")
+
+    def assert_routed_identity_change_denies_claim(self, change, reason):
+        spec, registered = self.registered(self.spec(kind=AllocationKind.ROUTED))
+        self.store.mark_prepared(spec.execution_id, caller=fixtures.WRAPPER, expected_revision=0)
+        self.connection().execute(change)
+        with self.assertRaisesRegex(LifecycleError, reason):
+            self.claim(spec, registered)
+        self.assertEqual(self.store.query(spec.execution_id)["claim_consumed"], 0)
+        self.assert_policy_uncertainty_retained()
+
+    def test_routed_task_change_after_prepare_denies_claim(self):
+        self.assert_routed_identity_change_denies_claim(
+            "UPDATE worker_reservations SET task_id='other'", "allocation_task_mismatch")
+
+    def test_routed_host_change_after_prepare_denies_claim(self):
+        self.assert_routed_identity_change_denies_claim(
+            "UPDATE workers SET capabilities_json='{\"local\":false}'", "nonlocal_allocation")
 
     def test_lowered_floor_cannot_be_used_to_claim(self):
         spec, registered = self.registered()

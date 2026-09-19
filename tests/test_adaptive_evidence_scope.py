@@ -75,6 +75,44 @@ class ObservedProvider:
         return Scope()
 
 
+class EvidenceTransactionConnection(sqlite3.Connection):
+    """Recognize only policy-bookkeeping writes outside native evidence.
+
+    SQLite's authorizer reports actual write targets, so mentioning a policy
+    column cannot hide an allocation, lifecycle, or recovery-barrier mutation.
+    Each store connection owns one transaction; statement caching therefore
+    cannot hide a write reused from an earlier transaction on this connection.
+    """
+    policy_columns = {"policy_instance_id", "policy_logon_id", "policy_entry_nonce", "policy_binding_initialized"}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.write_targets = set()
+        self.set_authorizer(self.observe_statement)
+
+    def observe_statement(self, action, table, column, database, trigger):
+        if action in {sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_INSERT, sqlite3.SQLITE_DELETE}:
+            self.write_targets.add((action, table, column))
+        return sqlite3.SQLITE_OK
+
+    def transaction_operation(self):
+        test = self.observed_test
+        policy_only = bool(self.write_targets) and all(
+            action == sqlite3.SQLITE_UPDATE and table == "adaptive_runtime" and
+            column in self.policy_columns
+            for action, table, column in self.write_targets)
+        if test.provider.active is None and policy_only:
+            return "policy_metadata"
+        test.assertIsNotNone(test.provider.active,
+                             "non-policy transaction requires live lifecycle evidence")
+        return test.provider.active
+
+    def record(self, operation, event):
+        test = self.observed_test
+        events = test.policy_events if operation == "policy_metadata" else test.provider.events
+        events.append((operation, event))
+
+
 class AdaptiveEvidenceScopeTests(unittest.TestCase):
     connection = fixtures.AdaptiveLifecycleTests.connection
     spec = fixtures.AdaptiveLifecycleTests.spec
@@ -86,31 +124,34 @@ class AdaptiveEvidenceScopeTests(unittest.TestCase):
         fixtures.AdaptiveLifecycleTests.setUp(self)
         self.provider = ObservedProvider(self)
         self.store.evidence_provider = self.provider
+        self.policy_events = []
         self.commit_error = None
         self.original_connection = self.store._connection
         test = self
 
-        class ObservedConnection(sqlite3.Connection):
+        class ObservedConnection(EvidenceTransactionConnection):
+            observed_test = test
+
             def commit(self):
-                test.assertIsNotNone(test.provider.active)
+                operation = self.transaction_operation()
                 test.assertTrue(self.in_transaction)
-                operation = test.provider.active
-                test.provider.events.append((operation, "commit_enter"))
-                if test.commit_error is not None:
+                self.record(operation, "commit_enter")
+                if operation != "policy_metadata" and test.commit_error is not None:
                     raise test.commit_error
                 super().commit()
-                test.assertEqual(test.provider.active, operation)
+                test.assertEqual(test.provider.active,
+                                 None if operation == "policy_metadata" else operation)
                 test.assertFalse(self.in_transaction)
-                test.provider.events.append((operation, "committed"))
+                self.record(operation, "committed")
 
             def rollback(self):
-                test.assertIsNotNone(test.provider.active)
-                operation = test.provider.active
-                test.provider.events.append((operation, "rollback_enter"))
+                operation = self.transaction_operation()
+                self.record(operation, "rollback_enter")
                 super().rollback()
-                test.assertEqual(test.provider.active, operation)
+                test.assertEqual(test.provider.active,
+                                 None if operation == "policy_metadata" else operation)
                 test.assertFalse(self.in_transaction)
-                test.provider.events.append((operation, "rolled_back"))
+                self.record(operation, "rolled_back")
 
         @contextmanager
         def observed_connection():
@@ -133,7 +174,8 @@ class AdaptiveEvidenceScopeTests(unittest.TestCase):
         previous = self.store._connection
         self.store._connection = self.original_connection
 
-        class FailingConnection(sqlite3.Connection):
+        class FailingConnection(EvidenceTransactionConnection):
+            observed_test = test
             cleanup_failure_armed = False
 
             def execute(self, sql, *args):
@@ -143,17 +185,19 @@ class AdaptiveEvidenceScopeTests(unittest.TestCase):
                 return super().execute(sql, *args)
 
             def commit(self):
-                test.assertIsNotNone(test.provider.active)
-                self.cleanup_failure_armed = True
+                operation = self.transaction_operation()
+                # Metadata commits precede evidence acquisition; preserve the
+                # test's injected failure for the lifecycle transaction itself.
+                self.cleanup_failure_armed = operation != "policy_metadata"
                 result = super().commit()
-                test.provider.events.append((test.provider.active, "committed"))
+                self.record(operation, "committed")
                 return result
 
             def rollback(self):
-                test.assertIsNotNone(test.provider.active)
-                self.cleanup_failure_armed = True
-                if rollback_error is not None:
-                    test.provider.events.append((test.provider.active, "rollback_failed"))
+                operation = self.transaction_operation()
+                self.cleanup_failure_armed = operation != "policy_metadata"
+                if operation != "policy_metadata" and rollback_error is not None:
+                    self.record(operation, "rollback_failed")
                     raise rollback_error
                 return super().rollback()
 
@@ -210,7 +254,22 @@ class AdaptiveEvidenceScopeTests(unittest.TestCase):
             self.assertEqual([event for _, event in events],
                              ["enter", "verified", "commit_enter", "committed", "exit"])
             self.assertEqual(len({operation for operation, _ in events}), 1)
+        self.assertEqual(self.policy_events,
+                         [("policy_metadata", "commit_enter"), ("policy_metadata", "committed")] * 2)
         self.assertIsNone(self.provider.active)
+
+    def test_policy_metadata_cannot_disguise_a_mutation_without_evidence(self):
+        with self.store._connection() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("UPDATE adaptive_runtime SET policy_entry_nonce=NULL WHERE singleton=1")
+            conn.execute("UPDATE adaptive_runtime SET admission_barrier='RECOVERY_HOLD' WHERE singleton=1")
+            with self.assertRaisesRegex(AssertionError, "requires live lifecycle evidence"):
+                conn.commit()
+            # Deliberately bypass observation only to clean up this rejected
+            # instrumentation probe; no production path uses this escape.
+            sqlite3.Connection.rollback(conn)
+        self.assertEqual(self.provider.events, [])
+        self.assertEqual(self.policy_events, [])
 
     def test_body_failure_rolls_back_before_cleanup_and_preserves_exact_exception(self):
         spec, _ = self.registered()

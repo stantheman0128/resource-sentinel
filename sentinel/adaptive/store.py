@@ -154,6 +154,13 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
                     CHECK(admission_barrier IN ('NONE','CONTROLLING','RECOVERY_HOLD'))
             )""")
             conn.execute("INSERT INTO adaptive_runtime(singleton,schema_version,protocol_version) VALUES(1,1,1)")
+        # Binding is initialized only by a verified policy operation, never by
+        # an ordinary constructor. Partial/malformed existing values fail shut.
+        for name in ("policy_instance_id", "policy_logon_id", "policy_entry_nonce"):
+            if name not in _columns(conn, "adaptive_runtime"):
+                conn.execute(f"ALTER TABLE adaptive_runtime ADD COLUMN {name} TEXT")
+        if "policy_binding_initialized" not in _columns(conn, "adaptive_runtime"):
+            conn.execute("ALTER TABLE adaptive_runtime ADD COLUMN policy_binding_initialized INTEGER NOT NULL DEFAULT 0 CHECK(policy_binding_initialized IN (0,1))")
         state_sql = ",".join("'" + value + "'" for value in _STATES)
         conn.execute(f"""CREATE TABLE IF NOT EXISTS managed_executions (
             execution_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, session_id TEXT NOT NULL,
@@ -441,7 +448,7 @@ def commit_managed_admission(conn: sqlite3.Connection, admission, reservation_id
 
 class LifecycleStore:
     def __init__(self, db_path: str | Path, *, evidence_provider: Callable[[str, Mapping[str, Any], ProcessIdentity], ContextManager[LifecycleEvidence]] | None = None,
-                 local_host_id: str | None = None):
+                 local_host_id: str | None = None, policy_provider=None):
         self.db_path = Path(db_path)
         self.evidence_provider = (_unavailable_evidence_provider
                                   if evidence_provider is None else evidence_provider)
@@ -453,6 +460,10 @@ class LifecycleStore:
         self._local_context = {"local_host_id": self.local_host_id}
         with self._connection() as conn:
             migrate_schema(conn)
+        from .policy import PolicyCoordinator
+        # This is an explicit fixture seam independent of lifecycle evidence.
+        # Construction creates no mutex and performs no native identity query.
+        self._policy = PolicyCoordinator(self, policy_provider)
 
     @contextmanager
     def _connection(self):
@@ -679,43 +690,157 @@ class LifecycleStore:
                                     "guardian_epoch": proof.guardian_epoch, "coverage": "job_contained"}))
 
     def claim_launch(self, execution_id: str, *, caller: ProcessIdentity, claim_token: str, spec_hash: str, guardian_epoch: str, expected_revision: int) -> dict[str, Any]:
+        from .policy import PolicyBusy, PolicyError
+        from .windows import NativePolicyMutexError
+
         if not isinstance(claim_token, str) or not 32 <= len(claim_token) <= 128 or not claim_token.isascii():
             raise LifecycleError("invalid_claim_token")
-        snapshot = self.query(execution_id)
-        # A consumed claim is a read-only retry, never another launch authority.
-        # Authenticate its immutable binding without requiring a surviving Job.
-        self._caller(snapshot, caller)
         token_hash = hashlib.sha256(claim_token.encode("ascii")).hexdigest()
-        with self._connection() as conn:
-            token_row = self._get(conn, execution_id)
-            if not hmac.compare_digest(token_row["claim_token_hash"], token_hash) or token_row["spec_hash"] != spec_hash:
+
+        def authenticate(row):
+            self._caller(row, caller)
+            if not hmac.compare_digest(row["claim_token_hash"], token_hash) or row["spec_hash"] != spec_hash:
                 raise LifecycleError("claim_binding_mismatch")
-            if token_row["guardian_epoch"] != guardian_epoch or not guardian_epoch:
+            if row["guardian_epoch"] != guardian_epoch or not guardian_epoch:
                 raise LifecycleError("guardian_identity_mismatch")
-            if token_row["claim_consumed"]:
-                return {**self._public(token_row), "launch_authorized": False, "duplicate": True}
-        self._require_revision(snapshot, expected_revision)
-        with self._evidence_scope("claim", snapshot, caller) as proof:
-            if proof.guardian_epoch != guardian_epoch or not guardian_epoch:
-                raise LifecycleError("guardian_identity_mismatch")
-            with self._transaction() as conn:
+
+        def inspect():
+            # Duplicate delivery remains read-only, even under a barrier or
+            # uncertain policy nonce. It never receives a new launch authority.
+            with self._connection() as conn:
+                _check_version(conn)
                 row = self._get(conn, execution_id)
-                self._caller(row, caller)
-                if not hmac.compare_digest(row["claim_token_hash"], token_hash) or row["spec_hash"] != spec_hash:
-                    raise LifecycleError("claim_binding_mismatch")
-                if row["guardian_epoch"] != guardian_epoch:
-                    raise LifecycleError("guardian_identity_mismatch")
+                authenticate(row)
                 if row["claim_consumed"]:
-                    return {**self._public(row), "launch_authorized": False, "duplicate": True}
+                    return self._public(row), True
                 self._require_revision(row, expected_revision)
                 if row["state"] != "PREPARED" or row["launch_sealed"]:
                     raise LifecycleError("invalid_lifecycle_transition")
                 runtime = conn.execute("SELECT guardian_epoch,admission_barrier FROM adaptive_runtime WHERE singleton=1").fetchone()
-                if runtime[0] != guardian_epoch or runtime[1] != "NONE":
+                if runtime is None or runtime[0] != guardian_epoch or runtime[1] != "NONE":
                     raise LifecycleError("launch_barrier_active")
-                self._require_allocation(conn, execution_id)
-                updated = self._cas(conn, execution_id, expected_revision, {"state": "LAUNCHING", "claim_consumed": 1, "launch_in_flight": 1})
-                return {**self._public(updated), "launch_authorized": True, "duplicate": False}
+                return self._public(row), False
+
+        snapshot, duplicate = inspect()
+        if duplicate:
+            return {**snapshot, "launch_authorized": False, "duplicate": True}
+        try:
+            logon_id = self._policy.current_logon()
+            if logon_id != caller.logon_id:
+                raise PolicyError("policy_logon_mismatch")
+            deadline = time.monotonic() + 1.0
+            while True:
+                try:
+                    guard = self._policy.prepare(logon_id)
+                    break
+                except PolicyBusy:
+                    snapshot, duplicate = inspect()
+                    if duplicate:
+                        return {**snapshot, "launch_authorized": False, "duplicate": True}
+                    if time.monotonic() >= deadline:
+                        raise
+                    # No connection/transaction/native mutex is held here.
+                    time.sleep(min(.01, max(0, deadline - time.monotonic())))
+            with self._policy.hold(guard):
+                # Another delivery may have committed immediately before this
+                # entry acquired its nonce. Recheck before asking for native
+                # lifecycle evidence, which a read-only duplicate never needs.
+                with self._connection() as conn:
+                    _check_version(conn)
+                    completed = self._get(conn, execution_id)
+                    is_duplicate = (completed["claim_consumed"] and
+                        hmac.compare_digest(completed["claim_token_hash"], token_hash) and
+                        completed["spec_hash"] == spec_hash and completed["guardian_epoch"] == guardian_epoch and
+                        completed["wrapper_pid"] == caller.pid and
+                        completed["wrapper_created_filetime_100ns"] == str(caller.created_filetime_100ns) and
+                        completed["logon_id"] == caller.logon_id)
+                    duplicate_result = ({**self._public(completed), "launch_authorized": False, "duplicate": True}
+                                        if is_duplicate else None)
+                if duplicate_result is not None:
+                    return duplicate_result
+                # POLICY precedes the provider, which may own a per-Job fence.
+                # Both survive the claim transaction and its cleanup.
+                with self._evidence_scope("claim", snapshot, caller) as proof:
+                    if proof.guardian_epoch != guardian_epoch:
+                        raise LifecycleError("guardian_identity_mismatch")
+                    decision_error = None
+                    try:
+                        with self._transaction() as conn:
+                            runtime = self._policy.revalidate(conn, guard)
+                            row = self._get(conn, execution_id)
+                            try:
+                                authenticate(row)
+                                if row["claim_consumed"]:
+                                    result = {**self._public(row), "launch_authorized": False, "duplicate": True}
+                                else:
+                                    self._require_revision(row, expected_revision)
+                                    if row["state"] != "PREPARED" or row["launch_sealed"]:
+                                        raise LifecycleError("invalid_lifecycle_transition")
+                                    if runtime["guardian_epoch"] != guardian_epoch or runtime["admission_barrier"] != "NONE":
+                                        raise LifecycleError("launch_barrier_active")
+                                    result = None
+                            except LifecycleError as error:
+                                # Mark only these checks at the actual decision
+                                # point, not a provider raising a similar error.
+                                decision_error = error
+                                raise
+                            if result is None:
+                                self._require_allocation(conn, execution_id)
+                                updated = self._cas(conn, execution_id, expected_revision,
+                                    {"state": "LAUNCHING", "claim_consumed": 1, "launch_in_flight": 1})
+                                result = {**self._public(updated), "launch_authorized": True, "duplicate": False}
+                    except LifecycleError as error:
+                        # Rollback and connection cleanup have now completed.
+                        if error is decision_error and not getattr(error, "__notes__", ()):
+                            guard.clean_rejection = True
+                        raise
+            # No successful authority ACK before native release + nonce clear.
+            return result
+        except (PolicyError, NativePolicyMutexError) as error:
+            raise LifecycleError(str(error)) from error
+
+    def enter_recovery_hold(self, *, expected_registry_revision: int,
+                            reason: str = "recovery_unverified") -> dict[str, Any]:
+        """Persist a conservative barrier under POLICY; never clear or tighten.
+
+        This internal cooperating-writer operation grants no guardian/actuator
+        authority. A repeated existing hold is a read-only acknowledgement.
+        """
+        from .policy import PolicyError
+        from .windows import NativePolicyMutexError
+        if type(expected_registry_revision) is not int or expected_registry_revision < 0:
+            raise ValueError("invalid_registry_revision")
+        if reason != "recovery_unverified":
+            raise ValueError("invalid_recovery_reason")
+        with self._connection() as conn:
+            _check_version(conn)
+            row = self._policy._runtime(conn)
+        if row["admission_barrier"] == "RECOVERY_HOLD":
+            return {"admission_barrier": "RECOVERY_HOLD", "registry_revision": row["registry_revision"]}
+        if row["registry_revision"] != expected_registry_revision:
+            raise LifecycleError("revision_conflict")
+        try:
+            logon_id = self._policy.current_logon()
+            guard = self._policy.prepare(logon_id)
+            with self._policy.hold(guard):
+                decision_error = None
+                try:
+                    with self._transaction() as conn:
+                        row = self._policy.revalidate(conn, guard)
+                        if row["admission_barrier"] != "RECOVERY_HOLD":
+                            if row["registry_revision"] != expected_registry_revision:
+                                decision_error = LifecycleError("revision_conflict")
+                                raise decision_error
+                            conn.execute("UPDATE adaptive_runtime SET admission_barrier='RECOVERY_HOLD',registry_revision=registry_revision+1 WHERE singleton=1")
+                        row = self._policy._runtime(conn)
+                        result = {"admission_barrier": row["admission_barrier"], "registry_revision": row["registry_revision"]}
+                except LifecycleError as error:
+                    if error is decision_error and not getattr(error, "__notes__", ()):
+                        guard.clean_rejection = True
+                    raise
+            return result
+        except (PolicyError, NativePolicyMutexError) as error:
+            raise LifecycleError(str(error)) from error
 
     @staticmethod
     def _require_never_started(row: Mapping[str, Any], proof: LifecycleEvidence) -> None:

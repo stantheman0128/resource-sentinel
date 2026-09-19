@@ -8,7 +8,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
-from tests.fixtures.adaptive_evidence import fixture_evidence_provider
+from tests.fixtures.adaptive_evidence import FixturePolicyProvider, fixture_evidence_provider
 import uuid
 
 from sentinel.adaptive.contracts import (
@@ -25,8 +25,8 @@ from sentinel.maintainer import Maintainer
 
 NOW = 2_000_000_000.0
 GIB = 1 << 30
-WRAPPER = ProcessIdentity(101, 134342315823996135, "test-logon")
-ROOT = ProcessIdentity(102, 134342315823996140, "test-logon")
+WRAPPER = ProcessIdentity(101, 134342315823996135, "S-1-5-5-1-2")
+ROOT = ProcessIdentity(102, 134342315823996140, "S-1-5-5-1-2")
 
 
 class SyntheticVerifier:
@@ -59,7 +59,9 @@ class AdaptiveLifecycleTests(unittest.TestCase):
         Maintainer(self.directory)
         self.db = self.directory / "sentinel.db"
         self.verifier = SyntheticVerifier()
-        self.store = LifecycleStore(self.db, evidence_provider=fixture_evidence_provider(self.verifier))
+        self.policy = FixturePolicyProvider(WRAPPER.logon_id)
+        self.store = LifecycleStore(self.db, evidence_provider=fixture_evidence_provider(self.verifier),
+                                    policy_provider=self.policy)
 
     def connection(self):
         conn = sqlite3.connect(self.db, timeout=3, isolation_level=None)

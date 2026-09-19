@@ -140,6 +140,7 @@ if ($gpu.source -eq 'none') {
 
 # ---------- process snapshot 2 (trees + cpu + io) ----------
 Set-CollectorStage 'process_snapshot_2_trees_cpu_io'
+$leaseDisplayProcessSampleStarted = [DateTimeOffset]::Now
 $procs = Get-CimInstance Win32_Process |
     Select-Object ProcessId, ParentProcessId, Name, WorkingSetSize,
                   KernelModeTime, UserModeTime, WriteTransferCount, CreationDate
@@ -956,6 +957,34 @@ try {
 } catch { }
 
 # ---------- dashboard data (data.js) + static page copy ----------
+# Optional display-only probe. Reuse the existing process snapshot; never query
+# leases through the mutating grant API or enumerate processes a second time.
+Set-CollectorStage 'exemption_display_probe'
+$leaseDisplayJs = '{"version":1,"exemptions":{"state":"unavailable","occupied":null,"limit":null,"leases":[]}}'
+try {
+    . (Join-Path $PSScriptRoot 'bounded-query.ps1')
+    $leaseDisplayArgs = '"' + (Join-Path $PSScriptRoot 'exemption-snapshot.py') + '" --data-dir "' + $dataDir + '"'
+    try {
+        $leaseDisplayPath = Join-Path $dataDir 'lease-display-processes.json'
+        $leaseDisplayNodes = @($procs | Where-Object { $_.ProcessId -gt 0 -and $null -ne $_.CreationDate } | ForEach-Object {
+            @{ pid = [int]$_.ProcessId;
+               create_time = (([datetime]$_.CreationDate).ToUniversalTime() - [datetime]::new(1970,1,1,0,0,0,[DateTimeKind]::Utc)).TotalSeconds }
+        })
+        # The oldest observation time bounds freshness conservatively, including
+        # a slow CIM enumeration. Do not restamp these identities at publication.
+        @{ sampled_epoch = $leaseDisplayProcessSampleStarted.ToUnixTimeSeconds(); processes = $leaseDisplayNodes } |
+            ConvertTo-Json -Depth 4 -Compress | Set-Content -LiteralPath "$leaseDisplayPath.tmp" -Encoding ascii
+        Move-Item -LiteralPath "$leaseDisplayPath.tmp" -Destination $leaseDisplayPath -Force
+        $leaseDisplayArgs += ' --process-snapshot-file "' + $leaseDisplayPath + '"'
+    } catch { } # Lease facts remain readable; unavailable identities stay unknown.
+    # Requires python.exe on PATH. Launcher-only (py) installs stay unavailable:
+    # do not add an unbounded launcher child whose lifetime escapes this probe.
+    $leaseDisplayPython = (Get-Command python.exe -ErrorAction Stop).Source
+    $leaseDisplayRaw = Invoke-BoundedQuery $leaseDisplayPython $leaseDisplayArgs 3000
+    $leaseDisplayParsed = $leaseDisplayRaw | ConvertFrom-Json
+    if ($leaseDisplayParsed.version -ne 1 -or $null -eq $leaseDisplayParsed.exemptions) { throw 'InvalidLeaseDisplay' }
+    $leaseDisplayJs = $leaseDisplayRaw
+} catch { }
 Set-CollectorStage 'dashboard_data_data_js_static_page_copy'
 $dataJsPath = Join-Path $dataDir 'data.js'
 $orchestratorSnapshot = @{}
@@ -980,6 +1009,7 @@ $js = @(
     'window.SENTINEL_STATUS=' + ($status | ConvertTo-Json -Depth 5 -Compress) + ';'
     'window.SENTINEL_SAMPLES=' + $samplesJs + ';'
     'window.SENTINEL_EVENTS=' + $evJs + ';'
+    'window.SENTINEL_EXEMPTIONS=' + $leaseDisplayJs + ';'
     'window.SENTINEL_ORCHESTRATOR=' + ($orchestratorSnapshot | ConvertTo-Json -Depth 8 -Compress) + ';'
 )
 $tmp = "$dataJsPath.tmp"

@@ -41,6 +41,8 @@
   .warn { color: var(--yellow); } .crit { color: var(--red); }
   .empty { color: var(--dim); font-size: 13px; }
   .tag { background: var(--line); border-radius: 4px; padding: 1px 6px; font-size: 11px; color: var(--dim); }
+  .lease-card { padding: 10px 0; border-bottom: 1px solid var(--line); }
+  .lease-card p { margin-top: 4px; }
 </style>
 </head>
 <body>
@@ -72,6 +74,13 @@
   <div id="orchestration"></div>
 </section>
 
+<section aria-labelledby="exemption-title">
+  <h2 id="exemption-title">臨時豁免</h2>
+  <p id="exemption-summary">等待租約資料。</p>
+  <div id="exemption-active"></div>
+  <details data-panel="exemptions"><summary>查看租約識別與歷史</summary><div id="exemption-details"></div></details>
+</section>
+
 <section>
   <h2>Active reservations</h2>
   <div id="reservations"></div>
@@ -99,6 +108,45 @@ setTimeout(() => location.reload(), 5000 - (Date.now() % 5000) + 250);
 const esc = value => String(value == null ? '' : value)
   .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
   .replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+
+// BEGIN EXEMPTION DISPLAY
+(function renderExemptionPanel() {
+  const snapshot = window.SENTINEL_EXEMPTIONS || {};
+  const leases = snapshot.exemptions || {};
+  const rows = Array.isArray(leases.leases) ? leases.leases : [];
+  const escape = value => String(value == null ? '' : value).replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+  const label = value => typeof value === 'string' ? value.trim() : '';
+  const when = value => typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? new Date(value * 1000).toLocaleString() : '未知';
+  const age = Date.now() / 1000 - snapshot.observed_at;
+  const fresh = typeof snapshot.observed_at === 'number' && Number.isFinite(age) && age >= -30 && age <= 90;
+  const occupied = Number.isInteger(leases.occupied) && leases.occupied >= 0 ? leases.occupied : null;
+  const limit = Number.isInteger(leases.limit) && leases.limit > 0 ? leases.limit : '未知';
+  document.getElementById('exemption-summary').textContent = occupied === null
+    ? '豁免名額未知，等待正式租約資料。'
+    : `名額占用 ${occupied}／${limit} · 最近到期 ${when(leases.next_expiry)}` +
+      (!fresh ? ' · 資料延遲，等待更新' : leases.state !== 'ok' ? ' · 程序身分待確認' : '');
+  const active = rows.filter(row => row.occupies_slot === true).slice(0, 3);
+  document.getElementById('exemption-active').innerHTML = active.length ? active.map(row => {
+    const context = [label(row.agent), label(row.project)].filter(Boolean).map(escape).join(' · ');
+    return `<article class="lease-card"><strong>${escape(label(row.session_name) || '尚未記錄 session 名稱')}</strong>` +
+      (context ? `<p class="stamp">${context}</p>` : '') +
+      `<p class="stamp">${escape(label(row.process_name) || label(row.agent) || '程序')} · PID ${escape(row.root_pid ?? '未知')} · 原始到期 ${escape(when(row.expires_at))}</p>` +
+      `<p class="stamp">占位 · ${escape(row.state)}</p></article>`;
+  }).join('') : `<p class="empty">${fresh && leases.state === 'ok' && occupied === 0
+    ? '目前沒有占位的豁免租約。' : '尚無可確認的占位租約明細。'}</p>`;
+  document.getElementById('exemption-details').innerHTML =
+    '<p class="stamp">以正式資料的未到期、未撤銷租約計數。程序退出仍可能占位，頁面不會自行釋放名額。無法核實的 session 名稱保留未知。</p>' +
+    (rows.length ? '<table><tr><th>任務／session</th><th>原始到期</th><th>名額／有效性</th></tr>' + rows.map(row =>
+      `<tr><td><strong>${escape(label(row.session_name) || '未記錄 session 名稱')}</strong><br>` +
+      `<span class="stamp">${escape(label(row.agent))} ${escape(label(row.project))}</span>` +
+      `<details><summary>租約識別</summary>${escape(row.id)} · PID ${escape(row.root_pid)}<br>` +
+      `session ${escape(label(row.session_id) || '未記錄')} · ${escape(label(row.attribution_source) || 'unrecorded')}</details></td>` +
+      `<td>${escape(when(row.expires_at))}</td><td>${row.occupies_slot === true ? '占位' : '未占位'} · ${escape(row.state)}</td></tr>`
+    ).join('') + '</table>' : '');
+})();
+// END EXEMPTION DISPLAY
 
 if (!S) {
   document.getElementById('stamp').textContent = '讀不到 data.js — 採集器還沒跑過？';

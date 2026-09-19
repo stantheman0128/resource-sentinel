@@ -21,9 +21,10 @@ Implementation edits are isolated in `.worktrees/adaptive-scheduler-implementati
 
 The dashboard/attribution dependency baseline includes preexisting dirty or
 untracked work: do not wholesale stage those files or treat the full diff against
-HEAD as this task's patch. The display implementation and tests remain as local
-changes in both working trees; only this new evidence document is independently
-committable. Preserve unrelated disk/P1 implementation changes.
+HEAD as this task's patch. The first display implementation remained local
+because of this dependency boundary. The resume work below extracts a narrowly
+publishable alternative; the larger pre-existing baseline remains protected.
+Preserve unrelated disk/P1 implementation changes.
 
 ## Validation and activation
 
@@ -42,9 +43,39 @@ updates use the existing refresh behavior.
 
 ## Remaining integration boundary
 
-The requested local display fix is active. A clean checkout of the implementation
-branch does not yet contain the preexisting uncommitted dashboard/attribution
-baseline. Integrate that baseline through its own reviewed commit before trying
-to publish this dependent source delta; do not silently scoop it into an adaptive
-commit. Original empty-metadata leases can use the verified Claude fallback;
-partially recorded metadata remains authoritative and is not merged automatically.
+The requested local display fix is active. Original empty-metadata leases can
+use the verified Claude fallback; partially recorded metadata remains
+authoritative and is not merged automatically.
+
+## Resume: independent publication
+
+The fix is now extracted into `sentinel/lease_display.py` and a bounded,
+read-only `scripts/exemption-snapshot.py`. Minimal sanitizer/DB prerequisites
+have explicit P0 provenance in the module. They do not depend on the uncommitted
+attribution, dashboard or pressure modules. HEAD-based HTML/collector patches
+add only the visible lease panel and its read-only producer; the working-tree
+versions and unrelated changes are not replaced.
+
+The display lookup budget of three is not grant authority. The CLI reads the
+installed grant implementation's public limit constant when present and reports
+`null` otherwise; it does not claim an older checkout enforces a cap. No grant,
+revoke, migration or accounting mutation occurs. The optional collector child
+requires `python.exe` directly on PATH; a launcher-only installation reports
+display unavailable, without an unbounded `py` fallback.
+
+Independent review found two accuracy issues, both corrected: reused process
+snapshots keep their actual pre-enumeration timestamp, and a missing PID remains
+`identity_unknown` rather than being called exited. A positively observed
+different birth is `identity_mismatch`. Unknown occupied identities make the
+observation partial without changing occupancy. Corresponding two old fixture
+expectations were updated only after the original baseline had passed; they
+reflect this deliberate display-contract correction.
+
+Verification on a fresh archive of commit `82b542a`, overlaid with only the four
+new source/test files and two integration candidates: **26 Python tests passed**,
+independent Node renderer tests passed, and the PowerShell collector parsed.
+The first 24-test version also passed before review; the two additional cases
+cover the review findings. A capacity wait was honored before the final rerun.
+These results establish clean-checkout independence, not production activation
+or browser visual acceptance. The extracted collector version is not deployed;
+the earlier verified local display remains in place.

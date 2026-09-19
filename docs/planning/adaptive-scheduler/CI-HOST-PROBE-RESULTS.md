@@ -50,8 +50,38 @@ observations, restricted affinity/groups, inherited Jobs with zero CPU flags,
 exception redaction, unsupported platforms and the distinction between a
 successful observation and capability authority. They are not native evidence.
 
-The first remote result will be recorded after the reviewed source is pushed
-and the exact-commit workflow completes. No remote execution is claimed here.
+The first remote observation completed at 2026-09-19 22:09:23 UTC
+(2026-09-20 06:09:23 Asia/Taipei), on exact source
+`b590b276fcc778f8ed5965a39b7e0ec592a8dfef`:
+
+[GitHub Actions run 35472488128](https://github.com/stantheman0128/resource-sentinel/actions/runs/35472488128)
+
+| Field | Observed result |
+|---|---|
+| Workflow | Completed / success; valid observation, not capability success |
+| OS | Windows Server 2025, build 26100 |
+| Runner image in setup log | `windows-2025-vs2026`, `20260907.229.1` |
+| Python | 3.12.10, 64-bit |
+| Processor topology | 1 group, 4 logical processors |
+| Process/system affinity | 15 / 15 |
+| In any Job | **true** |
+| Immediate Job CPU flags | 0; ancestor chain still unknown |
+| Session zero | false; does not independently prove interactive context |
+| Native query errors | None |
+| Topology candidate | **false**: `foreign_or_unknown_parent_job` |
+| P1 / continuous admission / interactive verification | All false |
+| New OS control writes / created test Jobs | None |
+
+The script's `runner_image_os` is null because the observed image alias is
+outside its intentionally narrow environment-value allowlist. The official
+runner setup log supplies the image label above; no broader environment dump
+was used. The image version was returned by the probe as well.
+
+This existing Windows CI route therefore does not resolve the unknown-parent
+blocker. S1/S2/S3 remain unrun here. No breakaway, parent substitution, nested
+Sentinel Job or CI configuration workaround was attempted. Further native
+promotion needs a supported launch host plus real continuous admission and
+recovery custody; a valid observation alone supplies neither.
 
 ## Official contracts
 

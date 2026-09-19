@@ -7,6 +7,17 @@
 與 [P2 admission-only 實作紀錄](P2-ADMISSION-ONLY.md)。
 以下「只做規劃」及 GPT Pro 提示是原規劃階段的歷史背景，不限制後續已授權的實作。
 
+2026-09-20 最新整合：[S1 execution owner](P1-S1-EXECUTION-OWNER.md)
+已串接準入、建立前登記、單次 launch claim、恢復與清帳；
+481 項測試通過。這是 test-only 實作與帳本整合證據，
+native P1 與完整 P3–P6 仍未完成。`continuous_admission_provider_unavailable`
+表示 runtime authority 實作缺口，不是 Windows API 錯誤；之前觀測到的
+unknown inherited Job 是另一項尚未通過的 native 環境條件。
+
+後續已接上 [真實 ledger coverage 驗證](P2-LEDGER-COVERAGE.md)：S1 owner 會先直接
+驗證同一帳本的 exact allocation 與保留額度，再呼叫 host callback；237 項
+針對性測試通過。這不代表日常主機上所有舊 consumers 的 runtime 交接已完成。
+
 使用者要求：先自行嚴格質疑方案，把資料放入 repo；由使用者交給 GPT Pro
 完成 plan，再交回 Codex 實作。本包不代表使用者已選定控制演算法、常駐服務或參數。
 

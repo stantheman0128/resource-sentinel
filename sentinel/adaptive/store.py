@@ -399,6 +399,49 @@ def _unavailable_evidence_provider(operation: str, record: Mapping[str, Any],
     raise LifecycleError("native_lifecycle_evidence_unavailable")
 
 
+@contextmanager
+def _coverage_read_transaction(db_path):
+    """One bounded read-only snapshot; never migrate or recreate a lost DB."""
+    conn = None
+    deadline = time.monotonic() + .25
+    try:
+        try:
+            # The caller already pinned the absolute path before authenticating
+            # the admission. Never re-resolve a relative selector after that.
+            uri = Path(db_path).as_uri() + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=.25, isolation_level=None)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("PRAGMA trusted_schema=OFF")
+            conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+            conn.execute("BEGIN")
+            if not _check_version(conn):
+                raise LifecycleError("coverage_registry_unavailable")
+            yield conn
+            if time.monotonic() >= deadline:
+                raise LifecycleError("coverage_read_timeout")
+        except sqlite3.Error as error:
+            code = getattr(error, "sqlite_errorcode", None)
+            reason = ("coverage_read_timeout" if code == sqlite3.SQLITE_INTERRUPT else
+                      "coverage_database_busy" if code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED} else
+                      "coverage_registry_unavailable")
+            raise LifecycleError(reason) from None
+        except (OSError, TypeError, ValueError, OverflowError):
+            raise LifecycleError("coverage_registry_unavailable") from None
+    except BaseException as primary:
+        if conn is not None:
+            try:
+                conn.close()
+            except BaseException:
+                primary.add_note("coverage_reader_cleanup_failed")
+        raise
+    else:
+        try:
+            conn.close()
+        except BaseException:
+            raise LifecycleError("coverage_reader_cleanup_failed") from None
+
+
 def _registration_row(spec: ExecutionSpec, now: float) -> dict[str, Any]:
     kind = spec.reservation.kind.value
     row = {"execution_id": spec.execution_id, "task_id": spec.task_id, "session_id": spec.session_id,
@@ -776,6 +819,85 @@ class LifecycleStore:
         with self._connection() as conn:
             _check_version(conn)
             return self._public(self._get(conn, execution_id))
+
+    def assert_admission_covered(self, admission, expected_row: Mapping[str, Any]) -> None:
+        """Verify one direct admission's retained ledger custody, read-only.
+
+        This asserts neither host cohort cutover nor collector exclusion, native
+        containment, exemption state or control permission. The caller retains
+        its independent lifecycle/mutation fences. No terminal record, queued
+        intent or returned ``allowed`` flag substitutes for the exact allocation.
+        START_UNKNOWN and UNCERTAIN_HOLD still have custody to reconcile.
+        """
+        from .admission import ManagedAdmission
+
+        if type(admission) is not ManagedAdmission:
+            raise LifecycleError("managed_admission_context_required")
+        try:
+            ledger_path = Path(self.db_path).resolve()
+        except (OSError, TypeError, ValueError, RuntimeError):
+            raise LifecycleError("coverage_registry_unavailable") from None
+        snapshot = admission.snapshot_for_ledger(ledger_path)
+        names = (
+            "execution_id", "task_id", "session_id", "principal_id", "logon_id",
+            "allocation_kind", "reservation_id", "parent_execution_id", "spec_hash",
+            "admission_binding_hash", "wrapper_pid", "wrapper_created_filetime_100ns",
+            "role", "priority", "state", "state_revision", "coverage", "job_name", "job_nonce",
+            "guardian_epoch", "root_pid", "root_created_filetime_100ns", "root_outcome",
+            "claim_consumed", "launch_in_flight", "launch_sealed", "hold_reason",
+        ) + tuple(prefix + key for prefix in ("requested_", "floor_") for key in snapshot.requested.to_dict())
+        if not isinstance(expected_row, Mapping) or any(name not in expected_row for name in names):
+            raise LifecycleError("coverage_expected_row_invalid")
+        expected = {name: expected_row[name] for name in names}
+        if (expected["execution_id"] != snapshot.execution_id or
+                type(expected["state_revision"]) is not int or expected["state_revision"] < 0):
+            raise LifecycleError("coverage_expected_row_mismatch")
+
+        with _coverage_read_transaction(ledger_path) as conn:
+            row = self._get(conn, snapshot.execution_id)
+            self._require_revision(row, expected["state_revision"])
+            if any(row[name] != value for name, value in expected.items()):
+                raise LifecycleError("coverage_expected_row_mismatch")
+            if row["state"] in TERMINAL_STATES:
+                raise LifecycleError("coverage_execution_terminal")
+            if row["state"] not in {"RESERVED", "PREPARED", "LAUNCHING", "RUNNING", "DRAINING",
+                                    "START_UNKNOWN", "UNCERTAIN_HOLD"}:
+                raise LifecycleError("coverage_execution_state_invalid")
+            if row["allocation_kind"] != "direct" or row["parent_execution_id"] is not None:
+                raise LifecycleError("coverage_direct_allocation_required")
+            # This existing verifier checks all immutable admission metadata and
+            # the original claim/IPC binding. Its allowed=False for a held
+            # execution does not negate that execution's retained allocation.
+            replay = retry_managed_admission(conn, snapshot, local_context=self._local_context)
+            if replay is None:
+                raise LifecycleError("execution_not_found")
+            try:
+                source = validate_active_allocation(conn, snapshot.execution_id, local_context=self._local_context)
+            except AccountingError as error:
+                raise LifecycleError(str(error)) from error
+            reservation_id = row["reservation_id"]
+            if (conn.execute("SELECT count(*) FROM reservations WHERE execution_id=? OR id=?",
+                             (snapshot.execution_id, reservation_id)).fetchone()[0] != 1 or
+                    conn.execute("SELECT count(*) FROM worker_reservations WHERE execution_id=?",
+                                 (snapshot.execution_id,)).fetchone()[0] != 0 or
+                    conn.execute("""SELECT count(*) FROM managed_executions
+                        WHERE execution_id=? OR (allocation_kind='direct' AND reservation_id=?)""",
+                                 (snapshot.execution_id, reservation_id)).fetchone()[0] != 1):
+                raise LifecycleError("coverage_allocation_not_unique")
+            request = snapshot.request
+            bound = {
+                "id": reservation_id, "execution_id": snapshot.execution_id, "lifecycle_managed": 1,
+                "managed_spec_hash": snapshot.spec_hash, "request_key": request.request_key,
+                "spec_hash": request.spec_hash, "owner_pid": request.owner_pid,
+                "owner_started": request.owner_started, "tool_use_id": request.tool_use_id,
+                "repo": request.repo, "command_signature": request.command_signature, "command_text": "",
+                "resource_class": request.resource_class, "priority": request.priority,
+                "priority_rank": int(request.priority[1:]), "cpu_units": request.cpu_units,
+                "ram_gib": request.ram_gib, "io_slots": request.io_slots,
+                "physical_bytes": snapshot.requested.physical_bytes, "commit_bytes": snapshot.requested.commit_bytes,
+            }
+            if any(source["allocation"].get(key) != value for key, value in bound.items()):
+                raise LifecycleError("coverage_allocation_binding_mismatch")
 
     @staticmethod
     def _caller(row: Mapping[str, Any], caller: ProcessIdentity) -> None:

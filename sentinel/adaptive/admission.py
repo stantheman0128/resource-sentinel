@@ -213,6 +213,24 @@ class ManagedAdmission:
             self._submitted = True
             return snapshot, first_submission
 
+    def snapshot_for_ledger(self, db_path) -> ManagedAdmissionSnapshot:
+        """Revalidate this current wrapper and its already pinned ledger.
+
+        This read does not submit, export a launch credential, renew capacity or
+        unseal cancellation. It remains available after sealing so the original
+        owner can verify retained custody during cancellation and recovery.
+        A matching path is trusted configuration, not proof of host-wide writer
+        handoff or protection against a hostile replacement at that path.
+        """
+        with self._lock:
+            snapshot = self.snapshot()
+            path = self._ledger_path(db_path)
+            if not self._submitted or self._admission_db_path is None:
+                raise ManagedAdmissionUnavailable("managed_admission_not_submitted")
+            if path != self._admission_db_path:
+                raise ManagedAdmissionUnavailable("managed_admission_ledger_mismatch")
+            return snapshot
+
     def launch_claim_token(self) -> str:
         """Read the same private one-use claim after checking current identity.
 

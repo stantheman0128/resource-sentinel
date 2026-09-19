@@ -81,7 +81,9 @@ class S1ExecutionOwner:
     """Keep allocation, creation capability, native handles and journal together.
 
     ``authority`` is an in-process runtime owner, never deserialized input.
-    It provides assert_covered(admission, row) and assert_excluded(row), and
+    The owner always verifies its actual retained ledger allocation before
+    calling authority.assert_covered(admission, row) for host cohort coverage.
+    The authority also provides assert_excluded(row), and
     authorize_control(owner, target) must enforce fresh exemption state, the
     single-victim slot and the host admission barrier under the borrowed POLICY
     fence before any intent/Set. control_restored(owner) reports verified local
@@ -124,6 +126,12 @@ class S1ExecutionOwner:
         self._assert_row(row)
         if row["state"] != "RESERVED" or row["job_name"] is not None or row["claim_consumed"]:
             raise LifecycleError("case_owner_already_started")
+        self._assert_covered(row)
+
+    def _assert_covered(self, row):
+        # An injected host collaborator cannot replace actual ledger custody.
+        # This read grants neither launch nor permission to apply a CPU cap.
+        self.store.assert_admission_covered(self.admission, row)
         self.authority.assert_covered(self.admission, row)
 
     def _assert_row(self, row):
@@ -291,7 +299,7 @@ class S1ExecutionOwner:
                 with self.mutation_scope():
                     row = self.store.query(self.execution_id)
                     self._assert_row(row)
-                    self.authority.assert_covered(self.admission, row)
+                    self._assert_covered(row)
                     row = self.store.register_job_scope(self.execution_id, caller=self.caller,
                         expected_revision=row["state_revision"], guardian_epoch=self.guardian_epoch,
                         job_name=self.job_name, job_nonce=self.creation_nonce)
@@ -325,7 +333,7 @@ class S1ExecutionOwner:
             raise LifecycleError("case_identity_mismatch")
         with self.mutation_scope():
             self._assert_row(row)
-            self.authority.assert_covered(self.admission, row)
+            self._assert_covered(row)
             named = row["job_name"] is not None or operation == "register_scope"
             count, members = None, None
             current, settled, durable, initial = False, False, False, False
@@ -433,7 +441,7 @@ class S1ExecutionOwner:
             with self.mutation_scope():
                 row = self.store.query(self.execution_id)
                 self._assert_row(row)
-                self.authority.assert_covered(self.admission, row)
+                self._assert_covered(row)
                 self.authority.assert_excluded(row)
                 self.authority.authorize_control(self, target)
                 previous = self._read_manifest()

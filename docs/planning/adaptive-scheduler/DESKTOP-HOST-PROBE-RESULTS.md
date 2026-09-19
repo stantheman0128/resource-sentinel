@@ -132,3 +132,37 @@ authorize S1 CPU control. The separate live demand-floor continuity prerequisite
 is recorded in [CAPABILITY-RESULTS.md](CAPABILITY-RESULTS.md). Stop further unchanged
 desktop dispatch attempts; continue safe admission-only implementation until a
 supported host and continuous test admission coverage can be established.
+
+## Bounded holder-attribution follow-up, 2026-09-20
+
+One read-only PSS handle snapshot of the already identified, exact-held Explorer
+process completed under ordinary same-user rights. The initial sandboxed open
+returned Win32 5 before capture; the identical read outside that tool sandbox
+succeeded. It did not request administrator elevation or launch another child.
+
+The snapshot used only handles and handle-name flags (`0xC`), with no clone,
+virtual-memory/thread capture or process/Job control. Capture took 43.9 ms and
+the complete walk took 68.1 ms including capture. All 11,506 entries were walked
+under a 16,384-entry bound. Zero entries resolved to type `Job`, but 1,152 entries
+had no usable type name. The observed duration is not a hard timeout guarantee
+for the synchronous capture API.
+
+The held target's exact identity and liveness were rechecked. Walk-marker and
+snapshot cleanup both returned success, and the observer's target handle closed.
+No source-process handle was closed, no Job was opened or changed, no diagnostic
+tool was installed, and no runtime configuration or Scheduled Task changed.
+
+This does **not** prove the target holds no Job handles. Microsoft's
+[PSS object types](https://learn.microsoft.com/en-us/windows/win32/api/processsnapshot/ne-processsnapshot-pss_object_type)
+do not provide a supported Job-specific type, and
+[PSS_HANDLE_ENTRY](https://learn.microsoft.com/en-us/windows/win32/api/processsnapshot/ns-processsnapshot-pss_handle_entry)
+does not identify the Job creator or assignment ancestry. A holder/name would
+only be a candidate, not proof of the assigner. Complete attribution still needs
+a live held affected process and a reliable Job-object reference followed by
+exact membership matching; the earlier affected child has already exited.
+
+Private command text, actual output records, execution scope and cleanup are in
+`.local-adaptive/resume-host/pss-holder-attribution-20260920/`. The synchronous
+snapshot route is feasible but did not provide complete Job attribution. P1
+remains blocked; no CPU denominator, capability allowlist or native gate pass is
+inferred from this result. Do not repeat unchanged membership-only probes.

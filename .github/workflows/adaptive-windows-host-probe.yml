@@ -1,0 +1,43 @@
+name: Adaptive Windows host probe
+run-name: Read-only Windows host probe at ${{ github.sha }}
+
+# Host observations only: this does not run capability/control canaries or
+# authorize managed enrollment. The production adaptive mode remains off.
+on:
+  push:
+    branches:
+      - codex/adaptive-scheduler-implementation
+    paths:
+      - .github/workflows/adaptive-windows-host-probe.yml
+      - tests/windows/probe_adaptive_ci_host.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adaptive-windows-host-probe-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  host-probe:
+    if: >-
+      github.event_name == 'push' &&
+      github.repository == 'stantheman0128/resource-sentinel' &&
+      github.ref == 'refs/heads/codex/adaptive-scheduler-implementation'
+    runs-on: windows-2025
+    timeout-minutes: 5
+    steps:
+      - name: Check out the reviewed probe source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+          fetch-depth: 1
+          clean: false
+
+      # The script uses preinstalled Python and prints allowlisted diagnostics.
+      # Public logs must not contain environment dumps, credentials, or payloads.
+      - name: Read current runner host properties
+        shell: pwsh
+        timeout-minutes: 1
+        run: python -X utf8 tests/windows/probe_adaptive_ci_host.py

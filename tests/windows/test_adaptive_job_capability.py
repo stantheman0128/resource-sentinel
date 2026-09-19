@@ -48,6 +48,7 @@ from adaptive_win32 import (  # noqa: E402
 from tests.windows.adaptive_admission import (  # noqa: E402
     ContinuousAdmissionUnavailable, require_continuous_admission,
 )
+from sentinel.adaptive.contracts import ResourceDemand  # noqa: E402
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "adaptive_cpu_worker.py"
 ENABLED = os.name == "nt" and os.environ.get(OPT_IN) == "1"
@@ -153,7 +154,7 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
         cls.evidence = _isolated_evidence_directory()
         _write_json(cls.evidence / "stage-gate.json", cls._s1_gate.record())
         try:
-            require_continuous_admission()
+            cls.coverage = require_continuous_admission()
         except ContinuousAdmissionUnavailable as exc:
             _write_json(cls.evidence / "admission-gate.json", {
                 "status": "blocked", "reason": exc.reason,
@@ -177,16 +178,26 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
                                    "RDP/DFSS availability not established by preflight"],
         })
 
-    def _launch(self, job, directory, seconds, workers=1, foreign_probe=False):
-        import msvcrt
-        args = [sys.executable, str(FIXTURE), "--nonce", job.nonce,
-                "--job-name", job.name, "--directory", str(directory),
+    def _open_case(self, directory, seconds, workers=1, foreign_probe=False, cpu_units=None):
+        nonce = uuid.uuid4().hex
+        args = [sys.executable, str(FIXTURE), "--nonce", nonce,
+                "--job-name", "Local\\ResourceSentinel.Test.Job." + nonce, "--directory", str(directory),
                 "--seconds", str(seconds), "--workers", str(workers)]
         if foreign_probe:
             args.append("--probe-foreign-host")
-        from adaptive_win32 import launch_in_job
+        command = subprocess.list2cmdline(args)
+        requested = ResourceDemand(float(cpu_units if cpu_units is not None else workers + 1),
+                                   1 << 30, 1 << 30, 0)
+        owner = self.coverage.open_case(command=command, cwd=str(directory),
+            directory=directory, requested=requested, creation_nonce=nonce)
+        # Runtime retains the owner even if preparation raises before return.
+        job = owner.prepare()
+        return owner, job, command
+
+    def _launch(self, owner, command, directory):
+        import msvcrt
         with open(os.devnull, "rb") as source, open(os.devnull, "wb") as sink:
-            return launch_in_job(job, sys.executable, subprocess.list2cmdline(args),
+            return owner.launch_once(sys.executable, command,
                 cwd=str(directory), stdin_handle=msvcrt.get_osfhandle(source.fileno()),
                 stdout_handle=msvcrt.get_osfhandle(sink.fileno()),
                 stderr_handle=msvcrt.get_osfhandle(sink.fileno()))
@@ -202,7 +213,7 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
             time.sleep(0.05)
         self.fail(f"fixture failed to announce {count} contained members within {timeout}s")
 
-    def _cleanup(self, job, process, directory, record, deadline):
+    def _cleanup(self, owner, job, process, directory, record, deadline):
         """Restore/query first, then request voluntary stop and verify Job empty.
 
         Even a restore exception does not skip the independent stop request.
@@ -212,10 +223,12 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
         try:
             observed = job.query_cpu()
             record["cleanup_before"] = observed
-            if observed["flags"] & ENABLE:
-                if observed != record.get("intended_cpu"):
-                    raise RuntimeError("restore conflict: observed CPU control differs from own intent")
-                job.disable()
+        except Exception as exc:
+            # A broken observation handle must not prevent the separately
+            # retained owner from attempting restoration.
+            errors.append(f"observation query failed: {type(exc).__name__}: {exc}")
+        try:
+            owner.restore()
             record["cleanup_after"] = job.query_cpu()
             if record["cleanup_after"]["flags"] & ENABLE:
                 errors.append("CPU restriction still enabled")
@@ -238,15 +251,18 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
                 record["root_exit_code"] = process.exit_code()
         except Exception as exc:
             errors.append(f"empty verification failed: {type(exc).__name__}: {exc}")
-        if process is not None:
+        if not errors:
             try:
-                process.close()
+                record["lifecycle_terminal"] = owner.finalize()["state"]
             except Exception as exc:
-                errors.append(f"process handle close failed: {type(exc).__name__}: {exc}")
-        try:
-            job.close()
-        except Exception as exc:
-            errors.append(f"Job handle close failed: {type(exc).__name__}: {exc}")
+                errors.append(f"lifecycle finalization failed: {type(exc).__name__}: {exc}")
+        if not errors:
+            try:
+                owner.close()
+            except Exception as exc:
+                errors.append(f"owner handle close failed: {type(exc).__name__}: {exc}")
+        if errors:
+            owner._retain()
         record["cleanup_errors"] = errors
         record["handles_closed"] = job.handle is None and (process is None or process.handle is None)
         if errors:
@@ -261,15 +277,16 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
     def test_00_fixture_self_stops_and_job_has_no_other_limits(self):
         directory = self.evidence / "self-stop"
         directory.mkdir()
-        started = time.monotonic()
-        deadline = started + 120
-        job, process = OwnedJob.create(), None
+        owner, job, command = self._open_case(directory, seconds=2)
+        started = owner.observation_started_at
+        deadline = owner.observation_deadline
+        process = None
         record = {"case": "voluntary_self_stop", "status": "running", "nonce": job.nonce,
                   "job_security": job.security, "absolute_observation_seconds": 120}
         try:
             self.assertEqual(job.query_limits(), {"limit_flags": 0, "ui_restrictions": 0})
             self.assertEqual(job.query_cpu()["flags"], 0)
-            process = self._launch(job, directory, seconds=2)
+            process = self._launch(owner, command, directory)
             record["root_identity"] = process.identity()
             record["earliest_membership"] = self._ready(directory, 1, deadline)
             self.assertTrue(process.wait(max(0, min(8, deadline - time.monotonic()))),
@@ -285,15 +302,16 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
             process = exc.process
             raise
         finally:
-            self._cleanup(job, process, directory, record, deadline)
+            self._cleanup(owner, job, process, directory, record, deadline)
 
     @_s1_stage("empty_job_restore")
     def test_05_empty_job_can_reopen_and_restore_cpu_binding(self):
         """Prove API restoration before any capped workload, not CPU effect."""
         directory = self.evidence / "empty-job-restore"
         directory.mkdir()
-        deadline = time.monotonic() + 120
-        job, reopened = OwnedJob.create(), None
+        owner, job, _ = self._open_case(directory, seconds=0, cpu_units=1)
+        deadline = owner.observation_deadline
+        reopened = None
         record = {"case": "empty_job_restore_binding", "status": "running", "nonce": job.nonce,
                   "job_security": job.security, "cpu_effect_verified": False}
         try:
@@ -302,7 +320,7 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
             record["initial_cpu"] = job.query_cpu()
             self.assertEqual(record["initial_cpu"]["flags"], 0)
             # An empty named Job needs its original handle kept until reopen.
-            reopened = OwnedJob.open(job.name, job.nonce)
+            reopened = owner.reopen_probe()
             record["reopened_security"] = reopened.security
             self.assertEqual(reopened.query_cpu(), record["initial_cpu"])
             record["intended_cpu"] = {"flags": ENABLE | HARD_CAP, "rate_bp": 2500}
@@ -311,18 +329,18 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
                 "logon_sid": job.logon_sid, "original_cpu": record["initial_cpu"],
                 "target": record["intended_cpu"], "workload_process_count": 0,
             }, durable=True)
-            record["applied"] = job.set_cpu_rate(2500)
+            record["applied"] = owner.set_cpu_rate(2500)
             self.assertEqual(record["applied"], record["intended_cpu"])
             job.close()
             job, reopened = reopened, None
             self.assertEqual(job.query_cpu(), record["intended_cpu"])
-            record["disabled"] = job.disable()
+            record["disabled"] = owner.restore(through=job)
             self.assertEqual(record["disabled"]["flags"] & ENABLE, 0)
             self.assertEqual(job.active_pids(), [])
             record["status"] = "pass"
         finally:
             try:
-                self._cleanup(job, None, directory, record, deadline)
+                self._cleanup(owner, job, None, directory, record, deadline)
             finally:
                 if reopened is not None:
                     reopened.close()
@@ -331,11 +349,12 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
     def test_10_parent_job_is_explicitly_unsupported(self):
         directory = self.evidence / "foreign-parent"
         directory.mkdir()
-        deadline = time.monotonic() + 120
-        job, process = OwnedJob.create(), None
+        owner, job, command = self._open_case(directory, seconds=5, foreign_probe=True)
+        deadline = owner.observation_deadline
+        process = None
         record = {"case": "foreign_parent_negative", "status": "running", "nonce": job.nonce}
         try:
-            process = self._launch(job, directory, seconds=5, foreign_probe=True)
+            process = self._launch(owner, command, directory)
             record["root_identity"] = process.identity()
             self.assertTrue(process.wait(max(0, min(10, deadline - time.monotonic()))))
             self.assertEqual(process.exit_code(), 0)
@@ -348,7 +367,7 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
             process = exc.process
             raise
         finally:
-            self._cleanup(job, process, directory, record, deadline)
+            self._cleanup(owner, job, process, directory, record, deadline)
 
     def _window(self, job, deadline):
         start = time.monotonic()
@@ -381,8 +400,10 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
         for iteration in range(ROUNDS):
             directory = self.evidence / f"effect-{iteration:02d}"
             directory.mkdir()
-            deadline = time.monotonic() + 120
-            job, process, reopened = OwnedJob.create(), None, None
+            owner, job, command = self._open_case(directory, seconds=115, workers=workers,
+                                                  cpu_units=admission_cpu_estimate)
+            deadline = owner.observation_deadline
+            process, reopened = None, None
             record = {"case": "normal_host_25_percent", "round": iteration,
                       "status": "running", "nonce": job.nonce,
                       "target_cpu_units": target, "denominator_logical_processors": n,
@@ -397,7 +418,7 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
                 self.assertEqual(job.query_limits(), {"limit_flags": 0, "ui_restrictions": 0})
                 record["initial_cpu"] = job.query_cpu()
                 self.assertEqual(record["initial_cpu"]["flags"], 0)
-                process = self._launch(job, directory, seconds=115, workers=workers)
+                process = self._launch(owner, command, directory)
                 record["root_identity"] = process.identity()
                 record["earliest_membership"] = self._ready(directory, workers, deadline)
                 self.assertEqual(set(job.active_pids()), {item["pid"] for item in record["earliest_membership"]})
@@ -414,21 +435,21 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
                     "original_cpu": record["initial_cpu"], "target": record["intended_cpu"],
                     "fixture_maximum_lifetime_seconds": 120,
                 }, durable=True)
-                record["applied"] = job.set_cpu_rate(2500)
+                record["applied"] = owner.set_cpu_rate(2500)
                 self.assertEqual(record["applied"], {"flags": ENABLE | HARD_CAP, "rate_bp": 2500})
                 record["capped"] = self._window(job, deadline)
                 self.assertAlmostEqual(record["capped"]["cpu_units"], target,
                     delta=tolerance, msg="actual Job CPU does not match known denominator")
-                # Drop the original handle while the Job has live members. This
-                # is deliberately not called restoration. Reopen by owned nonce.
+                # Drop only the observation handle. The execution owner keeps
+                # separate custody; this is not an all-handles-lost experiment.
                 name, nonce = job.name, job.nonce
                 job.close()
-                reopened = OwnedJob.open(name, nonce)
+                reopened = owner.reopen_probe()
                 job = reopened
                 record["reopened_security"] = job.security
                 record["reopened_cpu"] = job.query_cpu()
                 self.assertEqual(record["reopened_cpu"], record["applied"])
-                record["disabled"] = job.disable()
+                record["disabled"] = owner.restore(through=job)
                 self.assertEqual(record["disabled"]["flags"] & ENABLE, 0)
                 record["restored"] = self._window(job, deadline)
                 self.assertGreaterEqual(record["restored"]["cpu_units"],
@@ -452,30 +473,10 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
                                      "win32_error": getattr(exc, "win32_error", None)}
                 raise
             finally:
-                # If reopen failed after closing, attempt exactly the same owned
-                # object once for restore; never create/adopt a replacement Job.
-                if job.handle is None:
-                    try:
-                        job = OwnedJob.open(name, nonce)
-                    except Exception as exc:
-                        record["restore_unverified"] = str(exc)
-                        record["job_empty_verified"] = False
-                        try:
-                            (directory / "stop").touch(exist_ok=True)
-                        except Exception as stop_exc:
-                            record["stop_error"] = str(stop_exc)
-                        if process is not None:
-                            try:
-                                record["root_exit_observed"] = process.wait(max(0, deadline - time.monotonic()))
-                            except Exception as wait_exc:
-                                record["root_observation_error"] = str(wait_exc)
-                            try:
-                                process.close()
-                            except Exception as close_exc:
-                                record["process_close_error"] = str(close_exc)
-                        _write_json(directory / "result.json", record)
-                        raise
-                self._cleanup(job, process, directory, record, deadline)
+                # A failed observation-handle reopen must not lose restoration
+                # or accounting ownership. Use the original retained handle.
+                cleanup_job = job if job.handle is not None else owner.job
+                self._cleanup(owner, cleanup_job, process, directory, record, deadline)
             completed.append(iteration)
         _write_json(self.evidence / "effect-summary.json", {
             "status": "pass", "supported_case": "normal_host_25_percent",

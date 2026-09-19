@@ -109,7 +109,20 @@ def main() -> int:
     check = sub.add_parser("exemption-check")
     check.add_argument("--pid", type=int, required=True)
     sub.add_parser("snapshot")
+    adaptive_query = sub.add_parser("adaptive-query", help="Read bounded lifecycle diagnostics without migrations or control writes")
+    adaptive_query.add_argument("--execution-id")
+    adaptive_query.add_argument("--reservation-id")
+    adaptive_query.add_argument("--limit", type=int, default=20)
     args = parser.parse_args()
+    if args.command == "adaptive-query":
+        from sentinel.adaptive.query import query_adaptive
+        try:
+            result = query_adaptive(Path(args.data_dir) / "sentinel.db", execution_id=args.execution_id,
+                                    reservation_id=args.reservation_id, limit=args.limit)
+        except ValueError as exc:
+            parser.error(str(exc))
+        print(json.dumps(result, separators=(",", ":")))
+        return 0 if result["available"] else 2
     if args.command.startswith("exemption-"):
         exemptions = Exemptions(args.data_dir)
         if args.command == "exemption-grant":

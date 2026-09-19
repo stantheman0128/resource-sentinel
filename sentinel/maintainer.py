@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 import re
+import socket
 import sqlite3
 import time
 import uuid
@@ -19,6 +21,11 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+from sentinel.accounting import frame_from_status, shared_admission_blockers
+from sentinel.adaptive.store import (
+    allocation_is_bound, check_schema_version, hold_bound_allocation,
+    hold_expired_allocations, migrate_schema,
+)
 
 
 ACTIVE_STATES = {"AVAILABLE", "BUSY"}
@@ -26,6 +33,16 @@ AUTOMATION_RANK = {"AUTOMATABLE": 0, "PARTIAL": 1, "MANUAL": 2, "UNKNOWN": 3}
 PREFERENCES = {"LOCAL_REQUIRED", "LOCAL_PREFERRED", "CLOUD_OK", "CLOUD_PREFERRED"}
 CAPACITY_SCOPES = {"SHARED_POOL", "PER_EXECUTION"}
 SENSITIVE_KEY = re.compile(r"(?i)(token|password|passwd|secret|credential|api[_-]?key)")
+
+
+def local_host_identity() -> str:
+    """Local-sync binding, not a caller-supplied worker alias or a security token.
+
+    A shared ledger belongs to one host. The OS hostname binds aliases on that
+    host without publishing the hostname itself. Unbound legacy aliases are
+    still counted conservatively by common accounting.
+    """
+    return "host-" + hashlib.sha256(socket.gethostname().casefold().encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -110,6 +127,8 @@ class Task:
     allowed_worker_ids: tuple[str, ...] = ()
     automated_only: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
+    commit_bytes: int | None = None
+    io_slots: int = 1
 
     def normalized(self) -> "Task":
         preference = self.execution_preference.upper()
@@ -117,8 +136,14 @@ class Task:
             raise ValueError(f"unknown execution preference: {preference}")
         if not self.id:
             raise ValueError("task id is required")
+        if not all(math.isfinite(float(value)) for value in (self.ram_gib, self.cpu_units, self.disk_gib)):
+            raise ValueError("task resources must be finite")
         if min(self.ram_gib, self.cpu_units, self.disk_gib) < 0:
             raise ValueError("task resources cannot be negative")
+        if self.commit_bytes is not None and (type(self.commit_bytes) is not int or self.commit_bytes < 0):
+            raise ValueError("commit_bytes must be a nonnegative integer")
+        if type(self.io_slots) is not int or self.io_slots < 0:
+            raise ValueError("io_slots must be a nonnegative integer")
         return Task(
             id=self.id,
             ram_gib=float(self.ram_gib),
@@ -136,6 +161,8 @@ class Task:
             allowed_worker_ids=tuple(self.allowed_worker_ids),
             automated_only=bool(self.automated_only),
             metadata=dict(self.metadata),
+            commit_bytes=self.commit_bytes,
+            io_slots=self.io_slots,
         )
 
 
@@ -147,10 +174,19 @@ class Maintainer:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = Path(db_path) if db_path else self.data_dir / "sentinel.db"
         self._init_db()
+        with self._db() as conn:
+            migrate_schema(conn)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
         conn.row_factory = sqlite3.Row
+        try:
+            # An unknown adaptive schema must be rejected before legacy schema
+            # initialization, cleanup or even changing its journal mode.
+            check_schema_version(conn)
+        except BaseException:
+            conn.close()
+            raise
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
@@ -372,7 +408,13 @@ class Maintainer:
 
     @staticmethod
     def _spec_hash(task: Task) -> str:
-        payload = json.dumps(asdict(task), sort_keys=True, separators=(",", ":"), default=str)
+        spec = asdict(task)
+        # Keep existing idempotency hashes for callers with the legacy shape.
+        if task.commit_bytes is None:
+            spec.pop("commit_bytes")
+        if task.io_slots == 1:
+            spec.pop("io_slots")
+        payload = json.dumps(spec, sort_keys=True, separators=(",", ":"), default=str)
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
     @staticmethod
@@ -399,6 +441,7 @@ class Maintainer:
     def _pool_usage(
         conn: sqlite3.Connection, worker: dict[str, Any]
     ) -> dict[str, float | int]:
+        local = bool(worker["capabilities"].get("local"))
         usage = conn.execute(
             """SELECT COALESCE(SUM(ram_gib),0) ram,COALESCE(SUM(cpu_units),0) cpu,
                       COALESCE(SUM(disk_gib),0) disk,COUNT(*) jobs
@@ -407,12 +450,32 @@ class Maintainer:
         ).fetchone()
         result: dict[str, float | int] = {
             "ram": float(usage["ram"]), "cpu": float(usage["cpu"]),
-            "disk": float(usage["disk"]), "jobs": int(usage["jobs"]),
+            "disk": float(usage["disk"]), "jobs": int(usage["jobs"]), "io": int(usage["jobs"]),
         }
+        if local:
+            # All local aliases spend the same host, even if a legacy registry
+            # gives each alias another capacity_pool. Unknown registry entries
+            # cannot create capacity by being omitted.
+            result = {"ram": 0.0, "cpu": 0.0, "disk": 0.0, "jobs": 0, "io": 0}
+            for reservation in conn.execute(
+                """SELECT r.*,w.capabilities_json FROM worker_reservations r
+                   LEFT JOIN workers w ON w.id=r.worker_id"""
+            ):
+                try:
+                    capabilities = json.loads(reservation["capabilities_json"])
+                    include = not isinstance(capabilities, dict) or capabilities.get("local") is not False
+                except (TypeError, ValueError):
+                    include = True
+                if include:
+                    result["ram"] += float(reservation["ram_gib"])
+                    result["cpu"] += float(reservation["cpu_units"])
+                    result["disk"] += float(reservation["disk_gib"])
+                    result["jobs"] += 1
+                    result["io"] += 1 if reservation["io_slots"] is None else int(reservation["io_slots"])
         # Coordinator reservations are another entry point to this same local
         # pool.  Counting them here prevents local agent commands and routed
         # executions from independently spending the same headroom.
-        if bool(worker["capabilities"].get("local")):
+        if local:
             has_table = conn.execute(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='reservations'"
             ).fetchone()
@@ -424,6 +487,7 @@ class Maintainer:
                 result["ram"] = float(result["ram"]) + float(direct["ram"])
                 result["cpu"] = float(result["cpu"]) + float(direct["cpu"])
                 result["jobs"] = int(result["jobs"]) + int(direct["jobs"])
+                result["io"] = int(result["io"]) + int(direct["io"])
         return result
 
     @staticmethod
@@ -440,11 +504,28 @@ class Maintainer:
         t = task.normalized()
         spec_hash = self._spec_hash(t)
         now = time.time() if now is None else now
+        # Capture the machine topology and immutable telemetry before beginning
+        # the capacity transaction. Revalidate the worker snapshot inside it.
+        logical_processors = os.cpu_count() or 1
+        local_frames = {}
+        for observed_worker in self.workers(now=now):
+            caps = observed_worker["capabilities"]
+            if caps.get("local") and caps.get("admission_policy") == "resource-v2":
+                config = caps.get("admission_config") or {}
+                snapshot = caps.get("admission_snapshot") or {}
+                local_frames[observed_worker["id"]] = (
+                    snapshot, config,
+                    frame_from_status(snapshot, config, now=now, logical_processors=logical_processors),
+                )
         with self._db() as conn:
             conn.execute("BEGIN IMMEDIATE")
             self._cleanup_locked(conn, now)
             existing = conn.execute("SELECT * FROM worker_reservations WHERE task_id=?", (t.id,)).fetchone()
             if existing:
+                if allocation_is_bound(conn, "routed", existing["id"]):
+                    conn.execute("COMMIT")
+                    return {"reserved": False, "reason": "execution_bound", "task_id": t.id,
+                            "reservation_id": existing["id"]}
                 if existing["spec_hash"] != spec_hash:
                     conn.execute("COMMIT")
                     return {
@@ -478,17 +559,33 @@ class Maintainer:
                 accounted_ram = float(usage["ram"]) if shared else 0.0
                 accounted_cpu = float(usage["cpu"]) if shared else 0.0
                 accounted_disk = float(usage["disk"]) if shared else 0.0
-                if accounted_ram + t.ram_gib > float(worker["allocatable_ram_gib"]):
+                caps = worker["capabilities"]
+                local_v2 = bool(caps.get("local")) and caps.get("admission_policy") == "resource-v2"
+                if local_v2:
+                    snapshot, config = caps.get("admission_snapshot") or {}, caps.get("admission_config") or {}
+                    expected_host = config.get("local_host_id", config.get("canonical_host_id"))
+                    if expected_host and caps.get("canonical_host_id") and expected_host != caps["canonical_host_id"]:
+                        rejected[worker["id"]] = "local_scope_unknown"
+                        continue
+                    captured = local_frames.get(worker["id"])
+                    if captured is None or captured[:2] != (snapshot, config):
+                        rejected[worker["id"]] = "revision_conflict"
+                        continue
+                    reasons = shared_admission_blockers(conn, t, captured[2], config)
+                    if reasons:
+                        rejected[worker["id"]] = reasons[0]["reason"]
+                        continue
+                if not local_v2 and accounted_ram + t.ram_gib > float(worker["allocatable_ram_gib"]):
                     rejected[worker["id"]] = "ram_capacity"
                     continue
-                if worker["allocatable_cpu"] is not None and accounted_cpu + t.cpu_units > float(worker["allocatable_cpu"]):
+                if not local_v2 and worker["allocatable_cpu"] is not None and accounted_cpu + t.cpu_units > float(worker["allocatable_cpu"]):
                     rejected[worker["id"]] = "cpu_capacity"
                     continue
                 if worker["allocatable_disk_gib"] is not None and accounted_disk + t.disk_gib > float(worker["allocatable_disk_gib"]):
                     rejected[worker["id"]] = "disk_capacity"
                     continue
                 observed_free = worker["capabilities"].get("observed_free_ram_gib")
-                if observed_free is not None:
+                if observed_free is not None and not local_v2:
                     headroom = float(worker["capabilities"].get("memory_headroom_gib") or 0)
                     if t.ram_gib > max(0.0, float(observed_free) - headroom - accounted_ram):
                         rejected[worker["id"]] = "observed_ram_headroom"
@@ -513,13 +610,17 @@ class Maintainer:
             conn.execute(
                 """INSERT INTO worker_reservations
                 (id,task_id,worker_id,failure_domain,capacity_scope,capacity_pool,spec_hash,
-                 ram_gib,cpu_units,disk_gib,created_at,heartbeat_at,expires_at,metadata_json)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 ram_gib,cpu_units,disk_gib,created_at,heartbeat_at,expires_at,metadata_json,
+                 physical_bytes,commit_bytes,io_slots)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     reservation_id, t.id, worker["id"], worker["failure_domain"],
                     worker["capacity_scope"], worker["capacity_pool"], spec_hash, t.ram_gib,
                     t.cpu_units, t.disk_gib, now, now, now + ttl_min * 60,
                     json.dumps(self._safe_metadata(t.metadata), separators=(",", ":")),
+                    math.ceil(t.ram_gib * 2**30),
+                    math.ceil(t.ram_gib * 2**30) if t.commit_bytes is None else t.commit_bytes,
+                    t.io_slots,
                 ),
             )
             conn.execute("COMMIT")
@@ -535,16 +636,27 @@ class Maintainer:
             "ram_gib": t.ram_gib,
             "cpu_units": t.cpu_units,
             "disk_gib": t.disk_gib,
+            "physical_bytes": math.ceil(t.ram_gib * 2**30),
+            "commit_bytes": math.ceil(t.ram_gib * 2**30) if t.commit_bytes is None else t.commit_bytes,
+            "io_slots": t.io_slots,
+            "coverage": "unmanaged",
+            "lifecycle_evidence": "limited",
         }
 
     def _cleanup_locked(self, conn: sqlite3.Connection, now: float) -> int:
+        hold_expired_allocations(conn, "routed", now)
         rows = conn.execute("SELECT * FROM worker_reservations WHERE expires_at<=?", (now,)).fetchall()
+        archived = 0
         for row in rows:
-            self._archive_locked(conn, row, now, "stale")
-        return len(rows)
+            archived += self._archive_locked(conn, row, now, "stale")
+        return archived
 
     @staticmethod
-    def _archive_locked(conn: sqlite3.Connection, row: sqlite3.Row, now: float, outcome: str) -> None:
+    def _archive_locked(conn: sqlite3.Connection, row: sqlite3.Row, now: float, outcome: str) -> bool:
+        if allocation_is_bound(conn, "routed", row["id"]):
+            hold_bound_allocation(conn, "routed", row["id"],
+                                  "reservation_expired" if outcome == "stale" else "legacy_release_attempt", now)
+            return False
         conn.execute(
             """INSERT INTO routed_executions
             (reservation_id,task_id,worker_id,failure_domain,capacity_scope,capacity_pool,
@@ -558,6 +670,7 @@ class Maintainer:
             ),
         )
         conn.execute("DELETE FROM worker_reservations WHERE id=?", (row["id"],))
+        return True
 
     def release(self, *, reservation_id: str = "", task_id: str = "", outcome: str = "success", now: float | None = None) -> int:
         if not reservation_id and not task_id:
@@ -569,10 +682,9 @@ class Maintainer:
                 rows = conn.execute("SELECT * FROM worker_reservations WHERE id=?", (reservation_id,)).fetchall()
             else:
                 rows = conn.execute("SELECT * FROM worker_reservations WHERE task_id=?", (task_id,)).fetchall()
-            for row in rows:
-                self._archive_locked(conn, row, now, outcome)
+            released = sum(self._archive_locked(conn, row, now, outcome) for row in rows)
             conn.execute("COMMIT")
-        return len(rows)
+        return released
 
     def heartbeat(self, task_id: str, *, ttl_min: int = 120, now: float | None = None) -> bool:
         now = time.time() if now is None else now

@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from sentinel.maintainer import Maintainer, Task, Worker
+from sentinel.maintainer import Maintainer, Task, Worker, local_host_identity
 
 
 def read_json(value: str) -> object:
@@ -71,6 +71,16 @@ def main() -> int:
             observed_at = time.time()
         light = str(status.get("light") or "UNKNOWN").upper()
         state = "AVAILABLE" if light in {"GREEN", "YELLOW"} else "CAPACITY_FULL" if light in {"ORANGE", "RED"} else "UNKNOWN"
+        v2 = config.get("admission_policy") == "resource-v2"
+        if v2:
+            state = "AVAILABLE" if (status.get("resource_policy") or {}).get("mode") == "resource-v2" else "UNKNOWN"
+        admission_snapshot = {k: status.get(k) for k in ("generated_at", "sampled_at", "cpu_5min_avg", "cpu_pct", "ram", "memory", "disks", "disk_performance", "resource_policy")}
+        admission_config = {k: v for k,v in config.items() if k.startswith(('local_', 'disk_', 'heavy_io_', 'admission_'))}
+        # Mint the host binding here from this OS; worker aliases cannot create
+        # distinct physical pools. This is cooperative scope metadata, not an
+        # authorization credential. Existing unbound aliases remain counted.
+        canonical_host_id = local_host_identity()
+        admission_config["local_host_id"] = canonical_host_id
         system_disk = next((d for d in status.get("disks") or [] if str(d.get("drive")).rstrip(":").upper() == "C"), {})
         computer = os.environ.get("COMPUTERNAME", "local-windows").lower()
         browser_paths = [
@@ -103,6 +113,8 @@ def main() -> int:
             allocatable_disk_gib=max(0, float(system_disk.get("free_gb") or 0) - 30),
             capabilities={
                 "local": True,
+                "canonical_host_id": canonical_host_id,
+                "host_binding_source": "resource-sentinel-local-sync",
                 "enabled": True,
                 "adapter": "local",
                 "adapter_ready": True,
@@ -116,6 +128,9 @@ def main() -> int:
                 "observed_free_ram_gib": float(ram.get("free_gb") or 0),
                 "memory_headroom_gib": max(0, total_ram - allocatable_ram),
                 "light": light,
+                "admission_policy": "resource-v2" if v2 else "legacy",
+                "admission_snapshot": admission_snapshot if v2 else None,
+                "admission_config": admission_config if v2 else None,
             },
             trust_domain="local-private",
             source="resource-sentinel-live",

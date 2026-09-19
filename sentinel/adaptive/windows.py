@@ -174,7 +174,7 @@ class _WindowsMutexBackend:
             start = C.addressof(buffer)
             return self._sid_text(owner, start, start + required.value)[0]
 
-    def verify_security(self, handle, logon_id, owner_sid):
+    def verify_security(self, handle, logon_id, owner_sid, *, access_mask=_ACCESS):
         owner, dacl, descriptor = (C.c_void_p() for _ in range(3))
         # SE_KERNEL_OBJECT=6, OWNER_SECURITY_INFORMATION|DACL_SECURITY_INFORMATION.
         code = self.security.GetSecurityInfo(handle, 6, 0x0001 | 0x0004,
@@ -204,7 +204,7 @@ class _WindowsMutexBackend:
                 raise NativePolicyMutexError("policy_mutex_dacl_mismatch")
             ace_pointer = dacl.value + C.sizeof(_Acl)
             ace = _AceHeader.from_address(ace_pointer)
-            if (ace.kind != 0 or ace.flags != 0 or ace.mask != _ACCESS or
+            if (ace.kind != 0 or ace.flags != 0 or ace.mask != access_mask or
                     ace.size != acl.size - C.sizeof(_Acl)):
                 raise NativePolicyMutexError("policy_mutex_dacl_mismatch")
             sid, sid_size = self._sid_text(ace_pointer + C.sizeof(_AceHeader),

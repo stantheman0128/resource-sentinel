@@ -34,6 +34,67 @@ FAULTS = (
 )
 REPEATS = 10
 OBSERVATION_SECONDS = 120
+TICKS_PER_SECOND = 10_000_000
+
+
+def _record_tick(record: dict, field: str = "interrupt_tick_100ns") -> int:
+    """Reject unknown or lossy timing evidence instead of manufacturing zero."""
+    value = record.get(field)
+    if (not isinstance(value, str) or not value or not value.isascii()
+            or not value.isdecimal() or len(value) > 20):
+        raise ValueError(f"invalid_or_missing_timing_evidence:{field}")
+    tick = int(value)
+    if tick > 2**64 - 1:
+        raise ValueError(f"timing_evidence_out_of_range:{field}")
+    return tick
+
+
+def guardian_restore_timing(anchor: dict, records: list[dict], *, anchor_field="interrupt_tick_100ns") -> dict:
+    """Conservative pre-fault -> verified readback bound, independent of observer.
+
+    The actor injection marker precedes os._exit; a forced-stop anchor precedes
+    TerminateProcess. ACK timestamps follow native disabled Query. This includes
+    any delay around the actual death and never starts a new clock when the
+    outside observer finally resumes. It is an upper bound, not an exact kernel
+    death timestamp or a replacement for the held-process-handle death witness.
+    """
+    start = _record_tick(anchor, anchor_field)
+    if not records:
+        raise ValueError("missing_restore_timing_evidence")
+    ends = []
+    for record in records:
+        if (record.get("result") != "RESTORED" or
+                not isinstance(record.get("after"), dict) or
+                type(record["after"].get("flags")) is not int or
+                record["after"]["flags"] < 0 or record["after"]["flags"] & 1):
+            raise ValueError("timing_endpoint_is_not_verified_disabled_readback")
+        end = _record_tick(record)
+        if end < start:
+            raise ValueError("restore_clock_order_unknown")
+        ends.append(end)
+    end = min(ends)
+    duration_ticks = end - start
+    return {"anchor_tick_100ns": str(start), "first_restore_tick_100ns": str(end),
+            "upper_bound_seconds": duration_ticks / TICKS_PER_SECOND,
+            "within_8_seconds": duration_ticks <= 8 * TICKS_PER_SECOND,
+            "basis": "pre_fault_to_first_disabled_readback_upper_bound"}
+
+
+def observation_timing(start_tick: int, end_tick: int, monotonic_elapsed: float) -> dict:
+    """The deadline covers observation and cleanup, even after a stalled wait."""
+    if (type(start_tick) is not int or type(end_tick) is not int or
+            not 0 <= start_tick <= end_tick <= 2**64 - 1 or
+            not isinstance(monotonic_elapsed, (int, float)) or
+            isinstance(monotonic_elapsed, bool) or not math.isfinite(monotonic_elapsed) or
+            monotonic_elapsed < 0):
+        raise ValueError("observation_clock_evidence_unknown")
+    interrupt_elapsed = (end_tick - start_tick) / TICKS_PER_SECOND
+    return {"start_tick_100ns": str(start_tick), "end_tick_100ns": str(end_tick),
+            "interrupt_elapsed_seconds": interrupt_elapsed,
+            "monotonic_elapsed_seconds": monotonic_elapsed,
+            "deadline_seconds": OBSERVATION_SECONDS,
+            "within_deadline": (end_tick - start_tick < OBSERVATION_SECONDS * TICKS_PER_SECOND
+                                and monotonic_elapsed < OBSERVATION_SECONDS)}
 
 
 class RecoveryCapability(unittest.TestCase):
@@ -88,7 +149,9 @@ class RecoveryCapability(unittest.TestCase):
     def _await(self, case: Path, name: str, deadline: float, maximum: float = 10) -> dict:
         self.assertTrue(actor.wait_file(case / f"{name}.json", self._remaining(deadline, maximum)),
                         f"missing {name}; fixture evidence retained in {case.name}")
-        return actor.read_json(case / f"{name}.json")
+        record = actor.read_json(case / f"{name}.json")
+        self._remaining(deadline)  # A resumed/stalled wait may already be late.
+        return record
 
     def _popen(self, case: Path, role: str, children: dict, streams: list):
         output = (case / f"{role}.stdout").open("wb")
@@ -122,15 +185,18 @@ class RecoveryCapability(unittest.TestCase):
         self.assertIsNone(child.poll())
         # Popen's retained native handle targets this one manager, even if a PID
         # is later reused. It cannot terminate descendants or other agents.
+        termination_requested = win.interrupt_time_100ns()
         child.terminate()
         actor.mark(case, "guardian-fixture-terminated", identity=ready["identity"],
-                   workload_termination=False)
+                   workload_termination=False,
+                   termination_requested_tick_100ns=str(termination_requested))
 
     def _case(self, fault: str, iteration: int):
         nonce = uuid.uuid4().hex
         case = self.run / nonce
         case.mkdir(exist_ok=False)
         started = time.monotonic()
+        started_tick = win.interrupt_time_100ns()
         deadline = started + OBSERVATION_SECONDS
         result = {"fault": fault, "iteration": iteration, "nonce": nonce,
                   "result": "failed", "restore_verified": False,
@@ -205,7 +271,6 @@ class RecoveryCapability(unittest.TestCase):
                 self._fence_fixture_guardian(case, config, guardian, guardian_handle)
             self.assertTrue(guardian_handle.wait(self._remaining(deadline, 20)),
                             "guardian did not exit within observation bound")
-            death_observed = time.monotonic()
             # An unexpected pre-Set actor error must not look like successful
             # crash recovery merely because the Job was never restricted.
             crash_points = {"intent_before", "intent_after_set_before", "set_after_query_before",
@@ -242,8 +307,16 @@ class RecoveryCapability(unittest.TestCase):
             else:
                 self.assertTrue(all(not record["before"]["flags"] & 1 for record in restore_records))
             if fault not in ("lease_renewal", "wrapper_loss", "audit_unavailable", "grant_before_cap"):
-                self.assertLessEqual(time.monotonic() - death_observed, 8,
-                                     "guardian-loss restore exceeded 8s normal-scheduling goal")
+                if fault == "guardian_hang":
+                    anchor = self._await(case, "guardian-fixture-terminated", deadline)
+                    anchor_field = "termination_requested_tick_100ns"
+                else:
+                    anchor = self._await(case, "injected", deadline)
+                    anchor_field = "interrupt_tick_100ns"
+                timing = guardian_restore_timing(anchor, restore_records, anchor_field=anchor_field)
+                result["guardian_loss_timing"] = timing
+                self.assertTrue(timing["within_8_seconds"],
+                                "guardian-loss restore bound exceeded 8s; observer resume is not a new start")
             after = job.query_cpu()
             self.assertFalse(after["flags"] & 1, "native Query still shows enabled cap")
             restored = True
@@ -382,6 +455,17 @@ class RecoveryCapability(unittest.TestCase):
             for stream in streams:
                 stream.close()
             result["elapsed_seconds"] = time.monotonic() - started
+            try:
+                timing = observation_timing(started_tick, win.interrupt_time_100ns(),
+                                            result["elapsed_seconds"])
+                result["observation_timing"] = timing
+                if not timing["within_deadline"]:
+                    raise AssertionError("120s outside observation deadline reached; cleanup does not reset it")
+            except (AssertionError, ValueError, OSError, win.UnsupportedCapability) as error:
+                result["result"] = "failed"
+                result["timing_error"] = {"type": type(error).__name__, "reason": str(error)}
+                if failure is None:
+                    failure = error
             self.results.append(result)
             actor.write_json(case / "result.json", result)
         if failure is not None:

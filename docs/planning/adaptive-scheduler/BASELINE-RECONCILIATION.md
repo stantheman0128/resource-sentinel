@@ -124,3 +124,22 @@ one new fixture test were also deliberately updated. Other captured files remain
 byte-identical. Runtime policy/configuration, Scheduled Tasks, leases and adaptive
 control were unchanged. See the new exemption-visibility work note for the exact
 commit/dependency and live-publication boundary.
+
+## Continuation baseline: admission hook correction
+
+At the user's explicit priority change, adaptive work paused for the Gradle-path
+classification / exact queue cancellation / repeated Stop reminder incident.
+Commit `56fc1e6274907c90bdf1edb43a89279921fe2f3a` contains the reviewed correction;
+the maintained main hook source received only its verified task-owned delta.
+The historical Stop-hook row above describes the original P0 baseline: Stop
+now shares three reminders across an owner/birth queue episode and never
+automatically cancels requests. Explicit cancellation has a separate verified
+caller/ancestor CLI. See [the hotfix record](../../work/admission-hook-hotfix-20260919.md)
+for before/after tests, clean-commit reproduction and protected-source handling.
+
+All four normal admission reservations for those test batches were queried by
+their exact IDs after wrapper completion; none remained. Production config and
+bootstrap bytes were unchanged, and no Job control or Scheduled Task was used.
+Adaptive P1 investigation resumes from this newer source baseline. A future A0
+measurement must pin this updated live source, not silently reuse the earlier
+classification behavior as though no intervening fix had occurred.

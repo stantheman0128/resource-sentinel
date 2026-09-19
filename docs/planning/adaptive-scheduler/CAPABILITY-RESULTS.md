@@ -149,3 +149,45 @@ with no breakaway, parent spoofing or production fallback. Detailed sanitized
 evidence is in [DESKTOP-HOST-PROBE-RESULTS.md](DESKTOP-HOST-PROBE-RESULTS.md).
 P1 native gates, P3–P6 promotion, real cap effects and recovery remain unverified;
 the safe P2-A work continues independently under the formal fallback.
+
+## Continuation: test verdict and admission coverage corrections
+
+Following the separately completed hook correction (`56fc1e6`), native tests were
+audited before any further control experiment. Three test-evidence gaps were
+corrected without changing CPU effect thresholds or claiming a native pass:
+
+- S1 now requires same-run successful fixture self-stop, empty named Job
+  reopen/set/query/disable binding, and foreign-parent rejection before its
+  effect workload. Cleanup and evidence publication must complete before a stage
+  passes. A failed, skipped, reordered or selected-only stage blocks later native
+  calls even under unittest's default non-failfast runner. The documented command
+  also uses `-f`. The empty Job check is API restoration evidence, not CPU effect.
+- S3 guardian-loss time is measured conservatively from the actor's pre-exit
+  interrupt-time marker (or the test guardian's pre-termination-request marker)
+  to the first independently recorded disabled Query ACK. Observer resumption
+  cannot restart this clock. The measurement is an upper bound around process
+  death, not a claimed exact kernel death timestamp.
+- S3's original 120-second outside deadline now determines the final verdict
+  using interrupt-time and monotonic elapsed, including cleanup. Safety cleanup
+  may continue after expiry; it cannot convert that case into a pass.
+
+Normal admission on Windows/Python 3.13.3 ran
+`py -m unittest tests.test_adaptive_s1_gate tests.test_adaptive_recovery_timing`:
+**21 passed, 0 failed, 0 skipped**. Native spike opt-in was explicitly zero.
+These are L1 tests only; no Job was created or restricted.
+
+There is also a separate execution prerequisite: the actual live Coordinator
+still ages pending CPU/RAM out by `created_at` grace. P2-A's continuous floor is
+implemented in the isolated branch, not deployed. The live wrapper prints its
+exact reservation ID but does not pass a verified coverage lease to the child;
+repeat admission of the same key extends expiry, not the floor's created-at age.
+Consequently, one ordinary reservation is not demonstrated to cover the full
+ten-round S1 experiment through Query-confirmed restore and Job empty.
+
+Do not run that long control experiment against the current live path. Breaking
+it into roughly 90-second measurement rounds alone is also insufficient: setup,
+scheduling stalls, failure and cleanup can cross the grace boundary. A future
+bounded runner must prove exact coverage for the entire controlled lifetime, or
+use an actually independent test host with its own correct admission accounting.
+No runtime grace change, nested-reservation workaround, P2 deployment, exemption
+or different local data directory was used to evade this prerequisite.

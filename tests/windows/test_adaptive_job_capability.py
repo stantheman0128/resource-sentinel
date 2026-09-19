@@ -3,7 +3,7 @@
 Explicit invocation (after normal Sentinel admission, in an isolated host):
   SENTINEL_ADAPTIVE_WINDOWS_SPIKES=1
   SENTINEL_ADAPTIVE_SPIKE_DIR=<isolated directory>
-  python -m unittest discover -s tests/windows -p test_adaptive_job_capability.py -v
+  python -m unittest discover -s tests/windows -p test_adaptive_job_capability.py -v -f
 
 The full supported-host experiment is 10 rounds, each with three fixed 30s
 CPU windows (uncapped, hard cap, restored). It deliberately cannot be shortened
@@ -14,10 +14,18 @@ The workload uses a fixed, bounded worker count sufficient to saturate the cap,
 not the whole machine. The rate denominator remains all N logical processors.
 For N=12, four busy workers prove a 3-unit cap; request five CPU units through
 normal admission (four workers plus one conservative unit for test overhead).
+
+Execution gate: the current live wrapper does not expose a verified continuous
+demand-floor lease for this roughly 900-second suite. Its legacy created-at
+grace is not extended by reservation heartbeat. Do not execute CPU-control
+stages against that live admission path until exact reservation coverage through
+restoration and empty verification is proven. Same-run prerequisite tests and
+splitting rounds alone do not satisfy that separate admission requirement.
 """
 from __future__ import annotations
 
 import json
+from functools import wraps
 import math
 import os
 from pathlib import Path
@@ -37,6 +45,68 @@ FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "adaptive_cpu_worke
 ENABLED = os.name == "nt" and os.environ.get(OPT_IN) == "1"
 WINDOW_SECONDS = 30.0
 ROUNDS = 10
+S1_STAGES = ("fixture_self_stop", "empty_job_restore", "foreign_parent_rejection", "cpu_effect")
+
+
+class _S1RunGate:
+    """In-memory evidence for this run only; persisted files cannot unlock it."""
+
+    def __init__(self):
+        self.completed = []
+        self.active = None
+        self.failure = None
+
+    def begin(self, stage):
+        if self.failure is not None:
+            raise AssertionError("S1 BLOCKED: an earlier stage failed; start a fresh run after diagnosis")
+        if self.active is not None or len(self.completed) == len(S1_STAGES):
+            raise AssertionError("S1 BLOCKED: duplicate or concurrent stage")
+        required = S1_STAGES[len(self.completed)]
+        if stage != required:
+            raise AssertionError(f"S1 BLOCKED: {stage} requires successful {required} evidence in this run")
+        self.active = stage
+
+    def pass_stage(self, stage):
+        if self.active != stage or self.failure is not None:
+            raise AssertionError("S1 BLOCKED: no matching successful active stage")
+        self.completed.append(stage)
+        self.active = None
+
+    def fail(self, stage, error):
+        if self.failure is None:
+            self.failure = {"stage": stage, "type": type(error).__name__, "message": str(error)}
+        self.active = None
+
+    def record(self):
+        return {
+            "status": "failed" if self.failure else (
+                "stages_passed" if len(self.completed) == len(S1_STAGES) else "incomplete"),
+            "completed_stages": list(self.completed), "active_stage": self.active,
+            "first_failure": self.failure, "capability_allowlist_eligible": False,
+            "scope": "this S1 run only; other host cases and S2/S3 remain separate gates",
+        }
+
+
+def _s1_stage(stage):
+    def decorate(method):
+        @wraps(method)
+        def guarded(self, *args, **kwargs):
+            gate = type(self)._s1_gate
+            try:
+                gate.begin(stage)
+                _write_json(self.evidence / "stage-gate.json", gate.record())
+                value = method(self, *args, **kwargs)
+                # The method includes its finally/cleanup: no pass token exists
+                # until restoration, empty verification and evidence all return.
+                gate.pass_stage(stage)
+                _write_json(self.evidence / "stage-gate.json", gate.record())
+                return value
+            except BaseException as exc:
+                gate.fail(stage, exc)
+                _write_json(self.evidence / "stage-gate.json", gate.record())
+                raise
+        return guarded
+    return decorate
 
 
 def _write_json(path, value, *, durable=False):
@@ -71,7 +141,9 @@ def _isolated_evidence_directory():
 class WindowsJobCapabilitySpike(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        cls._s1_gate = _S1RunGate()
         cls.evidence = _isolated_evidence_directory()
+        _write_json(cls.evidence / "stage-gate.json", cls._s1_gate.record())
         try:
             cls.host = require_supported_host()
         except UnsupportedCapability as exc:
@@ -168,6 +240,7 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
         if errors:
             self.fail("; ".join(errors))
 
+    @_s1_stage("fixture_self_stop")
     def test_00_fixture_self_stops_and_job_has_no_other_limits(self):
         directory = self.evidence / "self-stop"
         directory.mkdir()
@@ -197,6 +270,47 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
         finally:
             self._cleanup(job, process, directory, record, deadline)
 
+    @_s1_stage("empty_job_restore")
+    def test_05_empty_job_can_reopen_and_restore_cpu_binding(self):
+        """Prove API restoration before any capped workload, not CPU effect."""
+        directory = self.evidence / "empty-job-restore"
+        directory.mkdir()
+        deadline = time.monotonic() + 120
+        job, reopened = OwnedJob.create(), None
+        record = {"case": "empty_job_restore_binding", "status": "running", "nonce": job.nonce,
+                  "job_security": job.security, "cpu_effect_verified": False}
+        try:
+            self.assertEqual(job.active_pids(), [])
+            self.assertEqual(job.query_limits(), {"limit_flags": 0, "ui_restrictions": 0})
+            record["initial_cpu"] = job.query_cpu()
+            self.assertEqual(record["initial_cpu"]["flags"], 0)
+            # An empty named Job needs its original handle kept until reopen.
+            reopened = OwnedJob.open(job.name, job.nonce)
+            record["reopened_security"] = reopened.security
+            self.assertEqual(reopened.query_cpu(), record["initial_cpu"])
+            record["intended_cpu"] = {"flags": ENABLE | HARD_CAP, "rate_bp": 2500}
+            _write_json(directory / "control-intent.json", {
+                "status": "intent_before_set", "job_name": job.name, "nonce": job.nonce,
+                "logon_sid": job.logon_sid, "original_cpu": record["initial_cpu"],
+                "target": record["intended_cpu"], "workload_process_count": 0,
+            }, durable=True)
+            record["applied"] = job.set_cpu_rate(2500)
+            self.assertEqual(record["applied"], record["intended_cpu"])
+            job.close()
+            job, reopened = reopened, None
+            self.assertEqual(job.query_cpu(), record["intended_cpu"])
+            record["disabled"] = job.disable()
+            self.assertEqual(record["disabled"]["flags"] & ENABLE, 0)
+            self.assertEqual(job.active_pids(), [])
+            record["status"] = "pass"
+        finally:
+            try:
+                self._cleanup(job, None, directory, record, deadline)
+            finally:
+                if reopened is not None:
+                    reopened.close()
+
+    @_s1_stage("foreign_parent_rejection")
     def test_10_parent_job_is_explicitly_unsupported(self):
         directory = self.evidence / "foreign-parent"
         directory.mkdir()
@@ -233,6 +347,7 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
                 "active_processes_start": initial["active_processes"],
                 "active_processes_end": final["active_processes"]}
 
+    @_s1_stage("cpu_effect")
     def test_20_ten_create_set_disable_reopen_effect_rounds(self):
         n = self.host["logical_processors"]
         target = n * 0.25
@@ -356,4 +471,4 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(failfast=True)

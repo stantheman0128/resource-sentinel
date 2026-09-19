@@ -23,6 +23,9 @@ from tests.windows.adaptive_win32 import (  # noqa: E402
     NamedMutex, OwnedJob, ProcessHandle, current_identity, launch_in_job,
     require_supported_host, interrupt_time_100ns,
 )
+from tests.windows.adaptive_admission import (  # noqa: E402
+    ContinuousAdmissionUnavailable, require_continuous_admission,
+)
 
 
 def write_json(path: Path, value: dict) -> None:
@@ -211,6 +214,10 @@ def wrapper(case: Path, config: dict) -> int:
 
 
 def guardian(case: Path, config: dict) -> int:
+    # Block new restrictive experiments, including direct actor CLI invocation.
+    # Do not put this gate in restore()/compare_restore(): recovery must work
+    # even when admission is unavailable or an old experiment left a cap.
+    require_continuous_admission()
     require_supported_host()
     identity = current_identity()
     config = {**config, "guardian_identity": identity}
@@ -398,6 +405,13 @@ def main() -> int:
     parser.add_argument("role", choices=("worker", "root", "helper", "wrapper", "guardian", "restore-a", "restore-b"))
     parser.add_argument("case", type=Path)
     args = parser.parse_args()
+    if not args.role.startswith("restore-"):
+        try:
+            require_continuous_admission()
+        except ContinuousAdmissionUnavailable:
+            # mark() reads a native clock. Deny before case/identity queries,
+            # native error reporting, fixture process launch or control.
+            return 125
     case, config = load_case(args.case)
     try:
         if args.role.startswith("restore-"):

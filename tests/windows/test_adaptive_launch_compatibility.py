@@ -5,6 +5,8 @@ SENTINEL_ADAPTIVE_WINDOWS_SPIKES=1 and SENTINEL_ADAPTIVE_SPIKE_DIR pointing to
 an isolated evidence directory. No production wrapper/runtime is imported or
 changed. Skips mean NOT VERIFIED, not a supported host. This file also supplies
 the test-only Base64 launch host used by a generated thin PowerShell fixture.
+The continuous-admission provider is unavailable; native setup and direct
+fixture launch/console entry points fail closed before any native operation.
 """
 
 from __future__ import annotations
@@ -25,6 +27,12 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from tests.windows.adaptive_admission import (  # noqa: E402
+    ContinuousAdmissionUnavailable, require_continuous_admission,
+)
+
 FIXTURE = ROOT / "tests" / "fixtures" / "adaptive_spawn_tree.py"
 CMD_LIMIT = 8191
 CREATE_PROCESS_LIMIT = 32767
@@ -82,6 +90,10 @@ def _native():
 
 def _launch_host(payload: str) -> int:
     if os.environ.get("SENTINEL_ADAPTIVE_WINDOWS_SPIKES") != "1":
+        return 125
+    try:
+        require_continuous_admission()
+    except ContinuousAdmissionUnavailable:
         return 125
     spec = json.loads(base64.b64decode(payload, validate=True).decode("utf-8"))
     directory = Path(spec["directory"]).resolve(strict=True)
@@ -172,6 +184,10 @@ exit $LASTEXITCODE
 
 def _console_driver(payload: str) -> int:
     """Run only inside a NEW_CONSOLE owned by this fixture invocation."""
+    try:
+        require_continuous_admission()
+    except ContinuousAdmissionUnavailable:
+        return 125
     spec = json.loads(base64.b64decode(payload, validate=True).decode("utf-8"))
     directory = Path(spec["directory"]).resolve(strict=True)
     authorization = json.loads((directory / "fixture-authorization.json").read_text("utf-8"))
@@ -290,6 +306,14 @@ class WindowsLaunchCompatibility(unittest.TestCase):
             raise RuntimeError("production_directory_forbidden")
         cls.evidence = base_path / ("s2-" + uuid.uuid4().hex)
         cls.evidence.mkdir(parents=True, exist_ok=False)
+        try:
+            require_continuous_admission()
+        except ContinuousAdmissionUnavailable as exc:
+            write_json(cls.evidence / "admission-gate.json", {
+                "status": "blocked", "reason": exc.reason,
+                "cpu_control_writes": 0, "capability_allowlist_eligible": False,
+            })
+            raise
         cls.native = _native()
         try:
             cls.capability = cls.native.require_supported_host()

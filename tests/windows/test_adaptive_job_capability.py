@@ -21,6 +21,9 @@ grace is not extended by reservation heartbeat. Do not execute CPU-control
 stages against that live admission path until exact reservation coverage through
 restoration and empty verification is proven. Same-run prerequisite tests and
 splitting rounds alone do not satisfy that separate admission requirement.
+This prerequisite is enforced before native host setup, not just documented:
+there is no trusted lifetime-coverage provider yet, so explicit opt-in still
+fails closed. Portable fixture records and environment flags cannot enable it.
 """
 from __future__ import annotations
 
@@ -36,9 +39,14 @@ import unittest
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+if str(Path(__file__).resolve().parents[2]) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from adaptive_win32 import (  # noqa: E402
     ENABLE, HARD_CAP, OPT_IN, LaunchOutcomeUnknown, OwnedJob,
     UnsupportedCapability, require_supported_host,
+)
+from tests.windows.adaptive_admission import (  # noqa: E402
+    ContinuousAdmissionUnavailable, require_continuous_admission,
 )
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "adaptive_cpu_worker.py"
@@ -144,6 +152,15 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
         cls._s1_gate = _S1RunGate()
         cls.evidence = _isolated_evidence_directory()
         _write_json(cls.evidence / "stage-gate.json", cls._s1_gate.record())
+        try:
+            require_continuous_admission()
+        except ContinuousAdmissionUnavailable as exc:
+            _write_json(cls.evidence / "admission-gate.json", {
+                "status": "blocked", "reason": exc.reason,
+                "cpu_control_writes": 0, "capability_allowlist_eligible": False,
+                "scope": "no trusted coverage through restore and verified Job empty",
+            })
+            raise
         try:
             cls.host = require_supported_host()
         except UnsupportedCapability as exc:

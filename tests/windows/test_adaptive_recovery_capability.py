@@ -9,6 +9,8 @@ Each fault runs ten times; no option lowers that gate. A non-Windows/foreign hos
 is unsupported, not a pass. Native query/fencing/restore are real; the filesystem
 rendezvous and allocation/grant SQLite rows are a test protocol. They do not
 verify production store, IPC, supervisor, exemption, or admission integration.
+Until a trusted continuous-admission provider exists, opted-in setup fails
+before host queries, fixture launch or control. Restore-only actors remain usable.
 """
 from __future__ import annotations
 
@@ -23,6 +25,7 @@ import unittest
 import uuid
 
 from tests.windows import adaptive_win32 as win
+from tests.windows.adaptive_admission import require_continuous_admission
 from tests.fixtures import adaptive_recovery_actor as actor
 
 ACTOR = Path(actor.__file__).resolve()
@@ -104,6 +107,7 @@ class RecoveryCapability(unittest.TestCase):
             raise unittest.SkipTest("S3 not tested: explicit Windows spike opt-in absent")
         if sys.platform != "win32":
             raise unittest.SkipTest("S3 unsupported: real Windows APIs required")
+        require_continuous_admission()
         # Reject before creating any Job, launching a fixture, or setting a cap.
         try:
             cls.host = win.require_supported_host()

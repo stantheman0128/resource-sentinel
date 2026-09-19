@@ -82,27 +82,34 @@ class AdaptiveLifecycleTests(unittest.TestCase):
         )
 
     def allocate(self, spec):
+        # Synthetic capacity setup represents a protocol-aware writer, not an
+        # old-binary compatibility test. Keep persistent fences enabled.
         conn = self.connection()
         demand = spec.requested
         if spec.reservation.kind == AllocationKind.DIRECT:
             conn.execute("""INSERT INTO reservations(id,request_key,owner_pid,owner_started,
                 tool_use_id,repo,command_signature,command_text,resource_class,priority,priority_rank,
-                cpu_units,ram_gib,io_slots,created_at,heartbeat_at,expires_at,spec_hash,physical_bytes,commit_bytes)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                cpu_units,ram_gib,io_slots,created_at,heartbeat_at,expires_at,spec_hash,physical_bytes,commit_bytes,
+                writer_protocol,writer_revision)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,0)""",
                 (spec.reservation.id, uuid.uuid4().hex, 100, 1.0, "tool", "repo-label", "safe-family", "",
                  "MEDIUM", "P2", 2, demand.cpu_units, demand.physical_bytes / GIB, demand.io_slots,
                  NOW, NOW, NOW + 120, spec.spec_hash, demand.physical_bytes, demand.commit_bytes))
         elif spec.reservation.kind == AllocationKind.ROUTED:
-            conn.execute("""INSERT OR IGNORE INTO workers(id,provider,failure_domain,capacity_scope,capacity_pool,
-                max_concurrency,quota_domain,state,automation_level,os,capacity_ram_gib,allocatable_ram_gib,
-                visible_cpu,allocatable_cpu,disk_free_gib,allocatable_disk_gib,capabilities_json,trust_domain,
-                source,observed_at,probe_expires_at,updated_at)
-                VALUES('local-alias','alias-provider','local','SHARED_POOL','local',8,'','AVAILABLE',
-                'AUTOMATABLE','windows',64,58,12,8,100,100,'{"local":true}','local-private','test',?,?,?)""",
-                (NOW, NOW + 3600, NOW))
+            # Reusing this fixture worker makes no write. An INSERT OR IGNORE
+            # still runs BEFORE INSERT guards for a referenced worker.
+            if conn.execute("SELECT 1 FROM workers WHERE id='local-alias'").fetchone() is None:
+                conn.execute("""INSERT INTO workers(id,provider,failure_domain,capacity_scope,capacity_pool,
+                    max_concurrency,quota_domain,state,automation_level,os,capacity_ram_gib,allocatable_ram_gib,
+                    visible_cpu,allocatable_cpu,disk_free_gib,allocatable_disk_gib,capabilities_json,trust_domain,
+                    source,observed_at,probe_expires_at,updated_at,writer_protocol,writer_revision)
+                    VALUES('local-alias','alias-provider','local','SHARED_POOL','local',8,'','AVAILABLE',
+                    'AUTOMATABLE','windows',64,58,12,8,100,100,'{"local":true}','local-private','test',?,?,?,1,0)""",
+                    (NOW, NOW + 3600, NOW))
             conn.execute("""INSERT INTO worker_reservations(id,task_id,worker_id,failure_domain,capacity_scope,
                 capacity_pool,spec_hash,ram_gib,cpu_units,disk_gib,created_at,heartbeat_at,expires_at,metadata_json,
-                physical_bytes,commit_bytes,io_slots) VALUES(?,?,'local-alias','local','SHARED_POOL','local',?,?,?,?,?,?,?,?,?,?,?)""",
+                physical_bytes,commit_bytes,io_slots,writer_protocol,writer_revision)
+                VALUES(?,?,'local-alias','local','SHARED_POOL','local',?,?,?,?,?,?,?,?,?,?,?,1,0)""",
                 (spec.reservation.id, spec.task_id, spec.spec_hash, demand.physical_bytes / GIB,
                  demand.cpu_units, 0, NOW, NOW, NOW + 120, "{}", demand.physical_bytes, demand.commit_bytes, demand.io_slots))
 
@@ -420,7 +427,8 @@ class AdaptiveLifecycleTests(unittest.TestCase):
     def test_routed_provider_name_cannot_override_explicit_nonlocal_scope(self):
         spec = self.spec(kind=AllocationKind.ROUTED)
         self.allocate(spec)
-        self.connection().execute("UPDATE workers SET provider='local',capabilities_json='{\"local\":false}'")
+        self.connection().execute("""UPDATE workers SET provider='local',capabilities_json='{\"local\":false}',
+            writer_protocol=1,writer_revision=writer_revision+1""")
         with self.assertRaisesRegex(LifecycleError, "nonlocal_allocation"):
             self.store.prepare_registration(spec, caller=WRAPPER, now=NOW)
 

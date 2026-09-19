@@ -25,6 +25,8 @@ from sentinel.accounting import (
     validate_active_allocation,
 )
 from .contracts import AllocationKind, ExecutionSpec, ProcessIdentity, ReservationRef, MAX_ENROLLED_JOBS
+from .capacity_schema import prepare_capacity_schema
+from .writers import migrate_writer_fence
 
 SCHEMA_VERSION = 1
 TERMINAL_STATES = frozenset({"FINISHED", "CANCELLED_BEFORE_START", "START_FAILED"})
@@ -66,6 +68,9 @@ def prelaunch_record_hash(row: Mapping[str, Any], *, claim_token_hash: str,
         record["claim_token_hash"] = claim_token_hash
         source.pop("heartbeat_at", None)
         source.pop("expires_at", None)
+        # SQL compatibility bookkeeping may advance independently of native
+        # launch custody. Keep writer_protocol bound, but not its revision.
+        source.pop("writer_revision", None)
         encoded = json.dumps({"domain": "sentinel-prelaunch-record-v1",
                               "record": record, "allocation": source},
                              sort_keys=True, separators=(",", ":"),
@@ -104,13 +109,26 @@ def check_schema_version(conn: sqlite3.Connection) -> bool:
     return _check_version(conn)
 
 
-def migrate_schema(conn: sqlite3.Connection) -> None:
-    """Serialize the additive migration; do not implicitly commit caller work."""
-    if conn.in_transaction:
-        raise LifecycleError("migration_requires_own_transaction")
-    conn.execute("BEGIN IMMEDIATE")
+def migrate_schema(conn: sqlite3.Connection, *, in_transaction: bool = False) -> None:
+    """Serialize the additive migration without committing caller-owned work.
+
+    Constructors use ``in_transaction=True`` to cover first table creation and
+    fence installation under one writer lock. The default still owns its whole
+    transaction and rejects nesting, preserving existing callers' semantics.
+    """
+    if in_transaction:
+        if not conn.in_transaction:
+            raise LifecycleError("migration_requires_transaction")
+    else:
+        if conn.in_transaction:
+            raise LifecycleError("migration_requires_own_transaction")
+        conn.execute("BEGIN IMMEDIATE")
     try:
         existing = _check_version(conn)
+        # Pre-create both real ledgers before installing persistent guards. An
+        # old opposite constructor must never be able to CREATE an unguarded
+        # capacity table after a managed obligation has already been admitted.
+        prepare_capacity_schema(conn)
         # No third capacity store: metadata binds the two existing ledgers.
         for table in _TABLES.values():
             if not _has_table(conn, table):
@@ -212,9 +230,12 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
             # Old rows deliberately stay NULL: constructing a store must not
             # mint a new cross-process credential for an existing execution.
             conn.execute("ALTER TABLE managed_executions ADD COLUMN ipc_auth_key BLOB")
-        conn.commit()
+        migrate_writer_fence(conn)
+        if not in_transaction:
+            conn.commit()
     except BaseException:
-        conn.rollback()
+        if not in_transaction:
+            conn.rollback()
         raise
 
 
@@ -446,7 +467,8 @@ def commit_managed_admission(conn: sqlite3.Connection, admission, reservation_id
     names = ",".join(row)
     conn.execute(f"INSERT INTO managed_executions({names}) VALUES({','.join('?' for _ in row)})", tuple(row.values()))
     changed = conn.execute("""UPDATE reservations SET execution_id=?,lifecycle_managed=1,
-        physical_bytes=?,commit_bytes=?,managed_spec_hash=? WHERE id=? AND execution_id=? AND lifecycle_managed=1 AND managed_spec_hash=?""",
+        physical_bytes=?,commit_bytes=?,managed_spec_hash=?,writer_protocol=1,writer_revision=writer_revision+1
+        WHERE id=? AND execution_id=? AND lifecycle_managed=1 AND managed_spec_hash=?""",
         (admission.execution_id, admission.requested.physical_bytes, admission.requested.commit_bytes,
          admission.spec_hash, reservation_id, admission.execution_id, admission.spec_hash)).rowcount
     if changed != 1:
@@ -871,7 +893,7 @@ class LifecycleStore:
                             capabilities = None
                         if resolve_worker_locality(capabilities, self._local_context) != "local":
                             raise LifecycleError("nonlocal_allocation")
-                    conn.execute(f"UPDATE {table} SET execution_id=?,lifecycle_managed=1,physical_bytes=?,commit_bytes=? WHERE id=?",
+                    conn.execute(f"UPDATE {table} SET execution_id=?,lifecycle_managed=1,physical_bytes=?,commit_bytes=?,writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?",
                                  (spec.execution_id, physical, commit, spec.reservation.id))
                 names = ",".join(row)
                 conn.execute(f"INSERT INTO managed_executions({names}) VALUES({','.join('?' for _ in row)})", tuple(row.values()))
@@ -1101,13 +1123,14 @@ class LifecycleStore:
             if runtime is None or runtime[0] != row["guardian_epoch"] or runtime[1] != row["logon_id"]:
                 raise LifecycleError("guardian_identity_mismatch")
         self._require_no_live_descendants(conn, row["execution_id"])
-        if row["allocation_kind"] != "parent":
-            self._archive_allocation(conn, row, now, outcome="managed_" + state.lower())
         updates = {"state": state, "finished_at": now, "launch_sealed": 1,
                    "launch_in_flight": 0, "claim_consumed": 1, "claim_token_hash": "", "hold_reason": None}
         if state == "CANCELLED_BEFORE_START":
             updates["cancel_requested_at"] = now
-        return self._public(self._cas(conn, row["execution_id"], expected_revision, updates))
+        finished = self._cas(conn, row["execution_id"], expected_revision, updates)
+        if row["allocation_kind"] != "parent":
+            self._archive_allocation(conn, finished, now, outcome="managed_" + state.lower())
+        return self._public(finished)
 
     def cancel_before_start(self, execution_id: str, *, caller: ProcessIdentity,
                             expected_revision: int, now: float | None = None) -> dict[str, Any]:
@@ -1259,9 +1282,10 @@ class LifecycleStore:
                     SELECT execution_id FROM descendants""", (execution_id,)).fetchall()
                 for child in descendants:
                     conn.execute("UPDATE managed_executions SET state='FINISHED',state_revision=state_revision+1,finished_at=?,launch_sealed=1,launch_in_flight=0 WHERE execution_id=? AND state NOT IN ('FINISHED','CANCELLED_BEFORE_START','START_FAILED')", (now, child[0]))
-                self._archive_allocation(conn, row, now)
-                return self._public(self._cas(conn, execution_id, expected_revision, {"state": "FINISHED", "finished_at": now,
-                    "launch_sealed": 1, "launch_in_flight": 0}))
+                finished = self._cas(conn, execution_id, expected_revision, {"state": "FINISHED", "finished_at": now,
+                    "launch_sealed": 1, "launch_in_flight": 0})
+                self._archive_allocation(conn, finished, now)
+                return self._public(finished)
 
     @staticmethod
     def _archive_allocation(conn: sqlite3.Connection, row: Mapping[str, Any], now: float,

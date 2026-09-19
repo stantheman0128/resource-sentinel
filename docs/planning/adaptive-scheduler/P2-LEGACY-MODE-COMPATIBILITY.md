@@ -42,6 +42,11 @@ This guard exists in the updated binaries. It cannot fence already-loaded old
 writers that do not call it. A coherent writer cutover and native lifetime
 provider remain necessary before managed production use or P1 promotion.
 
+The subsequent [persistent writer fence](P2-WRITER-COMPATIBILITY-FENCE.md)
+extends protection to incompatible mutations from already-loaded historical
+writers. Its deliberately limited DML guarantee does not fence SELECT-only old
+approval paths or remove the remaining native lifetime/cutover prerequisite.
+
 ## Verification
 
 Environment: Windows build 26340, x64 Python 3.13.3. Clean staged tree

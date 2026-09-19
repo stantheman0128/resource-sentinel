@@ -52,8 +52,10 @@ class AdaptiveCoordinatorTests(unittest.TestCase):
     def mark_bound(self, reservation_id):
         # An incomplete binding is deliberate fault injection: it must remain
         # protected even if the metadata writer crashed before registry repair.
+        # Model a compatible metadata writer, not an unversioned old binary.
         with closing(sqlite3.connect(self.coordinator.db_path)) as conn, conn:
-            conn.execute("UPDATE reservations SET lifecycle_managed=1,execution_id=? WHERE id=?",
+            conn.execute("UPDATE reservations SET lifecycle_managed=1,execution_id=?,"
+                         "writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?",
                          ("a" * 32, reservation_id))
 
     def test_active_allocation_still_counts_after_legacy_grace(self):
@@ -196,22 +198,24 @@ class AdaptiveCoordinatorTests(unittest.TestCase):
             conn.execute("ALTER TABLE queue DROP COLUMN commit_bytes")
         both_observed_old_queue = Barrier(2)
         observations = []
+        migration_reads = []
         original_connect = sqlite3.connect
 
         class SynchronizedConnection(sqlite3.Connection):
             def execute(connection, sql, parameters=()):
-                cursor = super().execute(sql, parameters)
-                if sql == "PRAGMA table_info(queue)" and not connection.in_transaction:
+                if sql == "BEGIN IMMEDIATE":
+                    cursor = super().execute("PRAGMA table_info(queue)")
                     rows = cursor.fetchall()
                     cursor.close()
                     if "commit_bytes" not in {row[1] for row in rows}:
                         observations.append(True)
-                        # Force both constructors to read the same old schema.
-                        # An ALTER based on that outside observation would race;
-                        # migrate_schema must recheck under its writer lock.
+                        # Both constructors see the old schema before taking
+                        # their real writer lock. Migration must recheck inside
+                        # that lock, after any competing upgrade has committed.
                         both_observed_old_queue.wait(timeout=5)
-                    return rows
-                return cursor
+                if sql == "PRAGMA table_info(queue)":
+                    migration_reads.append(connection.in_transaction)
+                return super().execute(sql, parameters)
 
         def connect(*args, **kwargs):
             return original_connect(*args, factory=SynchronizedConnection, **kwargs)
@@ -224,6 +228,8 @@ class AdaptiveCoordinatorTests(unittest.TestCase):
             with ThreadPoolExecutor(max_workers=2) as pool:
                 rows = list(pool.map(initialize, (1, 2)))
         self.assertEqual(len(observations), 2)
+        self.assertTrue(migration_reads)
+        self.assertTrue(all(migration_reads))
         self.assertTrue(all(row["commit_bytes"] is None and row["spec_hash"] == req.spec_hash for row in rows))
         with closing(sqlite3.connect(self.coordinator.db_path)) as conn:
             self.assertEqual(sum(row[1] == "commit_bytes" for row in conn.execute("PRAGMA table_info(queue)")), 1)
@@ -271,7 +277,8 @@ class AdaptiveCoordinatorTests(unittest.TestCase):
         admitted = self.admit()
         self.mark_bound(admitted["reservation_id"])
         with closing(sqlite3.connect(self.coordinator.db_path)) as conn, conn:
-            conn.execute("UPDATE reservations SET tool_use_id='' WHERE id=?", (admitted["reservation_id"],))
+            # Model the incomplete binding below the SQL compatibility fence.
+            conn.execute("UPDATE reservations SET tool_use_id='',writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?", (admitted["reservation_id"],))
         before = self.coordinator.snapshot()["reservations"]
         other = self.coordinator.admit(request(tool="different-tool"), status(), now=NOW+1)
         self.assertFalse(other["allowed"])

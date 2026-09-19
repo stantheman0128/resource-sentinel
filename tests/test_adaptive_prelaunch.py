@@ -406,7 +406,10 @@ class AdaptivePrelaunchTests(unittest.TestCase):
     def test_missing_allocation_binding_cannot_terminalize_or_archive_another_row(self):
         spec, _ = self.registered()
         row = self.store.query(spec.execution_id)
-        self.connection().execute("UPDATE reservations SET lifecycle_managed=0 WHERE id=?", (spec.reservation.id,))
+        # Corrupt the binding through a protocol-aware fixture write so the
+        # lifecycle layer, rather than the older-writer fence, sees the fault.
+        self.connection().execute("""UPDATE reservations SET lifecycle_managed=0,
+            writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?""", (spec.reservation.id,))
         with self.assertRaisesRegex(LifecycleError, "allocation_binding_missing"):
             self.cancel(spec, 0)
         self.assertEqual(self.store.query(spec.execution_id), row)
@@ -463,7 +466,7 @@ class AdaptivePrelaunchTests(unittest.TestCase):
         store = LifecycleStore(self.db, evidence_provider=fixture_evidence_provider(self.verifier), local_host_id="fixture-host")
         spec = self.spec(kind=AllocationKind.ROUTED)
         self.allocate(spec)
-        self.connection().execute("UPDATE workers SET capabilities_json=?",
+        self.connection().execute("UPDATE workers SET capabilities_json=?,writer_protocol=1,writer_revision=writer_revision+1",
             (json.dumps({"canonical_host_id": "fixture-host"}),))
         row = store.prepare_registration(spec, caller=fixtures.WRAPPER, now=fixtures.NOW)
         self.assertTrue(row["registered"])
@@ -480,7 +483,7 @@ class AdaptivePrelaunchTests(unittest.TestCase):
                              {"canonical_host_id": "remote-host"}, {},
                              {"local": "true", "canonical_host_id": "fixture-host"}):
             with self.subTest(capabilities=capabilities):
-                self.connection().execute("UPDATE workers SET capabilities_json=?", (json.dumps(capabilities),))
+                self.connection().execute("UPDATE workers SET capabilities_json=?,writer_protocol=1,writer_revision=writer_revision+1", (json.dumps(capabilities),))
                 with self.assertRaisesRegex(LifecycleError, "nonlocal_allocation"):
                     store.prepare_registration(spec, caller=fixtures.WRAPPER, now=fixtures.NOW)
                 self.assertEqual(self.allocation(spec), before)
@@ -498,7 +501,7 @@ class AdaptivePrelaunchTests(unittest.TestCase):
             store = LifecycleStore(self.db, evidence_provider=fixture_evidence_provider(self.verifier))
             spec = self.spec(kind=AllocationKind.ROUTED)
             self.allocate(spec)
-            self.connection().execute("UPDATE workers SET capabilities_json=?",
+            self.connection().execute("UPDATE workers SET capabilities_json=?,writer_protocol=1,writer_revision=writer_revision+1",
                 (json.dumps({"canonical_host_id": "fixture-host"}),))
             store.prepare_registration(spec, caller=fixtures.WRAPPER, now=fixtures.NOW)
             observe.assert_called_once_with()

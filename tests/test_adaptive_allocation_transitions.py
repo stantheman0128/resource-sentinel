@@ -35,7 +35,8 @@ class AllocationTransitionTests(unittest.TestCase):
 
     def test_preparation_requires_the_same_retained_allocation(self):
         spec, _ = self.registered()
-        self.connection().execute("UPDATE reservations SET execution_id=NULL WHERE id=?", (spec.reservation.id,))
+        self.connection().execute("""UPDATE reservations SET execution_id=NULL,
+            writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?""", (spec.reservation.id,))
         with self.assertRaisesRegex(LifecycleError, "allocation_binding_mismatch"):
             self.store.mark_prepared(spec.execution_id, caller=fixtures.WRAPPER, expected_revision=0)
         row = self.store.query(spec.execution_id)
@@ -45,6 +46,36 @@ class AllocationTransitionTests(unittest.TestCase):
         runtime = self.connection().execute(
             "SELECT policy_entry_nonce FROM adaptive_runtime WHERE singleton=1").fetchone()
         self.assertIsNotNone(runtime["policy_entry_nonce"])
+
+    def inject_missing_allocation(self, spec):
+        """Create isolated storage damage, restoring the exact guard before use.
+
+        Normal DELETE is now correctly rejected by the writer fence. These
+        earlier tests still need to prove a missing allocation cannot authorize
+        lifecycle transitions. Only the target table's DELETE guard is removed,
+        and its original SQL is restored in the same fixture transaction.
+        """
+        table = ("reservations" if spec.reservation.kind is AllocationKind.DIRECT
+                 else "worker_reservations")
+        name = f"adaptive_writer_{table}_delete"
+        conn = self.connection()
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                               (name,)).fetchone()
+            self.assertIsNotNone(row)
+            original_sql = row[0]
+            conn.execute(f"DROP TRIGGER {name}")
+            self.assertEqual(conn.execute(f"DELETE FROM {table} WHERE id=?",
+                                          (spec.reservation.id,)).rowcount, 1)
+            conn.execute(original_sql)
+            self.assertEqual(conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)
+            ).fetchone()[0], original_sql)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
 
     def assert_allocation_change_denies_claim(self, kind, sql, reason):
         # Each caller is a separate test: uncertain native entry intentionally
@@ -56,7 +87,12 @@ class AllocationTransitionTests(unittest.TestCase):
         def corrupt(operation, record, caller):
             evidence = self.verifier(operation, record, caller)
             if operation == "claim":
-                self.connection().execute(sql.format(table=table), (spec.reservation.id,))
+                if sql.startswith("DELETE FROM"):
+                    self.inject_missing_allocation(spec)
+                else:
+                    # Stamped fixture corruption deliberately reaches the
+                    # lifecycle revalidation with every writer guard active.
+                    self.connection().execute(sql.format(table=table), (spec.reservation.id,))
             return evidence
 
         self.store.evidence_provider = fixture_evidence_provider(corrupt)
@@ -73,15 +109,15 @@ class AllocationTransitionTests(unittest.TestCase):
 
     def test_direct_managed_flag_changed_during_claim_denies_launch(self):
         self.assert_allocation_change_denies_claim(
-            AllocationKind.DIRECT, "UPDATE {table} SET lifecycle_managed=0 WHERE id=?", "allocation_binding_mismatch")
+            AllocationKind.DIRECT, "UPDATE {table} SET lifecycle_managed=0,writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?", "allocation_binding_mismatch")
 
     def test_direct_cpu_changed_during_claim_denies_launch(self):
         self.assert_allocation_change_denies_claim(
-            AllocationKind.DIRECT, "UPDATE {table} SET cpu_units=cpu_units+1 WHERE id=?", "allocation_binding_mismatch")
+            AllocationKind.DIRECT, "UPDATE {table} SET cpu_units=cpu_units+1,writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?", "allocation_binding_mismatch")
 
     def test_direct_spec_changed_during_claim_denies_launch(self):
         self.assert_allocation_change_denies_claim(
-            AllocationKind.DIRECT, "UPDATE {table} SET spec_hash='changed' WHERE id=?", "allocation_spec_mismatch")
+            AllocationKind.DIRECT, "UPDATE {table} SET spec_hash='changed',writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?", "allocation_spec_mismatch")
 
     def test_routed_allocation_deleted_during_claim_denies_launch(self):
         self.assert_allocation_change_denies_claim(
@@ -89,15 +125,15 @@ class AllocationTransitionTests(unittest.TestCase):
 
     def test_routed_managed_flag_changed_during_claim_denies_launch(self):
         self.assert_allocation_change_denies_claim(
-            AllocationKind.ROUTED, "UPDATE {table} SET lifecycle_managed=0 WHERE id=?", "allocation_binding_mismatch")
+            AllocationKind.ROUTED, "UPDATE {table} SET lifecycle_managed=0,writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?", "allocation_binding_mismatch")
 
     def test_routed_cpu_changed_during_claim_denies_launch(self):
         self.assert_allocation_change_denies_claim(
-            AllocationKind.ROUTED, "UPDATE {table} SET cpu_units=cpu_units+1 WHERE id=?", "allocation_binding_mismatch")
+            AllocationKind.ROUTED, "UPDATE {table} SET cpu_units=cpu_units+1,writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?", "allocation_binding_mismatch")
 
     def test_routed_spec_changed_during_claim_denies_launch(self):
         self.assert_allocation_change_denies_claim(
-            AllocationKind.ROUTED, "UPDATE {table} SET spec_hash='changed' WHERE id=?", "allocation_spec_mismatch")
+            AllocationKind.ROUTED, "UPDATE {table} SET spec_hash='changed',writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?", "allocation_spec_mismatch")
 
     def assert_routed_identity_change_denies_claim(self, change, reason):
         spec, registered = self.registered(self.spec(kind=AllocationKind.ROUTED))
@@ -110,11 +146,11 @@ class AllocationTransitionTests(unittest.TestCase):
 
     def test_routed_task_change_after_prepare_denies_claim(self):
         self.assert_routed_identity_change_denies_claim(
-            "UPDATE worker_reservations SET task_id='other'", "allocation_task_mismatch")
+            "UPDATE worker_reservations SET task_id='other',writer_protocol=1,writer_revision=writer_revision+1", "allocation_task_mismatch")
 
     def test_routed_host_change_after_prepare_denies_claim(self):
         self.assert_routed_identity_change_denies_claim(
-            "UPDATE workers SET capabilities_json='{\"local\":false}'", "nonlocal_allocation")
+            "UPDATE workers SET capabilities_json='{\"local\":false}',writer_protocol=1,writer_revision=writer_revision+1", "nonlocal_allocation")
 
     def test_lowered_floor_cannot_be_used_to_claim(self):
         spec, registered = self.registered()
@@ -126,7 +162,7 @@ class AllocationTransitionTests(unittest.TestCase):
 
     def test_active_registration_retry_detects_capacity_loss(self):
         spec, _ = self.registered()
-        self.connection().execute("DELETE FROM reservations WHERE id=?", (spec.reservation.id,))
+        self.inject_missing_allocation(spec)
         with self.assertRaisesRegex(LifecycleError, "allocation_missing"):
             self.store.prepare_registration(spec, caller=fixtures.WRAPPER, now=fixtures.NOW)
         self.assertEqual(self.store.query(spec.execution_id)["state"], "RESERVED")
@@ -134,7 +170,7 @@ class AllocationTransitionTests(unittest.TestCase):
     def test_nested_adoption_cannot_hide_missing_parent_capacity(self):
         parent, _ = self.running()
         child = self.spec(kind=AllocationKind.PARENT, parent=parent.execution_id)
-        self.connection().execute("DELETE FROM reservations WHERE id=?", (parent.reservation.id,))
+        self.inject_missing_allocation(parent)
         with self.assertRaisesRegex(LifecycleError, "allocation_missing"):
             self.store.prepare_registration(child, caller=fixtures.WRAPPER, now=fixtures.NOW)
         self.assertIsNone(self.connection().execute("SELECT 1 FROM managed_executions WHERE execution_id=?", (child.execution_id,)).fetchone())

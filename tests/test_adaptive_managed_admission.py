@@ -200,7 +200,10 @@ class ManagedAdmissionTests(unittest.TestCase):
                         return observations
                     legacy._cleanup_observations = cancel_after_read
                 now = NOW + 1900 if expired else NOW
-                with self.assertRaisesRegex(sqlite3.IntegrityError, "managed_admission_context_required"):
+                # Either persistent guard may run first; both must abort the
+                # historical writer without creating a reservation or claim.
+                with self.assertRaisesRegex(sqlite3.IntegrityError,
+                        "^(managed_admission_context_required|capacity_writer_protocol_required)$"):
                     legacy.retry_queued(result["request_key"], status(now=now), config=CONFIG, now=now)
                 self.assertEqual(self.counts()[1:], (0, 0))
                 # The expired deletion was in the aborted old transaction. The
@@ -231,7 +234,8 @@ class ManagedAdmissionTests(unittest.TestCase):
         legacy = LegacyAdmissionCoordinator(self.directory, pid_identity=lambda pid: (None, 0.0))
         for entry in (legacy, self.coordinator):
             with self.subTest(algorithm=type(entry).__name__):
-                with self.assertRaisesRegex(sqlite3.IntegrityError, "managed_admission_context_required"):
+                with self.assertRaisesRegex(sqlite3.IntegrityError,
+                        "^(managed_admission_context_required|capacity_writer_protocol_required)$"):
                     entry.admit(snapshot.request, status(), config=CONFIG, now=NOW)
                 self.assertEqual(before, dict(self.conn().execute("SELECT * FROM reservations").fetchone()))
                 self.assertEqual(self.counts(), (0, 1, 0))
@@ -318,9 +322,11 @@ class ManagedAdmissionTests(unittest.TestCase):
         context = self.context()
         result = self.admit(context)
         with self.assertRaisesRegex(sqlite3.IntegrityError, "managed_admission_context_required"):
-            self.conn().execute("UPDATE reservations SET managed_spec_hash=NULL WHERE id=?", (result["reservation_id"],))
+            self.conn().execute("UPDATE reservations SET managed_spec_hash=NULL,writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?", (result["reservation_id"],))
         self.assertTrue(self.admit(context)["allowed"])
-        self.conn().execute("UPDATE reservations SET managed_spec_hash=? WHERE id=?", ("c" * 64, result["reservation_id"]))
+        # Deliberately corrupt a synthetic compatible-writer record so the
+        # semantic spec guard still runs below the cooperative SQL fence.
+        self.conn().execute("UPDATE reservations SET managed_spec_hash=?,writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?", ("c" * 64, result["reservation_id"]))
         with self.assertRaisesRegex(LifecycleError, "allocation_spec_mismatch"):
             self.admit(context)
 

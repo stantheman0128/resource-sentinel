@@ -394,13 +394,16 @@ class IpcAdmissionTests(unittest.TestCase):
         # normal admission trigger correctly refuses these corrupt updates;
         # dropping it here does not change the production admission boundary.
         conn.execute("DROP TRIGGER managed_direct_update_guard")
+        # Keep the new compatibility fence installed. This deliberate corrupt
+        # SQL writer knows its marker, which is not authentication or authority.
         lifecycle_before = self.row(snapshot.execution_id)
         for column, value in (("execution_id", b"private-corrupt-execution"),
                               ("lifecycle_managed", "private-corrupt-managed-flag")):
             with self.subTest(column=column):
                 before = dict(conn.execute("SELECT * FROM reservations WHERE id=?",
                                            (admitted["reservation_id"],)).fetchone())
-                conn.execute(f"UPDATE reservations SET {column}=? WHERE id=?",
+                conn.execute(f"""UPDATE reservations SET {column}=?,writer_protocol=1,
+                    writer_revision=writer_revision+1 WHERE id=?""",
                              (value, admitted["reservation_id"]))
                 damaged = dict(conn.execute("SELECT * FROM reservations WHERE id=?",
                                             (admitted["reservation_id"],)).fetchone())
@@ -413,7 +416,8 @@ class IpcAdmissionTests(unittest.TestCase):
                 self.assertEqual(dict(conn.execute("SELECT * FROM reservations WHERE id=?",
                     (admitted["reservation_id"],)).fetchone()), damaged)
                 self.assertEqual(self.row(snapshot.execution_id), lifecycle_before)
-                conn.execute(f"UPDATE reservations SET {column}=? WHERE id=?",
+                conn.execute(f"""UPDATE reservations SET {column}=?,writer_protocol=1,
+                    writer_revision=writer_revision+1 WHERE id=?""",
                              (before[column], admitted["reservation_id"]))
 
     def test_prelaunch_digest_excludes_query_key_blob_but_includes_admission_binding(self):

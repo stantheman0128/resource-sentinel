@@ -142,10 +142,16 @@ class NativeCancelProtocolTests(unittest.TestCase):
         for name, value in {"request_key": "wrong", "owner_pid": original["owner_pid"] + 1,
                             "spec_hash": "b" * 64, "commit_bytes": original["commit_bytes"] + 1}.items():
             with self.subTest(field=name):
-                conn.execute(f"UPDATE reservations SET {name}=?", (value,))
-                with self.assertRaisesRegex(ManagedAdmissionUnavailable, "reserved_cancel_allocation_mismatch"):
-                    self.cancel(context, admitted)
-                conn.execute(f"UPDATE reservations SET {name}=?", (original[name],))
+                # Deliberately model a SQL writer that knows the compatibility
+                # protocol. Its marker grants no native/cancellation authority.
+                update = (f"UPDATE reservations SET {name}=?,writer_protocol=1,"
+                          "writer_revision=writer_revision+1 WHERE id=?")
+                try:
+                    conn.execute(update, (value, admitted["reservation_id"]))
+                    with self.assertRaisesRegex(ManagedAdmissionUnavailable, "reserved_cancel_allocation_mismatch"):
+                        self.cancel(context, admitted)
+                finally:
+                    conn.execute(update, (original[name], admitted["reservation_id"]))
         actual = self.process.observed
         self.process.observed = IdentityObservation(actual.identity, IdentityStatus.UNKNOWN, "query_failed")
         with self.assertRaisesRegex(ManagedAdmissionUnavailable, "wrapper_identity_not_alive"):
@@ -239,6 +245,12 @@ class NativeCancelProtocolTests(unittest.TestCase):
                 target = admitted["execution_id"] if table == "managed_executions" else admitted["reservation_id"]
                 original = conn.execute(f"SELECT {field} FROM {table} WHERE {identifier}=?", (target,)).fetchone()[0]
                 enter_transaction = LifecycleStore._transaction
+                # This adversarial writer knows the SQL compatibility marker;
+                # it still cannot bypass the immutable prelaunch digest. Only
+                # writer_revision advances, never the lifecycle state_revision.
+                writer_stamp = (",writer_protocol=1,writer_revision=writer_revision+1"
+                                if table == "reservations" else "")
+                update = f"UPDATE {table} SET {field}=?{writer_stamp} WHERE {identifier}=?"
 
                 from contextlib import contextmanager
                 @contextmanager
@@ -246,17 +258,22 @@ class NativeCancelProtocolTests(unittest.TestCase):
                     # The credential has already been sealed; mutation wins
                     # before BEGIN without incrementing lifecycle revision.
                     self.assertTrue(context._cancel_sealed)
-                    conn.execute(f"UPDATE {table} SET {field}=? WHERE {identifier}=?", (value, target))
+                    conn.execute(update, (value, target))
                     with enter_transaction(store) as transaction:
                         yield transaction
 
-                with patch.object(LifecycleStore, "_transaction", change_after_proof):
-                    with self.assertRaises(LifecycleError):
-                        self.cancel(context, admitted)
-                self.assert_sealed(context)
-                self.assertIsNotNone(conn.execute("SELECT 1 FROM reservations WHERE id=?", (admitted["reservation_id"],)).fetchone())
-                conn.execute(f"UPDATE {table} SET {field}=? WHERE {identifier}=?", (original, target))
-                self.cancel(context, admitted)
+                try:
+                    with patch.object(LifecycleStore, "_transaction", change_after_proof):
+                        with self.assertRaises(LifecycleError):
+                            self.cancel(context, admitted)
+                    self.assert_sealed(context)
+                    self.assertIsNotNone(conn.execute("SELECT 1 FROM reservations WHERE id=?", (admitted["reservation_id"],)).fetchone())
+                finally:
+                    # Each subtest owns this exact reservation. Restore its
+                    # fixture binding and cancel it before the next admission,
+                    # even when an assertion fails, avoiding cascading I/O waits.
+                    conn.execute(update, (original, target))
+                    self.cancel(context, admitted)
 
     def test_heartbeat_and_deadline_refresh_do_not_invalidate_unused_claim_proof(self):
         context, admitted = self.admitted()
@@ -268,7 +285,11 @@ class NativeCancelProtocolTests(unittest.TestCase):
         def heartbeat_after_proof(store):
             self.assertTrue(context._cancel_sealed)
             conn.execute("UPDATE managed_executions SET heartbeat_at=heartbeat_at+10")
-            conn.execute("UPDATE reservations SET heartbeat_at=heartbeat_at+10,expires_at=?", (NOW - 1,))
+            # A compatible heartbeat advances SQL bookkeeping without changing
+            # launch custody; the proof excludes writer_revision, not protocol.
+            conn.execute("""UPDATE reservations SET heartbeat_at=heartbeat_at+10,expires_at=?,
+                writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?""",
+                (NOW - 1, admitted["reservation_id"]))
             with enter_transaction(store) as transaction:
                 yield transaction
 

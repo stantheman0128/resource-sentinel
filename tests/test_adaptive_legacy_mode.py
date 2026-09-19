@@ -55,7 +55,10 @@ class LegacyManagedAccountingTests(unittest.TestCase):
             floor_physical_bytes=?,floor_commit_bytes=? WHERE execution_id=?""",
                      (59 * GIB, 96 * GIB, spec.execution_id))
         table = "reservations" if kind is AllocationKind.DIRECT else "worker_reservations"
-        conn.execute(f"UPDATE {table} SET created_at=?,expires_at=? WHERE id=?",
+        # Age the fixture through the compatible writer protocol; expiry still
+        # must not erase a managed floor or authorize legacy admission.
+        conn.execute(f"UPDATE {table} SET created_at=?,expires_at=?,"
+                     "writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?",
                      (NOW - 1000, NOW - 1, spec.reservation.id))
         return spec, table
 
@@ -72,8 +75,35 @@ class LegacyManagedAccountingTests(unittest.TestCase):
         return task, parent, reserved, caps
 
     def set_replay_capabilities(self, caps):
-        self.connection().execute("UPDATE workers SET capabilities_json=? WHERE id='legacy-local'",
+        self.connection().execute("UPDATE workers SET capabilities_json=?,"
+                                  "writer_protocol=1,writer_revision=writer_revision+1 WHERE id='legacy-local'",
                                   (json.dumps(caps),))
+
+    def corrupt_delete_allocation(self, conn, table, reservation_id):
+        """Inject lost storage, restoring its exact guard before any assertion.
+
+        Normal compatible writers cannot delete a live managed allocation.
+        This fixture deliberately models damage beneath that writer boundary;
+        a savepoint makes dropping/restoring just its DELETE guard atomic.
+        """
+        self.assertIn(table, ("reservations", "worker_reservations"))
+        trigger = f"adaptive_writer_{table}_delete"
+        saved = conn.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                             (trigger,)).fetchone()
+        self.assertIsNotNone(saved)
+        ddl = saved[0]
+        conn.execute("SAVEPOINT fixture_storage_corruption")
+        try:
+            conn.execute(f"DROP TRIGGER {trigger}")
+            conn.execute(f"DELETE FROM {table} WHERE id=?", (reservation_id,))
+            conn.execute(ddl)
+            conn.execute("RELEASE SAVEPOINT fixture_storage_corruption")
+        except BaseException:
+            conn.execute("ROLLBACK TO SAVEPOINT fixture_storage_corruption")
+            conn.execute("RELEASE SAVEPOINT fixture_storage_corruption")
+            raise
+        self.assertEqual(conn.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                                      (trigger,)).fetchone()[0], ddl)
 
     def assert_local_denied(self):
         direct = self.coordinator.admit(self.request(), status(), now=NOW)
@@ -183,7 +213,8 @@ class LegacyManagedAccountingTests(unittest.TestCase):
         task = self.task()
         self.assertTrue(self.maintainer.route_and_reserve(task, now=NOW)["reserved"])
         self.managed()
-        self.connection().execute("UPDATE workers SET capabilities_json=? WHERE id='legacy-local'",
+        self.connection().execute("UPDATE workers SET capabilities_json=?,"
+                                  "writer_protocol=1,writer_revision=writer_revision+1 WHERE id='legacy-local'",
                                   (json.dumps({"admission_policy": "resource-v2"}),))
         result = self.maintainer.route_and_reserve(task, now=NOW)
         self.assertEqual((result["reserved"], result["reason"]), (False, BLOCKED))
@@ -273,7 +304,10 @@ class LegacyManagedAccountingTests(unittest.TestCase):
             with self.subTest(changed=changed):
                 values = {field: original[field] for field in fields}
                 values.update(changed)
-                conn.execute("UPDATE worker_reservations SET " + ",".join(field + "=?" for field in fields) + " WHERE id=?",
+                # Inject a malformed resource shape through a versioned fixture
+                # writer so replay validation, not the old-writer fence, is tested.
+                conn.execute("UPDATE worker_reservations SET " + ",".join(field + "=?" for field in fields)
+                             + ",writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?",
                              (*values.values(), reserved["reservation_id"]))
                 before = dict(conn.execute("SELECT * FROM worker_reservations WHERE id=?", (reserved["reservation_id"],)).fetchone())
                 self.assertEqual(before["spec_hash"], original["spec_hash"])
@@ -284,7 +318,8 @@ class LegacyManagedAccountingTests(unittest.TestCase):
 
     def test_v2_replay_accepts_legacy_null_fields_only_when_effective_demand_matches(self):
         task, _, reserved, _ = self.v2_replay_fixture(ram=2, io=1)
-        self.connection().execute("UPDATE worker_reservations SET physical_bytes=NULL,commit_bytes=NULL,io_slots=NULL WHERE id=?",
+        self.connection().execute("UPDATE worker_reservations SET physical_bytes=NULL,commit_bytes=NULL,io_slots=NULL,"
+                                  "writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?",
                                   (reserved["reservation_id"],))
         result = self.maintainer.route_and_reserve(task, now=NOW + 1)
         self.assertTrue(result["reserved"])
@@ -303,7 +338,7 @@ class LegacyManagedAccountingTests(unittest.TestCase):
                 spec, table = self.managed()
                 conn = self.connection()
                 if corruption == "missing_allocation":
-                    conn.execute(f"DELETE FROM {table} WHERE id=?", (spec.reservation.id,))
+                    self.corrupt_delete_allocation(conn, table, spec.reservation.id)
                 elif corruption == "missing_registry":
                     conn.execute("DELETE FROM managed_executions WHERE execution_id=?", (spec.execution_id,))
                 elif corruption == "terminal_with_allocation":
@@ -312,7 +347,7 @@ class LegacyManagedAccountingTests(unittest.TestCase):
                     conn.execute("UPDATE managed_executions SET floor_commit_bytes=0 WHERE execution_id=?", (spec.execution_id,))
                 self.assert_local_denied()
                 # Isolate each corrupt shape; no other broken row may mask it.
-                conn.execute(f"DELETE FROM {table} WHERE id=?", (spec.reservation.id,))
+                self.corrupt_delete_allocation(conn, table, spec.reservation.id)
                 conn.execute("DELETE FROM managed_executions WHERE execution_id=?", (spec.execution_id,))
 
     def test_unknown_schema_cannot_return_legacy_admission(self):

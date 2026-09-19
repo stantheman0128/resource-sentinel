@@ -28,6 +28,7 @@ from sentinel.adaptive.store import (
     hold_expired_allocations, migrate_schema,
 )
 from sentinel.coordinator import legacy_lifecycle_blocker
+from sentinel.adaptive.writers import writer_obligations_present
 
 
 ACTIVE_STATES = {"AVAILABLE", "BUSY"}
@@ -170,8 +171,6 @@ class Maintainer:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = Path(db_path) if db_path else self.data_dir / "sentinel.db"
         self._init_db()
-        with self._db() as conn:
-            migrate_schema(conn)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
@@ -199,100 +198,17 @@ class Maintainer:
 
     def _init_db(self) -> None:
         with self._db() as conn:
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS workers (
-                    id TEXT PRIMARY KEY,
-                    provider TEXT NOT NULL,
-                    failure_domain TEXT NOT NULL,
-                    capacity_scope TEXT NOT NULL DEFAULT 'SHARED_POOL',
-                    capacity_pool TEXT NOT NULL DEFAULT '',
-                    max_concurrency INTEGER NOT NULL DEFAULT 1,
-                    quota_domain TEXT NOT NULL DEFAULT '',
-                    state TEXT NOT NULL,
-                    automation_level TEXT NOT NULL,
-                    os TEXT NOT NULL,
-                    capacity_ram_gib REAL NOT NULL,
-                    allocatable_ram_gib REAL NOT NULL,
-                    visible_cpu REAL,
-                    allocatable_cpu REAL,
-                    disk_free_gib REAL,
-                    allocatable_disk_gib REAL,
-                    capabilities_json TEXT NOT NULL,
-                    trust_domain TEXT NOT NULL,
-                    source TEXT NOT NULL,
-                    observed_at REAL NOT NULL,
-                    probe_expires_at REAL NOT NULL,
-                    updated_at REAL NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_workers_domain ON workers(failure_domain);
-                CREATE TABLE IF NOT EXISTS worker_reservations (
-                    id TEXT PRIMARY KEY,
-                    task_id TEXT NOT NULL UNIQUE,
-                    worker_id TEXT NOT NULL,
-                    failure_domain TEXT NOT NULL,
-                    capacity_scope TEXT NOT NULL DEFAULT 'SHARED_POOL',
-                    capacity_pool TEXT NOT NULL DEFAULT '',
-                    spec_hash TEXT NOT NULL DEFAULT '',
-                    ram_gib REAL NOT NULL,
-                    cpu_units REAL NOT NULL,
-                    disk_gib REAL NOT NULL,
-                    created_at REAL NOT NULL,
-                    heartbeat_at REAL NOT NULL,
-                    expires_at REAL NOT NULL,
-                    metadata_json TEXT NOT NULL,
-                    FOREIGN KEY(worker_id) REFERENCES workers(id)
-                );
-                CREATE INDEX IF NOT EXISTS idx_worker_res_domain
-                    ON worker_reservations(failure_domain, expires_at);
-                CREATE TABLE IF NOT EXISTS routed_executions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    reservation_id TEXT NOT NULL,
-                    task_id TEXT NOT NULL,
-                    worker_id TEXT NOT NULL,
-                    failure_domain TEXT NOT NULL,
-                    capacity_scope TEXT NOT NULL DEFAULT 'SHARED_POOL',
-                    capacity_pool TEXT NOT NULL DEFAULT '',
-                    spec_hash TEXT NOT NULL DEFAULT '',
-                    ram_gib REAL NOT NULL,
-                    cpu_units REAL NOT NULL,
-                    disk_gib REAL NOT NULL,
-                    started_at REAL NOT NULL,
-                    ended_at REAL NOT NULL,
-                    outcome TEXT NOT NULL,
-                    metadata_json TEXT NOT NULL
-                );
-                """
-            )
-            # Additive migrations keep existing live databases usable.
-            self._ensure_columns(conn, "workers", {
-                "capacity_scope": "TEXT NOT NULL DEFAULT 'SHARED_POOL'",
-                "capacity_pool": "TEXT NOT NULL DEFAULT ''",
-                "max_concurrency": "INTEGER NOT NULL DEFAULT 1",
-                "quota_domain": "TEXT NOT NULL DEFAULT ''",
-            })
-            self._ensure_columns(conn, "worker_reservations", {
-                "capacity_scope": "TEXT NOT NULL DEFAULT 'SHARED_POOL'",
-                "capacity_pool": "TEXT NOT NULL DEFAULT ''",
-                "spec_hash": "TEXT NOT NULL DEFAULT ''",
-            })
-            self._ensure_columns(conn, "routed_executions", {
-                "capacity_scope": "TEXT NOT NULL DEFAULT 'SHARED_POOL'",
-                "capacity_pool": "TEXT NOT NULL DEFAULT ''",
-                "spec_hash": "TEXT NOT NULL DEFAULT ''",
-            })
-            conn.execute("UPDATE workers SET capacity_pool=failure_domain WHERE capacity_pool='' OR capacity_pool IS NULL")
-            conn.execute("UPDATE workers SET quota_domain=capacity_pool WHERE quota_domain='' OR quota_domain IS NULL")
-            conn.execute("UPDATE worker_reservations SET capacity_pool=failure_domain WHERE capacity_pool='' OR capacity_pool IS NULL")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_worker_res_pool ON worker_reservations(capacity_pool, expires_at)")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_worker_res_worker ON worker_reservations(worker_id)")
-
-    @staticmethod
-    def _ensure_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
-        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-        for name, declaration in columns.items():
-            if name not in existing:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+            # Migration creates both existing ledgers and their guards under
+            # this lock, including a peer not yet used by this entry point.
+            conn.execute("BEGIN IMMEDIATE")
+            migrate_schema(conn, in_transaction=True)
+            # Legacy locality backfills must not reinterpret retained or corrupt
+            # managed capacity. Resolve those obligations explicitly first.
+            if not writer_obligations_present(conn):
+                conn.execute("UPDATE workers SET capacity_pool=failure_domain,writer_protocol=1,writer_revision=writer_revision+1 WHERE capacity_pool='' OR capacity_pool IS NULL")
+                conn.execute("UPDATE workers SET quota_domain=capacity_pool,writer_protocol=1,writer_revision=writer_revision+1 WHERE quota_domain='' OR quota_domain IS NULL")
+                conn.execute("UPDATE worker_reservations SET capacity_pool=failure_domain,writer_protocol=1,writer_revision=writer_revision+1 WHERE capacity_pool='' OR capacity_pool IS NULL")
+            conn.commit()
 
     def upsert_worker(self, worker: Worker, *, now: float | None = None) -> dict[str, Any]:
         w = worker.normalized()
@@ -326,36 +242,35 @@ class Maintainer:
 
                 if old_scope != new_scope or (old_scope == "unknown" and binding(previous_caps) != binding(w.capabilities)):
                     raise ValueError("worker_locality_change_with_active_reservations")
-            conn.execute(
-                """INSERT INTO workers
-                (id,provider,failure_domain,capacity_scope,capacity_pool,max_concurrency,quota_domain,
-                 state,automation_level,os,capacity_ram_gib,
-                 allocatable_ram_gib,visible_cpu,allocatable_cpu,disk_free_gib,
-                 allocatable_disk_gib,capabilities_json,trust_domain,source,observed_at,
-                 probe_expires_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(id) DO UPDATE SET
-                  provider=excluded.provider,failure_domain=excluded.failure_domain,
-                  capacity_scope=excluded.capacity_scope,capacity_pool=excluded.capacity_pool,
-                  max_concurrency=excluded.max_concurrency,quota_domain=excluded.quota_domain,
-                  state=excluded.state,automation_level=excluded.automation_level,os=excluded.os,
-                  capacity_ram_gib=excluded.capacity_ram_gib,
-                  allocatable_ram_gib=excluded.allocatable_ram_gib,
-                  visible_cpu=excluded.visible_cpu,allocatable_cpu=excluded.allocatable_cpu,
-                  disk_free_gib=excluded.disk_free_gib,
-                  allocatable_disk_gib=excluded.allocatable_disk_gib,
-                  capabilities_json=excluded.capabilities_json,trust_domain=excluded.trust_domain,
-                  source=excluded.source,observed_at=excluded.observed_at,
-                  probe_expires_at=excluded.probe_expires_at,updated_at=excluded.updated_at""",
-                (
-                    w.id, w.provider, w.failure_domain, w.capacity_scope, w.capacity_pool,
-                    w.max_concurrency, w.quota_domain, w.state, w.automation_level, w.os,
-                    w.capacity_ram_gib, w.allocatable_ram_gib, w.visible_cpu, w.allocatable_cpu,
-                    w.disk_free_gib, w.allocatable_disk_gib,
-                    json.dumps(w.capabilities, separators=(",", ":")), w.trust_domain, w.source,
-                    observed, expires, now,
-                ),
+            columns = (
+                "id", "provider", "failure_domain", "capacity_scope", "capacity_pool",
+                "max_concurrency", "quota_domain", "state", "automation_level", "os",
+                "capacity_ram_gib", "allocatable_ram_gib", "visible_cpu", "allocatable_cpu",
+                "disk_free_gib", "allocatable_disk_gib", "capabilities_json", "trust_domain",
+                "source", "observed_at", "probe_expires_at", "updated_at",
             )
+            record = (
+                w.id, w.provider, w.failure_domain, w.capacity_scope, w.capacity_pool,
+                w.max_concurrency, w.quota_domain, w.state, w.automation_level, w.os,
+                w.capacity_ram_gib, w.allocatable_ram_gib, w.visible_cpu, w.allocatable_cpu,
+                w.disk_free_gib, w.allocatable_disk_gib,
+                json.dumps(w.capabilities, separators=(",", ":")), w.trust_domain, w.source,
+                observed, expires, now,
+            )
+            # The writer lock serializes this choice. A plain UPDATE avoids the
+            # replacement guard on INSERT into an occupied managed worker ID.
+            if conn.execute("SELECT 1 FROM workers WHERE id=?", (w.id,)).fetchone():
+                conn.execute(
+                    "UPDATE workers SET " + ",".join(name + "=?" for name in columns[1:])
+                    + ",writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?",
+                    (*record[1:], w.id),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO workers (" + ",".join(columns)
+                    + ",writer_protocol,writer_revision) VALUES ("
+                    + ",".join("?" for _ in columns) + ",1,0)", record,
+                )
             conn.execute("COMMIT")
         return values
 
@@ -384,7 +299,7 @@ class Maintainer:
         now = time.time() if now is None else now
         with self._db() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            cur = conn.execute("UPDATE workers SET state=?,updated_at=? WHERE id=?", (state.upper(), now, worker_id))
+            cur = conn.execute("UPDATE workers SET state=?,updated_at=?,writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?", (state.upper(), now, worker_id))
             conn.execute("COMMIT")
         return cur.rowcount > 0
 
@@ -611,7 +526,7 @@ class Maintainer:
                             return {"reserved": False, "reason": reason, "task_id": t.id,
                                     "reservation_id": existing["id"]}
                 conn.execute(
-                    "UPDATE worker_reservations SET heartbeat_at=?,expires_at=? WHERE id=?",
+                    "UPDATE worker_reservations SET heartbeat_at=?,expires_at=?,writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?",
                     (now, now + ttl_min * 60, existing["id"]),
                 )
                 conn.execute("COMMIT")
@@ -690,8 +605,8 @@ class Maintainer:
                 """INSERT INTO worker_reservations
                 (id,task_id,worker_id,failure_domain,capacity_scope,capacity_pool,spec_hash,
                  ram_gib,cpu_units,disk_gib,created_at,heartbeat_at,expires_at,metadata_json,
-                 physical_bytes,commit_bytes,io_slots)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                 physical_bytes,commit_bytes,io_slots,writer_protocol,writer_revision)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,0)""",
                 (
                     reservation_id, t.id, worker["id"], worker["failure_domain"],
                     worker["capacity_scope"], worker["capacity_pool"], spec_hash, t.ram_gib,
@@ -770,7 +685,7 @@ class Maintainer:
         with self._db() as conn:
             conn.execute("BEGIN IMMEDIATE")
             cur = conn.execute(
-                "UPDATE worker_reservations SET heartbeat_at=?,expires_at=? WHERE task_id=?",
+                "UPDATE worker_reservations SET heartbeat_at=?,expires_at=?,writer_protocol=1,writer_revision=writer_revision+1 WHERE task_id=?",
                 (now, now + ttl_min * 60, task_id),
             )
             conn.execute("COMMIT")

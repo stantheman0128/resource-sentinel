@@ -238,28 +238,10 @@ class Coordinator:
     def _init_db(self) -> None:
         with self._db() as conn:
             check_schema_version(conn)
-            conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS reservations (
-                    id TEXT PRIMARY KEY,
-                    request_key TEXT NOT NULL UNIQUE,
-                    owner_pid INTEGER NOT NULL,
-                    owner_started REAL NOT NULL,
-                    tool_use_id TEXT,
-                    repo TEXT NOT NULL,
-                    command_signature TEXT NOT NULL,
-                    command_text TEXT NOT NULL,
-                    resource_class TEXT NOT NULL,
-                    priority TEXT NOT NULL,
-                    priority_rank INTEGER NOT NULL,
-                    cpu_units REAL NOT NULL,
-                    ram_gib REAL NOT NULL,
-                    io_slots INTEGER NOT NULL,
-                    created_at REAL NOT NULL,
-                    heartbeat_at REAL NOT NULL,
-                    expires_at REAL NOT NULL
-                    ,spec_hash TEXT NOT NULL DEFAULT ''
-                );
+            # Own non-capacity tables and the complete shared capacity schema
+            # become visible together with their persistent writer guards.
+            conn.execute("BEGIN IMMEDIATE")
+            schema = """
                 CREATE TABLE IF NOT EXISTS queue (
                     request_key TEXT PRIMARY KEY,
                     owner_pid INTEGER NOT NULL,
@@ -278,22 +260,6 @@ class Coordinator:
                     heartbeat_at REAL NOT NULL
                     ,spec_hash TEXT NOT NULL DEFAULT ''
                 );
-                CREATE TABLE IF NOT EXISTS executions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    reservation_id TEXT NOT NULL,
-                    request_key TEXT NOT NULL,
-                    owner_pid INTEGER NOT NULL,
-                    repo TEXT NOT NULL,
-                    command_signature TEXT NOT NULL,
-                    resource_class TEXT NOT NULL,
-                    priority TEXT NOT NULL,
-                    cpu_units REAL NOT NULL,
-                    ram_gib REAL NOT NULL,
-                    io_slots INTEGER NOT NULL,
-                    started_at REAL NOT NULL,
-                    ended_at REAL NOT NULL,
-                    outcome TEXT NOT NULL
-                );
                 CREATE TABLE IF NOT EXISTS resource_samples (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     sampled_at REAL NOT NULL,
@@ -310,16 +276,15 @@ class Coordinator:
                     agent_trees_json TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_samples_time ON resource_samples(sampled_at);
-                CREATE INDEX IF NOT EXISTS idx_exec_signature ON executions(command_signature, ended_at);
                 """
-            )
-            reservation_columns = {row[1] for row in conn.execute("PRAGMA table_info(reservations)")}
-            if "spec_hash" not in reservation_columns:
-                conn.execute("ALTER TABLE reservations ADD COLUMN spec_hash TEXT NOT NULL DEFAULT ''")
+            for statement in schema.split(";"):
+                if statement.strip():
+                    conn.execute(statement)
             queue_columns = {row[1] for row in conn.execute("PRAGMA table_info(queue)")}
             if "spec_hash" not in queue_columns:
                 conn.execute("ALTER TABLE queue ADD COLUMN spec_hash TEXT NOT NULL DEFAULT ''")
-            migrate_schema(conn)
+            migrate_schema(conn, in_transaction=True)
+            conn.commit()
 
     @staticmethod
     def _config(config: dict[str, Any] | None, *, local_host_id: str | None = None) -> dict[str, Any]:
@@ -541,7 +506,7 @@ class Coordinator:
                         "request_key": req.request_key, "reservation_id": existing["id"],
                     }
                 conn.execute(
-                    "UPDATE reservations SET heartbeat_at=?,expires_at=?,tool_use_id=? WHERE id=?",
+                    "UPDATE reservations SET heartbeat_at=?,expires_at=?,tool_use_id=?,writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?",
                     (now, now + float(cfg["reservation_ttl_min"]) * 60, req.tool_use_id, existing["id"]),
                 )
                 conn.execute("COMMIT")
@@ -554,7 +519,7 @@ class Coordinator:
             handoff = next((row for row in handoffs
                             if not allocation_is_bound(conn, "direct", row["id"])), None)
             if managed is None and not legacy_blocker and handoff and handoff["spec_hash"] == req.spec_hash:
-                conn.execute("UPDATE reservations SET tool_use_id=?,heartbeat_at=? WHERE id=?", (req.tool_use_id, now, handoff["id"]))
+                conn.execute("UPDATE reservations SET tool_use_id=?,heartbeat_at=?,writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?", (req.tool_use_id, now, handoff["id"]))
                 conn.execute("COMMIT")
                 self._mirror()
                 return {"allowed": True, "reservation_id": handoff["id"], "reused": True, "request_key": handoff["request_key"]}
@@ -666,8 +631,9 @@ class Coordinator:
                     """INSERT INTO reservations
                     (id,request_key,owner_pid,owner_started,tool_use_id,repo,command_signature,command_text,
                      resource_class,priority,priority_rank,cpu_units,ram_gib,io_slots,created_at,
-                     heartbeat_at,expires_at,spec_hash,commit_bytes,execution_id,lifecycle_managed,managed_spec_hash)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                     heartbeat_at,expires_at,spec_hash,commit_bytes,execution_id,lifecycle_managed,managed_spec_hash,
+                     writer_protocol,writer_revision)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,0)""",
                     (
                         reservation_id, req.request_key, req.owner_pid, req.owner_started, req.tool_use_id,
                         req.repo, req.command_signature, redact_command(req.command), req.resource_class, req.priority,
@@ -740,7 +706,7 @@ class Coordinator:
                     result = {"allowed": False, "reason": legacy_blocker,
                               "reservation_id": result["reservation_id"], "request_key": request_key}
                 else:
-                    conn.execute("UPDATE reservations SET tool_use_id='' WHERE id=?", (result["reservation_id"],))
+                    conn.execute("UPDATE reservations SET tool_use_id='',writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?", (result["reservation_id"],))
                 conn.execute("COMMIT")
             self._mirror()
         return result

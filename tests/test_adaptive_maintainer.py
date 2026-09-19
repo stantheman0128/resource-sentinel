@@ -283,7 +283,9 @@ class AdaptiveMaintainerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "worker_locality_change_with_active_reservations"):
             self.maintainer.upsert_worker(remote, now=NOW+1)
         with self.maintainer._db() as conn:
-            conn.execute("UPDATE worker_reservations SET lifecycle_managed=1,execution_id='uncertain' WHERE id=?",
+            # Simulate a compatible metadata writer leaving an incomplete bind.
+            conn.execute("UPDATE worker_reservations SET lifecycle_managed=1,execution_id='uncertain',"
+                         "writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?",
                          (reserved["reservation_id"],))
         self.assertEqual(self.maintainer.release(task_id="hold-local", now=NOW+1), 0)
         with self.assertRaisesRegex(ValueError, "worker_locality_change_with_active_reservations"):
@@ -364,7 +366,9 @@ class AdaptiveMaintainerTests(unittest.TestCase):
         self.add_local()
         result = self.maintainer.route_and_reserve(self.task("bound", ram=.5), ttl_min=1, now=NOW)
         with self.maintainer._db() as conn:
-            conn.execute("UPDATE worker_reservations SET lifecycle_managed=1,execution_id='missing-registry' WHERE id=?",
+            # The missing registry is the fault, not the writer's SQL protocol.
+            conn.execute("UPDATE worker_reservations SET lifecycle_managed=1,execution_id='missing-registry',"
+                         "writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?",
                          (result["reservation_id"],))
         self.assertEqual(self.maintainer.release(task_id="bound", now=NOW+1), 0)
         state = self.maintainer.snapshot(now=NOW+61)

@@ -18,7 +18,10 @@ import sqlite3
 import time
 from typing import Callable, Mapping, Any
 
-from sentinel.accounting import local_host_identity, resolve_worker_locality
+from sentinel.accounting import (
+    AccountingError, local_host_identity, resolve_worker_locality,
+    validate_active_allocation,
+)
 from .contracts import ExecutionSpec, ProcessIdentity, MAX_ENROLLED_JOBS
 
 SCHEMA_VERSION = 1
@@ -355,6 +358,12 @@ class LifecycleStore:
         if type(expected_revision) is not int or row["state_revision"] != expected_revision:
             raise LifecycleError("revision_conflict")
 
+    def _require_allocation(self, conn: sqlite3.Connection, execution_id: str) -> None:
+        try:
+            validate_active_allocation(conn, execution_id, local_context=self._local_context)
+        except AccountingError as error:
+            raise LifecycleError(str(error)) from error
+
     def prepare_registration(self, spec: ExecutionSpec, *, caller: ProcessIdentity, now: float | None = None) -> dict[str, Any]:
         """Bind exact existing capacity in RESERVED; this does not prepare a Job."""
         if not isinstance(spec, ExecutionSpec):
@@ -384,6 +393,8 @@ class LifecycleStore:
                 immutable = [key for key in row if key not in {"created_at", "heartbeat_at", "state", "state_revision", "claim_token_hash"} and not key.startswith("floor_")]
                 if any(previous[key] != row[key] for key in immutable):
                     raise LifecycleError("execution_spec_mismatch")
+                if previous["state"] not in TERMINAL_STATES:
+                    self._require_allocation(conn, spec.execution_id)
                 return {**self._public(previous), "claim_token": None, "registered": False}
             if kind == "parent":
                 parent = self._get(conn, spec.parent_execution_id)
@@ -395,6 +406,8 @@ class LifecycleStore:
                     if ancestor["execution_id"] in visited:
                         raise LifecycleError("parent_cycle")
                     visited.add(ancestor["execution_id"])
+                    if ancestor["logon_id"] != row["logon_id"] or ancestor["state"] not in {"RUNNING", "DRAINING"}:
+                        raise LifecycleError("parent_membership_unverified")
                     if ancestor["allocation_kind"] != "parent":
                         break
                     ancestor = self._get(conn, ancestor["parent_execution_id"])
@@ -422,6 +435,8 @@ class LifecycleStore:
                 if (allocation["cpu_units"], physical, commit, io) != (spec.requested.cpu_units, spec.requested.physical_bytes, spec.requested.commit_bytes, spec.requested.io_slots):
                     raise LifecycleError("reservation_resource_mismatch")
                 if kind == "routed":
+                    if allocation["task_id"] != spec.task_id:
+                        raise LifecycleError("allocation_task_mismatch")
                     worker = conn.execute("SELECT capabilities_json FROM workers WHERE id=?", (allocation["worker_id"],)).fetchone()
                     try:
                         capabilities = json.loads(worker[0]) if worker is not None else None
@@ -433,6 +448,7 @@ class LifecycleStore:
                              (spec.execution_id, physical, commit, spec.reservation.id))
             names = ",".join(row)
             conn.execute(f"INSERT INTO managed_executions({names}) VALUES({','.join('?' for _ in row)})", tuple(row.values()))
+            self._require_allocation(conn, spec.execution_id)
             _bump_registry(conn)
             return {**self._public(self._get(conn, spec.execution_id)), "claim_token": raw_token, "registered": True}
 
@@ -449,6 +465,7 @@ class LifecycleStore:
             self._require_revision(row, expected_revision)
             if row["state"] != "RESERVED" or row["allocation_kind"] == "parent":
                 raise LifecycleError("invalid_lifecycle_transition")
+            self._require_allocation(conn, execution_id)
             enrolled = conn.execute("""SELECT count(*) FROM managed_executions
                 WHERE allocation_kind IN ('direct','routed') AND job_name IS NOT NULL
                   AND state NOT IN ('FINISHED','CANCELLED_BEFORE_START','START_FAILED')""").fetchone()[0]
@@ -496,6 +513,7 @@ class LifecycleStore:
             runtime = conn.execute("SELECT guardian_epoch,admission_barrier FROM adaptive_runtime WHERE singleton=1").fetchone()
             if runtime[0] != guardian_epoch or runtime[1] != "NONE":
                 raise LifecycleError("launch_barrier_active")
+            self._require_allocation(conn, execution_id)
             updated = self._cas(conn, execution_id, expected_revision, {"state": "LAUNCHING", "claim_consumed": 1, "launch_in_flight": 1})
             return {**self._public(updated), "launch_authorized": True, "duplicate": False}
 

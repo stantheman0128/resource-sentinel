@@ -295,6 +295,30 @@ def resolve_allocation_source(conn, execution_id):
     raise AccountingError("allocation_parent_depth_exceeded")
 
 
+def validate_active_allocation(conn, execution_id, *, local_context):
+    """Validate retained capacity at a lifecycle transition, in its transaction.
+
+    This is ledger evidence only, not caller authorization or native membership.
+    It deliberately ignores allocation TTL: a managed lifetime floor survives it.
+    """
+    source = resolve_allocation_source(conn, execution_id)
+    row, allocation = source["execution"], source["allocation"]
+    if row.get("state") in TERMINAL_STATES:
+        raise AccountingError("execution_terminal")
+    if allocation.get("spec_hash") != row.get("spec_hash"):
+        raise AccountingError("allocation_spec_mismatch")
+    routed = source["allocation_kind"] == "routed"
+    if routed:
+        if allocation.get("task_id") != row.get("task_id"):
+            raise AccountingError("allocation_task_mismatch")
+        worker = next((w for w in _rows(conn, "workers")
+                       if w.get("id") == allocation.get("worker_id")), None)
+        if _worker_scope(worker, local_context) != "local":
+            raise AccountingError("nonlocal_allocation")
+    floor = _managed_floor(row, _demand(allocation, routed=routed))
+    return {**source, "floor": floor}
+
+
 def update_demand_floor(conn, execution_id, observed, *, expected_revision,
                         valid=True, uncapped=False):
     """Raise a top-level floor with a validated observation; never shrink it.

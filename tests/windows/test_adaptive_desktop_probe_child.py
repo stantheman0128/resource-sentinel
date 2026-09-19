@@ -85,6 +85,8 @@ class ChildProbeTests(unittest.TestCase):
         self.native_factory = mock.Mock(side_effect=AssertionError("No native calls in pure tests"))
         self.module = SimpleNamespace(NativeReadOnly=self.native_factory,
                                       _public_process=lambda value: {key: value[key] for key in PUBLIC_FIELDS})
+        self.collector = mock.Mock(side_effect=lambda api, handle, identity, **kwargs:
+                                   {"self": self.module._public_process(identity)})
         self.write("request.json", ticket())
 
     def write(self, name, value):
@@ -96,19 +98,20 @@ class ChildProbeTests(unittest.TestCase):
     def run_child(self):
         with mock.patch.object(child.os, "getpid", return_value=123):
             code = child.run_probe(self.directory, NONCE, api=self.api, preflight_module=self.module,
-                                   clock=self.clock, sleeper=self.clock.sleep)
+                                   clock=self.clock, sleeper=self.clock.sleep, diagnostic_collector=self.collector)
         self.native_factory.assert_not_called()
         return code
 
     def acknowledge(self):
         self.write("ack.json", dict(schema_version=1, nonce=NONCE, accepted=True))
 
-    def test_ack_success_queries_only_self_twice_and_exports_no_private_values(self):
+    def test_ack_success_rechecks_self_and_exports_no_private_values(self):
         self.clock.on_sleep = self.acknowledge
         self.assertEqual(self.run_child(), 0)
-        self.assertEqual(self.api.opened, [123])
-        self.assertEqual(self.api.reads, [(456, 123), (456, 123)])
-        self.assertEqual(self.api.closed, [456])
+        self.assertEqual(self.api.opened, [123, 123])
+        self.assertEqual(self.api.reads, [(456, 123)] * 4)
+        self.assertEqual(self.api.closed, [456, 456])
+        self.collector.assert_called_once()
         self.assertEqual(self.done()["outcome"], "acknowledged")
         for name in ("ready.json", "done.json"):
             raw = (self.directory / name).read_text(encoding="utf-8")
@@ -214,8 +217,8 @@ class ChildProbeTests(unittest.TestCase):
         self.assertEqual(self.run_child(), 2)
         self.assertFalse((self.directory / "ready.json").exists())
 
-    def test_job_elevation_integrity_and_basename_each_disqualify_self(self):
-        for key, value in (("in_any_job", True), ("elevated", True), ("integrity_rid", 0x3000),
+    def test_unknown_job_elevation_integrity_and_basename_each_disqualify_self(self):
+        for key, value in (("in_any_job", None), ("elevated", True), ("integrity_rid", 0x3000),
                            ("image_path", r"C:\Private\python.exe")):
             with self.subTest(key=key):
                 api = FakeQueries()
@@ -224,6 +227,42 @@ class ChildProbeTests(unittest.TestCase):
                     public, supported = child.observe_self(self.module, api)
                 self.assertFalse(supported)
                 self.assertEqual(public["pid"], 123)
+
+    def test_in_job_child_publishes_ready_and_collects_only_after_identity_ack(self):
+        self.api.identity["in_any_job"] = True
+        def acknowledge_after_ready():
+            self.assertTrue((self.directory / "ready.json").exists())
+            self.collector.assert_not_called()
+            self.acknowledge()
+        self.clock.on_sleep = acknowledge_after_ready
+        self.assertEqual(self.run_child(), 0)
+        self.assertTrue(self.done()["process"]["in_any_job"])
+        self.assertTrue(self.done()["diagnostics"]["self"]["in_any_job"])
+        self.assertEqual(self.done()["outcome"], "acknowledged")
+        self.collector.assert_called_once()
+
+    def test_no_ack_never_collects_job_or_lineage_diagnostics(self):
+        self.assertEqual(self.run_child(), 2)
+        self.collector.assert_not_called()
+
+    def test_diagnostic_exception_after_ack_is_not_success_and_is_sanitized(self):
+        self.clock.on_sleep = self.acknowledge
+        self.collector.side_effect = RuntimeError("private path or SID")
+        self.assertEqual(self.run_child(), 2)
+        self.assertEqual(self.done()["errors"], [{"stage": "unexpected_probe_error"}])
+        self.assertNotIn("private", json.dumps(self.done()))
+        self.assertEqual(self.api.closed, [456, 456])
+
+    def test_diagnostics_exceeding_ticket_are_unknown_and_do_not_succeed(self):
+        self.clock.on_sleep = self.acknowledge
+        def collect(*args, **kwargs):
+            self.clock.now = 115.0
+            return {"self": self.module._public_process(self.api.identity)}
+        self.collector.side_effect = collect
+        self.assertEqual(self.run_child(), 2)
+        self.assertEqual(self.done()["outcome"], "ticket_expired")
+        self.assertNotIn("diagnostics", self.done())
+        self.assertEqual(self.api.closed, [456, 456])
 
     def test_bounded_reader_rejects_duplicate_nonfinite_and_nonobject(self):
         for raw in ('{"x":1,"x":2}', '{"x":NaN}', '{"x":Infinity}', '{"x":1e999}', '[]'):

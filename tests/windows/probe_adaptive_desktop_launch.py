@@ -6,6 +6,8 @@ The native preflight must first identify a same-logon, normal desktop Explorer.
 Explorer COM automation follows Microsoft's 2013 desktop folder-view route.
 An uncertain dispatch is recorded once, never retried or killed. The child has
 a shared 15-second ticket deadline and at most 10 seconds waiting for an ACK.
+ACK proves only independent observation of this test child. In-Job children can
+complete diagnostics, but remain unsupported control hosts and never candidates.
 """
 from __future__ import annotations
 
@@ -304,7 +306,14 @@ def verify_child(api, ready, nonce, context, executable):
             raise ProbeError("child_executable_mismatch")
         if int(child["creation_filetime"]) <= int(context["caller"]["creation_filetime"]):
             raise ProbeError("child_not_new_for_this_probe")
-        assert_desktop_identity(context["caller"], child, executable)
+        # Do not reuse assert_desktop_identity: Explorer must remain outside a
+        # Job, whereas a diagnostic child inside a Job still has observable
+        # exact identity. Observation never authorizes managed enrollment.
+        for field in ("user_sid", "logon_sid", "authentication_luid", "session_id"):
+            if child[field] != context["caller"][field]:
+                raise ProbeError("child_identity_mismatch")
+        if child["elevated"] is not False or child["integrity_rid"] != 0x2000:
+            raise ProbeError("child_not_normal_integrity")
         if child != api.read_process(handle, published["pid"]):
             raise ProbeError("child_identity_changed")
         # Parent also independently reopens and verifies the desktop identity
@@ -335,16 +344,60 @@ def child_exit_code(api, handle):
     return int(code.value)
 
 
+def sanitized_child_diagnostics(value, child):
+    specification = importlib.util.spec_from_file_location(
+        "adaptive_parent_diagnostics", Path(__file__).with_name("adaptive_job_diagnostics.py"))
+    if specification is None or specification.loader is None:
+        raise ProbeError("diagnostics_import_unavailable")
+    module = importlib.util.module_from_spec(specification)
+    specification.loader.exec_module(module)
+    try:
+        result = module.sanitize_diagnostics(value)
+        if result["self"] != preflight._public_process(child):
+            raise ValueError("identity mismatch")
+        return result
+    except Exception:
+        raise ProbeError("child_diagnostics_invalid") from None
+
+
 def completion_verified(done, nonce, child, exit_code):
-    return (type(exit_code) is int and exit_code == 0 and type(done.get("schema_version")) is int
+    required = {"schema_version", "nonce", "outcome", "errors", "process"}
+    matches = (required.issubset(done) and set(done).issubset(required | {"diagnostics"})
+            and type(exit_code) is int and exit_code == 0 and type(done.get("schema_version")) is int
             and done.get("schema_version") == 1 and done.get("nonce") == nonce and done.get("errors") == []
             and done.get("outcome") == "acknowledged" and done.get("process") == preflight._public_process(child))
+    if matches and "diagnostics" in done:
+        try:
+            sanitized_child_diagnostics(done["diagnostics"], child)
+        except Exception:
+            return False
+    return matches
+
+
+def finish_observation(report, child, *, complete, com_success, dispatch_attempted, worker_errors):
+    report["observation_completed"] = bool(complete and com_success and report["child_verified"]
+                                           and report["child_exit_verified"]
+                                           and not worker_errors and not report["errors"])
+    # In particular, an immediate Job with CPU flags == 0 says nothing about
+    # its ancestors. Only native held-child membership can pass this narrow
+    # host-candidate predicate; neither handshake nor diagnostics override it.
+    report["candidate"] = bool(report["observation_completed"] and child is not None
+                               and child["in_any_job"] is False)
+    report["control_eligible"] = False  # no CPU/control capability was tested
+    report["control_status"] = ("unsupported_foreign_or_unknown_job" if child is not None
+                                and child["in_any_job"] is True else "not_control_verified")
+    if report["candidate"]:
+        report["result"] = "candidate_independent_host_not_control_verified"
+    elif report["observation_completed"]:
+        report["result"] = "observation_complete_control_unsupported"
+    else:
+        report["result"] = "launch_outcome_unknown" if dispatch_attempted else "desktop_preflight_blocked"
 
 
 def summarize_unverified_child_report(done, nonce):
     """Diagnostics only: no READY/held handle means self-reports prove no gate."""
     required = {"schema_version", "nonce", "outcome", "errors"}
-    if not required.issubset(done) or not set(done).issubset(required | {"process"}) or type(done.get("schema_version")) is not int or done["schema_version"] != 1 or done["nonce"] != nonce:
+    if not required.issubset(done) or not set(done).issubset(required | {"process", "diagnostics"}) or type(done.get("schema_version")) is not int or done["schema_version"] != 1 or done["nonce"] != nonce:
         raise ProbeError("unverified_done_protocol_mismatch")
     outcomes = {"acknowledged", "ack_timeout", "observation_unknown", "ticket_expired"}
     if done["outcome"] not in outcomes or not isinstance(done["errors"], list):
@@ -354,6 +407,10 @@ def summarize_unverified_child_report(done, nonce):
               "reported_error_count": len(done["errors"])}
     if "process" in done:
         result["process"] = validate_ready({"schema_version": 1, "nonce": nonce, "process": done["process"]}, nonce)
+    if "diagnostics" in done:
+        if "process" not in result:
+            raise ProbeError("unverified_done_fields_invalid")
+        result["diagnostics"] = sanitized_child_diagnostics(done["diagnostics"], result["process"])
     allowed_reasons = {"unsupported_self_identity", "self_identity_changed", "ticket_expired", "ack_invalid",
                        "self_observation_failed", "unexpected_probe_error", "run_directory_already_used",
                        "output_already_exists"}
@@ -386,6 +443,7 @@ def run_probe(output_directory):
     run_directory = root / nonce
     run_directory.mkdir()  # collision is an error, never reuse earlier evidence
     report = dict(schema_version=1, nonce=nonce, result="not_started", candidate=False,
+                  observation_completed=False, control_eligible=False, control_status="not_control_verified",
                   dispatch_attempted=False, com_returned_successfully=False,
                   child_verified=False, child_exit_verified=False, process_control_writes=0,
                   production_tasks_changed=0, retries=0, capability_status="host_only_not_control_verified", errors=[])
@@ -430,12 +488,13 @@ def run_probe(output_directory):
             report["child_exit_code"] = exit_code
             done_path = run_directory / "done.json"
             if done_path.exists():
-                report["child_exit_verified"] = completion_verified(read_json(done_path), nonce, child, exit_code)
-        report["candidate"] = bool(complete.is_set() and state.get("com_returned_successfully")
-                                   and report["child_verified"] and report["child_exit_verified"]
-                                   and not state["errors"] and not report["errors"])
-        report["result"] = "candidate_independent_host_not_control_verified" if report["candidate"] else (
-            "launch_outcome_unknown" if state.get("dispatch_attempted") else "desktop_preflight_blocked")
+                done = read_json(done_path)
+                report["child_exit_verified"] = completion_verified(done, nonce, child, exit_code)
+                if report["child_exit_verified"] and "diagnostics" in done:
+                    report["child_diagnostics_self_report"] = sanitized_child_diagnostics(done["diagnostics"], child)
+        finish_observation(report, child, complete=complete.is_set(),
+                           com_success=bool(state.get("com_returned_successfully")),
+                           dispatch_attempted=bool(state.get("dispatch_attempted")), worker_errors=state["errors"])
     except Exception as error:
         state["stop_dispatch"].set()
         report["errors"].append(_safe_error(error))
@@ -456,7 +515,8 @@ def run_probe(output_directory):
         add_unverified_child_diagnostic(report, run_directory, nonce)
         if report["errors"]:
             report["candidate"] = False
-            if report["result"] == "candidate_independent_host_not_control_verified":
+            report["observation_completed"] = False
+            if report["result"] in ("candidate_independent_host_not_control_verified", "observation_complete_control_unsupported"):
                 report["result"] = "completion_or_cleanup_unknown"
         write_new_json(run_directory / "result.json", report)
     return report

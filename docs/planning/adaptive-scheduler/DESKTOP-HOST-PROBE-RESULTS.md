@@ -82,3 +82,53 @@ native capability/recovery gates.
 Ticket and ACK checks bound the cooperative protocol under normal scheduling;
 synchronous native or filesystem calls can still block. They are not an
 OS-enforced maximum process lifetime.
+
+## Instrumented continuation: identity and exit verified, control unsupported
+
+On 2026-09-19 at approximately 20:10 local time, the revised observation protocol
+was exercised once after independent static review and **85 pure tests passed**
+(0 failures, 0 skips). This was a separately instrumented diagnostic to resolve
+the missing-READY evidence gap; it did not repeat the old unchanged probe or
+relax enrollment. The original nonce/evidence above remains untouched.
+
+Command, through the normal P2 admission wrapper with 1 CPU unit, 0.75 GiB RAM
+and no heavy-I/O slot:
+
+```text
+py tests/windows/probe_adaptive_desktop_launch.py --output-directory <implementation-worktree>/.local-adaptive/resume-host --dispatch-read-only-probe
+```
+
+Private evidence is under nonce `e49553251a188e69af43eef273e26292` in that output
+directory. The fixed child now completes READY and parent-held exact identity
+verification before collecting diagnostics. The parent sends ACK, verifies the
+same handle's natural exit and checks the completed report.
+
+| Evidence | New observation |
+| --- | --- |
+| Identity / exit | `child_verified=true`, `child_exit_verified=true`, child exit code 0 |
+| Protocol | `observation_completed=true`, no controller errors, COM thread completed |
+| Control gate | `candidate=false`, `control_eligible=false`, `unsupported_foreign_or_unknown_job` |
+| Immediate Job self-query | Membership present; CPU flags 0; extended limit flags `0x800`; UI flags 0 |
+| Group self-query | Group 0 affinity mask 4095; immediate Job data only |
+| Process lineage self-query | First parent matches the independently held desktop identity and is outside a Job; relation/birth rechecked; further parent read unknown |
+| Mutations | Zero process-control writes, Job creation, CPU caps or production Task changes; no dispatch retry in this invocation |
+
+The parent independently verifies the child identity, Job membership and exit.
+The additional Job-limit and lineage details remain explicitly labeled child
+self-reports; they are bounded diagnostics, not complete native capability proof.
+Only the first process-parent link was observed; the full process ancestry is
+unknown, and process ancestry is not Job ancestry.
+
+`QueryInformationJobObject(NULL)` queries the calling process's **immediate** Job;
+it does not reveal the entire Job hierarchy. A zero immediate CPU flag therefore
+does not establish the inherited denominator or remove the formal foreign-Job
+gate. See [Microsoft's API contract](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-queryinformationjobobject)
+and [nested Job behavior](https://learn.microsoft.com/en-us/windows/win32/procthread/nested-jobs).
+No source/owner of the external Job was established or guessed, and no breakaway
+flag, altered token or parent substitution was used.
+
+This closes the earlier identity/exit diagnostic gap. It does **not** pass P1 or
+authorize S1 CPU control. The separate live demand-floor continuity prerequisite
+is recorded in [CAPABILITY-RESULTS.md](CAPABILITY-RESULTS.md). Stop further unchanged
+desktop dispatch attempts; continue safe admission-only implementation until a
+supported host and continuous test admission coverage can be established.

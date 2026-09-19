@@ -3,6 +3,7 @@ import copy
 import ctypes as c
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -103,6 +104,74 @@ class LaunchProtocolTests(unittest.TestCase):
                     launch.verify_child(api, ready, "a" * 32, dict(caller=caller, desktop=desktop, binding=(101, 22)), child["image_path"])
                 self.assertEqual(api.closed, [33])
 
+    def test_in_job_child_identity_is_observable_without_changing_desktop_guard(self):
+        caller, desktop, child = identities()
+        child["in_any_job"] = True
+        api = FakeChildQueries(desktop, child)
+        ready = dict(schema_version=1, nonce="a" * 32, process=launch.preflight._public_process(child))
+        handle, observed = launch.verify_child(api, ready, "a" * 32,
+                dict(caller=caller, desktop=desktop, binding=(101, 22)), child["image_path"])
+        self.assertEqual(handle, 33)
+        self.assertTrue(observed["in_any_job"])
+        with self.assertRaises(launch.ProbeError):
+            launch.assert_desktop_identity(caller, dict(desktop, in_any_job=True), desktop["image_path"])
+
+    def test_in_job_ready_ack_natural_exit_completes_observation_but_not_candidate(self):
+        caller, desktop, child = identities()
+        child["in_any_job"] = True
+        nonce = "d" * 32
+        api = FakeChildQueries(desktop, child)
+        ready = dict(schema_version=1, nonce=nonce, process=launch.preflight._public_process(child))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / nonce
+            def dispatch(state, complete, *arguments):
+                state.update(dispatch_attempted=True, com_returned_successfully=True,
+                             identity=dict(caller=caller, desktop=desktop, binding=(101, 22)))
+                (directory / "ready.json").write_text(json.dumps(ready), encoding="utf-8")
+                complete.set()
+            def exited(api, handle):
+                self.assertEqual(handle, 33)
+                self.assertEqual(json.loads((directory / "ack.json").read_text(encoding="utf-8")),
+                                 dict(schema_version=1, nonce=nonce, accepted=True))
+                (directory / "done.json").write_text(json.dumps(dict(ready, outcome="acknowledged", errors=[])), encoding="utf-8")
+                return 0
+            def thread_factory(*, target, args, daemon):
+                return SimpleNamespace(start=lambda: target(*args))
+            with mock.patch.object(launch, "os", SimpleNamespace(name="nt", fsync=os.fsync, fstat=os.fstat)), \
+                    mock.patch.object(launch, "local_output_root", return_value=root), \
+                    mock.patch.object(launch, "fixed_launch", return_value=(child["image_path"], "fixed")), \
+                    mock.patch.object(launch.secrets, "token_hex", return_value=nonce), \
+                    mock.patch.object(launch.threading, "Thread", side_effect=thread_factory), \
+                    mock.patch.object(launch, "dispatch_worker", side_effect=dispatch), \
+                    mock.patch.object(launch.preflight, "NativeReadOnly", return_value=api), \
+                    mock.patch.object(launch.time, "monotonic", return_value=100.0), \
+                    mock.patch.object(launch, "child_exit_code", side_effect=exited):
+                report = launch.run_probe(root)
+            self.assertTrue(report["child_verified"])
+            self.assertTrue(report["child_exit_verified"])
+            self.assertTrue(report["observation_completed"])
+            self.assertFalse(report["candidate"])
+            self.assertFalse(report["control_eligible"])
+            self.assertEqual(report["result"], "observation_complete_control_unsupported")
+            self.assertEqual(report["control_status"], "unsupported_foreign_or_unknown_job")
+            self.assertEqual(report["process_control_writes"], 0)
+            self.assertEqual(api.closed, [22, 33])
+            with mock.patch.object(launch, "run_probe", return_value=report), mock.patch("sys.stdout"):
+                self.assertEqual(launch.main(["--output-directory", str(root), "--dispatch-read-only-probe"]), 2)
+
+    def test_readback_cannot_promote_in_job_or_unverified_child(self):
+        child = dict(identities()[2], in_any_job=True)
+        report = dict(child_verified=True, child_exit_verified=True, errors=[],
+                      child_diagnostics_self_report={"immediate_job": {"cpu_flags": 0}})
+        launch.finish_observation(report, child, complete=True, com_success=True, dispatch_attempted=True, worker_errors=[])
+        self.assertFalse(report["candidate"])
+        self.assertFalse(report["control_eligible"])
+        report["child_verified"] = False
+        launch.finish_observation(report, dict(child, in_any_job=False), complete=True, com_success=True,
+                                  dispatch_attempted=True, worker_errors=[])
+        self.assertFalse(report["candidate"])
+
     def test_desktop_replacement_closes_both_query_handles(self):
         caller, desktop, child = identities()
         api = FakeChildQueries(dict(desktop, creation_filetime="51"), child)
@@ -121,6 +190,27 @@ class LaunchProtocolTests(unittest.TestCase):
         self.assertFalse(launch.completion_verified(done, "b" * 32, child, 0))
         self.assertFalse(launch.completion_verified({}, "a" * 32, child, 0))
         self.assertFalse(launch.completion_verified(dict(done, errors=[{"stage": "unverified"}]), "a" * 32, child, 0))
+        self.assertFalse(launch.completion_verified(dict(done, private_path="secret"), "a" * 32, child, 0))
+
+    def test_malformed_or_mismatched_diagnostics_cannot_verify_completion(self):
+        child = identities()[2]
+        done = dict(schema_version=1, nonce="a" * 32, outcome="acknowledged", errors=[],
+                    process=launch.preflight._public_process(child), diagnostics={"private": "secret"})
+        with mock.patch.object(launch, "sanitized_child_diagnostics", side_effect=launch.ProbeError("child_diagnostics_invalid")) as sanitizer:
+            self.assertFalse(launch.completion_verified(done, "a" * 32, child, 0))
+            sanitizer.assert_called_once_with(done["diagnostics"], child)
+
+    def test_diagnostic_identity_is_compared_with_held_child_after_allowlist(self):
+        child = identities()[2]
+        for public in (dict(launch.preflight._public_process(child), creation_filetime="201"),
+                       dict(launch.preflight._public_process(child), in_any_job=True)):
+            with self.subTest(public=public):
+                module = SimpleNamespace(sanitize_diagnostics=mock.Mock(return_value={"self": public}))
+                specification = SimpleNamespace(loader=SimpleNamespace(exec_module=lambda module: None))
+                with mock.patch.object(launch.importlib.util, "spec_from_file_location", return_value=specification), \
+                        mock.patch.object(launch.importlib.util, "module_from_spec", return_value=module), \
+                        self.assertRaises(launch.ProbeError):
+                    launch.sanitized_child_diagnostics({"untrusted": "input"}, child)
 
     def test_evidence_parser_rejects_duplicate_nonfinite_and_oversize(self):
         with tempfile.TemporaryDirectory() as temporary:

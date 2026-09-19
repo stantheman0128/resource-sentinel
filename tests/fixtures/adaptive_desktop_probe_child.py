@@ -195,10 +195,40 @@ def observe_self(module, api=None):
             raise ProtocolError("self_identity_changed")
         # This filter is a self-report only. The parent's held-handle token and
         # exact image/birth verification remains mandatory before it sends ACK.
-        supported = (first["in_any_job"] is False and first["elevated"] is False
+        # Job membership is an observation, not an identity failure. A known
+        # in-Job child can complete this diagnostic handshake but cannot become
+        # a supported control host. The controller enforces that separately.
+        supported = (type(first["in_any_job"]) is bool and first["elevated"] is False
                      and type(first["integrity_rid"]) is int and first["integrity_rid"] == 0x2000
                      and ntpath.basename(first["image_path"]).casefold() == "pythonw.exe")
         return module._public_process(first), supported
+    finally:
+        api.close(handle)
+
+
+def collect_self_diagnostics(module, identity, *, api, clock, deadline, collector=None):
+    """Collect after identity ACK; do not keep an unverified child waiting on it."""
+    if collector is None:
+        source = Path(__file__).resolve().parents[1] / "windows" / "adaptive_job_diagnostics.py"
+        specification = importlib.util.spec_from_file_location("adaptive_child_diagnostics", source)
+        if specification is None or specification.loader is None:
+            raise ProtocolError("diagnostics_import_unavailable")
+        diagnostics = importlib.util.module_from_spec(specification)
+        specification.loader.exec_module(diagnostics)
+        collector = diagnostics.collect_diagnostics
+    if clock() >= deadline:
+        raise TicketExpired("ticket_expired")
+    handle = api.open_process(os.getpid())
+    try:
+        first = api.read_process(handle, os.getpid())
+        if module._public_process(first) != identity:
+            raise ProtocolError("self_identity_changed")
+        result = collector(api, handle, first, clock=clock, deadline=deadline)
+        if clock() >= deadline:
+            raise TicketExpired("ticket_expired")
+        if first != api.read_process(handle, os.getpid()):
+            raise ProtocolError("self_identity_changed")
+        return result
     finally:
         api.close(handle)
 
@@ -212,7 +242,8 @@ def _error(error):
     return {"stage": "unexpected_probe_error"}
 
 
-def run_probe(run_directory, nonce, *, api=None, preflight_module=None, clock=None, sleeper=None):
+def run_probe(run_directory, nonce, *, api=None, preflight_module=None, clock=None, sleeper=None,
+              diagnostic_collector=None):
     clock, sleeper = clock or time.monotonic, sleeper or time.sleep
     # A rejected path must never receive an error report or any other write.
     try:
@@ -230,6 +261,7 @@ def run_probe(run_directory, nonce, *, api=None, preflight_module=None, clock=No
         # Importing the adapter does not call Win32. Recheck the ticket before
         # NativeReadOnly construction and after its two held-handle observations.
         validate_ticket(ticket, nonce, clock())
+        api = module.NativeReadOnly() if api is None else api
         identity, supported = observe_self(module, api)
         result["process"] = identity
         validate_ticket(ticket, nonce, clock())
@@ -253,6 +285,14 @@ def run_probe(run_directory, nonce, *, api=None, preflight_module=None, clock=No
                     result["outcome"] = "acknowledged"
                 break
             sleeper(min(0.05, ack_deadline - now))
+        if result["outcome"] == "acknowledged":
+            # ACK only confirms the parent's independent identity observation;
+            # it grants no enrollment/control. Queries happen while the parent
+            # still holds the exact child handle and remain within this ticket.
+            result["diagnostics"] = collect_self_diagnostics(
+                module, identity, api=api, clock=clock, deadline=deadline,
+                collector=diagnostic_collector)
+            validate_ticket(ticket, nonce, clock())
     except TicketExpired as error:
         result["outcome"] = "ticket_expired"
         result["errors"].append(_error(error))
@@ -264,7 +304,7 @@ def run_probe(run_directory, nonce, *, api=None, preflight_module=None, clock=No
         except Exception:
             # An existing done file or failed publication can never be success.
             return 2
-    return 0 if result["outcome"] == "acknowledged" else 2
+    return 0 if result["outcome"] == "acknowledged" and not result["errors"] else 2
 
 
 def main(argv=None):

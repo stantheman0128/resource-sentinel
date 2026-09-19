@@ -191,3 +191,12 @@ bounded runner must prove exact coverage for the entire controlled lifetime, or
 use an actually independent test host with its own correct admission accounting.
 No runtime grace change, nested-reservation workaround, P2 deployment, exemption
 or different local data directory was used to evade this prerequisite.
+
+One subsequent, revised read-only desktop diagnostic completed the previously
+missing held-child handshake and natural exit: `observation_completed=true`,
+`child_verified=true`, `child_exit_verified=true`, exit code 0, zero control
+writes. The independently observed child remains in a foreign/unknown Job, so
+candidate/control eligibility remain false. Immediate CPU flags 0 do not prove
+the inherited denominator. The 85 pure diagnostic tests passed first; full
+details and bounded-query limitations are in the instrumented-continuation
+section of [DESKTOP-HOST-PROBE-RESULTS.md](DESKTOP-HOST-PROBE-RESULTS.md).

@@ -40,6 +40,45 @@ wrapper 會排隊、原子取得 CPU/RAM/I/O reservation、執行命令，最後
 `-ResourceClass AUTO` 仍是 bootstrap rule；`orchestratorctl.py profiles` 提供歷史 P50/P90/P95
 供後續調整顯式需求，但尚未自動改寫 task request。
 
+## 命令分類、等待與放棄單筆排隊請求
+
+Hook 與 wrapper 的 bootstrap classifier 依實際執行的程式與動作分類。
+`git show branch:app/build.gradle.kts`、`git add app/build.gradle.kts`、
+`ls ~/.gradle/jdks`，以及只用 `cat`／`grep` 讀取或搜尋這些路徑，不會因為
+檔名有 `gradle` 而成為 HEAVY。真正的 `gradle`／`gradlew`／`./gradlew.bat`、
+`npm run build` 等工作仍需准入；`cmd /c`、`bash -c` 或 `&&` 串接也會檢查
+其中實際執行的命令。不能靜態辨認的 script、動態 shell 語法與未知執行程式
+保守視為 HEAVY；分類不是任意 shell 的完整解譯器。
+
+`heavy_patterns` 改為比對執行簽章（例如 `gradlew`、`npm run build`），
+不再掃描整段命令的檔案路徑／資料參數。格式不合法或不支援的規則不會放行工作。
+本次不修改日常 config 的規則、資源門檻或豁免上限。
+
+需要繼續的工作應留在佇列，使用 hook 提供的 exact `wait-existing` 命令等待。
+確定放棄一筆請求時，替換下例的 request key 與 owner PID：
+
+```powershell
+py C:\Users\stans\Projects\resource-sentinel\scripts\sentinelctl.py `
+  cancel --request-key RETURNED_REQUEST_KEY --owner-pid 12345
+```
+
+CLI 會驗證 owner 是呼叫程序本身或其真實祖先，並將 PID 與建立時間和 SQLite
+queue row 精確比對；`--owner-pid` 不是可以冒用其他 session 的授權欄位。
+同 PID 已換程序、建立時間未知（含舊資料的 0）、非本人祖先或不同 owner 均拒絕。
+成功回傳 `ok=true, cancelled=1`；已經准入／不存在則 `cancelled=0`，可安全重試。
+拒絕時回傳非零 exit code 與具體 reason，保留原請求。
+
+此命令不操作 reservations、執行中的工作或 exemptions，不需要新增資源 reservation。
+它不呼叫 cleanup，也不初始化缺少的資料庫。SQLite 中的刪除立即生效；
+`queue.json` 是唯讀相容鏡像，由正常採集／發布稍後刷新，不能手動改鏡像假裝取消。
+取消表示明確放棄這筆工作，應向使用者交代；不能為了結束回合就丟掉仍需要的請求。
+
+同一 owner PID＋建立時間的所有排隊請求，共用最多三次 Stop 提醒；
+換成下一筆或加入新請求不會重新獲得三次提醒。次數用完只停止攔截 Stop，
+不再自動取消任何請求；全部 queue 清空後才開始新的提醒週期。
+提醒計數使用 SQLite 短交易避免平行 subagents 相互覆寫；舊
+`stop-blocks.json` 僅作一次性計數匯入。這不改變 PreToolUse 的准入保護。
+
 ## 使用者授權的暫時豁免
 
 使用者在目前任務明確說「我給你最高權限，你可以不用理會 Resource Sentinel」

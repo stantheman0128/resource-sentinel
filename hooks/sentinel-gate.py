@@ -8,11 +8,12 @@ import shlex
 import sys
 from pathlib import Path
 
-PROJECT = Path(r"C:\Users\stans\Projects\resource-sentinel")
+PROJECT = Path(__file__).resolve().parents[1]
 if str(PROJECT) not in sys.path:
     sys.path.insert(0, str(PROJECT))
 
 from sentinel.coordinator import Coordinator, ResourceRequest, classify_command
+from sentinel.command_classification import is_single_static_command
 
 
 DATA = Path(os.environ.get("USERPROFILE", "")) / ".resource-sentinel"
@@ -75,6 +76,8 @@ def release_outcome(inp):
 
 def is_atomic_wrapper(command):
     """Recognize only a direct invocation of the reservation-owning wrapper."""
+    if not is_single_static_command(command):
+        return False
     try:
         tokens = shlex.split(command, posix=False)
     except ValueError:
@@ -89,10 +92,30 @@ def is_atomic_wrapper(command):
     if any(token in {";", "&&", "||", "|"} for token in tokens):
         return False
     lowered = [token.lower() for token in tokens]
-    try:
-        file_index = lowered.index("-file")
-    except ValueError:
-        return False
+    file_index = 1
+    while file_index < len(tokens):
+        option = lowered[file_index]
+        if option == "-file":
+            break
+        if option in {"-noprofile", "-nologo", "-noninteractive", "-sta", "-mta"}:
+            file_index += 1
+        elif option == "-executionpolicy":
+            if file_index + 1 >= len(tokens) or lowered[file_index + 1] not in {
+                "bypass", "allsigned", "remotesigned", "restricted", "unrestricted", "undefined",
+            }:
+                return False
+            file_index += 2
+        elif option == "-windowstyle":
+            if file_index + 1 >= len(tokens) or lowered[file_index + 1] not in {
+                "hidden", "normal", "minimized", "maximized",
+            }:
+                return False
+            file_index += 2
+        else:
+            # -Command/-EncodedCommand (including abbreviations), positional
+            # scripts and unknown host switches cannot be laundered by a later
+            # -File token that is merely part of their payload.
+            return False
     if file_index + 1 >= len(tokens):
         return False
     try:
@@ -133,13 +156,10 @@ def main():
         # The wrapper performs the same atomic admission itself. Reserving in
         # both layers would make the inner request wait on the outer slot.
         return
-    coordinator = Coordinator(DATA)
-    resource_class = classify_command(command)
-    patterns = config.get("heavy_patterns") or []
-    if resource_class == "LIGHT" and any(re.search(pattern, command) for pattern in patterns):
-        resource_class = "HEAVY"
+    resource_class = classify_command(command, heavy_patterns=config.get("heavy_patterns"))
     if resource_class == "LIGHT":
         return
+    coordinator = Coordinator(DATA)
 
     cwd = inp.get("cwd") or os.getcwd()
     request = ResourceRequest(

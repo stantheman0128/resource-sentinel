@@ -94,6 +94,10 @@ def main() -> int:
     cleanup = sub.add_parser("cleanup")
     cleanup.add_argument("--config-file")
 
+    cancel = sub.add_parser("cancel", help="Abandon one queued request owned by this caller or its verified ancestor")
+    cancel.add_argument("--request-key", required=True)
+    cancel.add_argument("--owner-pid", type=int, required=True)
+
     sample = sub.add_parser("sample")
     sample.add_argument("--status-file", required=True)
 
@@ -114,6 +118,11 @@ def main() -> int:
     adaptive_query.add_argument("--reservation-id")
     adaptive_query.add_argument("--limit", type=int, default=20)
     args = parser.parse_args()
+    if args.command == "cancel":
+        from sentinel.queue_cancellation import cancel_for_caller
+        result = cancel_for_caller(args.data_dir, request_key=args.request_key, owner_pid=args.owner_pid)
+        print(json.dumps(result, separators=(",", ":")))
+        return 0 if result["ok"] else 2
     if args.command == "adaptive-query":
         from sentinel.adaptive.query import query_adaptive
         try:

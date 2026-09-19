@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from sentinel.exemptions import Exemptions
+from sentinel.command_classification import classify_command
+from sentinel.stop_reminders import claim_reminder
 from sentinel.accounting import frame_from_status, shared_admission_blockers
 from sentinel.adaptive.store import allocation_is_bound, check_schema_version, hold_expired_allocations, migrate_schema
 
@@ -119,26 +121,6 @@ class ResourceRequest:
             values["commit_bytes"] = req.commit_bytes
         raw = json.dumps(values, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def classify_command(command: str) -> str:
-    """Conservative bootstrap classifier; telemetry will supersede it."""
-    cmd = command.lower()
-    if re.search(r"\bdocker\s+compose\s+up\b|\bplaywright\b.*(--project|--workers)|\bcargo\s+build\b.*--release", cmd):
-        return "EXTREME"
-    if re.search(
-        r"\b(npm|pnpm|yarn|bun)\s+(install|ci|update|rebuild)\b|"
-        r"\b(npm|pnpm|yarn|bun)\s+run\s+(build|test)\b|"
-        r"\b(cargo|go|dotnet)\s+(build|test|install|restore|publish)\b|"
-        r"\b(make|cmake|msbuild|ninja|gradle|gradlew|mvn)\b|"
-        r"\bdocker\s+(build|compose)\b|\bpytest\b(?!.*(::|\s-k\s))|"
-        r"\b(vitest|jest)\b|\b(webpack|vite|next|nuxt|tsup|esbuild)\s+build\b|\btsc\b",
-        cmd,
-    ):
-        return "HEAVY"
-    if re.search(r"\bpytest\b|\b(npm|pnpm|yarn|bun)\s+run\s+(lint|typecheck)\b|\b(dotnet|go|cargo)\s+test\b", cmd):
-        return "MEDIUM"
-    return "LIGHT"
 
 
 def redact_command(command: str) -> str:
@@ -687,6 +669,17 @@ class Coordinator:
             conn.execute("COMMIT")
         self._mirror()
         return cur.rowcount
+
+    def claim_stop_reminder(
+        self, *, owner_pid: int, owner_started: float,
+        max_reminders: int = 3, legacy_blocks: dict | None = None,
+    ) -> dict[str, Any]:
+        """Claim one session reminder, independently of queue scheduling."""
+        with self._db() as conn:
+            return claim_reminder(
+                conn, owner_pid=owner_pid, owner_started=owner_started,
+                max_reminders=max_reminders, legacy_blocks=legacy_blocks,
+            )
 
     def queued_for_owner(self, owner_pid: int) -> list[dict[str, Any]]:
         with self._db() as conn:

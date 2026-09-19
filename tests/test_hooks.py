@@ -161,23 +161,94 @@ class GateHookTests(unittest.TestCase):
             self.run_gate(event, ["sentinel-gate.py"], FakeCoordinator)
         self.assertEqual(len(admissions), 1)
 
+    def test_read_paths_and_owned_cancel_need_no_admission_database(self):
+        class FailingCoordinator:
+            def __init__(self, _data):
+                raise AssertionError("a light command must not initialize the admission DB")
+
+        commands = [
+            "git show branch:app/build.gradle.kts",
+            "git add app/build.gradle.kts",
+            "ls ~/.gradle/jdks",
+            f'py "{ROOT / "scripts" / "sentinelctl.py"}" cancel '
+            f'--request-key {"a" * 64} --owner-pid 42',
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.run_gate(
+                    {"tool_name": "Bash", "tool_input": {"command": command}},
+                    ["sentinel-gate.py"], FailingCoordinator,
+                    load_result={"heavy_patterns": ["gradle"]},
+                )
+
+    def test_no_space_chain_after_wrapper_cannot_bypass_admission(self):
+        admissions = []
+
+        class FakeCoordinator:
+            def __init__(self, _data):
+                pass
+
+            def admit(self, request, _status, config):
+                admissions.append(request)
+                return {"allowed": False, "reason": "capacity", "position": 1,
+                        "request_key": request.request_key}
+
+        command = (
+            f'powershell -NoProfile -File "{self.gate.ATOMIC_WRAPPER}" '
+            '-Command "git status"&&gradlew build'
+        )
+        with self.assertRaises(SystemExit) as raised:
+            self.run_gate(
+                {"tool_name": "Bash", "tool_input": {"command": command}},
+                ["sentinel-gate.py"], FakeCoordinator,
+            )
+        self.assertEqual(raised.exception.code, 2)
+        self.assertEqual(len(admissions), 1)
+        self.assertEqual(admissions[0].resource_class, "HEAVY")
+
+    def test_real_gradle_with_missing_measurements_still_queues(self):
+        with tempfile.TemporaryDirectory(dir=ROOT / "tests") as directory:
+            coordinator = Coordinator(directory, pid_identity=lambda _pid: (True, 123.0))
+            with self.assertRaises(SystemExit) as raised:
+                self.run_gate(
+                    {"tool_name": "Bash", "tool_input": {"command": "cmd /c gradlew.bat build"}},
+                    ["sentinel-gate.py"], lambda _data: coordinator,
+                )
+            self.assertEqual(raised.exception.code, 2)
+            snapshot = coordinator.snapshot()
+            self.assertEqual(len(snapshot["queue"]), 1)
+            self.assertEqual(snapshot["queue"][0]["resource_class"], "HEAVY")
+            self.assertEqual(snapshot["reservations"], [])
+
+    def test_powershell_command_before_fake_file_is_not_a_wrapper(self):
+        for option in ("-Command", "-EncodedCommand", "-c", "-Unknown"):
+            command = (
+                f'powershell -NoProfile {option} "gradle build" '
+                f'-File "{self.gate.ATOMIC_WRAPPER}"'
+            )
+            with self.subTest(option=option):
+                self.assertFalse(self.gate.is_atomic_wrapper(command))
+
+    def test_powershell_wrapper_declares_actual_cmd_classifier_dialect(self):
+        wrapper = (ROOT / "scripts" / "invoke-sentinel.ps1").read_text(encoding="utf-8-sig")
+        self.assertIn("classify_command(sys.argv[1], shell='cmd')", wrapper)
+        self.assertIn("& cmd.exe /d /s /c $Command", wrapper)
+
 
 class StopHookTests(unittest.TestCase):
     def setUp(self):
         self.stop = load_script("sentinel_stop_test", "hooks/sentinel-stop.py")
 
-    def test_max_reminders_cancel_only_the_selected_request(self):
+    def test_max_reminders_only_stop_reminding_without_cancelling_work(self):
         calls = []
 
         class FakeCoordinator:
             def __init__(self, _data):
                 pass
 
-            def queued_for_owner(self, owner_pid):
-                return [
-                    {"request_key": "req-a", "owner_pid": owner_pid},
-                    {"request_key": "req-b", "owner_pid": owner_pid},
-                ]
+            def claim_stop_reminder(self, **kwargs):
+                return {"should_block": False, "queued_count": 2,
+                        "request_key": "req-a", "reminder_count": 3}
 
             def cancel_queued(self, **kwargs):
                 calls.append(kwargs)
@@ -186,34 +257,34 @@ class StopHookTests(unittest.TestCase):
         blocks = {"42:req-a": {"n": self.stop.MAX_BLOCKS, "ts": 1}}
         with (
             mock.patch.object(self.stop, "Coordinator", FakeCoordinator),
-            mock.patch.object(self.stop, "my_agent_pid", return_value=42),
+            mock.patch.object(self.stop, "my_agent_identity", return_value=(42, 123.0)),
             mock.patch.object(self.stop, "load", return_value=blocks),
-            mock.patch.object(self.stop, "save"),
             mock.patch.object(sys, "stdin", io.StringIO("{}")),
         ):
             self.stop.main()
-        self.assertEqual(calls, [{"owner_pid": 42, "request_key": "req-a"}])
+        self.assertEqual(calls, [])
 
     def test_reminder_names_the_exact_request(self):
         class FakeCoordinator:
             def __init__(self, _data):
                 pass
 
-            def queued_for_owner(self, owner_pid):
-                return [{"request_key": "req-a", "owner_pid": owner_pid}]
+            def claim_stop_reminder(self, **kwargs):
+                return {"should_block": True, "queued_count": 1,
+                        "request_key": "req-a", "reminder_count": 1}
 
         output = io.StringIO()
         with (
             mock.patch.object(self.stop, "Coordinator", FakeCoordinator),
-            mock.patch.object(self.stop, "my_agent_pid", return_value=42),
+            mock.patch.object(self.stop, "my_agent_identity", return_value=(42, 123.0)),
             mock.patch.object(self.stop, "load", return_value={}),
-            mock.patch.object(self.stop, "save"),
             mock.patch.object(sys, "stdin", io.StringIO("{}")),
             redirect_stdout(output),
         ):
             self.stop.main()
         payload = json.loads(output.getvalue())
-        self.assertIn("-RequestId req-a", payload["reason"])
+        self.assertIn("wait-existing --request-key req-a --owner-pid 42", payload["reason"])
+        self.assertIn("cancel --request-key req-a --owner-pid 42", payload["reason"])
 
 
 class SentinelCtlWaitTests(unittest.TestCase):

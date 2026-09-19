@@ -72,7 +72,7 @@ try {
     }
 
     if ($ResourceClass -eq 'AUTO') {
-        $ResourceClass = (& py -c "import sys;sys.path.insert(0,r'$((Split-Path $PSScriptRoot -Parent))');from sentinel.coordinator import classify_command;print(classify_command(sys.argv[1]))" $Command).Trim()
+        $ResourceClass = (& py -c "import sys;sys.path.insert(0,r'$((Split-Path $PSScriptRoot -Parent))');from sentinel.coordinator import classify_command;print(classify_command(sys.argv[1], shell='cmd'))" $Command).Trim()
     }
     if ($ResourceClass -ne 'LIGHT') {
         $request = @{

@@ -46,6 +46,7 @@ class SyntheticVerifier:
             process_ids=() if self.active == 0 else (ROOT.pid,), launch_sealed=self.sealed,
             original_cpu_disabled=True, durable_manifest=True, legacy_exclusion=True,
             root_exited=True, parent_membership=self.parent_membership,
+            current_cpu_disabled=True, recovery_manifest_settled=True,
         )
 
 
@@ -354,7 +355,8 @@ class AdaptiveLifecycleTests(unittest.TestCase):
     def test_typed_evidence_rejects_truthy_strings_and_boolean_counts(self):
         spec, registered = self.registered()
         proof = self.verifier("prepare", registered, WRAPPER)
-        for name in ("launch_sealed", "original_cpu_disabled", "durable_manifest", "legacy_exclusion", "root_exited", "parent_membership"):
+        for name in ("launch_sealed", "original_cpu_disabled", "durable_manifest", "legacy_exclusion", "root_exited", "parent_membership",
+                     "current_cpu_disabled", "recovery_manifest_settled"):
             for malformed in ("false", 1, None):
                 with self.subTest(field=name, malformed=malformed):
                     with self.assertRaisesRegex(ValueError, "invalid_evidence_boolean"):

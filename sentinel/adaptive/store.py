@@ -314,6 +314,13 @@ class LifecycleEvidence:
     launch_failed/user_code_started are tri-state observations, not caller
     assertions. The current-process unexported-credential cancellation provider
     is deliberately narrower than a native Job lifecycle provider.
+
+    For finalization, current_cpu_disabled is a current native Query result,
+    not the original state. recovery_manifest_settled verifies the durable
+    manifest for this exact execution/nonce/Job has no unresolved intent or
+    active applied cap. Both require the same retained policy then Job mutation
+    fences, through terminal CAS/archive commit or rollback; no writer may
+    invalidate either observation while SQLite waits or the release commits.
     """
     operation: str
     execution_id: str
@@ -334,6 +341,8 @@ class LifecycleEvidence:
     user_code_started: bool | None = None
     launch_failed: bool | None = None
     prelaunch_record_hash: str | None = None
+    current_cpu_disabled: bool = False
+    recovery_manifest_settled: bool = False
 
     def __post_init__(self):
         if self.operation not in {"register", "prepare", "claim", "bind_root", "root_exited", "finalize", "cancel", "start_failed"}:
@@ -357,7 +366,8 @@ class LifecycleEvidence:
                     any(type(pid) is not int or not 0 < pid < 1 << 32 for pid in self.process_ids) or
                     len(set(self.process_ids)) != len(self.process_ids)):
                 raise ValueError("invalid_evidence_process_list")
-        for name in ("launch_sealed", "original_cpu_disabled", "durable_manifest", "legacy_exclusion", "root_exited", "parent_membership"):
+        for name in ("launch_sealed", "original_cpu_disabled", "durable_manifest", "legacy_exclusion", "root_exited", "parent_membership",
+                     "current_cpu_disabled", "recovery_manifest_settled"):
             if type(getattr(self, name)) is not bool:
                 raise ValueError("invalid_evidence_boolean")
         for name in ("user_code_started", "launch_failed"):
@@ -1265,6 +1275,13 @@ class LifecycleStore:
                     proof.guardian_epoch != snapshot["guardian_epoch"] or type(proof.active_process_count) is not int or proof.active_process_count != 0 or
                     proof.process_ids != () or not proof.launch_sealed):
                 raise LifecycleError("job_empty_unverified")
+            # Initial disabled state is not restoration evidence. The provider
+            # must query current CPU control and settle the matching durable
+            # recovery manifest (no pending intent or active applied cap), while
+            # retaining policy/Job mutation fences through this transaction.
+            # Empty membership alone cannot release recovery/accounting custody.
+            if not proof.current_cpu_disabled or not proof.recovery_manifest_settled:
+                raise LifecycleError("restore_unverified")
             now = time.time() if now is None else now
             if not math.isfinite(now):
                 raise ValueError("invalid_time")

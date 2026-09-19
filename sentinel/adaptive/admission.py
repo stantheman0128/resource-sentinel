@@ -1,16 +1,17 @@
 """Trusted, in-process metadata for one wrapper's direct admission attempt.
 
 This context is created by the wrapper itself, retaining its exact native
-process handle. It is neither an IPC authentication scheme nor an enrollment
-gate. The Coordinator must obtain ``snapshot()`` before its SQLite transaction;
+process handle. It is not an enrollment gate. The Coordinator must obtain
+``snapshot()`` before its SQLite transaction;
 the returned immutable data cannot replace the live context on future retries.
 Raw command, cwd, and environment are not retained here. The HMAC key and
-one-use launch claim remain private in memory until close; neither is part of
-a snapshot or diagnostic representation.
+one-use launch claim remain private in memory until close. A separate query-only
+IPC key is carried by the trusted admission snapshot and persisted atomically;
+that snapshot must never be exported as diagnostics or generic JSON.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from contextlib import contextmanager
 import hashlib
 import hmac
@@ -24,7 +25,7 @@ import uuid
 
 from .contracts import (
     ContractViolation, IdentityStatus, Priority, ProcessIdentity, ResourceDemand,
-    Role, make_spec_hash,
+    Role, make_spec_hash, MAX_MESSAGE_BYTES,
 )
 from .identity import VerifiedProcess
 
@@ -52,6 +53,7 @@ class ManagedAdmissionSnapshot:
     spec_hash: str
     binding_hash: str
     claim_token_hash: str
+    ipc_auth_key: bytes = field(repr=False)
     requested: ResourceDemand
     role: Role
     priority: Priority
@@ -113,6 +115,9 @@ class ManagedAdmission:
             principal_id = f"unattributed:{identity.logon_id}"
             claim_token = secrets.token_urlsafe(32)
             claim_token_hash = hashlib.sha256(claim_token.encode("ascii")).hexdigest()
+            # The digest is a usable shared secret, not a public verifier. It
+            # never reuses or exports the one-use launch claim credential.
+            ipc_auth_key = hashlib.sha256(secrets.token_bytes(32)).digest()
             # Existing ResourceRequest uses GiB. Refuse values that cannot make
             # the boundary conversion exactly; never silently shrink a demand.
             ram_gib = requested.physical_bytes / _GIB
@@ -139,6 +144,7 @@ class ManagedAdmission:
                 "task_id": task_id, "session_id": session_id,
                 "principal_id": principal_id,
                 "claim_token_hash": claim_token_hash,
+                "ipc_auth_key": ipc_auth_key.hex(),
                 "wrapper_identity": identity.to_dict(),
                 "requested": requested.to_dict(),
                 "role": role.value, "priority": priority.value,
@@ -149,7 +155,7 @@ class ManagedAdmission:
             ).hexdigest()
             snapshot = ManagedAdmissionSnapshot(
                 execution_id, task_id, session_id, principal_id, identity.logon_id,
-                identity, managed_hash, digest, claim_token_hash,
+                identity, managed_hash, digest, claim_token_hash, ipc_auth_key,
                 requested, role, priority, request,
             )
             return cls(_token=_CONSTRUCTION_TOKEN, _process=process,
@@ -222,6 +228,25 @@ class ManagedAdmission:
             # cannot prove exclusive control of every possible launch path.
             self._claim_exported = True
             return self._claim_token
+
+    def _ipc_mac(self, transcript: bytes, *, execution_id: str,
+                 spec_hash: str, caller: ProcessIdentity) -> str:
+        """Authenticate the trusted IPC factory's canonical query transcript.
+
+        The sibling IPC implementation owns domain/envelope validation and
+        native server authentication. This internal helper checks the current
+        wrapper binding and bounds input; it does not turn arbitrary bytes into
+        a valid RPC. Query authentication neither exports the launch token nor
+        consumes cancellation authority, so terminal readback remains possible.
+        """
+        with self._lock:
+            snapshot = self.snapshot()
+            if type(transcript) is not bytes or not 1 <= len(transcript) <= MAX_MESSAGE_BYTES:
+                raise ManagedAdmissionUnavailable("invalid_ipc_transcript")
+            if (execution_id != snapshot.execution_id or spec_hash != snapshot.spec_hash or
+                    type(caller) is not ProcessIdentity or caller != snapshot.wrapper_identity):
+                raise ManagedAdmissionUnavailable("ipc_binding_mismatch")
+            return hmac.new(snapshot.ipc_auth_key, transcript, hashlib.sha256).hexdigest()
 
     def verify_launch_payload(self, *, command: str, cwd: str) -> None:
         """Bind the actual launch payload to the immutable admitted request.
@@ -383,6 +408,9 @@ class ManagedAdmission:
                 self._closed = True
                 self._claim_token = None
                 self._key = None
+                # Drop this context's reference to the IPC key as well. Python
+                # immutable bytes do not provide guaranteed physical erasure.
+                self._snapshot = None
                 self._process.close()
 
     def __enter__(self):

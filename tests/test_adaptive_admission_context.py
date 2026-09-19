@@ -61,6 +61,17 @@ class ManagedAdmissionContextTests(unittest.TestCase):
         self.addCleanup(context.close)
         return context
 
+    def snapshot_diagnostics(self, snapshot):
+        private = asdict(snapshot)
+        # The internal IPC credential is deliberately not JSON serializable.
+        # Generic dataclass serialization must fail instead of exposing it.
+        self.assertIsInstance(private["ipc_auth_key"], bytes)
+        with self.assertRaisesRegex(TypeError, "bytes is not JSON serializable") as error:
+            json.dumps(private)
+        self.assertNotIn(private["ipc_auth_key"].hex(), str(error.exception))
+        return repr(snapshot) + json.dumps({key: value for key, value in private.items()
+                                            if key != "ipc_auth_key"})
+
     def test_current_context_retains_exact_owner_and_resource_values(self):
         with self.create() as context:
             snapshot = context.snapshot()
@@ -112,6 +123,7 @@ class ManagedAdmissionContextTests(unittest.TestCase):
             "task_id": snapshot.task_id, "session_id": snapshot.session_id,
             "principal_id": snapshot.principal_id,
             "claim_token_hash": snapshot.claim_token_hash,
+            "ipc_auth_key": snapshot.ipc_auth_key.hex(),
             "wrapper_identity": IDENTITY.to_dict(), "requested": DEMAND.to_dict(),
             "role": Role.BACKGROUND.value, "priority": Priority.P2.value,
         }
@@ -129,7 +141,7 @@ class ManagedAdmissionContextTests(unittest.TestCase):
         self.assertEqual(token, context.launch_claim_token())
         self.assertEqual(hashlib.sha256(token.encode("ascii")).hexdigest(),
                          snapshot.claim_token_hash)
-        self.assertNotIn(token, repr(context) + repr(snapshot) + json.dumps(asdict(snapshot)))
+        self.assertNotIn(token, repr(context) + self.snapshot_diagnostics(snapshot))
         context.close()
         self.assertIsNone(context._claim_token)
         with self.assertRaisesRegex(ManagedAdmissionUnavailable, "managed_admission_closed"):
@@ -177,7 +189,7 @@ class ManagedAdmissionContextTests(unittest.TestCase):
         with patch("sentinel.adaptive.admission.secrets.token_bytes", return_value=key):
             context = self.create()
         snapshot = context.snapshot()
-        visible = repr(context) + repr(snapshot) + json.dumps(asdict(snapshot))
+        visible = repr(context) + self.snapshot_diagnostics(snapshot)
         self.assertNotIn(key.decode("ascii"), visible)
         self.assertNotIn(context.launch_claim_token(), visible)
         self.assertEqual(context._key, key)
@@ -244,7 +256,7 @@ class ManagedAdmissionContextTests(unittest.TestCase):
             snapshot.request.command = "altered"
         with self.assertRaises(FrozenInstanceError):
             snapshot.requested.cpu_units = 0
-        visible = repr(context.__dict__) + repr(snapshot) + json.dumps(asdict(snapshot))
+        visible = repr(context.__dict__) + self.snapshot_diagnostics(snapshot)
         self.assertNotIn("private-launch-marker", visible)
         self.assertNotIn("private-cwd-marker", visible)
         self.assertNotIn("key", asdict(snapshot))

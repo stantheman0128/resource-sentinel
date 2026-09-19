@@ -8,7 +8,7 @@ CLI or verifier callback is adapted into production lifecycle authority.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import hmac
 import json
@@ -18,6 +18,7 @@ import secrets
 import sqlite3
 import time
 from typing import Callable, ContextManager, Mapping, Any
+from uuid import UUID
 
 from sentinel.accounting import (
     AccountingError, local_host_identity, resolve_worker_locality,
@@ -57,6 +58,11 @@ def prelaunch_record_hash(row: Mapping[str, Any], *, claim_token_hash: str,
         record = dict(row)
         source = dict(allocation)
         record.pop("heartbeat_at", None)
+        # The independent IPC credential authenticates queries, not launch
+        # custody. Public proof snapshots intentionally omit it. The immutable
+        # admission binding remains in this digest, and admission retries still
+        # compare the private key itself; do not export it to fill a proof.
+        record.pop("ipc_auth_key", None)
         record["claim_token_hash"] = claim_token_hash
         source.pop("heartbeat_at", None)
         source.pop("expires_at", None)
@@ -202,6 +208,10 @@ def migrate_schema(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE managed_executions ADD COLUMN cancel_requested_at REAL")
         if "admission_binding_hash" not in _columns(conn, "managed_executions"):
             conn.execute("ALTER TABLE managed_executions ADD COLUMN admission_binding_hash TEXT")
+        if "ipc_auth_key" not in _columns(conn, "managed_executions"):
+            # Old rows deliberately stay NULL: constructing a store must not
+            # mint a new cross-process credential for an existing execution.
+            conn.execute("ALTER TABLE managed_executions ADD COLUMN ipc_auth_key BLOB")
         conn.commit()
     except BaseException:
         conn.rollback()
@@ -368,7 +378,10 @@ def _admitted_row(admission, reservation_id: str, now: float) -> dict[str, Any]:
         admission.principal_id, ReservationRef(AllocationKind.DIRECT, reservation_id), None,
         admission.spec_hash, admission.role, admission.priority, admission.requested, admission.wrapper_identity)
     row = _registration_row(spec, now)
-    row.update(admission_binding_hash=admission.binding_hash, claim_token_hash=admission.claim_token_hash)
+    if type(admission.ipc_auth_key) is not bytes or len(admission.ipc_auth_key) != 32:
+        raise LifecycleError("managed_admission_binding_mismatch")
+    row.update(admission_binding_hash=admission.binding_hash, claim_token_hash=admission.claim_token_hash,
+               ipc_auth_key=admission.ipc_auth_key)
     return row
 
 
@@ -446,6 +459,209 @@ def commit_managed_admission(conn: sqlite3.Connection, admission, reservation_id
     return _admission_result(row, admission.request.request_key, reused=False)
 
 
+@dataclass(frozen=True)
+class _IpcAuthRecord:
+    """Trusted service-local authentication material, never a wire response.
+
+    The key is an actual shared secret. Its presence proves no native peer
+    identity and confers no lifecycle mutation or launch authority.
+    """
+    execution_id: str
+    spec_hash: str
+    wrapper_identity: ProcessIdentity
+    allocation_kind: str
+    reservation_id: str
+    admission_binding_hash: str
+    ipc_auth_key: bytes = field(repr=False)
+
+
+def _ipc_query_arguments(execution_id, timeout_ms):
+    try:
+        parsed = UUID(execution_id) if isinstance(execution_id, str) else None
+        valid = parsed is not None and parsed.int != 0 and str(parsed) == execution_id
+    except (ValueError, AttributeError):
+        valid = False
+    if not valid or type(timeout_ms) is not int or not 1 <= timeout_ms <= 1000:
+        raise LifecycleError("invalid_ipc_query")
+
+
+@contextmanager
+def _ipc_read_transaction(db_path, *, timeout_ms):
+    """No migration/creation; a short read snapshot with bounded SQL work.
+
+    As with the diagnostic reader, a stalled filesystem open cannot be
+    preempted by SQLite's lock/progress deadlines. Native peer handles belong
+    to the service and must remain retained outside this entire scope.
+    """
+    conn = None
+    deadline = time.monotonic() + timeout_ms / 1000
+    try:
+        try:
+            uri = Path(db_path).absolute().as_uri() + "?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, timeout=timeout_ms / 1000, isolation_level=None)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+            conn.execute("PRAGMA trusted_schema=OFF")
+            conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 100)
+            conn.execute("BEGIN")
+            if not _has_table(conn, "adaptive_runtime"):
+                raise LifecycleError("ipc_registry_unavailable")
+            versions = conn.execute("""SELECT
+                CASE WHEN typeof(schema_version)='integer' THEN schema_version END,
+                CASE WHEN typeof(protocol_version)='integer' THEN protocol_version END
+                FROM adaptive_runtime LIMIT 2""").fetchall()
+            if len(versions) != 1 or versions[0][0] != SCHEMA_VERSION or versions[0][1] != 1:
+                raise LifecycleError("ipc_registry_unavailable")
+            yield conn
+            if time.monotonic() >= deadline:
+                raise LifecycleError("ipc_query_timeout")
+        except sqlite3.Error as error:
+            code = getattr(error, "sqlite_errorcode", None)
+            reason = ("ipc_query_timeout" if code == sqlite3.SQLITE_INTERRUPT else
+                      "ipc_database_busy" if code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED} else
+                      "ipc_registry_unavailable")
+            raise LifecycleError(reason) from None
+        except (OSError, TypeError, ValueError, OverflowError):
+            raise LifecycleError("ipc_registry_unavailable") from None
+    except BaseException as primary:
+        if conn is not None:
+            try:
+                conn.close()
+            except BaseException:
+                primary.add_note("ipc_reader_cleanup_failed")
+        raise
+    else:
+        try:
+            conn.close()
+        except BaseException:
+            raise LifecycleError("ipc_reader_cleanup_failed") from None
+
+
+def _ipc_auth_record(conn, execution_id):
+    # Bound private reads as well as diagnostics: a damaged large BLOB/text
+    # value must not become an unbounded service allocation or an error value.
+    rows = conn.execute("""SELECT execution_id,
+        substr(spec_hash,1,65) AS spec_hash,
+        CASE WHEN typeof(wrapper_pid)='integer' THEN wrapper_pid END AS wrapper_pid,
+        substr(wrapper_created_filetime_100ns,1,21) AS wrapper_created_filetime_100ns,
+        substr(logon_id,1,129) AS logon_id,
+        substr(allocation_kind,1,8) AS allocation_kind,
+        substr(reservation_id,1,129) AS reservation_id,
+        parent_execution_id IS NULL AS no_parent,
+        substr(admission_binding_hash,1,65) AS admission_binding_hash,
+        CASE WHEN typeof(ipc_auth_key)='blob' AND length(ipc_auth_key)=32
+             THEN ipc_auth_key END AS ipc_auth_key
+        FROM managed_executions WHERE execution_id=? LIMIT 2""", (execution_id,)).fetchall()
+    if len(rows) != 1:
+        raise LifecycleError("ipc_auth_unavailable")
+    row = rows[0]
+    try:
+        from .query import _identifier
+        for value in (row["spec_hash"], row["admission_binding_hash"]):
+            if (not isinstance(value, str) or len(value) != 64 or
+                    any(char not in "0123456789abcdef" for char in value)):
+                raise ValueError("invalid_hash")
+        if (row["allocation_kind"] != "direct" or row["no_parent"] != 1 or
+                type(row["ipc_auth_key"]) is not bytes or len(row["ipc_auth_key"]) != 32):
+            raise ValueError("invalid_ipc_binding")
+        reservation_id = _identifier(row["reservation_id"])
+        identity = ProcessIdentity.from_dict({"pid": row["wrapper_pid"],
+            "created_filetime_100ns": row["wrapper_created_filetime_100ns"], "logon_id": row["logon_id"]})
+    except (TypeError, ValueError, OverflowError):
+        raise LifecycleError("ipc_auth_unavailable") from None
+    return _IpcAuthRecord(execution_id, row["spec_hash"], identity, "direct", reservation_id,
+                          row["admission_binding_hash"], row["ipc_auth_key"])
+
+
+def _get_ipc_auth_record(db_path, execution_id: str, *, timeout_ms: int = 250) -> _IpcAuthRecord:
+    """Read the existing credential; never mint one for NULL/legacy rows.
+
+    Only the trusted IPC service may consume this private result. It must
+    authenticate a held native peer and the request MAC before final readback.
+    """
+    _ipc_query_arguments(execution_id, timeout_ms)
+    with _ipc_read_transaction(db_path, timeout_ms=timeout_ms) as conn:
+        return _ipc_auth_record(conn, execution_id)
+
+
+def authenticated_query(db_path, execution_id: str, expected_record: _IpcAuthRecord, *,
+                        timeout_ms: int = 250) -> dict[str, Any]:
+    """Read one sanitized execution after service-side native/MAC verification.
+
+    ``expected_record`` is internal material, not caller authentication. The
+    service retains the actual peer throughout this call. Authentication
+    metadata and the result are checked in this same read transaction, so a
+    changed binding between challenge and dispatch cannot expose another row.
+    """
+    _ipc_query_arguments(execution_id, timeout_ms)
+    if (type(expected_record) is not _IpcAuthRecord or
+            expected_record.execution_id != execution_id or
+            type(expected_record.ipc_auth_key) is not bytes or len(expected_record.ipc_auth_key) != 32):
+        raise LifecycleError("invalid_ipc_query")
+    from .query import _base, _row, _integer, _FIELDS, _TEXT_FIELDS
+    with _ipc_read_transaction(db_path, timeout_ms=timeout_ms) as conn:
+        actual = _ipc_auth_record(conn, execution_id)
+        names = ("execution_id", "spec_hash", "wrapper_identity", "allocation_kind",
+                 "reservation_id", "admission_binding_hash")
+        if (any(getattr(actual, name) != getattr(expected_record, name) for name in names) or
+                not hmac.compare_digest(actual.ipc_auth_key, expected_record.ipc_auth_key)):
+            raise LifecycleError("ipc_auth_binding_changed")
+        runtime = conn.execute("""SELECT
+            CASE WHEN typeof(schema_version)='integer' THEN schema_version END,
+            CASE WHEN typeof(protocol_version)='integer' THEN protocol_version END,
+            CASE WHEN typeof(mode)='text' THEN substr(mode,1,8) END,
+            CASE WHEN typeof(registry_revision)='integer' THEN registry_revision END,
+            CASE WHEN typeof(admission_barrier)='text' THEN substr(admission_barrier,1,14) END,
+            CASE WHEN typeof(singleton)='integer' THEN singleton END
+            FROM adaptive_runtime LIMIT 2""").fetchall()
+        if len(runtime) != 1:
+            raise LifecycleError("ipc_registry_unavailable")
+        current = runtime[0]
+        if (type(current[0]) is not int or current[0] != SCHEMA_VERSION or
+                type(current[1]) is not int or current[1] != 1 or
+                current[2] not in {"off", "shadow", "canary", "limited"} or
+                current[4] not in {"NONE", "CONTROLLING", "RECOVERY_HOLD"} or
+                type(current[5]) is not int or current[5] != 1):
+            raise LifecycleError("ipc_registry_unavailable")
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('managed_executions','reservations','worker_reservations') LIMIT 3")}
+        # SQLite comparison CHECKs do not guarantee a numeric storage class.
+        # Guard before fetching: rejecting a huge BLOB/TEXT in Python is late.
+        projections = []
+        for name in _FIELDS:
+            if name in _TEXT_FIELDS:
+                expression = (f"CASE WHEN typeof({name})='text' THEN substr({name},1,129) "
+                              f"WHEN {name} IS NULL THEN NULL ELSE '<invalid>' END")
+            else:
+                types = "('integer','real')" if name == "floor_cpu_units" else "('integer')"
+                expression = (f"CASE WHEN typeof({name}) IN {types} THEN {name} "
+                              f"WHEN {name} IS NULL THEN NULL ELSE -1 END")
+            projections.append(f"{expression} AS {name}")
+        record = conn.execute("SELECT " + ",".join(projections) +
+            " FROM managed_executions WHERE execution_id=? LIMIT 1", (execution_id,)).fetchone()
+        execution = _row(record)
+        if "reservations" not in tables:
+            binding = "allocation_table_missing"
+        else:
+            # This authenticated path only accepts direct allocations. Compute
+            # the match in SQL so malformed large binding values stay private
+            # and cannot become unbounded Python allocations before rejection.
+            matches = conn.execute("""SELECT CASE WHEN typeof(execution_id)='text'
+                AND execution_id=? AND typeof(lifecycle_managed)='integer'
+                AND lifecycle_managed=1 THEN 1 ELSE 0 END
+                FROM reservations WHERE id=? LIMIT 2""",
+                (execution_id, actual.reservation_id)).fetchall()
+            if not matches:
+                binding = "terminal_allocation_absent" if execution["state"] in TERMINAL_STATES else "allocation_missing"
+            else:
+                binding = "recorded_binding_matches" if len(matches) == 1 and matches[0][0] == 1 else "allocation_binding_inconsistent"
+        execution["allocation"]["recorded_binding"] = binding
+        return {**_base(), "available": True, "reason": "ok", "schema_version": SCHEMA_VERSION,
+                "protocol_version": 1, "recorded_mode": current[2],
+                "registry_revision": _integer(current[3]), "admission_barrier": current[4],
+                "executions": [execution], "truncated": False, "row_limit": 1}
+
+
 class LifecycleStore:
     def __init__(self, db_path: str | Path, *, evidence_provider: Callable[[str, Mapping[str, Any], ProcessIdentity], ContextManager[LifecycleEvidence]] | None = None,
                  local_host_id: str | None = None, policy_provider=None):
@@ -501,7 +717,7 @@ class LifecycleStore:
 
     @staticmethod
     def _public(row: Mapping[str, Any]) -> dict[str, Any]:
-        return {key: row[key] for key in row.keys() if key != "claim_token_hash"}
+        return {key: row[key] for key in row.keys() if key not in {"claim_token_hash", "ipc_auth_key"}}
 
     @staticmethod
     def _get(conn: sqlite3.Connection, execution_id: str) -> sqlite3.Row:

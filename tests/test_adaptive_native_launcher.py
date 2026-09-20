@@ -620,6 +620,53 @@ class NativeLauncherTests(unittest.TestCase):
         self.assertEqual(self.calls("CloseHandle"), [("CloseHandle", PROCESS_HANDLE)])
         self.assert_no_create()
 
+    def test_close_publication_interruption_can_finish_without_query_or_second_native_close(self):
+        class InterruptedPublication(native.CreatedProcess):
+            def __setattr__(self, name, value):
+                mode = getattr(self, "_interrupt_clear", None)
+                if name == "handle" and value is None and mode is not None:
+                    object.__setattr__(self, "_interrupt_clear", None)
+                    if mode == "before":
+                        raise self._clear_error
+                    super().__setattr__(name, value)
+                    raise self._clear_error
+                super().__setattr__(name, value)
+
+        for mode in ("before", "after"):
+            with self.subTest(mode=mode):
+                process = InterruptedPublication(self.backend, IDENTITY.logon_id)
+                process.handle, process.pid = PROCESS_HANDLE, IDENTITY.pid
+                process._creation_outcome = "created"
+                original = KeyboardInterrupt("fixture_close_publication_interruption")
+                process._clear_error, process._interrupt_clear = original, mode
+                before = len(self.kernel.calls)
+                with self.assertRaises(KeyboardInterrupt) as failed:
+                    process.close()
+                self.assertIs(failed.exception, original)
+                self.assertTrue(process._closed)
+                self.assertEqual(self.kernel.calls[before:], [("CloseHandle", PROCESS_HANDLE)])
+                self.assertEqual(process.handle, PROCESS_HANDLE if mode == "before" else None)
+                for operation in (process.identity, lambda: process.wait(0), process.exit_code,
+                                  lambda: process.is_in_job(self.job),
+                                  lambda: process.full_identity(expected_logon_id=IDENTITY.logon_id)):
+                    with self.assertRaises(native.NativeLaunchError):
+                        operation()
+                process.close()
+                process.close()
+                self.assertIsNone(process.handle)
+                self.assertEqual(self.kernel.calls[before:], [("CloseHandle", PROCESS_HANDLE)])
+        self.assertEqual(self.identity.calls, [])
+        self.assert_no_create()
+
+    def test_close_before_creation_finishes_without_native_operations(self):
+        process = native.CreatedProcess(self.backend, IDENTITY.logon_id)
+        process.close()
+        process.close()
+        self.assertTrue(process._closed)
+        self.assertIsNone(process.handle)
+        self.assertEqual(self.kernel.calls, [])
+        self.assert_no_create()
+
     def test_interruption_after_backend_native_success_keeps_preexisting_quarantine(self):
         process = native.CreatedProcess(self.backend, IDENTITY.logon_id)
         process.handle, process.pid = PROCESS_HANDLE, IDENTITY.pid

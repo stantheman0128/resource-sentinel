@@ -3,8 +3,11 @@
 An identity proves which process was observed, not who sent an IPC request or
 who owns an allocation. This module neither enrolls work nor enables a P1 gate.
 No float epoch, PID-only fallback, process enumeration or control API is used.
-Handles are limited to QUERY_LIMITED_INFORMATION | SYNCHRONIZE. The caller must
-retain the context until its decision completes; a snapshot is not a launch fence.
+VerifiedProcess handles are limited to QUERY_LIMITED_INFORMATION | SYNCHRONIZE.
+Cross-process transfer briefly opens a separately owned exact source-process
+handle with PROCESS_DUP_HANDLE as well. It never changes normal handle rights.
+The caller must retain the context until its decision completes; a snapshot is
+not a launch fence or authenticated IPC peer proof.
 """
 from __future__ import annotations
 
@@ -38,11 +41,24 @@ def retry_identity_cleanup(error: BaseException) -> None:
     A failed close leaves its owner attached to the original exception. Only a
     known FALSE result can be retried. An uncertain completion is quarantined:
     the numeric handle may already belong to a different object. Successful
-    earlier closes are idempotent. This grants no unverified identity/authority.
+    earlier closes are idempotent. One quarantined owner must not prevent the
+    independent cleanup of another known handle. This grants no identity or
+    authority to any unresolved owner.
     """
+    first_error = None
+    unresolved = []
     for owner in getattr(error, "_identity_handle_cleanup", ()):
-        owner.close()
-    error._identity_handle_cleanup = ()
+        try:
+            owner.close()
+        except BaseException as failure:
+            if first_error is None:
+                first_error = failure
+            unresolved.append(owner)
+    error._identity_handle_cleanup = tuple(unresolved)
+    if first_error is not None:
+        for owner in unresolved:
+            _retain_cleanup(first_error, owner)
+        raise first_error
 
 
 def _known_close_failure(error):
@@ -101,10 +117,67 @@ class _DuplicateCleanup:
             _close_retained(self)
 
 
+class _TransferDuplicate(_DuplicateCleanup):
+    """Own the output cell before DuplicateHandle can publish a local handle.
+
+    An invocation exception or invalid completion leaves the output quarantined.
+    A nonzero output on explicit FALSE is not documented ownership evidence;
+    never close it speculatively. Keeping this owner records unresolved custody.
+    """
+
+    def __init__(self, backend):
+        super().__init__(backend, None)
+        self._output = _HANDLE()
+        self._duplicate_outcome_unknown = True
+
+    def acquire(self, locator, *, source_process=None):
+        try:
+            self._backend.duplicate_into(locator, self._output,
+                                         source_process=source_process)
+        except BaseException as error:
+            if (getattr(error, "_native_duplicate_failed", False) is True
+                    and self._output.value is None):
+                self._duplicate_outcome_unknown = False
+            else:
+                error._native_duplicate_outcome_unknown = True
+                _retain_cleanup(error, self)
+            raise
+        value = self._output.value
+        if type(value) is not int or not 0 < value < 1 << (8 * C.sizeof(C.c_void_p) - 1):
+            error = IdentityUnavailable("process_duplicate_outcome_unknown")
+            error._native_duplicate_outcome_unknown = True
+            _retain_cleanup(error, self)
+            raise error
+        self._handle = value
+        self._duplicate_outcome_unknown = False
+
+    def close(self):
+        with self._lock:
+            if self._duplicate_outcome_unknown:
+                error = IdentityUnavailable("process_duplicate_outcome_unknown")
+                error._native_duplicate_outcome_unknown = True
+                _retain_cleanup(error, self)
+                raise error
+            _close_retained(self)
+
+
+def _transfer_cleanup(primary, *owners):
+    """Attempt known cleanup once; preserve the operation's original failure."""
+    for owner in owners:
+        if owner is None or any(item is owner for item in
+                                getattr(primary, "_identity_handle_cleanup", ())):
+            continue
+        try:
+            owner.close()
+        except BaseException:
+            _retain_cleanup(primary, owner)
+
+
 _DWORD = C.c_uint32
 _HANDLE = C.c_void_p
 _BOOL = C.c_int32
 _PROCESS_ACCESS = 0x1000 | 0x100000
+_TRANSFER_SOURCE_ACCESS = _PROCESS_ACCESS | 0x0040
 _MAX_TOKEN_BYTES = 64 * 1024
 _LOGON_SID = re.compile(r"S-1-5-5-([0-9]{1,10})-([0-9]{1,10})\Z")
 
@@ -160,6 +233,23 @@ class _WindowsBackend:
         handle = self.kernel.OpenProcess(_PROCESS_ACCESS, False, pid)
         _check(handle, "process_open_unavailable")
         return handle
+
+    def open_transfer_source(self, pid):
+        handle = self.kernel.OpenProcess(_TRANSFER_SOURCE_ACCESS, False, pid)
+        _check(handle, "process_transfer_source_unavailable")
+        return handle
+
+    def duplicate_into(self, locator, output, *, source_process=None):
+        current = self.kernel.GetCurrentProcess()
+        source = current if source_process is None else source_process
+        # Explicit bounded query rights; no inherited handle, SAME_ACCESS,
+        # CLOSE_SOURCE or remote target handle is ever requested.
+        result = self.kernel.DuplicateHandle(source, locator, current,
+            C.byref(output), _PROCESS_ACCESS, False, 0)
+        if not result:
+            error = IdentityUnavailable("process_duplicate_unavailable", C.get_last_error())
+            error._native_duplicate_failed = True
+            raise error
 
     def duplicate_process(self, source_handle):
         copied = _HANDLE()
@@ -314,6 +404,102 @@ class VerifiedProcess:
     def current(cls):
         return cls._open(os.getpid())
 
+    def _require_transfer_source_locked(self):
+        if self._close_outcome_unknown:
+            raise IdentityUnavailable("process_handle_close_outcome_unknown")
+        if self._handle is None:
+            raise IdentityUnavailable("identity_handle_closed")
+        try:
+            alive = self._backend.wait(self._handle) is IdentityStatus.ALIVE
+        except Exception:
+            raise IdentityUnavailable("process_transfer_source_unverified") from None
+        if not alive:
+            raise IdentityUnavailable("process_transfer_source_unverified")
+
+    def duplicate(self):
+        """Retain this exact process independently of a borrowed scope.
+
+        The caller still supplies authentication/provenance (for example an
+        active verified_peer scope). This method grants no IPC or launch rights.
+        Ordinary limited query rights are explicitly requested for the copy.
+        A process can already be dead; this operation makes no liveness claim.
+        """
+        with self._lock:
+            if self._close_outcome_unknown:
+                raise IdentityUnavailable("process_handle_close_outcome_unknown")
+            if self._handle is None:
+                raise IdentityUnavailable("identity_handle_closed")
+            copied = _TransferDuplicate(self._backend)
+            result = None
+            try:
+                copied.acquire(self._handle)
+                if self._backend.identity(copied._handle) != self.identity:
+                    raise IdentityUnavailable("identity_mismatch")
+                result = VerifiedProcess(self._backend, copied._handle, self.identity)
+                copied._handle = None
+                return result
+            except BaseException as primary:
+                # An interruption after retiring the temporary owner must keep
+                # the newly constructed owner, even if return never completed.
+                owner = result if result is not None and copied._handle is None else copied
+                _transfer_cleanup(primary, owner)
+                raise
+
+    def duplicate_remote_handle(self, locator: int, *, expected: ProcessIdentity):
+        """Copy one process handle from an independently authenticated peer.
+
+        Invoke only while the transport's verified_peer scope is held. ``self``
+        is that retained live peer, not a process selected by wire PID. Locator
+        and expected identity are untrusted consistency inputs: the temporary
+        DUP_HANDLE source is pinned to this peer's exact birth/logon, and the
+        copied root must match all expected identity fields before publication.
+
+        The root can already be dead; its PID is never reopened. Verify process
+        type/identity before any wait on the copied locator, since an arbitrary
+        locator could refer to a synchronization object. This does not establish
+        creation provenance or Job membership; the guardian must verify those.
+        On uncertain duplication or failed cleanup, preserve the exception and
+        its retained cleanup owners. A quarantined output cannot be retried as
+        a close or interpreted as a successful transfer.
+        """
+        if (type(locator) is not int or
+                not 0 < locator < 1 << (8 * C.sizeof(C.c_void_p) - 1)):
+            raise ValueError("invalid_remote_process_handle")
+        if type(expected) is not ProcessIdentity:
+            raise TypeError("exact_process_identity_required")
+        if expected.logon_id != self.identity.logon_id:
+            raise IdentityUnavailable("identity_mismatch")
+        with self._lock:
+            self._require_transfer_source_locked()
+            source = copied = result = None
+            try:
+                # Only the independently retained peer PID may be reopened to
+                # acquire DUP_HANDLE. It cannot replace the original evidence.
+                handle = self._backend.open_transfer_source(self.identity.pid)
+                source = _DuplicateCleanup(self._backend, handle)
+                if self._backend.identity(handle) != self.identity:
+                    raise IdentityUnavailable("identity_mismatch")
+                if self._backend.wait(handle) is not IdentityStatus.ALIVE:
+                    raise IdentityUnavailable("process_transfer_source_unverified")
+                self._require_transfer_source_locked()
+                copied = _TransferDuplicate(self._backend)
+                copied.acquire(locator, source_process=handle)
+                if self._backend.identity(copied._handle) != expected:
+                    raise IdentityUnavailable("identity_mismatch")
+                self._require_transfer_source_locked()
+                if self._backend.wait(handle) is not IdentityStatus.ALIVE:
+                    raise IdentityUnavailable("process_transfer_source_unverified")
+                # Retire the stronger temporary capability before returning a
+                # normal limited-right root owner; a close failure is not ACK.
+                source.close()
+                result = VerifiedProcess(self._backend, copied._handle, expected)
+                copied._handle = None
+                return result
+            except BaseException as primary:
+                owner = result if result is not None and copied._handle is None else copied
+                _transfer_cleanup(primary, owner, source)
+                raise
+
     @classmethod
     def duplicate_from_handle(cls, source_handle: int, *, expected_pid: int,
                               expected_logon_id: str):
@@ -425,6 +611,27 @@ class VerifiedProcess:
                     return None
                 return member
             except IdentityUnavailable:
+                return None
+
+    def query_owned_job_membership(self, job_handle: int) -> bool | None:
+        """Query one held Job against this retained exact process, even exited.
+
+        The trusted caller retains a real JOB_OBJECT_QUERY handle throughout.
+        This reports only IsProcessInJob's current native result; it establishes
+        neither liveness nor historical membership. False/unknown must not be
+        inferred into a positive bind from root exit or expected Job metadata.
+        Post-exit positive membership remains an empirical native gate.
+        """
+        if (type(job_handle) is not int or
+                not 0 < job_handle < 1 << (8 * C.sizeof(C.c_void_p) - 1)):
+            raise ValueError("invalid_job_handle")
+        with self._lock:
+            if self._handle is None or self._close_outcome_unknown:
+                return None
+            try:
+                member = self._backend.membership(self._handle, job_handle)
+                return member if type(member) is bool else None
+            except Exception:
                 return None
 
     def close(self):

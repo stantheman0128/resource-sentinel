@@ -278,6 +278,9 @@ class CreatedProcess:
     def close(self):
         with self._lock:
             if self._closed:
+                # Finish local publication if an earlier close was interrupted
+                # after recording completion but before clearing this field.
+                self.handle = None
                 return
             errors = []
             try:
@@ -305,8 +308,11 @@ class CreatedProcess:
                 except BaseException as error:
                     error.cleanup_owner = self
                     raise
-                self.handle = None
+            # Record completion before discarding the handle. Otherwise an
+            # interruption could leave a created outcome with no handle and no
+            # completion marker, making every later cleanup reject it forever.
             self._closed = True
+            self.handle = None
 
 
 def retry_launch_cleanup(error):

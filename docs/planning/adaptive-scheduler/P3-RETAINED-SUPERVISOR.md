@@ -50,6 +50,27 @@ failure is sticky with the original error, so a retry loop cannot allocate an
 unbounded series of mutexes. `close()` after a failed capture settles the owners
 held only by the capture error, or refuses with `recovery_custody_unsettled`.
 
+A follow-up pass closed four holes in that custody. When a raw handle or a
+security descriptor failed to release inside `windows.py`, the error kept a note
+but nothing that could try again. `_retain_native` now puts a small owner on the
+error, which retries the release and drops its value only after the release
+succeeds. The helpers that read and settle those owners moved into `windows.py`
+as `retained_owners`, `settle_retained`, `replacement_allowed` and
+`unresolved_construction`, so the recovery owner and the guardian use one
+definition. `RecoveryOwner.close()` refuses a capture error whose cleanup note
+has no owner behind it, because a note alone cannot be settled. `close_verified`
+clears each handle as it closes, so a retry after a failed mutex close does not
+close the Job a second time. `GuardianLifecycle` builds its per-Job mutex through
+the same three-way rule and refuses with `guardian_job_mutex_unverified` while
+the first outcome is unknown.
+
+Three limits remain. An entry whose Job open failed keeps `close_verified`
+refusing, and no path settles owners carried on that open error. The guardian's
+pending execution has no field for a mutex failure, so its stickiness lasts one
+attempt. The branch that lets a clean native failure construct again cannot be
+reached from a guardian entry point, because the fence failure poisons the
+restorer first.
+
 ## Concurrent bound and retirement
 
 The supervisor bound is now ten unretired scopes, not ten rows per cohort. A
@@ -66,11 +87,16 @@ A held obligation is asked again on every tick, at most ten proofs, so evidence
 that completes later still frees the slot and lets `close()` succeed.
 
 History is read once in `rowid` order, sixteen proofs per tick. While a
-remainder is unread the tick reports unverified inventory. Other terminal states
-(`CANCELLED_BEFORE_START`, `START_FAILED`) still count as live, because only
-finalization carries a native proof. Enough unprovable history therefore ends in
-`supervisor_inventory_bound_exceeded`, and the tick reports that as unverified
-inventory.
+remainder is unread the tick reports unverified inventory. A named scope in
+`CANCELLED_BEFORE_START` or `START_FAILED` still counts as live. The store would
+write either state only under a never-started proof, but no production path can
+reach that today. The one production cancel, in `admission.py`, accepts only a
+row with no Job name, and the supervisor never lists such a row.
+`mark_start_failed` has no caller, and neither guardian evidence provider
+answers `cancel` or `start_failed`. A retirement check for those two states
+would therefore verify evidence nothing can produce, so none was added. Enough
+unprovable history ends in `supervisor_inventory_bound_exceeded`, and the tick
+reports that as unverified inventory.
 
 Unavailable and contradictory inventory are separated by the primary SQLite
 result code (`BUSY`, `LOCKED`, `IOERR` and similar), two journal read reasons
@@ -93,6 +119,11 @@ review pass reproduced the earlier 1513-test run, then refuted the first
 unavailability classification and showed a held terminal scope could never
 retire. Both are fixed above, each with a test.
 
+A later run the same day, after the custody follow-ups and the P4 to P6 tooling
+landed, named all 70 modules the same way: 1629 tests, 0 failures, 0 errors,
+0 skips, 190.1 s. The added modules are portable or read-only. None of them sets
+a CPU control, and none is native evidence for a P4, P5 or P6 gate.
+
 `tests/test_adaptive_p3_flow.py` runs flow A to G on one isolated ledger with the
 production consumers: `Coordinator.admit_managed`, `ManagedAdmission`,
 `GuardianLaunchOwner`, its `GuardianLifecycle`, the formal `RecoveryJournal`,
@@ -110,8 +141,10 @@ mutexes, named Jobs and process handles is a fixture, and so is the wrapper's
 process creation. One test process plays both roles, so the supervisor PID is a
 fixture value patched into `recovery_owner` only. The cap is the fourth. No production
 tightening path exists yet, so a labelled fixture publishes a pending intent
-through the formal journal and sets the synthetic native flags. The control slot
-is not exercised. None of this is evidence of Windows launch, containment,
+through the formal journal and sets the synthetic native flags. The same fixture
+takes the control slot through the formal `begin_control_slot_locked`, with a
+fixture evidence provider and a fixture mode value, because production supplies
+no `control_begin` evidence and no mode switch. None of this is evidence of Windows launch, containment,
 crash, CPU effect or restore timing, and no such number is claimed.
 
 Flow step H is not delivered. No production entry point lets a legitimate owner
@@ -122,6 +155,15 @@ current safe behavior: a replacement guardian identity is refused with
 keeps its allocation and its supervisor slot until the ownership transition
 listed below exists.
 
+The flow test also shows the wider cost. After the restore the control slot is
+still `HELD` and the admission barrier is still `CONTROLLING`, which is correct
+for a restore-only owner. `accounting.py` refuses every non-exempt admission
+while the barrier is not `NONE`, so a guardian that dies while it holds the slot
+blocks new non-exempt work on the host until a legitimate lifecycle owner
+releases the slot. Nothing in production can take the slot today, so the daily
+runtime is unaffected, but the ownership transition has to exist before any
+canary.
+
 Not red-verified: the new custody tests were not shown failing against the old
 code by execution. That claim rests on reading the old code path.
 
@@ -129,7 +171,20 @@ Supervisor lock tests take a real exclusive file lock. The ledger is WAL, so a
 plain `BEGIN EXCLUSIVE` does not block readers; the blocker uses
 `PRAGMA locking_mode=EXCLUSIVE` and readers get a real `SQLITE_BUSY`.
 
-## Contract clarification still required for all-witness loss
+## Contract clarification for all-witness loss
+
+Decided by the user on 2026-09-20: §8.3 is narrowed and §3.2 stays as written. A
+fresh process that never held the old guardian's handle reports the guardian as
+UNKNOWN, tells the user and performs no restore. The supported route is the one
+built here: the supervisor attaches while the guardian is alive and keeps the
+handle. This matches the last row of the §9 fault matrix, which promises an
+independent supervisor or a manual restore when every recovery owner is lost,
+and no automatic settlement. No weaker death evidence is accepted, so the PID
+and creation-time inference below is recorded as considered and rejected. Two
+existing cases pin this behavior:
+`test_capture_requires_alive_witness_and_retains_failed_capture_owners` and
+`test_alive_and_unknown_guardian_do_not_open_or_control_job`. The background
+that led to the decision follows.
 
 Formal plan §3.2 requires the old guardian's held process handle to be signaled.
 §8.3 also describes a fresh Scheduled Task recovery after helper, guardian and
@@ -163,10 +218,10 @@ pass. Promotion remains stopped for this unresolved all-witness-loss contract.
   and an accepted exact-death contract when every native witness is gone.
 - Separate durable recovery ownership transfer, followed by lifecycle adoption,
   child accounting, original lease handling and full barrier/slot reconciliation.
-- Retirement for `CANCELLED_BEFORE_START` and `START_FAILED` scopes, which need
-  their own formal evidence before they can leave the concurrent bound.
-- `GuardianLifecycle._job_scope` constructs its per-Job mutex without the custody
-  handling now in `RecoveryOwner._job_mutex`. Not changed in this slice.
+- Guardian evidence for `cancel` and `start_failed` on a named Job. Without it a
+  prepared Job whose launch positively failed before user code keeps its
+  allocation and its supervisor slot. Retirement of those two states follows
+  that evidence and is not built ahead of it.
 - Real continuous host capacity and loaded legacy-writer authority, native
   S1-S3 recovery, P4 observer/shadow costs, P5 canary and P6 paired A/B evidence.
 

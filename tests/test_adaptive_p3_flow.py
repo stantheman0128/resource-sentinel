@@ -34,10 +34,11 @@ from sentinel.adaptive.guardian_lifecycle import GuardianLifecycle, job_mutex_in
 from sentinel.adaptive.native_job import JobAccess, NativeJobError
 from sentinel.adaptive.policy import PolicyBinding
 from sentinel.adaptive.recovery_journal import RecoveryJournal, RecoveryJournalError
-from sentinel.adaptive.store import LifecycleError, LifecycleStore
+from sentinel.adaptive.store import LifecycleError, LifecycleEvidence, LifecycleStore
 from sentinel.adaptive.supervisor import GuardianSupervisor
 from sentinel.adaptive.windows import NativePolicyMutexError, PolicyMutexLease
 from sentinel.coordinator import Coordinator
+from tests.fixtures.adaptive_evidence import fixture_evidence_provider
 from tests import test_adaptive_guardian_launch as launch
 from tests import test_adaptive_guardian_lifecycle as lifecycle_fixture
 from tests.test_adaptive_coordinator import NOW
@@ -258,6 +259,23 @@ class P3FlowTests(unittest.TestCase):
         """
         old = self.manifest(case)
         state = self.kernel.jobs[old.job_name]
+        # Slot first, then intent, then Set. Production offers no control_begin
+        # evidence or mode switch yet, so both are fixture values around the
+        # formal begin_control_slot_locked.
+        caller, members = case.peer.identity, tuple(state.members)
+        def evidence(operation, row, identity):
+            return LifecycleEvidence(operation, row["execution_id"], row["state_revision"],
+                "synthetic-control-setup", identity, guardian_epoch=EPOCH, job_name=old.job_name,
+                job_nonce=old.creation_nonce, root=case.root.identity, durable_manifest=True,
+                legacy_exclusion=True, active_process_count=len(members), process_ids=members)
+        self.sql("UPDATE adaptive_runtime SET mode='canary'")
+        guard = self.store._policy.prepare(LOGON)
+        with patch.object(self.store, "evidence_provider", fixture_evidence_provider(evidence)):
+            with self.store._policy.hold(guard):
+                case.slot = self.store.begin_control_slot_locked(old.execution_id, caller=caller,
+                    expected_revision=self.row(case)["state_revision"], slot_id=str(uuid4()),
+                    exemption_revision=0)
+        self.sql("UPDATE adaptive_runtime SET mode='off'")
         scope = SimpleNamespace(execution_id=old.execution_id, creation_nonce=old.creation_nonce,
             job_name=old.job_name, reservation=old.reservation, spec_hash=old.spec_hash,
             assert_held=lambda: None,
@@ -267,6 +285,10 @@ class P3FlowTests(unittest.TestCase):
         self.journal.publish(RecoveryManifest.create(**values), expected_seq=old.manifest_seq,
                              expected_hash=old.manifest_hash, writer_scope=scope)
         state.flags, state.rate_bp = 5, CAP.cpu_rate_bp
+
+    def sql(self, statement):
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute(statement)
 
     def snapshot(self):
         with closing(sqlite3.connect(self.db)) as conn:
@@ -328,6 +350,12 @@ class P3FlowTests(unittest.TestCase):
         self.assertEqual((settled.pending_intent, settled.last_applied), (None, DISABLED))
         self.assertEqual((settled.guardian_identity, settled.guardian_epoch), (GUARDIAN, EPOCH))
         self.assertEqual(self.snapshot(), ledger)
+        # The native cap is gone, yet the slot and the admission barrier stay
+        # with the lifecycle owner: recovery settles the journal only.
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("""SELECT slot_id,slot_state,execution_id,admission_barrier
+                FROM adaptive_control_slot,adaptive_runtime""").fetchone(),
+                (case.slot["slot_id"], "HELD", execution, "CONTROLLING"))
         self.assertEqual(self.row(case)["state"], "DRAINING")
         self.assertEqual(state.members, [CHILD_PID])
         with self.assertRaisesRegex(LifecycleError, "supervisor_custody_unsettled"):

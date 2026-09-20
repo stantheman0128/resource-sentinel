@@ -416,6 +416,81 @@ class FailClosedTests(unittest.TestCase):
         self.assertIs(capped.action, DecisionAction.REQUEST_RESTORE)
         self.assertEqual(capped.reason, "sample_gap")
 
+    def test_controller_warms_up_again_after_a_gap_once_frames_are_contiguous(self):
+        # Plan 5.4 and 6.2: a gap resets warmup and waits for fresh frames. It
+        # must not leave every later frame refused as another gap.
+        gap = tick(ENFORCE, settle(ENFORCE), 7, LOW_BUSY, seq=99)
+        self.assertEqual((gap.reason, gap.next_snapshot.uncapped_streak), ("sample_gap", 0))
+        state, reasons = gap.next_snapshot, []
+        for seq, second in enumerate(range(8, 13), start=100):
+            decision = tick(ENFORCE, state, second, LOW_BUSY, seq=seq)
+            reasons.append(decision.reason)
+            state = decision.next_snapshot
+        self.assertNotIn("sample_gap", reasons)
+        self.assertEqual(state.uncapped_streak, ENFORCE.baseline_samples)
+        self.assertIs(state.state, ControllerState.OBSERVING)
+
+    def test_controller_warms_up_again_after_a_rejected_frame_consumed_a_sequence(self):
+        state = settle(ENFORCE)
+        stale = tick(ENFORCE, state, 5, LOW_BUSY, now=at(5 + 60))
+        self.assertEqual(stale.reason, "sample_stale")
+        self.assertEqual(stale.next_snapshot.last_sample_seq, state.last_sample_seq)
+        state = stale.next_snapshot
+        for second in range(66, 72):
+            state = tick(ENFORCE, state, second, LOW_BUSY).next_snapshot
+        self.assertIs(state.state, ControllerState.OBSERVING)
+
+    def test_controller_warms_up_again_after_a_sampler_or_clock_epoch_change(self):
+        for changes in (dict(sampler_epoch="sampler-b"), dict(clock_epoch="clock-b")):
+            with self.subTest(changes):
+                state = settle(ENFORCE)
+                for seq, second in enumerate(range(5, 11), start=1):
+                    state = next_state(
+                        profile=ENFORCE, snapshot=state, candidates=CANDIDATES,
+                        frame=frame(seq, at(second), LOW_BUSY, **changes),
+                        now_tick_100ns=at(second)).next_snapshot
+                self.assertIs(state.state, ControllerState.OBSERVING)
+
+    def test_a_continuity_break_never_tightens_on_the_frame_that_rebases(self):
+        state = settle(ENFORCE)
+        for second in (5, 6):
+            state = tick(ENFORCE, state, second, HIGH_BUSY).next_snapshot
+        rebased = tick(ENFORCE, state, 7, HIGH_BUSY, seq=99)
+        self.assertIs(rebased.action, DecisionAction.OBSERVE)
+        self.assertEqual((rebased.next_snapshot.high_streak,
+                          rebased.next_snapshot.uncapped_streak), (0, 0))
+        # The rebasing frame is a baseline only. A replay of it stays refused.
+        again = tick(ENFORCE, rebased.next_snapshot, 8, HIGH_BUSY, seq=99)
+        self.assertEqual(again.reason, "sample_replay")
+
+    def test_an_unsound_frame_is_never_adopted_as_the_new_baseline(self):
+        state = settle(ENFORCE)
+        late = tick(ENFORCE, state, 7, LOW_BUSY, seq=99, now=at(7 + 60))
+        self.assertEqual(late.reason, "sample_gap")
+        self.assertEqual(late.next_snapshot.last_sample_seq, state.last_sample_seq)
+
+    def test_missing_memory_attribution_does_not_refuse_the_cpu_evidence(self):
+        # Plan 5.3: without private memory attribution the physical deduction is
+        # zero. The frame contract makes the frame say so with an error, and the
+        # CPU evidence in that frame is still sound.
+        unknown = job(private_working_set_bytes=None, private_commit_bytes=None,
+                      memory_validity=Validity.UNKNOWN)
+        note = FrameError("memory_attribution_unavailable", "job_memory",
+                          RetryClass.AFTER_RECONCILIATION, EXEC_A)
+        state = ControllerSnapshot.initial()
+        for second in range(5):
+            state = next_state(
+                profile=ENFORCE, snapshot=state, candidates=CANDIDATES,
+                frame=frame(second + 1, at(second), LOW_BUSY, jobs=(unknown,), errors=(note,)),
+                now_tick_100ns=at(second)).next_snapshot
+        self.assertIs(state.state, ControllerState.OBSERVING)
+        other = FrameError("membership_unknown", "job_membership", RetryClass.TRANSIENT, EXEC_A)
+        refused = next_state(
+            profile=ENFORCE, snapshot=state, candidates=CANDIDATES,
+            frame=frame(6, at(5), LOW_BUSY, jobs=(unknown,), errors=(note, other)),
+            now_tick_100ns=at(5))
+        self.assertEqual(refused.reason, "frame_errors")
+
     def test_replayed_sample_is_refused(self):
         state = settle(ENFORCE)
         replayed = tick(ENFORCE, state, 5, HIGH_BUSY, seq=2)

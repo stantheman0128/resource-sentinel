@@ -539,12 +539,18 @@ def _check_candidates(profile: PolicyProfile, candidates) -> None:
 # --- state machine -----------------------------------------------------------
 
 
+# Plan section 5.3: without private memory attribution the physical deduction is
+# zero. The frame contract makes such a frame carry this error. This module reads
+# no per-Job memory, so the error says nothing about the CPU evidence.
+NON_BLOCKING_FRAME_ERRORS = frozenset({"memory_attribution_unavailable"})
+
+
 def _evidence_problem(profile: PolicyProfile, snapshot: ControllerSnapshot,
                       frame: FastFrame, now_tick_100ns: int) -> str | None:
     """Fail closed reasons. Any non-None result forbids new tightening."""
     if frame.validity is not Validity.VALID:
         return "frame_invalid"
-    if frame.errors:
+    if any(error.code not in NON_BLOCKING_FRAME_ERRORS for error in frame.errors):
         return "frame_errors"
     if frame.machine.cpu_busy_units is None:
         return "denominator_unknown"
@@ -567,6 +573,27 @@ def _evidence_problem(profile: PolicyProfile, snapshot: ControllerSnapshot,
     if not profile.cpu_window_min_ms <= window_ms <= profile.cpu_window_max_ms:
         return "sample_window_invalid"
     return None
+
+
+CONTINUITY_BREAKS = frozenset({"sample_gap", "sampler_epoch_changed", "clock_epoch_changed"})
+
+
+def _rebase_frame(profile: PolicyProfile, snapshot: ControllerSnapshot, frame: FastFrame,
+                  now_tick_100ns: int, problem: str) -> FastFrame | None:
+    """The frame to restart warmup from after a continuity break, if it is sound.
+
+    Plan sections 5.4 and 6.2 reset warmup on a gap or an epoch change and wait
+    for fresh frames. Keeping the old sequence would refuse every later frame as
+    another gap. A frame becomes the new baseline only when it fails no check
+    besides continuity, and the tick that adopts it never acts on it. A replay
+    inside one epoch is not a continuity break and is never adopted.
+    """
+    if problem not in CONTINUITY_BREAKS:
+        return None
+    # Ticks of a new clock epoch are not comparable with the old last tick.
+    last_tick = None if problem == "clock_epoch_changed" else snapshot.last_tick_100ns
+    fresh = ControllerSnapshot(state=ControllerState.WARMUP, last_tick_100ns=last_tick)
+    return frame if _evidence_problem(profile, fresh, frame, now_tick_100ns) is None else None
 
 
 def _observed(snapshot: ControllerSnapshot, frame: FastFrame, now_tick_100ns: int,
@@ -626,9 +653,18 @@ def next_state(*, profile: PolicyProfile, snapshot: ControllerSnapshot, frame: F
 
     problem = _evidence_problem(profile, snapshot, frame, now_tick_100ns)
     if problem is not None:
+        rebase = _rebase_frame(profile, snapshot, frame, now_tick_100ns, problem)
         if snapshot.active is not None:
-            return _restore(profile, snapshot, now_tick_100ns, problem)
-        # Do not adopt epochs or sequence numbers from a frame we rejected.
+            return _restore(profile, snapshot, now_tick_100ns, problem, frame=rebase)
+        # Do not adopt epochs or sequence numbers from a frame we rejected. A
+        # sound frame after a continuity break is the one exception: it becomes
+        # the baseline warmup restarts from, with every streak at zero.
+        if rebase is not None:
+            return _decide(DecisionAction.OBSERVE, problem,
+                           _observed(snapshot, rebase, now_tick_100ns,
+                                     state=ControllerState.WARMUP, uncapped_streak=0,
+                                     high_streak=0, low_since_tick_100ns=None),
+                           mode=profile.mode)
         return _decide(DecisionAction.OBSERVE, problem,
                        ControllerSnapshot(state=ControllerState.WARMUP,
                                           sampler_epoch=snapshot.sampler_epoch,

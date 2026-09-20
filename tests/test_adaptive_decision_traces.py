@@ -9,9 +9,9 @@ Each invariant cites the plan section it comes from
 
 The generator takes the next sample sequence from the controller's own accepted
 snapshot rather than from a free running counter. That models a sampler that
-rebases its sequence after a rejected frame. decision.py only accepts
-last_sample_seq + 1, so a sampler that keeps counting through rejected frames
-locks the controller out permanently; see the report accompanying this change.
+rebases its sequence after a rejected frame. A sampler that keeps counting
+through rejected frames is covered in tests/test_adaptive_decision.py, where the
+controller rebases on the first sound frame after the gap.
 """
 
 import random
@@ -92,8 +92,14 @@ class Step:
             second, anomaly, frame, candidates, now)
 
 
-def generate(rng: random.Random, snapshot: ControllerSnapshot, second: int) -> Step:
-    """Build one tick from the controller's own accepted sequence."""
+def generate(rng: random.Random, snapshot: ControllerSnapshot, second: int,
+             free_running: bool = False) -> Step:
+    """Build one tick from the controller's own accepted sequence.
+
+    With free_running the sequence is the tick number instead, as from a sampler
+    that keeps counting through frames the controller refused. Every refused
+    frame then leaves a gap, and the controller has to rebase to recover.
+    """
     clean = second in CLEAN_PRESSURE or second >= STEPS - TAIL
     anomaly = None
     if not clean and rng.random() < 0.12:
@@ -109,6 +115,8 @@ def generate(rng: random.Random, snapshot: ControllerSnapshot, second: int) -> S
 
     accepted = snapshot.last_sample_seq
     seq = 1 if accepted is None else accepted + 1
+    if free_running:
+        seq = second + 1
     now = at(second)
     window_end = now
     kwargs = {}
@@ -143,7 +151,7 @@ def generate(rng: random.Random, snapshot: ControllerSnapshot, second: int) -> S
 
 
 class RandomizedTraceTests(unittest.TestCase):
-    def run_trace(self, seed: int):
+    def run_trace(self, seed: int, free_running: bool = False):
         rng = random.Random(seed)
         snapshot = ControllerSnapshot.initial()
         last_tighten = None
@@ -152,7 +160,7 @@ class RandomizedTraceTests(unittest.TestCase):
         restores = []
         tail_actions = []
         for second in range(STEPS):
-            step = generate(rng, snapshot, second)
+            step = generate(rng, snapshot, second, free_running)
             previous = snapshot
             decision = next_state(profile=ENFORCE, snapshot=previous, frame=step.frame,
                                   candidates=step.candidates, now_tick_100ns=step.now)
@@ -240,6 +248,18 @@ class RandomizedTraceTests(unittest.TestCase):
                 self.assertNotIn(DecisionAction.RENEW, late)
                 for action in TIGHTENING:
                     self.assertNotIn(action, late)
+
+    def test_free_running_sequences_recover_and_hold_every_invariant(self):
+        # Every refused frame leaves a gap here. A controller that never rebased
+        # would stay in warmup for the rest of the trace and propose nothing.
+        for seed in SEEDS:
+            with self.subTest(seed=seed):
+                snapshot, proposals, restores, tail = self.run_trace(seed, free_running=True)
+                self.assertTrue(proposals, "trace never proposed a cap after a gap")
+                self.assertTrue(restores, "trace never restored")
+                self.assertIsNone(snapshot.active, "cap survived the low pressure tail")
+                for action in (DecisionAction.RENEW, *TIGHTENING):
+                    self.assertNotIn(action, tail[-60:])
 
     def test_generator_produces_the_intended_anomalies(self):
         # A trace that never degrades an input would assert nothing about the

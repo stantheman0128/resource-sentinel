@@ -29,12 +29,21 @@ so a later guardian start can still register. Only a failure at or after that
 transaction keeps the durable entry, because the ledger outcome is unknown
 then.
 
+An opt in helper profile adds one shadow helper child to the same design. The
+helper child is created the same way as the guardian, and its creation handle is
+kept as the only witness of it. A verified death on that witness releases the
+helper's row in the infrastructure registry, and a replacement follows when the
+removal succeeded and the helper budget allows. A row that could not be removed
+refuses the next helper start as occupied, so no replacement is attempted then.
+Without a helper profile no helper child is created and no helper key appears in
+any record.
+
 The default mode ticks until the process is interrupted, which is the only stop
 condition this repository provides. Stopping does not stop the guardian. This
 host has no kill path at all, so it closes its own supervision and leaves the
 guardian running and unsupervised, and it says so. Nothing can re-adopt that
 guardian afterwards, because the creation handle that witnesses it cannot
-outlive this process.
+outlive this process. The same is true of the helper.
 """
 from __future__ import annotations
 
@@ -176,11 +185,26 @@ class _Guardian:
         self.process = process
 
 
+class _Helper:
+    """One started helper: its creation handle and its witness.
+
+    A helper carries no epoch. Nothing in the helper host takes one, and
+    inventing one here would put a provenance claim on a process that never
+    received it.
+    """
+
+    def __init__(self, *, pid, creation_handle, process):
+        self.pid = pid
+        self.creation_handle = creation_handle
+        self.process = process
+
+
 class SupervisorHost:
     """Start one guardian, attach to it, and observe it with bounded ticks."""
 
     def __init__(self, *, data_dir, journal_dir, child_cwd=None, python_executable=None,
                  profile_path=None, max_guardians=1, guardian_iterations=0,
+                 helper_profile_path=None, max_helpers=1,
                  sleep=time.sleep, tick_interval_sec=1.0):
         self.data_dir = Path(data_dir)
         self.journal_dir = Path(journal_dir)
@@ -189,6 +213,10 @@ class SupervisorHost:
         self.profile_path = profile_path
         self.max_guardians = max_guardians
         self.guardian_iterations = guardian_iterations
+        # Helper supervision is opt in. With no helper profile this host
+        # creates no helper child and reports no helper key anywhere.
+        self.helper_profile_path = helper_profile_path
+        self.max_helpers = max_helpers
         # Loop pacing only. Neither value is a measured reaction time and
         # neither one gates anything.
         self._sleep = sleep
@@ -200,6 +228,9 @@ class SupervisorHost:
         self.supervisor = None
         self.started_guardians = 0
         self.retired = []
+        self.helper = None
+        self.started_helpers = 0
+        self.retired_helpers = []
         # Children that were created but whose witness could not be built. The
         # raw creation handle is kept here so the process is never lost.
         self.unverified = []
@@ -230,6 +261,8 @@ class SupervisorHost:
                   "guardian_pid": self.guardian.pid, "pid": self.capability.pid,
                   "capability": self.capability.to_dict(), "attached": True,
                   "attach_reason": None}
+        if self.helper_profile_path is not None:
+            record["helper"] = self._start_helper_supervision()
         # Attach reads the guardian epoch from the ledger, and a guardian writes
         # it only when it prepares its first execution. On a fresh ledger the
         # first attach is therefore refused. The child already exists, so this
@@ -279,6 +312,55 @@ class SupervisorHost:
         return _Guardian(epoch=epoch, pid=int(info.dwProcessId), creation_handle=handle,
                          process=process)
 
+    def _helper_arguments(self):
+        return ["-m", "sentinel.adaptive.helper_host",
+                "--data-dir", str(self.data_dir), "--profile", str(self.helper_profile_path)]
+
+    def _start_helper(self):
+        """Create the helper child, then build its witness from that handle.
+
+        This is the guardian start without the epoch. The helper host takes no
+        epoch, and the reason the supervisor creates this child at all is the
+        creation handle: it is the only death evidence for the helper that can
+        exist on this host, and without it the helper's registry row can never
+        be removed.
+        """
+        from .identity import VerifiedProcess
+
+        if self.started_helpers >= self.max_helpers:
+            raise SupervisorHostRefused("supervisor_host_helper_budget_exhausted")
+        info = self.creation.create(self.python_executable, self._helper_arguments(),
+                                    self.child_cwd)
+        handle = int(info.hProcess)
+        try:
+            self.creation.close_handle(int(info.hThread))
+            process = VerifiedProcess.duplicate_from_handle(
+                handle, expected_pid=int(info.dwProcessId),
+                expected_logon_id=self.capability_logon())
+        except Exception as error:
+            # Same rule as the guardian. The child is running, this handle is
+            # the only witness of it, so it is retained and reported here and
+            # never replaced by a PID lookup later.
+            self.unverified.append({"pid": int(info.dwProcessId), "handle": handle,
+                                    "role": "helper", "reason": _reason(error)})
+            raise SupervisorHostRefused("supervisor_host_helper_unverified",
+                                        _reason(error)) from None
+        self.started_helpers += 1
+        return _Helper(pid=int(info.dwProcessId), creation_handle=handle, process=process)
+
+    def _start_helper_supervision(self):
+        """Start the one helper child at startup. A failure here stops nothing.
+
+        Guardian supervision is the job of this host and helper supervision is
+        an addition to it, so a helper that could not be created is reported
+        and the host carries on with the guardian.
+        """
+        try:
+            self.helper = self._start_helper()
+        except SupervisorHostRefused as error:
+            return {"started": False, "reason": error.reason, "detail": error.detail}
+        return {"started": True, "pid": self.helper.pid}
+
     def capability_logon(self):
         from .identity import VerifiedProcess
 
@@ -321,22 +403,28 @@ class SupervisorHost:
             # A guardian that could not be attached is never observed through a
             # closed supervisor. The iteration says so and retries the attach
             # against the same live guardian under the same epoch.
-            return self._retry_attach()
-        result = self.supervisor.tick()
-        record = {"event": "supervisor_host_iteration", "guardian_epoch": self.guardian.epoch,
-                  "guardian_status": result.guardian_status.value,
-                  "inventory_verified": result.inventory_verified,
-                  "known_executions": list(result.known_executions),
-                  "restored_executions": list(result.restored_executions),
-                  "unresolved_executions": list(result.unresolved_executions),
-                  "slot_released_executions": list(result.slot_released_executions),
-                  "finalized_executions": list(result.finalized_executions),
-                  "drain_unresolved_executions": list(result.drain_unresolved_executions),
-                  "inventory_error": result.inventory_error, "replacement": None}
-        # UNKNOWN holds. Only a verified death may lead to a replacement, and
-        # only after this supervisor settles its own custody.
-        if result.guardian_status is IdentityStatus.DEAD:
-            record["replacement"] = self._replace()
+            record = self._retry_attach()
+        else:
+            result = self.supervisor.tick()
+            record = {"event": "supervisor_host_iteration", "guardian_epoch": self.guardian.epoch,
+                      "guardian_status": result.guardian_status.value,
+                      "inventory_verified": result.inventory_verified,
+                      "known_executions": list(result.known_executions),
+                      "restored_executions": list(result.restored_executions),
+                      "unresolved_executions": list(result.unresolved_executions),
+                      "slot_released_executions": list(result.slot_released_executions),
+                      "finalized_executions": list(result.finalized_executions),
+                      "drain_unresolved_executions": list(result.drain_unresolved_executions),
+                      "inventory_error": result.inventory_error, "replacement": None}
+            # UNKNOWN holds. Only a verified death may lead to a replacement,
+            # and only after this supervisor settles its own custody.
+            if result.guardian_status is IdentityStatus.DEAD:
+                record["replacement"] = self._replace()
+        # The helper is observed on both paths. Its witness is independent of
+        # the guardian supervisor, so an unattached guardian says nothing about
+        # it either way.
+        if self.helper_profile_path is not None:
+            record["helper"] = self._supervise_helper()
         return record
 
     def supervise_until_stopped(self):
@@ -383,7 +471,7 @@ class SupervisorHost:
         # is what makes the next iteration take the unattached path.
         self.supervisor = None
         previous = self.guardian
-        removed, registry_reason = self._unregister(previous)
+        removed, registry_reason = self._unregister("guardian", previous)
         registry = {"registry_removed": removed, "registry_reason": registry_reason}
         if self.started_guardians >= self.max_guardians:
             return {"started": False, "reason": "supervisor_host_guardian_budget_exhausted",
@@ -405,15 +493,16 @@ class SupervisorHost:
         return {"started": True, "attached": True, "guardian_epoch": replacement.epoch,
                 "previous_epoch": previous.epoch, **registry}
 
-    def _unregister(self, guardian):
-        """Remove the dead guardian's infrastructure row under POLICY.
+    def _unregister(self, role, child):
+        """Remove the dead child's infrastructure row under POLICY.
 
-        The guardian registered itself at startup and cannot remove its own row
-        afterwards, so the row would stay until the capped registry refuses the
-        next registration. The retained witness this host created is the only
-        death evidence that exists for that guardian, and
-        unregister_dead_infrastructure_locked re-verifies death on it. Nothing
-        here reopens a PID, deletes by epoch or writes the table itself.
+        A guardian and a helper both register themselves at startup and neither
+        can remove its own row afterwards, so the row would stay until the
+        capped registry refuses the next registration. The retained witness
+        this host created is the only death evidence that exists for that
+        child, and unregister_dead_infrastructure_locked re-verifies death on
+        it. Nothing here reopens a PID, deletes by epoch or writes the table
+        itself.
 
         The return is the pair reported in the replacement record. False with no
         reason means the row was already absent.
@@ -421,7 +510,9 @@ class SupervisorHost:
         A refusal the writer decided before its transaction, which is what
         legacy_infrastructure_death_unverified and
         legacy_infrastructure_identity_required are, releases the POLICY entry
-        on the way out, so the next guardian start can still register. A failure
+        on the way out, so the next child start can still register. Letting
+        those propagate out of the hold is what releases them, so nothing in
+        this method raises an exception of its own inside the hold. A failure
         at or after that transaction keeps the entry, because the ledger outcome
         is then unknown, and the next POLICY user of this data directory sees
         policy_scope_busy.
@@ -432,8 +523,8 @@ class SupervisorHost:
         try:
             guard = policy.prepare(policy.current_logon())
             with policy.hold(guard):
-                removed = unregister_dead_infrastructure_locked(self.store, "guardian",
-                                                                guardian.process)
+                removed = unregister_dead_infrastructure_locked(self.store, role,
+                                                                child.process)
         except Exception as error:
             # LegacyMutationError carries its stable code as the message, the
             # same convention LifecycleError uses. Anything else reports the
@@ -444,6 +535,62 @@ class SupervisorHost:
             return False, _reason(error)
         return bool(removed), None
 
+    # --- the helper child --------------------------------------------------
+
+    def _supervise_helper(self):
+        """Observe the helper witness once. Only DEAD leads to anything.
+
+        An observation that fails is unknown, and unknown holds. A missing PID,
+        a failed open, a closed handle and a non zero exit code are none of
+        them death here, because the only thing this reads is what the retained
+        witness reports.
+        """
+        from .contracts import IdentityStatus
+
+        if self.helper is None:
+            # Either the start failed or a replacement did. Nothing is observed
+            # and nothing is started from here.
+            return {"status": "absent", "started": False}
+        try:
+            observed = self.helper.process.observe().status
+        except Exception as error:
+            return {"status": "unknown", "started": False, "reason": _reason(error)}
+        if observed is not IdentityStatus.DEAD:
+            return {"status": observed.value, "started": False}
+        return self._replace_helper()
+
+    def _replace_helper(self):
+        """Release the dead helper's row first, then start a replacement.
+
+        The order matters. helper_host refuses to start while another helper
+        row for this logon exists, so a replacement created before the row is
+        gone would refuse with helper_host_registry_occupied. A removal that
+        failed leaves that row in place, so no replacement is started in that
+        case and the record says why. False with no reason is a row that was
+        already absent, which is the expected state for a helper that never
+        managed to register.
+
+        The dead helper is retired whatever the outcome. Its creation handle is
+        released once at close, and it is never observed again, which is how
+        the guardian path treats its own predecessor.
+        """
+        dead, self.helper = self.helper, None
+        self.retired_helpers.append(dead)
+        removed, registry_reason = self._unregister("helper", dead)
+        record = {"status": "dead", "registry_removed": removed,
+                  "registry_reason": registry_reason, "started": False}
+        if registry_reason is not None:
+            record["reason"] = "supervisor_host_helper_row_retained"
+            return record
+        try:
+            replacement = self._start_helper()
+        except SupervisorHostRefused as error:
+            record["reason"] = error.reason
+            return record
+        self.helper = replacement
+        record["started"], record["pid"] = True, replacement.pid
+        return record
+
     # --- shutdown ---------------------------------------------------------
 
     def close(self):
@@ -453,6 +600,9 @@ class SupervisorHost:
         so. This host has no kill path, and ending a guardian that still owns
         Jobs is exactly what the design forbids. A child with no witness is
         reported too, and the entry point turns that into a non clean exit.
+
+        The helper is left running for the same reason, and its row stays in
+        the registry with nothing left that could witness its death.
         """
         if self.supervisor is not None:
             try:
@@ -461,17 +611,20 @@ class SupervisorHost:
                 raise SupervisorHostRefused("supervisor_host_custody_unsettled",
                                             _reason(error)) from None
         cleanup = []
-        for retired in self.retired:
+        for retired in [*self.retired, *self.retired_helpers]:
             try:
                 self.creation.close_handle(retired.creation_handle)
             except SupervisorHostRefused as error:
                 cleanup.append(error.reason)
-        return {"event": "supervisor_host_closed", "cleanup_errors": cleanup,
-                "guardian_epoch": None if self.guardian is None else self.guardian.epoch,
-                "guardian_left_running": self.guardian is not None,
-                "unverified": list(self.unverified),
-                "unsettled_captures": [{"epoch": item["epoch"], "reason": item["reason"]}
-                                       for item in self.unsettled_captures]}
+        record = {"event": "supervisor_host_closed", "cleanup_errors": cleanup,
+                  "guardian_epoch": None if self.guardian is None else self.guardian.epoch,
+                  "guardian_left_running": self.guardian is not None,
+                  "unverified": list(self.unverified),
+                  "unsettled_captures": [{"epoch": item["epoch"], "reason": item["reason"]}
+                                         for item in self.unsettled_captures]}
+        if self.helper_profile_path is not None:
+            record["helper_left_running"] = self.helper is not None
+        return record
 
 
 def build_parser():
@@ -487,6 +640,11 @@ def build_parser():
                              "child running until it is interrupted")
     parser.add_argument("--max-guardians", type=int, default=1,
                         help="how many guardian processes this host may start in total")
+    parser.add_argument("--helper-profile", default=None,
+                        help="policy profile JSON file for one shadow helper child; "
+                             "without it no helper is started and none is supervised")
+    parser.add_argument("--max-helpers", type=int, default=1,
+                        help="how many helper processes this host may start in total")
     parser.add_argument("--child-cwd", default=None, help="working directory for the child")
     parser.add_argument("--python", default=None, help="interpreter used for the child")
     parser.add_argument("--profile", default=None, help="policy profile JSON file for the child")
@@ -495,13 +653,16 @@ def build_parser():
 
 def main(argv=None):
     options = build_parser().parse_args(argv)
-    if options.iterations < 0 or options.guardian_iterations < 0 or options.max_guardians < 1:
+    if (options.iterations < 0 or options.guardian_iterations < 0 or options.max_guardians < 1
+            or options.max_helpers < 1):
         emit({"event": "supervisor_host_refused", "reason": "supervisor_host_arguments_invalid"})
         return EXIT_REFUSED
     host = SupervisorHost(data_dir=options.data_dir, journal_dir=options.journal_dir,
                           child_cwd=options.child_cwd, python_executable=options.python,
                           profile_path=options.profile, max_guardians=options.max_guardians,
-                          guardian_iterations=options.guardian_iterations)
+                          guardian_iterations=options.guardian_iterations,
+                          helper_profile_path=options.helper_profile,
+                          max_helpers=options.max_helpers)
     try:
         emit(host.start())
     except SupervisorHostRefused as error:

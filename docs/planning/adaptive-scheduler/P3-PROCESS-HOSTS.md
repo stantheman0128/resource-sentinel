@@ -89,20 +89,20 @@ restore, because the supervisor restores only after a verified death.
 
 ### Supervisor host
 
-`start` at `supervisor_host.py:207` refuses when the supervisor process is
+`start` at `supervisor_host.py:242` refuses when the supervisor process is
 itself inside a Job, mints the guardian epoch through `mint_guardian_epoch` at
-`supervisor_host.py:90`, and creates the child with plain `CreateProcessW`
+`supervisor_host.py:103`, and creates the child with plain `CreateProcessW`
 semantics. There is no breakaway flag and no parent spoofing. The creation
 handle is kept and the `VerifiedProcess` witness is built from that handle
 through `duplicate_from_handle`, never from a reopened PID. See
 `sentinel/adaptive/identity.py:361`.
 
-`run_once` at `supervisor_host.py:311` ticks the attached `GuardianSupervisor`
+`run_once` at `supervisor_host.py:397` ticks the attached `GuardianSupervisor`
 and starts a replacement only after `IdentityStatus.DEAD`. UNKNOWN holds. A
 missing PID, a failed OpenProcess, an expired TTL and an abandoned mutex are
 never treated as death. A replacement is attempted only after `close()`
 succeeds, and only with a new epoch, which `_start_guardian` at
-`supervisor_host.py:247` checks before the child is created rather than after.
+`supervisor_host.py:284` checks before the child is created rather than after.
 The supervisor never restarts a workload.
 
 Attach follows the contract of `GuardianSupervisor.attach`. When capture
@@ -145,7 +145,7 @@ capped at `MAX_INFRASTRUCTURE` 32 rows in
 raises `legacy_infrastructure_registry_full` beyond that, so enough guardian
 restarts would leave no guardian able to register at all.
 
-`_unregister` at `supervisor_host.py:404` removes it. It calls
+`_unregister` at `supervisor_host.py:496` removes it. It calls
 `unregister_dead_infrastructure_locked` from
 `sentinel/adaptive/legacy_writer.py:119` under the POLICY mutex, using the same
 prepare and hold pattern the guardian uses to register. The argument is the
@@ -154,7 +154,7 @@ evidence for that guardian anywhere on the host. That function re-verifies
 `IdentityStatus.DEAD` on the exact identity it deletes, and this host adds no
 check of its own, opens no PID and writes no SQL against the table.
 
-`_replace` at `supervisor_host.py:371` calls it after `supervisor.close()`
+`_replace` at `supervisor_host.py:463` calls it after `supervisor.close()`
 succeeded and before any replacement is created, whether or not
 `max_guardians` allows one. The replacement record reports `registry_removed`
 and `registry_reason`; false with a null reason means the row was already
@@ -206,9 +206,44 @@ replaces the guardian and removes its row. A clean exit is therefore a guardian
 death here, and it always was. This change only adds the row removal to it.
 
 The one case that still leaves a row behind is the unattached window described
-above. `_retry_attach` at `supervisor_host.py:357` never reaches `_replace`, so
+above. `_retry_attach` at `supervisor_host.py:449` never reaches `_replace`, so
 a guardian that died while this supervisor could not attach keeps its registry
 row, along with everything else that window leaves unresolved.
+
+#### The opt in helper child
+
+`--helper-profile` turns on one shadow helper child. Without it nothing below
+happens, no helper child is created, and no helper key appears in any record
+this host writes. Every existing record keeps its exact shape.
+
+With it, `start` creates one child after the guardian,
+`py -m sentinel.adaptive.helper_host --data-dir <directory> --profile <file>`,
+through the same `self.creation.create`, with the thread handle released and
+the witness built from the creation handle under the same expected pid and
+logon checks. `_start_helper` is at `supervisor_host.py:319`. A helper carries
+no epoch, because the helper host takes none. A child whose witness could not
+be built is kept in `unverified` with a `role` marker and its handle retained,
+exactly as an unwitnessed guardian is, and it blocks a clean exit the same way.
+A helper that could not be created at all is reported under the `helper` key of
+the start record and stops nothing, because guardian supervision is this host's
+job and helper supervision is an addition to it.
+
+`_supervise_helper` at `supervisor_host.py:540` observes that witness once per
+iteration, on the attached path and on the unattached one. An observation that
+fails is unknown, and unknown holds. Only `IdentityStatus.DEAD` reaches
+`_replace_helper` at `supervisor_host.py:562`, which removes the helper's row
+through the same `_unregister` the guardian uses, now taking the role, and then
+starts a replacement within `--max-helpers`. A removal that failed starts
+nothing, because `helper_host` refuses to start while another helper row for
+that logon exists, so the replacement would refuse with
+`helper_host_registry_occupied` and the failed removal would have cost a helper
+for nothing. A retired helper's creation handle is released at `close`, and
+`close` reports `helper_left_running`. There is no kill path for the helper
+either.
+
+This closes the removal half of the restart gap recorded in
+`P4-HELPER-HOST.md`, for a helper this supervisor started, while this
+supervisor is alive.
 
 #### The supervisor's own row is an open owner decision
 
@@ -220,10 +255,11 @@ not added either. A process removing its own row while it is alive is not a
 verified death, and it would drop the legacy writer's exclusion of that
 identity while the process is still running.
 
-The same problem will apply to a helper process unless the supervisor starts it
-and keeps its creation handle, which is what makes the guardian removable here.
-Neither the supervisor row nor the helper row is implemented in either
-direction. Both are owner decisions.
+The helper row is now removable on the one path described above. Everything
+else about it is still open. A supervisor that exits leaves the guardian row and
+the helper row behind with nothing left that could witness either death. A
+helper that this supervisor did not start stays unremovable, because no handle
+for it exists here. The supervisor's own row remains an owner decision.
 
 ### Wrapper host
 
@@ -342,11 +378,12 @@ directory and asserts exactly that typed refusal, and that stdout stays empty.
    typing four values.
 3. A finalization path that releases a bound managed reservation after the
    execution is verifiably terminal.
-4. Infrastructure rows for the supervisor itself and for a future helper. The
-   supervisor now removes the dead guardian's row, as described above, and a
-   clean guardian exit goes through that same path. Nothing holds a death
-   witness for the supervisor or for a helper the supervisor did not create, so
-   neither row is written and neither is removable. Both are owner decisions.
+4. The infrastructure row for the supervisor itself. The supervisor now removes
+   the dead guardian's row, as described above, and a clean guardian exit goes
+   through that same path. With `--helper-profile` it does the same for a
+   helper it started itself. Nothing holds a death witness for the supervisor,
+   or for a helper the supervisor did not create, so the supervisor row is
+   neither written nor removable and stays an owner decision.
 5. Supervisor attach against a fresh ledger refuses with
    `recovery_capture_binding_unverified` at
    `sentinel/adaptive/recovery_owner.py:102`, because

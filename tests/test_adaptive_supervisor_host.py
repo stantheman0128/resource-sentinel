@@ -56,10 +56,13 @@ class Creation:
         self.next_handle = 900
         self.next_pid = 4000
         self.create_error = None
+        # Which creation the error starts at, counting from zero. The default
+        # fails every creation; a later index fails only the children after it.
+        self.create_from = 0
         self.close_error = None
 
     def create(self, executable, arguments, cwd):
-        if self.create_error is not None:
+        if self.create_error is not None and len(self.created) >= self.create_from:
             raise self.create_error
         self.next_handle += 2
         self.next_pid += 1
@@ -102,8 +105,15 @@ class SupervisorHostTests(unittest.TestCase):
         self.supervisors = []
         self.attach_error = None
         self.witness_error = None
+        self.witnessed = []
+        # Which witness the error starts at, counting from one, so a test can
+        # give the guardian a witness and deny the helper one.
+        self.witness_from = 1
         self.removals = []
         self.removal_result = (True, None)
+        self.helper_removals = []
+        self.helper_removal_result = (True, None)
+        self.helper_profile = self.directory / "helper-profile.json"
 
     def build(self, **overrides):
         arguments = dict(data_dir=self.directory, journal_dir=self.directory,
@@ -121,10 +131,14 @@ class SupervisorHostTests(unittest.TestCase):
         host._unregister = self.unregister
         return host
 
-    def unregister(self, guardian):
+    def unregister(self, role, child):
         # How many children exist at this point records the ordering: the row
-        # is released before any replacement is created.
-        self.removals.append((guardian.epoch, len(self.creation.created)))
+        # is released before any replacement is created. A helper has no epoch,
+        # so its pid is what identifies the removal.
+        if role == "helper":
+            self.helper_removals.append((child.pid, len(self.creation.created)))
+            return self.helper_removal_result
+        self.removals.append((child.epoch, len(self.creation.created)))
         return self.removal_result
 
     def attach(self, guardian):
@@ -135,7 +149,8 @@ class SupervisorHostTests(unittest.TestCase):
         return supervisor
 
     def witness(self, handle, *, expected_pid, expected_logon_id):
-        if self.witness_error is not None:
+        self.witnessed.append(expected_pid)
+        if self.witness_error is not None and len(self.witnessed) >= self.witness_from:
             raise self.witness_error
         return SimpleNamespace(handle=handle, pid=expected_pid, logon=expected_logon_id)
 
@@ -145,7 +160,36 @@ class SupervisorHostTests(unittest.TestCase):
                    side_effect=self.witness):
             host.guardian = host._start_guardian()
             host.supervisor = host._attach(host.guardian)
+            if host.helper_profile_path is not None:
+                host.helper = host._start_helper()
         return host
+
+    def with_helper(self, **overrides):
+        """A started host that also supervises one helper child."""
+        overrides.setdefault("helper_profile_path", self.helper_profile)
+        overrides.setdefault("max_helpers", 2)
+        return self.started(**overrides)
+
+    def start_through_main_path(self, **overrides):
+        """Run the production start(), with the ledger and journal patched out."""
+        host = self.build(**overrides)
+        with patch.object(module, "read_host_capability", return_value=SYNTHETIC), \
+                patch("sentinel.adaptive.store.LifecycleStore", return_value=host.store), \
+                patch("sentinel.adaptive.recovery_journal.RecoveryJournal",
+                      return_value=host.journal), \
+                patch.object(module, "_Creation", return_value=self.creation), \
+                patch("sentinel.adaptive.identity.VerifiedProcess.duplicate_from_handle",
+                      side_effect=self.witness):
+            return host, host.start()
+
+    def observing(self, host, status):
+        """What the retained helper witness reports on the next iteration."""
+        host.helper.process.observe = lambda: SimpleNamespace(status=status)
+
+    def iterate(self, host):
+        with patch("sentinel.adaptive.identity.VerifiedProcess.duplicate_from_handle",
+                   side_effect=self.witness):
+            return host.run_once()
 
     # --- epoch and creation ----------------------------------------------
 
@@ -317,6 +361,199 @@ class SupervisorHostTests(unittest.TestCase):
         # Observation alone starts nothing and replaces nothing.
         self.assertIsNone(held["replacement"])
         self.assertEqual(len(self.creation.created), 2)
+
+    # --- the helper child --------------------------------------------------
+
+    def helper_died(self, host):
+        """The retained helper witness reports a verified death."""
+        self.observing(host, IdentityStatus.DEAD)
+        return self.iterate(host)
+
+    def test_no_helper_is_created_or_reported_without_a_helper_profile(self):
+        host, record = self.start_through_main_path()
+        self.assertEqual(len(self.creation.created), 1)
+        self.assertEqual(self.creation.created[0]["arguments"][:2],
+                         ["-m", "sentinel.adaptive.guardian_host"])
+        self.assertNotIn("helper", record)
+        self.assertIsNone(host.helper)
+        self.assertNotIn("helper", self.iterate(host))
+        self.assertNotIn("helper_left_running", host.close())
+        self.assertEqual(self.helper_removals, [])
+
+    def test_the_helper_child_is_created_with_the_exact_arguments(self):
+        host, record = self.start_through_main_path(helper_profile_path=self.helper_profile)
+        self.assertEqual(len(self.creation.created), 2)
+        self.assertEqual(self.creation.created[1]["arguments"],
+                         ["-m", "sentinel.adaptive.helper_host",
+                          "--data-dir", str(self.directory),
+                          "--profile", str(self.helper_profile)])
+        self.assertEqual(record["helper"], {"started": True, "pid": 4002})
+        # The thread handle is released; the process handle is retained and is
+        # the witness.
+        self.assertEqual(self.creation.closed, [903, 905])
+        self.assertEqual(host.helper.creation_handle, 904)
+        self.assertEqual(host.helper.process.handle, 904)
+        self.assertEqual(host.helper.process.logon, LOGON)
+
+    def test_a_helper_with_no_witness_is_retained_and_reported(self):
+        self.witness_error, self.witness_from = RuntimeError("fixture_duplicate_failed"), 2
+        host, record = self.start_through_main_path(helper_profile_path=self.helper_profile)
+        self.assertEqual(record["helper"], {"started": False, "detail": "RuntimeError",
+                                            "reason": "supervisor_host_helper_unverified"})
+        self.assertEqual(host.unverified, [{"pid": 4002, "handle": 904, "role": "helper",
+                                            "reason": "RuntimeError"}])
+        # The creation handle is never closed here; it is the only witness.
+        self.assertNotIn(904, self.creation.closed)
+        self.assertIsNone(host.helper)
+        # Guardian supervision carries on.
+        self.assertEqual(record["attached"], True)
+        self.assertIsNotNone(host.supervisor)
+        # An unwitnessed helper blocks a clean exit the same way.
+        self.assertEqual(host.close()["unverified"], host.unverified)
+
+    def test_a_helper_that_cannot_be_created_does_not_stop_the_guardian(self):
+        self.creation.create_error = SupervisorHostRefused("supervisor_host_create_failed", 8)
+        self.creation.create_from = 1
+        host, record = self.start_through_main_path(helper_profile_path=self.helper_profile)
+        self.assertEqual(record["helper"], {"started": False, "detail": 8,
+                                            "reason": "supervisor_host_create_failed"})
+        self.assertEqual(len(self.creation.created), 1)
+        self.assertIsNone(host.helper)
+        self.assertEqual((record["attached"], record["guardian_pid"]), (True, 4001))
+        observed = self.iterate(host)
+        self.assertEqual(observed["guardian_status"], "alive")
+        self.assertEqual(observed["helper"], {"status": "absent", "started": False})
+        self.assertEqual(len(self.creation.created), 1)
+
+    def test_an_alive_helper_is_only_observed(self):
+        host = self.with_helper()
+        self.observing(host, IdentityStatus.ALIVE)
+        record = self.iterate(host)
+        self.assertEqual(record["helper"], {"status": "alive", "started": False})
+        self.assertEqual(self.helper_removals, [])
+        self.assertEqual(len(self.creation.created), 2)
+
+    def test_an_unknown_helper_holds(self):
+        host = self.with_helper()
+        self.observing(host, IdentityStatus.UNKNOWN)
+        record = self.iterate(host)
+        self.assertEqual(record["helper"], {"status": "unknown", "started": False})
+        self.assertEqual(self.helper_removals, [])
+        self.assertEqual(len(self.creation.created), 2)
+        self.assertEqual(host.helper.pid, 4002)
+
+    def test_an_observation_that_fails_holds_and_says_why(self):
+        host = self.with_helper()
+
+        def failing():
+            raise RuntimeError("fixture_observe_failed")
+
+        host.helper.process.observe = failing
+        record = self.iterate(host)
+        self.assertEqual(record["helper"], {"status": "unknown", "started": False,
+                                            "reason": "RuntimeError"})
+        self.assertEqual(self.helper_removals, [])
+        self.assertEqual(len(self.creation.created), 2)
+        self.assertEqual(host.helper.pid, 4002)
+
+    def test_the_dead_helper_row_is_released_before_a_replacement_is_created(self):
+        host = self.with_helper()
+        record = self.helper_died(host)
+        # One removal, for the dead helper, while only the first two children
+        # existed. The replacement is created after that.
+        self.assertEqual(self.helper_removals, [(4002, 2)])
+        self.assertEqual(record["helper"], {"status": "dead", "registry_removed": True,
+                                            "registry_reason": None, "started": True,
+                                            "pid": 4003})
+        self.assertEqual(self.creation.created[2]["arguments"],
+                         ["-m", "sentinel.adaptive.helper_host",
+                          "--data-dir", str(self.directory),
+                          "--profile", str(self.helper_profile)])
+        self.assertEqual(host.helper.pid, 4003)
+        self.assertEqual([item.pid for item in host.retired_helpers], [4002])
+        # The guardian is untouched by any of it.
+        self.assertEqual(record["guardian_status"], "alive")
+        self.assertEqual(self.removals, [])
+
+    def test_the_helper_budget_stops_a_replacement(self):
+        host = self.with_helper(max_helpers=1)
+        record = self.helper_died(host)
+        # An exhausted budget does not keep the dead helper in the registry.
+        self.assertEqual(self.helper_removals, [(4002, 2)])
+        self.assertEqual(record["helper"],
+                         {"status": "dead", "registry_removed": True, "registry_reason": None,
+                          "started": False,
+                          "reason": "supervisor_host_helper_budget_exhausted"})
+        self.assertEqual(len(self.creation.created), 2)
+        self.assertIsNone(host.helper)
+
+    def test_a_failed_helper_removal_starts_nothing(self):
+        """A row that is still there refuses the next helper start as occupied."""
+        host = self.with_helper()
+        self.helper_removal_result = (False, "legacy_infrastructure_registry_unavailable")
+        record = self.helper_died(host)
+        self.assertEqual(record["helper"],
+                         {"status": "dead", "registry_removed": False,
+                          "registry_reason": "legacy_infrastructure_registry_unavailable",
+                          "started": False, "reason": "supervisor_host_helper_row_retained"})
+        self.assertEqual(len(self.creation.created), 2)
+        self.assertIsNone(host.helper)
+
+    def test_an_absent_helper_row_does_not_stop_the_replacement(self):
+        host = self.with_helper()
+        self.helper_removal_result = (False, None)
+        record = self.helper_died(host)
+        self.assertEqual((record["helper"]["registry_removed"],
+                          record["helper"]["registry_reason"],
+                          record["helper"]["started"]), (False, None, True))
+        self.assertEqual(len(self.creation.created), 3)
+
+    def test_the_helper_is_observed_on_the_unattached_guardian_path(self):
+        host = self.with_helper()
+        self.observing(host, IdentityStatus.ALIVE)
+        self.attach_error = "fixture_attach_unavailable"
+        self.replace(host)
+        self.assertIsNone(host.supervisor)
+        held = self.iterate(host)
+        self.assertEqual((held["guardian_status"], held["attached"]), ("unattached", False))
+        self.assertEqual(held["helper"], {"status": "alive", "started": False})
+
+    def test_close_leaves_the_helper_running_and_says_so(self):
+        host = self.with_helper()
+        record = host.close()
+        self.assertEqual(record["helper_left_running"], True)
+        self.assertNotIn(904, self.creation.closed)
+
+    def test_close_releases_a_retired_helper_handle_once(self):
+        host = self.with_helper()
+        self.helper_died(host)
+        record = host.close()
+        self.assertIn(904, self.creation.closed)
+        self.assertNotIn(host.helper.creation_handle, self.creation.closed)
+        self.assertEqual((record["helper_left_running"], record["cleanup_errors"]), (True, []))
+
+    def test_close_says_the_helper_is_gone_when_no_replacement_started(self):
+        host = self.with_helper(max_helpers=1)
+        self.helper_died(host)
+        record = host.close()
+        self.assertEqual(record["helper_left_running"], False)
+        self.assertIn(904, self.creation.closed)
+
+    def test_the_helper_options_default_to_off(self):
+        parser = module.build_parser()
+        default = parser.parse_args(["--data-dir", "d", "--journal-dir", "j"])
+        self.assertEqual((default.helper_profile, default.max_helpers), (None, 1))
+        chosen = parser.parse_args(["--data-dir", "d", "--journal-dir", "j",
+                                    "--helper-profile", "p.json", "--max-helpers", "2"])
+        self.assertEqual((chosen.helper_profile, chosen.max_helpers), ("p.json", 2))
+
+    def test_main_refuses_a_helper_budget_below_one(self):
+        records = []
+        with patch.object(module, "emit", side_effect=records.append):
+            code = module.main(["--data-dir", str(self.directory),
+                                "--journal-dir", str(self.directory), "--max-helpers", "0"])
+        self.assertEqual(code, EXIT_REFUSED)
+        self.assertEqual(records[-1]["reason"], "supervisor_host_arguments_invalid")
 
     # --- the real attach path ---------------------------------------------
 
@@ -521,13 +758,23 @@ class SupervisorHostRegistryTests(unittest.TestCase):
                    side_effect=self.witness):
             host.guardian = host._start_guardian()
             host.supervisor = host._attach(host.guardian)
+            if host.helper_profile_path is not None:
+                host.helper = host._start_helper()
         self.process, self.backend = self.witnesses[0]
         return host
 
-    def register(self, process):
-        """What the guardian process itself writes at startup."""
+    def with_helper(self, **overrides):
+        """A started host that also supervises one helper child."""
+        overrides.setdefault("helper_profile_path", self.directory / "helper-profile.json")
+        overrides.setdefault("max_helpers", 2)
+        host = self.started(**overrides)
+        self.helper_process, self.helper_backend = self.witnesses[-1]
+        return host
+
+    def register(self, process, role="guardian"):
+        """What the child process itself writes at startup."""
         with self.held():
-            self.assertTrue(writer.register_infrastructure_locked(self.store, "guardian", process))
+            self.assertTrue(writer.register_infrastructure_locked(self.store, role, process))
 
     def rows(self):
         return [(row["role"], row["pid"]) for row in self.connection().execute(
@@ -667,6 +914,80 @@ class SupervisorHostRegistryTests(unittest.TestCase):
         self.assertEqual(record["replacement"], {"started": False,
                                                  "reason": "supervisor_custody_unsettled"})
         self.assertEqual(self.rows(), [("guardian", host.guardian.pid)])
+        self.assertIsNone(self.runtime()["policy_entry_nonce"])
+
+    # --- the helper row ----------------------------------------------------
+
+    def helper_died(self, host):
+        """The retained helper witness reports a verified death."""
+        self.helper_backend.status = IdentityStatus.DEAD
+        return self.iterate(host)
+
+    def test_a_verified_helper_death_removes_the_helper_row_and_frees_the_scope(self):
+        host = self.with_helper()
+        self.register(self.process)
+        self.register(self.helper_process, "helper")
+        self.assertEqual(self.rows(), [("guardian", host.guardian.pid),
+                                       ("helper", self.helper_process.identity.pid)])
+        revision = self.runtime()["registry_revision"]
+        record = self.helper_died(host)
+        self.assertEqual((record["helper"]["registry_removed"],
+                          record["helper"]["registry_reason"],
+                          record["helper"]["started"]), (True, None, True))
+        self.assertEqual(self.rows(), [("guardian", host.guardian.pid)])
+        self.assertEqual(self.runtime()["registry_revision"], revision + 1)
+        # The POLICY scope is entered and released around that one call.
+        self.assertFalse(self.policy.active)
+        self.assertIsNone(self.runtime()["policy_entry_nonce"])
+        # The property the release exists for: the replacement helper the host
+        # just created can register itself.
+        replacement, _ = self.witnesses[-1]
+        self.register(replacement, "helper")
+        self.assertEqual(self.rows(), [("guardian", host.guardian.pid),
+                                       ("helper", replacement.identity.pid)])
+        self.assertIsNone(self.runtime()["policy_entry_nonce"])
+
+    def test_a_helper_death_the_witness_does_not_confirm_removes_nothing(self):
+        """The production function re-verifies death; this host adds no check.
+
+        The witness reports DEAD to the iteration and then reports the helper
+        alive again to the writer, which is the only way the two can disagree
+        when there is one witness. That refusal is decided before the writer's
+        transaction, so it is a clean rejection and POLICY releases its durable
+        entry nonce.
+        """
+        host = self.with_helper()
+        self.register(self.helper_process, "helper")
+        removal = writer.unregister_dead_infrastructure_locked
+
+        def revived(store, role, process):
+            self.helper_backend.status = IdentityStatus.ALIVE
+            return removal(store, role, process)
+
+        with patch.object(writer, "unregister_dead_infrastructure_locked", revived):
+            record = self.helper_died(host)
+        self.assertEqual(record["helper"],
+                         {"status": "dead", "registry_removed": False,
+                          "registry_reason": "legacy_infrastructure_death_unverified",
+                          "started": False, "reason": "supervisor_host_helper_row_retained"})
+        # The row stays, so no replacement was started that would refuse as
+        # occupied, and the scope is free for the next owner.
+        self.assertEqual(self.rows(), [("helper", self.helper_process.identity.pid)])
+        self.assertEqual(len(self.creation.created), 2)
+        self.assertIsNone(self.runtime()["policy_entry_nonce"])
+        self.assertFalse(self.policy.active)
+        with self.held():
+            pass
+
+    def test_a_helper_witness_that_is_not_dead_removes_nothing(self):
+        host = self.with_helper()
+        self.register(self.helper_process, "helper")
+        with patch.object(writer, "unregister_dead_infrastructure_locked") as removal:
+            record = self.iterate(host)
+        removal.assert_not_called()
+        self.assertEqual(record["helper"], {"status": "alive", "started": False})
+        self.assertEqual(self.rows(), [("helper", self.helper_process.identity.pid)])
+        self.assertEqual(len(self.creation.created), 2)
         self.assertIsNone(self.runtime()["policy_entry_nonce"])
 
     def test_unknown_never_reaches_the_removal(self):

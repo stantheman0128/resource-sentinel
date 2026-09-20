@@ -10,22 +10,23 @@ $proc.StartTime = $epoch.AddSeconds(11)
 Assert (-not (Test-SentinelExemption $proc $rows 99)) 'Reused PID must not inherit exemption'
 $proc.StartTime = $epoch.AddSeconds(10)
 Assert (-not (Test-SentinelExemption $proc @{} 99)) 'Revoked grant must not match'
-$script:io = 0
-function Set-IoPriority($Process, $Level) { $script:io = $Level }
+# The legacy direct setter is intentionally replaced by a read-only intent.
+# Only the guarded mutation adapter may apply it and acknowledge record cleanup.
 $demoted = @{ '123' = 'AboveNormal' }
-Restore-SentinelExemptProcess $proc $demoted
-Assert ($proc.PriorityClass -eq 'AboveNormal') 'Recorded CPU priority not restored'
-Assert ($script:io -eq 2) 'I/O priority not restored'
-Assert (-not $demoted.ContainsKey('123')) 'Demotion record not removed'
-$proc.PriorityClass = 'BelowNormal'
-Restore-SentinelExemptProcess $proc @{}
-Assert ($proc.PriorityClass -eq 'Normal') 'Inherited demotion not restored'
+$intent = Get-SentinelExemptRestoreIntent $proc $demoted
+Assert ($intent.priority_action -eq 'restore' -and $intent.restore_priority -eq 'AboveNormal') 'Recorded priority must become a restore intent'
+Assert ($intent.io_priority -eq 2 -and $intent.trim -eq $false) 'Restore intent must request normal I/O without trimming'
+Assert ($proc.PriorityClass -eq 'BelowNormal') 'Building an intent must not change process priority'
+Assert ($demoted.ContainsKey('123') -and $demoted['123'] -eq 'AboveNormal') 'Building an intent must retain the demotion record'
+$intent = Get-SentinelExemptRestoreIntent $proc @{}
+Assert ($intent.restore_priority -eq 'Normal') 'Unrecorded restore intent must use the legacy Normal target'
+Assert ($proc.PriorityClass -eq 'BelowNormal') 'Unrecorded intent must not apply its target'
 $proc.PriorityClass = 'Idle'
-Restore-SentinelExemptProcess $proc @{}
+$intent = Get-SentinelExemptRestoreIntent $proc @{}
 Assert ($proc.PriorityClass -eq 'Idle') 'Unrelated manual priority must be preserved'
 foreach ($path in @('collect.ps1', 'invoke-sentinel.ps1', 'exemption-policy.ps1')) {
     $tokens = $null; $parseErrors = $null
     [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot "../scripts/$path"), [ref]$tokens, [ref]$parseErrors) | Out-Null
     Assert ($parseErrors.Count -eq 0) "PowerShell parse failure: $path"
 }
-Write-Output 'Exemption collector policy: 9 assertions and 3 script parse checks passed.'
+Write-Output 'Exemption policy: identity/expiry, read-only restore intents, and script parse checks passed.'

@@ -668,33 +668,20 @@ function Test-CurrentExemption($Process) {
     return Test-SentinelExemption $Process $exemptProcesses $epochNow
 }
 
-# native helpers: working-set trim (RAM relief) + per-process IO priority (SSD relief)
-if (-not ('SentinelNative' -as [type])) {
-    try {
-        Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public static class SentinelNative {
-    [DllImport("psapi.dll")]
-    public static extern bool EmptyWorkingSet(IntPtr hProcess);
-    [DllImport("ntdll.dll")]
-    public static extern int NtSetInformationProcess(IntPtr hProcess, int cls, ref int info, int len);
-}
-"@
-    } catch { }
-}
-function Set-IoPriority($proc, [int]$level) {   # 33 = ProcessIoPriority; 1 Low, 2 Normal
-    try {
-        $v = $level
-        [SentinelNative]::NtSetInformationProcess($proc.Handle, 33, [ref]$v, 4) | Out-Null
-    } catch { }
-}
+# Build intents only. The executor retains exact process handles and POLICY
+# through validation and all CPU/IO/trim writes; no PowerShell setter fallback.
+. (Join-Path $PSScriptRoot 'legacy-mutation.ps1')
+$legacyCandidates = @{}
+$legacyTrimTargets = @{}
 
 # Restore an already-demoted grant even while the machine is YELLOW/ORANGE/RED.
 foreach ($key in $exemptProcesses.Keys) {
     try {
         $proc = Get-Process -Id ([int]$key) -ErrorAction Stop
-        if (Test-CurrentExemption $proc) { Restore-SentinelExemptProcess $proc $demoted }
+        if (Test-CurrentExemption $proc) {
+            $intent = Get-SentinelExemptRestoreIntent $proc $demoted
+            [void](Add-SentinelLegacyCandidate $legacyCandidates $proc -PriorityAction $intent.priority_action -RestorePriority $intent.restore_priority -IoPriority $intent.io_priority)
+        }
     } catch { }
 }
 
@@ -706,10 +693,9 @@ if ($throttleOn) {
             if (Test-CurrentExemption $proc) { continue }
             $orig = [string]$proc.PriorityClass
             if ($orig -eq 'Normal' -or $orig -eq 'AboveNormal' -or $orig -eq 'High') {
-                $proc.PriorityClass = 'BelowNormal'
-                if (-not $demoted.ContainsKey($key)) { $demoted[$key] = $orig }
+                [void](Add-SentinelLegacyCandidate $legacyCandidates $proc -PriorityAction 'demote')
             }
-            Set-IoPriority $proc 1   # SSD: agent IO gives way to desktop/RDP
+            [void](Add-SentinelLegacyCandidate $legacyCandidates $proc -IoPriority 1)   # SSD: agent IO gives way to desktop/RDP
         } catch { }
     }
 } elseif ($light -eq 'GREEN') {
@@ -720,15 +706,12 @@ if ($throttleOn) {
         try {
             $proc = Get-Process -Id $pid_ -ErrorAction Stop
             if (Test-CurrentExemption $proc) { continue }
-            if ([string]$proc.PriorityClass -eq 'BelowNormal') {
-                $target = 'Normal'
-                if ($demoted.ContainsKey($key)) { $target = $demoted[$key] }
-                $proc.PriorityClass = $target
-            }
-            Set-IoPriority $proc 2
+            $target = 'Normal'
+            if ($demoted.ContainsKey($key)) { $target = $demoted[$key] }
+            [void](Add-SentinelLegacyCandidate $legacyCandidates $proc -PriorityAction 'restore' -RestorePriority $target)
+            [void](Add-SentinelLegacyCandidate $legacyCandidates $proc -IoPriority 2)
         } catch { }
     }
-    $demoted = @{}
 }
 
 # ---------- RAM guard: trim working sets of fat agent procs when RAM tight ----------
@@ -741,8 +724,8 @@ if ($null -ne $prev -and $null -ne $prev.trims) {
 }
 $trimCount = 0
 $trimTargetMb = 0
+$nowEpochT = [double]((Get-Date).ToUniversalTime() - [datetime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)).TotalSeconds
 if ($ramUsedPct -ge $config.ram_orange_pct) {
-    $nowEpochT = [double]((Get-Date).ToUniversalTime() - (Get-Date '1970-01-01')).TotalSeconds
     foreach ($pid_ in $treeOf.Keys) {
         if (-not $byId.ContainsKey($pid_)) { continue }
         $node = $byId[$pid_]
@@ -752,25 +735,46 @@ if ($ramUsedPct -ge $config.ram_orange_pct) {
         try {
             $proc = Get-Process -Id $pid_ -ErrorAction Stop
             if (Test-CurrentExemption $proc) { continue }
-            if ([SentinelNative]::EmptyWorkingSet($proc.Handle)) {
-                $trims[$key] = $nowEpochT
-                $trimCount++
-                $trimTargetMb += [math]::Round([long]$node.WorkingSetSize / 1MB, 0)
+            if (Add-SentinelLegacyCandidate $legacyCandidates $proc -Trim $true) {
+                $legacyTrimTargets[$key] = [long]$node.WorkingSetSize
             }
         } catch { }
     }
-    if ($trimCount -gt 0) {
-        $evt = [ordered]@{ ts = $nowStr; type = 'ram_trim'; procs = $trimCount
-                           target_mb = $trimTargetMb; ram_used_pct = $ramUsedPct }
-        ($evt | ConvertTo-Json -Compress) | Add-Content $eventsPath -Encoding ascii
+}
+Set-CollectorStage 'guarded_legacy_mutation_batch'
+$legacyMutation = Invoke-SentinelLegacyMutation -DataDir $dataDir -Candidates @($legacyCandidates.Values)
+$legacyStats = Update-SentinelLegacyMutationRecords -Response $legacyMutation -Candidates $legacyCandidates -Demoted $demoted -Trims $trims -TrimTargets $legacyTrimTargets -NowEpoch $nowEpochT
+$trimCount = $legacyStats.trim_count
+$trimTargetMb = $legacyStats.trim_target_mb
+$legacyCpuAcknowledged = $false; $legacyIoAcknowledged = $false
+$legacyMutationSummary = [ordered]@{ available = $legacyMutation.available; reason = $legacyMutation.reason
+    candidates = $legacyCandidates.Count; applied = 0; partial = 0; skipped = 0; unacknowledged = $legacyCandidates.Count
+    reasons = @() }
+if ($legacyMutation.available) {
+    $legacyReasons = @{}
+    foreach ($row in $legacyMutation.results) {
+        $legacyMutationSummary[$row.status]++
+        $legacyMutationSummary.unacknowledged--
+        if ($row.status -ne 'applied') { $legacyReasons[$row.reason] = $true }
+        if ($row.status -eq 'skipped') { continue }
+        $candidate = $legacyCandidates[[string]$row.pid]
+        if ($candidate.priority_action -eq 'demote' -and $row.priority_after -eq 'BelowNormal') { $legacyCpuAcknowledged = $true }
+        if ($row.io_applied -eq 1) { $legacyIoAcknowledged = $true }
+    }
+    $legacyMutationSummary.reasons = @($legacyReasons.Keys | Sort-Object)
+    # Preserve every prior record when the batch outcome is uncertain. On an
+    # acknowledged batch, ordinary dead-PID housekeeping remains bounded.
+    foreach ($key in @($trims.Keys)) {
+        if (-not $byId.ContainsKey([uint32]$key)) { $trims.Remove($key) }
+    }
+    foreach ($key in @($demoted.Keys)) {
+        if (-not $byId.ContainsKey([uint32]$key)) { $demoted.Remove($key) }
     }
 }
-foreach ($key in @($trims.Keys)) {
-    if (-not $byId.ContainsKey([uint32]$key)) { $trims.Remove($key) }
-}
-# drop entries for dead pids so the map never grows unbounded
-foreach ($key in @($demoted.Keys)) {
-    if (-not $byId.ContainsKey([uint32]$key)) { $demoted.Remove($key) }
+if ($trimCount -gt 0) {
+    $evt = [ordered]@{ ts = $nowStr; type = 'ram_trim'; procs = $trimCount
+                       target_mb = $trimTargetMb; ram_used_pct = $ramUsedPct }
+    ($evt | ConvertTo-Json -Compress) | Add-Content $eventsPath -Encoding ascii
 }
 # live count of BelowNormal agent procs for display (never trust the map for UI)
 $demotedNow = 0
@@ -848,7 +852,8 @@ $status = [ordered]@{
     agent_trees = @($trees | Select-Object -First 10)
     top_disk_writers_interval = $topWriters
     heavy_slots = $activeSlots
-    throttle = [ordered]@{ active = $throttleOn; demoted_procs = $demotedNow }
+    throttle = [ordered]@{ active = $legacyCpuAcknowledged -or $legacyIoAcknowledged; requested = $throttleOn; demoted_procs = $demotedNow; cpu_active = $legacyCpuAcknowledged; io_active = $legacyIoAcknowledged }
+    legacy_mutation = $legacyMutationSummary
     exemptions = @($exemptProcesses.Values)
 }
 $tmp = "$statusJsonPath.tmp"
@@ -910,8 +915,12 @@ if ($activeSlots.Count -gt 0) {
 } else {
     [void]$md.Add("- heavy slot: free")
 }
-if ($throttleOn) {
-    [void]$md.Add("- central throttle ACTIVE: $($demotedNow) agent processes at BelowNormal to BelowNormal (restored at GREEN)")
+if ($legacyCpuAcknowledged -or $legacyIoAcknowledged) {
+    [void]$md.Add("- central throttle acknowledged this cycle: CPU=$legacyCpuAcknowledged IO=$legacyIoAcknowledged; observed BelowNormal processes=$demotedNow")
+}
+[void]$md.Add("- legacy mutation: available=$($legacyMutationSummary.available); reason=$($legacyMutationSummary.reason); applied=$($legacyMutationSummary.applied), partial=$($legacyMutationSummary.partial), skipped=$($legacyMutationSummary.skipped), unacknowledged=$($legacyMutationSummary.unacknowledged)")
+if ($legacyMutationSummary.reasons.Count -gt 0) {
+    [void]$md.Add("- legacy mutation reasons: $($legacyMutationSummary.reasons -join ', ')")
 }
 [void]$md.Add("")
 [void]$md.Add("## Guidance")

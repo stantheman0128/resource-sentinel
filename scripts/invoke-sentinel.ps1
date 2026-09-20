@@ -58,7 +58,7 @@ try {
         $grant = $grantJson | ConvertFrom-Json
         $exemptionId = [string]$grant.id
         if (-not $exemptionId) { throw 'Resource Sentinel returned no exemption ID.' }
-        if ([string]$self.PriorityClass -eq 'BelowNormal') { $self.PriorityClass = 'Normal' }
+        # Preserve inherited priority; exemption restores use the common POLICY executor.
         Write-Output "Resource Sentinel user exemption: $exemptionId; expires at epoch $($grant.expires_at)."
     } elseif (Test-Path (Join-Path $dataDir 'exemptions.sqlite3')) {
         # An existing grant may belong to a dedicated shell below the shared app.
@@ -67,7 +67,7 @@ try {
             $self = Get-Process -Id $PID
             $ownerPid = [int]$PID
             $ownerStarted = ($self.StartTime.ToUniversalTime() - [datetime]::new(1970, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)).TotalSeconds
-            if ([string]$self.PriorityClass -eq 'BelowNormal') { $self.PriorityClass = 'Normal' }
+            # Preserve inherited priority; exemption restores use the common POLICY executor.
         }
     }
 

@@ -10,14 +10,11 @@ function Test-SentinelExemption($Process, $Exemptions, [double]$NowEpoch) {
     } catch { return $false }
 }
 
-function Restore-SentinelExemptProcess($Process, $Demoted) {
+function Get-SentinelExemptRestoreIntent($Process, $Demoted) {
     $key = [string]$Process.Id
-    # Only undo recorded Sentinel CPU changes; never raise to admin/realtime.
-    if ([string]$Process.PriorityClass -eq 'BelowNormal') {
-        $target = 'Normal'
-        if ($Demoted.ContainsKey($key)) { $target = $Demoted[$key] }
-        $Process.PriorityClass = $target
-    }
-    $Demoted.Remove($key)
-    Set-IoPriority $Process 2
+    $target = 'Normal'
+    if ($Demoted.ContainsKey($key)) { $target = $Demoted[$key] }
+    # This is only an intent. The common executor must recheck exact identity,
+    # scope and current priority while holding POLICY before any native write.
+    return @{ priority_action = 'restore'; restore_priority = $target; io_priority = 2; trim = $false }
 }

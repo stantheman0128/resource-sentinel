@@ -19,6 +19,7 @@ import json
 import math
 from pathlib import Path
 import sqlite3
+import time
 from types import MappingProxyType
 from typing import Mapping
 from uuid import UUID, uuid4
@@ -111,12 +112,12 @@ def _now(value):
     return value
 
 
-def _connect(path, *, create=False, readonly=False):
+def _connect(path, *, create=False, readonly=False, timeout=.25):
     """Open exactly the captured absolute path; never create a bound ledger."""
     if create:
         path.parent.mkdir(parents=True, exist_ok=True)
     mode = "ro" if readonly else "rwc" if create else "rw"
-    conn = sqlite3.connect(path.as_uri() + "?mode=" + mode, uri=True, timeout=.25, isolation_level=None)
+    conn = sqlite3.connect(path.as_uri() + "?mode=" + mode, uri=True, timeout=timeout, isolation_level=None)
     conn.row_factory = sqlite3.Row
     try:
         conn.execute("PRAGMA foreign_keys=ON")
@@ -129,12 +130,26 @@ def _connect(path, *, create=False, readonly=False):
         raise
 
 
+def _read_budget(conn, deadline, clock):
+    if deadline is None:
+        return
+    remaining = deadline - clock()
+    if remaining <= 0:
+        raise ExemptionSyncError("exemption_snapshot_budget_exhausted")
+    # Do not restart a 250ms SQLite wait for each sequential ledger read.
+    conn.execute("PRAGMA busy_timeout=" + str(max(0, min(25, int(remaining * 1000)))))
+    conn.set_progress_handler(lambda: int(clock() >= deadline), 1000)
+
+
 @contextmanager
-def _transaction(path, *, create=False, write=True):
+def _transaction(path, *, create=False, write=True, deadline=None, clock=time.monotonic):
     conn = None
     try:
         try:
-            conn = _connect(path, create=create, readonly=not write)
+            if deadline is not None and clock() >= deadline:
+                raise ExemptionSyncError("exemption_snapshot_budget_exhausted")
+            conn = _connect(path, create=create, readonly=not write, timeout=0 if deadline is not None else .25)
+            _read_budget(conn, deadline, clock)
             conn.execute("BEGIN IMMEDIATE" if write else "BEGIN")
             yield conn
             if write:
@@ -501,7 +516,7 @@ class ExistingPolicyStore:
                 raise
 
 
-def _locked_path(exemptions, lifecycle_store, *, require_intent=True):
+def _locked_path(exemptions, lifecycle_store, *, require_intent=True, deadline=None, clock=time.monotonic):
     path = _path(exemptions)
     if not isinstance(lifecycle_store, (LifecycleStore, ExistingPolicyStore)):
         raise ExemptionSyncError("exemption_policy_store_required")
@@ -509,8 +524,11 @@ def _locked_path(exemptions, lifecycle_store, *, require_intent=True):
         raise ExemptionSyncError("exemption_policy_ledger_mismatch")
     guard = lifecycle_store._policy.assert_held()
     # Close this short sentinel read before opening an exemption transaction.
-    with lifecycle_store._connection() as conn:
-        conn.execute("BEGIN")
+    scope = (lifecycle_store._connection() if deadline is None else
+             _transaction(Path(lifecycle_store.db_path).resolve(), write=False, deadline=deadline, clock=clock))
+    with scope as conn:
+        if deadline is None:
+            conn.execute("BEGIN")
         runtime = _runtime_binding(conn)
         lifecycle_store._policy.revalidate(conn, guard)
         if runtime != ExemptionBinding(guard.binding.instance_id, guard.binding.logon_id):
@@ -593,10 +611,12 @@ def commit_revoke_locked(exemptions, exemption_id, *, lifecycle_store, now):
     return result
 
 
-def snapshot_locked(exemptions, *, lifecycle_store, now):
+def snapshot_locked(exemptions, *, lifecycle_store, now, deadline=None, clock=time.monotonic):
     now = _now(now)
-    path, binding, intent = _locked_path(exemptions, lifecycle_store)
-    with _transaction(path, write=False) as conn:
+    if deadline is not None and (type(deadline) not in {int, float} or not math.isfinite(deadline)):
+        raise ExemptionSyncError("exemption_snapshot_budget_invalid")
+    path, binding, intent = _locked_path(exemptions, lifecycle_store, deadline=deadline, clock=clock)
+    with _transaction(path, write=False, deadline=deadline, clock=clock) as conn:
         meta = _bound_meta(conn, binding, intent)
         leases = tuple(MappingProxyType(dict(row)) for row in _active(conn, now))
         return ExemptionSnapshot(binding, meta["revision"], leases)

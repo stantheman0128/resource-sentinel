@@ -24,6 +24,12 @@ unknown inherited Job 是另一項尚未通過的 native 環境條件。
 legacy writer handoff、native P1 或 P3–P6 的完整通過。側邊資源研究的採納／
 延後範圍亦記在同一份證據文件，不新增估計器作為本 MVP 的前置。
 
+[Legacy writer handoff 的實際接線](P3-LEGACY-WRITER-HANDOFF.md) 已將 collector 的
+priority／I/O／trim／restore 移入持有共用 POLICY 的 executor，並封住首次 wrapper
+與 Job metadata 公開的競爭。517 個 Python 測試及兩個 PowerShell 測試通過，
+最後增加一個案例後補跑的 23 個測試亦通過。這仍是 source 與隔離測試證據；
+production supervisor、完整 loaded-writer 交接及 native gate 尚未通過。
+
 使用者要求：先自行嚴格質疑方案，把資料放入 repo；由使用者交給 GPT Pro
 完成 plan，再交回 Codex 實作。本包不代表使用者已選定控制演算法、常駐服務或參數。
 

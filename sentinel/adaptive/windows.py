@@ -22,7 +22,7 @@ import threading
 from uuid import UUID
 
 from .contracts import IdentityStatus
-from .identity import IdentityUnavailable, VerifiedProcess
+from .identity import IdentityUnavailable, VerifiedProcess, retry_identity_cleanup
 
 
 _DWORD = C.c_uint32
@@ -90,6 +90,69 @@ def _cleanup_note(primary, reason, cleanup):
     primary.add_note(reason + suffix)
 
 
+class _RetainedNative:
+    """Own one raw native value whose release failed, so a settle can retry.
+
+    The value is dropped only after a positive release. Nothing here claims
+    the object is unused; it exists so the failure still has a closable owner.
+    """
+    def __init__(self, release, value):
+        self._release, self._value = release, value
+        self._lock = threading.Lock()
+
+    def close(self):
+        with self._lock:
+            if self._value is None:
+                return
+            self._release(self._value)
+            self._value = None
+
+
+def _retain_native(primary, release, value, reason, cleanup):
+    """Note the failed release and keep an owner that can finish it later."""
+    _cleanup_note(primary, reason, cleanup)
+    pending = getattr(primary, "_policy_mutex_cleanup", ())
+    primary._policy_mutex_cleanup = (*pending, _RetainedNative(release, value))
+
+
+def retained_owners(error):
+    return (*getattr(error, "_identity_handle_cleanup", ()), *getattr(error, "_policy_mutex_cleanup", ()))
+
+
+def settle_retained(error):
+    """Retry only the owners a failed constructor left on its exception.
+
+    True means every retained owner reported a positive close. The source
+    operation is never repeated here and a failed close keeps its owner.
+    """
+    try:
+        if getattr(error, "_identity_handle_cleanup", ()):
+            retry_identity_cleanup(error)
+    except BaseException:
+        return False
+    pending = []
+    for owner in getattr(error, "_policy_mutex_cleanup", ()):
+        try:
+            owner.close()
+        except BaseException:
+            pending.append(owner)
+    if hasattr(error, "_policy_mutex_cleanup"):
+        error._policy_mutex_cleanup = tuple(pending)
+    return not retained_owners(error)
+
+
+def replacement_allowed(failed):
+    """One replacement is built only after every retained owner closed."""
+    return (isinstance(failed, NativePolicyMutexError) and bool(retained_owners(failed))
+            and settle_retained(failed))
+
+
+def unresolved_construction(error):
+    """Only a sanitized native failure without notes or owners allocated nothing."""
+    return (not isinstance(error, NativePolicyMutexError) or bool(getattr(error, "__notes__", ()))
+            or bool(retained_owners(error)))
+
+
 @contextmanager
 def _owned_resource(value, release, reason):
     """Preserve the original failure when native resource cleanup also fails."""
@@ -99,7 +162,7 @@ def _owned_resource(value, release, reason):
         try:
             release(value)
         except BaseException as cleanup:
-            _cleanup_note(primary, reason, cleanup)
+            _retain_native(primary, release, value, reason, cleanup)
         raise
     else:
         release(value)
@@ -232,7 +295,8 @@ class _WindowsMutexBackend:
                 try:
                     self.close(handle)
                 except BaseException as cleanup:
-                    _cleanup_note(primary, "policy_mutex_handle_close_failed", cleanup)
+                    _retain_native(primary, self.close, handle,
+                                   "policy_mutex_handle_close_failed", cleanup)
             raise
 
     def wait(self, handle, timeout_ms):
@@ -306,7 +370,8 @@ class NativePolicyMutex:
                     _cleanup_note(primary, "policy_mutex_handle_close_failed", cleanup)
                     # The caller never receives this object. Keep it reachable
                     # so its one native handle still has a cleanup owner.
-                    primary._policy_mutex_cleanup = (self,)
+                    primary._policy_mutex_cleanup = (
+                        *getattr(primary, "_policy_mutex_cleanup", ()), self)
             if isinstance(primary, IdentityUnavailable):
                 converted = NativePolicyMutexError("policy_mutex_identity_unavailable", primary.win32_error)
                 # Sanitizing the reason must not make an unclean failure look

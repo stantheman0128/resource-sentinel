@@ -84,6 +84,73 @@ class FixtureBackend:
             raise self.close_error
 
 
+class PartialCreateBackend(native._WindowsMutexBackend):
+    """Drive create's failure path with no native mutex, descriptor or ACL.
+
+    This proves only the module's own custody bookkeeping. It makes no claim
+    about CreateMutexExW, CloseHandle or any real kernel object.
+    """
+    def __init__(self):
+        self.closed, self.freed = [], []
+        self.close_error = NativePolicyMutexError("policy_mutex_handle_close_failed", 6)
+        self.security = SimpleNamespace(
+            ConvertStringSecurityDescriptorToSecurityDescriptorW=self._descriptor)
+        self.kernel = SimpleNamespace(CreateMutexExW=lambda *unused: 909)
+
+    def _descriptor(self, sddl, revision, output, size):
+        output._obj.value = 4242
+        return 1
+
+    def free(self, pointer):
+        self.freed.append(getattr(pointer, "value", pointer))
+
+    def verify_security(self, handle, logon_id, owner_sid, *, access_mask=None):
+        raise NativePolicyMutexError("policy_mutex_dacl_mismatch")
+
+    def close(self, handle):
+        self.closed.append(handle)
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class RetainedNativeCustodyTests(unittest.TestCase):
+    def test_create_close_failure_keeps_a_closable_owner_for_the_raw_handle(self):
+        backend = PartialCreateBackend()
+        with self.assertRaises(NativePolicyMutexError) as caught:
+            backend.create("Local\\ResourceSentinel.Policy.fixture", LOGON, OWNER)
+        error = caught.exception
+        self.assertEqual(error.reason, "policy_mutex_dacl_mismatch")
+        self.assertEqual(error.__notes__, ["policy_mutex_handle_close_failed win32=6"])
+        self.assertEqual((backend.closed, backend.freed), ([909], [4242]))
+        # The supervisor's settle path is the one that must reach this owner.
+        self.assertFalse(native.settle_retained(error))
+        self.assertEqual(backend.closed, [909, 909])
+        backend.close_error = None
+        self.assertTrue(native.settle_retained(error))
+        self.assertEqual((backend.closed, error._policy_mutex_cleanup), ([909, 909, 909], ()))
+        self.assertTrue(native.settle_retained(error))
+        self.assertEqual(backend.closed, [909, 909, 909])
+
+    def test_failed_resource_release_retains_its_value_with_the_note(self):
+        state = {"fail": True}
+        released = []
+        def release(value):
+            released.append(value)
+            if state["fail"]:
+                raise NativePolicyMutexError("policy_mutex_security_free_failed", 6)
+        primary = ValueError("body failure")
+        with self.assertRaises(ValueError) as caught:
+            with native._owned_resource(4242, release, "policy_mutex_security_free_failed"):
+                raise primary
+        self.assertIs(caught.exception, primary)
+        self.assertEqual(primary.__notes__, ["policy_mutex_security_free_failed win32=6"])
+        (owner,) = primary._policy_mutex_cleanup
+        state["fail"] = False
+        owner.close()
+        owner.close()
+        self.assertEqual(released, [4242, 4242])
+
+
 class PolicyMutexTests(unittest.TestCase):
     def setUp(self):
         self.backend = FixtureBackend()

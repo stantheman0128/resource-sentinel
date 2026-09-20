@@ -21,7 +21,7 @@ from sentinel.adaptive.contracts import (
 from sentinel.adaptive.identity import IdentityUnavailable, VerifiedProcess
 from sentinel.adaptive.recovery_journal import RecoveryJournal
 from sentinel.adaptive.store import LifecycleError, LifecycleEvidence, LifecycleStore
-from sentinel.adaptive.windows import PolicyMutexLease
+from sentinel.adaptive.windows import NativePolicyMutexError, PolicyMutexLease
 from tests.fixtures.adaptive_evidence import fixture_evidence_provider
 from tests import test_adaptive_lifecycle as fixtures
 
@@ -874,6 +874,53 @@ class GuardianLifecycleTests(unittest.TestCase):
         self.assertEqual(self.processes.events.count(("close", root_handle)), 1)
         self.assertEqual(self.processes.events.count(("close", wrapper_handle)), 2)
         self.assertTrue(case.job.closed)
+
+    def test_job_mutex_constructor_failure_is_sticky_with_the_original_error(self):
+        case = self.seed_started()
+        self.start_consumer()
+        original = RuntimeError("fixture constructor interruption")
+        calls = []
+        def factory(*args):
+            calls.append(args)
+            raise original
+        self.owner._mutex_factory = factory
+        with self.assertRaises(RuntimeError) as caught:
+            self.owner.adopt_started(case.spec.execution_id, job=case.job,
+                                     wrapper=case.wrapper, root=case.root)
+        self.assertIs(caught.exception, original)
+        for _ in range(3):
+            with self.assertRaisesRegex(LifecycleError, "guardian_job_mutex_unverified"):
+                self.owner.retry_adoption(case.spec.execution_id)
+        # No replacement object is allocated while the first outcome is unknown.
+        self.assertEqual(len(calls), 1)
+        self.assertIs(self.owner._entries[case.spec.execution_id].mutex_error, original)
+        self.assertFalse(case.job.closed)
+
+    def test_job_mutex_replacement_waits_for_every_retained_owner(self):
+        case = self.adopt()
+        entry = self.owner._entries[case.spec.execution_id]
+        entry.mutex = None
+        class Partial:
+            def __init__(self):
+                self.attempts, self.error = 0, OSError("fixture close FALSE")
+            def close(self):
+                self.attempts += 1
+                if self.error is not None:
+                    raise self.error
+        partial = Partial()
+        original = NativePolicyMutexError("policy_mutex_identity_unavailable", 5)
+        original.add_note("policy_mutex_handle_close_failed win32=6")
+        original._policy_mutex_cleanup = (partial,)
+        entry.mutex_error = original
+        before = len(self.mutexes)
+        with self.assertRaisesRegex(LifecycleError, "guardian_job_mutex_unverified"):
+            self.owner._job_mutex(entry)
+        self.assertEqual((partial.attempts, len(self.mutexes)), (1, before))
+        partial.error = None
+        entry.mutex = self.owner._job_mutex(entry)
+        self.assertEqual((partial.attempts, len(self.mutexes)), (2, before + 1))
+        self.assertIsNone(entry.mutex_error)
+        self.assertEqual(original._policy_mutex_cleanup, ())
 
 
 if __name__ == "__main__":

@@ -20,12 +20,13 @@ from uuid import UUID, uuid5
 
 from .contracts import CpuControl, CpuControlMode, IdentityStatus, RecoveryManifest
 from .guardian_lifecycle import job_mutex_instance
-from .identity import VerifiedProcess, retry_identity_cleanup
+from .identity import VerifiedProcess
 from .native_job import JobAccess, NativeJob
 from .policy import PolicyBinding
 from .recovery_journal import RecoveryJournalError
 from .store import LifecycleError
-from .windows import NativePolicyMutex, NativePolicyMutexError, PolicyMutexLease
+from .windows import (NativePolicyMutex, NativePolicyMutexError, PolicyMutexLease,
+                      replacement_allowed, retained_owners, settle_retained, unresolved_construction)
 
 
 _CAPTURE = object()
@@ -42,32 +43,6 @@ class RecoveryResult:
     execution_id: str
     native_disabled: bool
     journal_settled: bool
-
-
-def _retained_owners(error):
-    return (*getattr(error, "_identity_handle_cleanup", ()), *getattr(error, "_policy_mutex_cleanup", ()))
-
-
-def _settle_retained(error):
-    """Retry only the owners a failed constructor left on its exception.
-
-    True means every retained owner reported a positive close. The source
-    operation is never repeated here and a failed close keeps its owner.
-    """
-    try:
-        if getattr(error, "_identity_handle_cleanup", ()):
-            retry_identity_cleanup(error)
-    except BaseException:
-        return False
-    pending = []
-    for mutex in getattr(error, "_policy_mutex_cleanup", ()):
-        try:
-            mutex.close()
-        except BaseException:
-            pending.append(mutex)
-    if hasattr(error, "_policy_mutex_cleanup"):
-        error._policy_mutex_cleanup = tuple(pending)
-    return not _retained_owners(error)
 
 
 class _Entry:
@@ -246,8 +221,7 @@ class RecoveryOwner:
             # A partial constructor may still own a native handle. Build a
             # replacement only after every owner it retained closed positively;
             # a failure that retained nothing verifiable stays sticky.
-            if (not isinstance(failed, NativePolicyMutexError) or not _retained_owners(failed) or
-                    not _settle_retained(failed)):
+            if not replacement_allowed(failed):
                 raise LifecycleError("recovery_job_mutex_unverified")
             entry.mutex_error = None
         try:
@@ -255,8 +229,7 @@ class RecoveryOwner:
         except BaseException as error:
             # Only a sanitized native failure without cleanup notes or owners
             # is a positive nothing-allocated result that may simply be retried.
-            if (not isinstance(error, NativePolicyMutexError) or getattr(error, "__notes__", ()) or
-                    _retained_owners(error)):
+            if unresolved_construction(error):
                 entry.mutex_error = error
             raise
 
@@ -386,8 +359,14 @@ class RecoveryOwner:
                     # dead original writer precede cleanup. Close itself is not
                     # evidence of restoration, Job emptiness or released floor.
                     entry.cleanup_started = True
-                entry.job.close()
-                entry.mutex.close()
+                # A retry closes only what is still open. Only a positive close
+                # drops an owner reference here.
+                if entry.job is not None:
+                    entry.job.close()
+                    entry.job = None
+                if entry.mutex is not None:
+                    entry.mutex.close()
+                    entry.mutex = None
                 del self._entries[execution_id]
             except BaseException as error:
                 error._recovery_owner = self
@@ -402,8 +381,13 @@ class RecoveryOwner:
             try:
                 # A failed capture may hold partial duplicate/mutex owners only
                 # on its exception. Closing the fields below cannot reach them.
-                if self._capture_error is not None and not _settle_retained(self._capture_error):
-                    raise LifecycleError("recovery_custody_unsettled")
+                error = self._capture_error
+                if error is not None:
+                    # A cleanup note is the only evidence left by a failure that
+                    # retained no owner; nothing here can ever account for it.
+                    accounted = bool(retained_owners(error))
+                    if not settle_retained(error) or (getattr(error, "__notes__", ()) and not accounted):
+                        raise LifecycleError("recovery_custody_unsettled")
                 for value in (self._policy_mutex, self._instance_mutex, self._guardian, self._current):
                     if value is not None:
                         value.close()

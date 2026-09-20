@@ -482,6 +482,39 @@ class RecoveryOwnerTests(TestCase):
         self.assertEqual(partial.attempts, 3)
         self.assertIsNotNone(self.old._handle)
 
+    def test_close_refuses_a_capture_cleanup_note_that_no_owner_accounts_for(self):
+        self.case()
+        original = NativePolicyMutexError("policy_mutex_create_failed", 8)
+        original.add_note("lifecycle_connection_cleanup_failed")
+        def factory(*args):
+            raise original
+        with self.assertRaises(NativePolicyMutexError) as caught:
+            self.capture(mutex_factory=factory)
+        owner = caught.exception._recovery_owner
+        for _ in range(2):
+            with self.assertRaisesRegex(LifecycleError, "custody_unsettled") as refused:
+                owner.close()
+            self.assertIs(refused.exception._recovery_owner, owner)
+        self.assertFalse(owner._closed)
+        self.assertIsNotNone(owner._current._handle)
+        self.assertIsNotNone(owner._guardian._handle)
+
+    def test_close_retry_after_mutex_failure_closes_only_what_is_still_open(self):
+        case = self.case()
+        self.capture()
+        self.dead()
+        self.restore(case)
+        entry = self.recovery._entries[case.spec.execution_id]
+        with patch.object(case.job, "close", wraps=case.job.close) as job_close:
+            with patch.object(entry.mutex, "close", side_effect=OSError("fixture close FALSE")):
+                with self.assertRaises(OSError):
+                    self.recovery.close_verified(case.spec.execution_id)
+            self.assertEqual(job_close.call_count, 1)
+            self.recovery.close_verified(case.spec.execution_id)
+            self.assertEqual(job_close.call_count, 1)
+        self.assertEqual(self.recovery.retained_execution_ids, ())
+        self.assertTrue(case.job.closed)
+
     def test_close_after_failed_capture_retries_identity_duplicate_cleanup(self):
         self.case()
         from sentinel.adaptive.identity import IdentityUnavailable

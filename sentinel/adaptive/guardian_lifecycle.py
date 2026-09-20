@@ -25,7 +25,7 @@ from .contracts import CpuControl, CpuControlMode, IdentityStatus, RecoveryManif
 from .identity import VerifiedProcess
 from .guardian_restore import GuardianRestorer
 from .store import LifecycleError, LifecycleEvidence
-from .windows import NativePolicyMutex
+from .windows import NativePolicyMutex, replacement_allowed, unresolved_construction
 
 
 _JOB_MUTEX_NAMESPACE = UUID("a649f2ae-1ed5-49b3-a0a5-2b85d18bbd7c")
@@ -52,7 +52,7 @@ class _Custody:
     def __init__(self, execution_id, job, wrapper, root):
         self.execution_id = execution_id
         self.job, self.wrapper, self.root = job, wrapper, root
-        self.manifest = self.mutex = None
+        self.manifest = self.mutex = self.mutex_error = None
         self.validated = self.terminal = self.closed = False
         self.completed = None
         self.journal_cleanup_error = None
@@ -175,12 +175,31 @@ class GuardianLifecycle:
             self._pending_policy = None
         return policy.prepare(self.guardian.identity.logon_id)
 
+    def _job_mutex(self, entry):
+        # Launch preparation entries reach this scope too and start clean.
+        failed = getattr(entry, "mutex_error", None)
+        if failed is not None:
+            # A partial constructor may still own a native handle. Build a
+            # replacement only after every owner it retained closed positively;
+            # a failure that retained nothing verifiable stays sticky.
+            if not replacement_allowed(failed):
+                raise LifecycleError("guardian_job_mutex_unverified")
+            entry.mutex_error = None
+        try:
+            return self._mutex_factory(self.guardian.identity.logon_id,
+                job_mutex_instance(entry.execution_id,
+                    entry.creation_nonce if hasattr(entry, "creation_nonce") else entry.job.nonce))
+        except BaseException as error:
+            # Only a sanitized native failure without cleanup notes or owners
+            # is a positive nothing-allocated result that may simply be retried.
+            if unresolved_construction(error):
+                entry.mutex_error = error
+            raise
+
     @contextmanager
     def _job_scope(self, entry):
         if entry.mutex is None:
-            entry.mutex = self._mutex_factory(self.guardian.identity.logon_id,
-                job_mutex_instance(entry.execution_id,
-                    entry.creation_nonce if hasattr(entry, "creation_nonce") else entry.job.nonce))
+            entry.mutex = self._job_mutex(entry)
         entered, primary, notes = False, None, ()
         try:
             with entry.mutex.acquire(timeout_ms=250) as lease:
@@ -461,7 +480,7 @@ class GuardianLifecycle:
             entry = self._entry(execution_id)
             if (not entry.terminal or self._scope_entry is not None or self._pending_policy is not None or
                     entry.journal_cleanup_error is not None or entry.restore_pending or
-                    self._restorer.fence_error is not None):
+                    entry.mutex_error is not None or self._restorer.fence_error is not None):
                 raise LifecycleError("guardian_custody_unsettled")
             # Each object retains its own known-failure/unknown-close custody;
             # exceptions leave all references here rather than dropping them.

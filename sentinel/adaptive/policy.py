@@ -220,6 +220,16 @@ class PolicyCoordinator:
                 self.record_recovery_hold(guard)
                 safe_to_clear = True
                 raise PolicyError("policy_mutex_abandoned")
+            # prepare() commits before the native wait. A delayed waiter must
+            # not expose a stale guard after another fenced owner has changed
+            # its durable nonce/binding. Verify while the acquired mutex is
+            # retained, before any consumer can borrow it or touch native Jobs.
+            # Read/connection cleanup failure leaves the nonce uncertain, using
+            # the same release/error path as every other pre-yield rejection.
+            with self.store._connection() as conn:
+                # Bound SQLite lock waiting while native POLICY is held.
+                conn.execute("PRAGMA busy_timeout=250")
+                self.revalidate(conn, guard)
             self._held.guard = guard
             yield guard
             safe_to_clear = True

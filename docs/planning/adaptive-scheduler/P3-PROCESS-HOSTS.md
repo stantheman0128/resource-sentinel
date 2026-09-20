@@ -59,12 +59,15 @@ substitute and none is accepted.
 `py -m sentinel.adaptive.guardian_host --data-dir ... --journal-dir ...
 --guardian-epoch ...`.
 
-`start` at `guardian_host.py:113` runs the capability preflight first, then
+`start` at `guardian_host.py:114` runs the capability preflight first, then
 builds the store, the `RecoveryJournal`, the `GuardianLaunchOwner` with
-`HostAuthority`, the `LaunchService` and `LifecycleQueryService` listeners and
-`GuardianControl`. `run_once` at `guardian_host.py:213` is one bounded
+`HostAuthority`, the `LaunchService` and `LifecycleQueryService` listeners,
+`GuardianControl`, and last the `ControlProposalService` listener described in
+`P3-CONTROL-TRANSPORT.md`. `run_once` at `guardian_host.py:237` is one bounded
 iteration: serve a pending launch RPC with a bounded timeout, serve a pending
-query RPC, reconcile lifecycle, then `control.tick(now)`. It never kills,
+helper proposal, serve a pending query RPC, reconcile lifecycle, then
+`control.tick(now)`. The host itself never calls `control.apply`; only the
+proposal service does, after it has authenticated the registered helper. It never kills,
 suspends or trims anything, and there is no second mode switch beside the
 ledger mode, so nothing can disagree with it about whether a native Set is
 allowed.

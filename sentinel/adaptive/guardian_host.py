@@ -2,12 +2,12 @@
 
 This wires the existing libraries into one process. It owns no policy of its
 own. The launch owner, the lifecycle dispatcher, the control consumer, the
-recovery journal and the two pipe services are the production modules, and the
+recovery journal and the three pipe services are the production modules, and the
 host authority is the live one in host_authority.py.
 
-One iteration serves at most one launch RPC and one query RPC with a bounded
-deadline, reconciles every retained execution, and calls the control consumer's
-expiry sweep. Nothing here starts a thread or keeps a request queue of its own.
+One iteration serves at most one launch RPC, one helper control proposal and one
+query RPC, each with a bounded deadline, reconciles every retained execution,
+and calls the control consumer's expiry sweep. Nothing here starts a thread or keeps a request queue of its own.
 
 The default mode runs iterations until the process is stopped. The only stop
 condition that exists in this repository today is an interrupt delivered to the
@@ -89,7 +89,7 @@ class GuardianHost:
 
     def __init__(self, *, data_dir, journal_dir, guardian_epoch, profile_path=None,
                  rpc_timeout_ms=DEFAULT_RPC_TIMEOUT_MS, launch_instance_id=None,
-                 query_instance_id=None, sleep=time.sleep):
+                 query_instance_id=None, control_instance_id=None, sleep=time.sleep):
         self.data_dir = Path(data_dir)
         self.journal_dir = Path(journal_dir)
         self.guardian_epoch = guardian_epoch
@@ -99,12 +99,13 @@ class GuardianHost:
         self._sleep = sleep
         self.launch_instance_id = str(uuid4()) if launch_instance_id is None else launch_instance_id
         self.query_instance_id = str(uuid4()) if query_instance_id is None else query_instance_id
+        self.control_instance_id = str(uuid4()) if control_instance_id is None else control_instance_id
         self.capability = None
         self.store = self.journal = self.guardian = self.authority = None
         self.owner = self.control = None
-        self.launch_endpoint = self.query_endpoint = None
-        self.launch_service = self.query_service = None
-        self.launch_listener = self.query_listener = None
+        self.launch_endpoint = self.query_endpoint = self.control_endpoint = None
+        self.launch_service = self.query_service = self.control_service = None
+        self.launch_listener = self.query_listener = self.control_listener = None
         self.registered = False
         self._started = False
 
@@ -148,12 +149,15 @@ class GuardianHost:
                                            exemptions=self.data_dir / "exemptions.sqlite3")
         except Exception as error:
             raise GuardianHostRefused("guardian_host_control_unavailable", _reason(error)) from None
+        self._control_endpoint()
         self._started = True
         return {"event": "guardian_host_started", "guardian_epoch": self.guardian_epoch,
                 "pid": self.capability.pid, "launch_endpoint": self.launch_endpoint.name,
                 "query_endpoint": self.query_endpoint.name,
+                "control_endpoint": self.control_endpoint.name,
                 "launch_instance_id": self.launch_instance_id,
                 "query_instance_id": self.query_instance_id,
+                "control_instance_id": self.control_instance_id,
                 "profile": str(self.profile_path), "capability": self.capability.to_dict()}
 
     @staticmethod
@@ -208,21 +212,48 @@ class GuardianHost:
         except Exception as error:
             raise GuardianHostRefused("guardian_host_endpoint_unavailable", _reason(error)) from None
 
+    def _control_endpoint(self):
+        """The helper's proposal pipe. It needs the control consumer, so it comes last.
+
+        The service authenticates the registered helper and hands the typed
+        proposal to GuardianControl. It adds no authority, and the consumer
+        still refuses every mode outside canary and limited.
+        """
+        from .control_transport import ControlProposalService
+        from .pipe_windows import NativePipeEndpoint, NativePipeListener
+
+        identity = self.guardian.identity
+        try:
+            self.control_endpoint = NativePipeEndpoint(identity.logon_id, self.control_instance_id,
+                                                       identity)
+            self.control_service = ControlProposalService(self.store.db_path, self.control_endpoint,
+                                                          self.control)
+            self.control_listener = NativePipeListener(self.control_endpoint)
+        except Exception as error:
+            raise GuardianHostRefused("guardian_host_endpoint_unavailable", _reason(error)) from None
+
     # --- one bounded iteration --------------------------------------------
 
     def run_once(self, *, serve_launch=True):
         """Serve at most one RPC of each kind, reconcile, then sweep leases.
 
         ``serve_launch`` is false while draining. A stopping guardian must not
-        take on new custody, but it keeps answering the read only query service
-        so callers can still observe what it is finishing.
+        take on new custody or a new cap, so neither the launch pipe nor the
+        proposal pipe is served then. A renewal that is not served lets the
+        lease run out, and the sweep below restores it. The read only query
+        service keeps answering so callers can still observe what is finishing.
+
+        The three pipes are served one after another, each with its own bounded
+        deadline, so an idle iteration can take up to three of them. That is a
+        property of this loop and not a measured reaction time.
         """
         if not self._started:
             raise GuardianHostRefused("guardian_host_not_started")
         record = {"event": "guardian_host_iteration", "launch_rpc": None, "query_rpc": None,
-                  "reconciled": [], "reconcile_errors": [], "restored": []}
+                  "control_rpc": None, "reconciled": [], "reconcile_errors": [], "restored": []}
         if serve_launch:
             record["launch_rpc"] = self._serve(self.launch_service, self.launch_listener)
+            record["control_rpc"] = self._control_rpc()
         record["query_rpc"] = self._serve(self.query_service, self.query_listener)
         for execution_id in self.owner.lifecycle.retained_execution_ids:
             try:
@@ -284,6 +315,15 @@ class GuardianHost:
             iterations += 1
         return {"event": "guardian_host_drained", "settled": True, "iterations": iterations}
 
+    def _control_rpc(self):
+        """Serve one proposal and record only the outcome fields of its ack."""
+        served = self._serve(self.control_service, self.control_listener)
+        if served["served"]:
+            ack = served["result"]
+            served["result"] = {"execution_id": ack.execution_id, "result": ack.result.value,
+                                "reason": ack.reason}
+        return served
+
     def _serve(self, service, listener):
         from .ipc import IpcError
         from .launch_transport import LaunchTransportError
@@ -311,7 +351,7 @@ class GuardianHost:
             raise GuardianHostRefused("guardian_host_custody_unsettled",
                                       ",".join(self.owner.retained_execution_ids))
         errors = []
-        for listener in (self.launch_listener, self.query_listener):
+        for listener in (self.launch_listener, self.query_listener, self.control_listener):
             if listener is None:
                 continue
             try:

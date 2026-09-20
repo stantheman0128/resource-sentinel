@@ -1,6 +1,6 @@
 """Guardian process host: one bounded iteration, the drain, and shutdown.
 
-The launch owner, the lifecycle dispatcher, the control consumer and the two
+The launch owner, the lifecycle dispatcher, the control consumer and the three
 pipe services are replaced here by explicit in-process fixtures that record
 what the host asks of them. Those modules have their own test files; what is
 under test here is the host loop, the drain and the exit conditions.
@@ -23,6 +23,7 @@ from sentinel.adaptive.guardian_host import (
     EXIT_OK, EXIT_REFUSED, GuardianHost, GuardianHostRefused,
 )
 from sentinel.adaptive.host_authority import HostCapabilityUnsupported
+from sentinel.adaptive.ipc import IpcError
 from sentinel.adaptive.pipe_windows import NativePipeError
 from tests.test_adaptive_host_authority import SYNTHETIC, live_capability_refusal
 
@@ -121,8 +122,15 @@ class GuardianHostTests(unittest.TestCase):
         host.control = Control(self.events)
         host.launch_service = Service("launch", self.events)
         host.query_service = Service("query", self.events)
+        host.control_service = Service("control", self.events)
+        # The proposal service returns the ApplyAck it sent. Only these three
+        # fields reach a host record.
+        host.control_service.result = SimpleNamespace(
+            execution_id="execution-a", result=SimpleNamespace(value="REJECTED"),
+            reason="fixture_rejected", request_id="private-request-marker")
         host.launch_listener = Listener("launch", self.events)
         host.query_listener = Listener("query", self.events)
+        host.control_listener = Listener("control", self.events)
         host._started = True
         return host
 
@@ -160,16 +168,25 @@ class GuardianHostTests(unittest.TestCase):
 
     # --- one iteration ----------------------------------------------------
 
-    def test_one_iteration_serves_both_services_then_reconciles_then_sweeps(self):
+    def test_one_iteration_serves_each_service_then_reconciles_then_sweeps(self):
         self.host.owner.lifecycle.retained = ["execution-a", "execution-b"]
         record = self.host.run_once()
         self.assertEqual(self.events, [
-            ("launch", 250, "launch"), ("query", 250, "query"),
+            ("launch", 250, "launch"), ("control", 250, "control"), ("query", 250, "query"),
             ("reconcile", "execution-a"), ("reconcile", "execution-b"), ("tick", 1000)])
         self.assertTrue(record["launch_rpc"]["served"])
         self.assertTrue(record["query_rpc"]["served"])
+        self.assertEqual(record["control_rpc"], {"served": True, "result": {
+            "execution_id": "execution-a", "result": "REJECTED", "reason": "fixture_rejected"}})
         self.assertEqual([entry["execution_id"] for entry in record["reconciled"]],
                          ["execution-a", "execution-b"])
+
+    def test_a_refused_proposal_is_reported_and_the_sweep_still_runs(self):
+        self.host.control_service.error = IpcError("control_helper_unregistered")
+        record = self.host.run_once()
+        self.assertEqual(record["control_rpc"],
+                         {"served": False, "reason": "control_helper_unregistered"})
+        self.assertIn(("tick", 1000), self.events)
 
     def test_an_idle_deadline_is_reported_and_not_retried(self):
         self.host.launch_service.error = NativePipeError("pipe_deadline_elapsed")
@@ -207,9 +224,10 @@ class GuardianHostTests(unittest.TestCase):
         self.assertEqual(record["exiting"], False)
         self.assertEqual(record["retained"], ["execution-a"])
         self.assertEqual(record["iterations"], 2)
-        # No launch RPC is served while draining; the read only query is.
-        self.assertEqual([event[0] for event in self.events if event[0] in {"launch", "query"}],
-                         ["query", "query"])
+        # No launch RPC and no proposal is served while draining; the read
+        # only query is.
+        self.assertEqual([event[0] for event in self.events
+                          if event[0] in {"launch", "control", "query"}], ["query", "query"])
         self.assertFalse(self.host.launch_listener.closed)
 
     def test_the_drain_returns_only_once_custody_clears(self):
@@ -261,11 +279,12 @@ class GuardianHostTests(unittest.TestCase):
         self.assertFalse(self.host.launch_listener.closed)
         self.assertFalse(self.host.query_listener.closed)
 
-    def test_close_releases_both_endpoints_once_settled(self):
+    def test_close_releases_every_endpoint_once_settled(self):
         record = self.host.close()
         self.assertEqual(record["guardian_epoch"], EPOCH)
         self.assertTrue(self.host.launch_listener.closed)
         self.assertTrue(self.host.query_listener.closed)
+        self.assertTrue(self.host.control_listener.closed)
 
     def test_an_endpoint_that_cannot_be_released_is_reported(self):
         self.host.query_listener.close_error = OSError("fixture_close_failed")

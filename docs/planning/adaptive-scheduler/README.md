@@ -72,13 +72,38 @@ Job 內，`require_supported_host()` 會拒絕，所以 native 測試一項都�
    `guardian_epoch`，barrier 停在 `RECOVERY_HOLD`。
 2. guardian 端的 ControlProposal consumer 見 [guardian control](P3-GUARDIAN-CONTROL.md)。
    順序依計畫 8.3：佔名額、寫入 durable intent、Set、Query、結算 manifest、回 ACK、
-   批次稽核。帳本模式為 off 或 shadow 時 Set 次數為零。租約到期由 `tick()` 自行還原。
+   批次稽核。帳本模式為 off 或 shadow 時不會套用或續期限速；模式離開 canary 時
+   已持有的限速會以一次 native disable 還原。租約到期由 `tick()` 自行還原。
+   結算 manifest 寫入失敗時，限速會循同一條還原路徑撤回，ACK 為 UNVERIFIED。
 3. P4 的決策層、shadow helper 與 Job sampler 只有 source，沒有呼叫端把它接到 guardian。
    設定檔現在可選 off 與 shadow，選不到 enforce。
 4. P5 的故障證據工具與唯讀成本探針、P6 的配對 A/B harness 已入庫。
    [驗收結果](ACCEPTANCE-RESULTS.md) 仍是空白範本，結論是 NOT_MEASURED。
    計畫 11.3 沒給數字的兩個比較，以 [門檻澄清](AB-THRESHOLD-CLARIFICATION.md)
    沿用計畫既有數字，並標明是澄清。
+5. guardian、supervisor、wrapper 三個可執行的行程入口與共用的 live host authority，
+   見 [process hosts](P3-PROCESS-HOSTS.md)。guardian 啟動時把自己登記進
+   `adaptive_infrastructure`，supervisor 從自己建立 guardian 時留下的 creation handle
+   取得 guardian 身分，只有確認 DEAD 才進入還原，UNKNOWN 不會重啟任何東西。
+   這台機器上三個入口都會以 `host_foreign_parent_job` 拒絕啟動，這是預期結果。
+6. helper 到 guardian 的 ControlProposal 傳輸與純函式的 proposal builder，見
+   [control transport](P3-CONTROL-TRANSPORT.md)。呼叫者必須是 `adaptive_infrastructure`
+   裡該 logon 唯一登記為 helper 的行程，先以 OS 驗證的 pipe peer 確認身分，
+   之後才讀取請求內容。服務本身不讀模式、不快取 ACK，所有安全判斷仍在
+   `GuardianControl`。guardian host 已在第三條 pipe 上提供這個服務；helper 端還沒有
+   常駐行程，所以實際上仍沒有任何東西會送出 proposal。
+
+已知缺口，都還沒有程式：
+
+1. 沒有常駐 helper host。沒有東西登記 helper、跑 sampler、驅動決策迴圈或跨 tick
+   持有 episode，B 組因此仍然不能量測。
+2. 沒有 endpoint 發現機制。wrapper 與 helper 要連哪個 guardian，目前只能由操作者
+   手動傳入 pid、creation FILETIME、instance id 與 epoch。
+3. 除了行程收到 interrupt 之外沒有正式的停止訊號。
+4. wrapper 被拒絕之後，已綁定的 reservation 沒有釋放路徑，細節在 process hosts 文件。
+5. guardian 在 supervisor 第一次 attach 成功之前死亡時無法被接管，因為
+   `RecoveryOwner.capture` 要求 guardian 為 ALIVE。
+6. guardian 結束時不會把自己從 `adaptive_infrastructure` 移除。
 
 需要 repo 擁有者裁決、程式目前一律 fail closed 的事項：
 
@@ -87,10 +112,15 @@ Job 內，`require_supported_host()` 會拒絕，所以 native 測試一項都�
    這一點在 canary 之前必須決定。
 2. `cancel` 與 `start_failed` 兩種狀態缺 guardian 證據，無法退場，細節在
    retained supervisor 文件的 remaining gates。
-3. helper 到 guardian 的 ControlProposal 傳輸尚未存在，B 組因此還不能量測。
+3. 計畫 5.5 要求 caller 以 OS 可驗證身分和一次性 token 綁定。helper 沒有
+   `ipc_auth_key`，registry 的欄位也是固定的，所以傳輸層目前只用 OS 驗證的 peer
+   加上每次請求的 server nonce，沒有共享密鑰。這樣是否滿足計畫的 token 要求，
+   需要擁有者確認；若要真正的共享密鑰，得先決定由誰簽發、存在哪一筆紀錄。
 
-整棵 adaptive 測試樹最後一次執行：72 個模組、1700 個測試、0 失敗、0 錯誤、
-0 略過，經 `scripts/invoke-sentinel.ps1` 正常准入。這是 source 行為的證據，
+整棵 adaptive 測試樹最後一次執行是 2026-09-21：78 個模組、1839 個測試、0 失敗、
+0 錯誤、0 略過，經 `scripts/invoke-sentinel.ps1` 正常准入。傳輸層的未登記呼叫者
+檢查沒有紅燈證據，因為產生紅燈必須先拿掉一道安全檢查，該次執行被權限分類器拒絕，
+之後沒有繞過。這是 source 行為的證據，
 不是任何 native gate 的通過聲明。
 
 使用者要求：先自行嚴格質疑方案，把資料放入 repo；由使用者交給 GPT Pro

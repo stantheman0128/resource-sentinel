@@ -626,6 +626,39 @@ class LegacyWriterTests(unittest.TestCase):
             self.assertFalse(writer.unregister_dead_infrastructure_locked(self.store, "guardian", original))
         self.assertEqual(self.runtime()["registry_revision"], revision + 1)
 
+    def test_infrastructure_removal_refused_before_the_transaction_releases_policy(self):
+        """A refusal that read no ledger is a clean rejection, so POLICY clears.
+
+        prepare refuses with policy_scope_busy while any entry nonce is left
+        behind and nothing else clears it, so retaining one here would wedge
+        every later POLICY writer on this data directory, the next guardian
+        registration included.
+        """
+        alive, _ = self.verified_process(self.identity())
+        for reason, argument in (("legacy_infrastructure_identity_required",
+                                  SimpleNamespace(identity=self.identity())),
+                                 ("legacy_infrastructure_death_unverified", alive)):
+            with self.subTest(reason=reason):
+                with self.assertRaisesRegex(writer.LegacyMutationError, reason):
+                    with self.held():
+                        writer.unregister_dead_infrastructure_locked(self.store, "guardian", argument)
+                self.assertIsNone(self.runtime()["policy_entry_nonce"])
+                self.assertFalse(self.policy.active)
+        # The scope is free, so the next owner can take it and write.
+        with self.held():
+            self.assertTrue(writer.register_infrastructure_locked(self.store, "guardian", alive))
+
+    def test_infrastructure_removal_failing_inside_the_transaction_retains_policy(self):
+        """The opposite direction: an unknown ledger outcome keeps the nonce."""
+        dead, _ = self.verified_process(self.identity(), IdentityStatus.DEAD)
+        self.connection().execute("DROP TABLE adaptive_infrastructure")
+        with self.assertRaisesRegex(writer.LegacyMutationError, "legacy_infrastructure_registry_unavailable"):
+            with self.held():
+                writer.unregister_dead_infrastructure_locked(self.store, "guardian", dead)
+        self.assertIsNotNone(self.runtime()["policy_entry_nonce"])
+        with self.assertRaisesRegex(PolicyError, "policy_scope_busy"):
+            self.store._policy.prepare(WRAPPER.logon_id)
+
     def test_candidate_json_requires_decimal_filetime_without_float_rounding(self):
         value = dict(pid=501, created_filetime_100ns="134342315823996150",
                      priority_action="demote", restore_priority="Normal", io_priority=1, trim=True)

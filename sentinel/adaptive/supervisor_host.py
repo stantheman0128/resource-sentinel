@@ -18,6 +18,17 @@ or an abandoned mutex is never treated as death. A replacement guardian is
 started only after supervisor.close() has succeeded, and only under a new
 epoch, so the dead epoch's provenance is never reused.
 
+A verified death also releases the dead guardian's row in the infrastructure
+registry. A guardian registers itself at startup, that registry is capped, and
+no other process holds a death witness for the guardian this host created. The
+removal re-verifies death on the retained witness, so this host adds no second
+and weaker liveness test of its own. It is reported and never blocks a
+replacement, and a supervisor that could not close attempts no removal at all.
+A refusal the writer decides before its own transaction releases POLICY again,
+so a later guardian start can still register. Only a failure at or after that
+transaction keeps the durable entry, because the ledger outcome is unknown
+then.
+
 The default mode ticks until the process is interrupted, which is the only stop
 condition this repository provides. Stopping does not stop the guardian. This
 host has no kill path at all, so it closes its own supervision and leaves the
@@ -366,17 +377,21 @@ class SupervisorHost:
         try:
             self.supervisor.close()
         except Exception as error:
+            # Custody is unsettled, so nothing is removed and the row stays.
             return {"started": False, "reason": _reason(error)}
         # A closed supervisor is never ticked again. Dropping the reference here
         # is what makes the next iteration take the unattached path.
         self.supervisor = None
-        if self.started_guardians >= self.max_guardians:
-            return {"started": False, "reason": "supervisor_host_guardian_budget_exhausted"}
         previous = self.guardian
+        removed, registry_reason = self._unregister(previous)
+        registry = {"registry_removed": removed, "registry_reason": registry_reason}
+        if self.started_guardians >= self.max_guardians:
+            return {"started": False, "reason": "supervisor_host_guardian_budget_exhausted",
+                    **registry}
         try:
             replacement = self._start_guardian(previous_epoch=previous.epoch)
         except SupervisorHostRefused as error:
-            return {"started": False, "reason": error.reason}
+            return {"started": False, "reason": error.reason, **registry}
         # The settled predecessor stays reachable until this host shuts down,
         # so its creation handle is released in one place with a reported
         # outcome instead of silently during a tick.
@@ -386,9 +401,48 @@ class SupervisorHost:
             self.supervisor = self._attach(replacement)
         except SupervisorHostRefused as error:
             return {"started": True, "attached": False, "reason": error.reason,
-                    "guardian_epoch": replacement.epoch}
+                    "guardian_epoch": replacement.epoch, **registry}
         return {"started": True, "attached": True, "guardian_epoch": replacement.epoch,
-                "previous_epoch": previous.epoch}
+                "previous_epoch": previous.epoch, **registry}
+
+    def _unregister(self, guardian):
+        """Remove the dead guardian's infrastructure row under POLICY.
+
+        The guardian registered itself at startup and cannot remove its own row
+        afterwards, so the row would stay until the capped registry refuses the
+        next registration. The retained witness this host created is the only
+        death evidence that exists for that guardian, and
+        unregister_dead_infrastructure_locked re-verifies death on it. Nothing
+        here reopens a PID, deletes by epoch or writes the table itself.
+
+        The return is the pair reported in the replacement record. False with no
+        reason means the row was already absent.
+
+        A refusal the writer decided before its transaction, which is what
+        legacy_infrastructure_death_unverified and
+        legacy_infrastructure_identity_required are, releases the POLICY entry
+        on the way out, so the next guardian start can still register. A failure
+        at or after that transaction keeps the entry, because the ledger outcome
+        is then unknown, and the next POLICY user of this data directory sees
+        policy_scope_busy.
+        """
+        from .legacy_writer import LegacyMutationError, unregister_dead_infrastructure_locked
+
+        policy = self.store._policy
+        try:
+            guard = policy.prepare(policy.current_logon())
+            with policy.hold(guard):
+                removed = unregister_dead_infrastructure_locked(self.store, "guardian",
+                                                                guardian.process)
+        except Exception as error:
+            # LegacyMutationError carries its stable code as the message, the
+            # same convention LifecycleError uses. Anything else reports the
+            # type name _reason gives it.
+            code = str(error)
+            if isinstance(error, LegacyMutationError) and _STABLE_CODE.fullmatch(code):
+                return False, code
+            return False, _reason(error)
+        return bool(removed), None
 
     # --- shutdown ---------------------------------------------------------
 

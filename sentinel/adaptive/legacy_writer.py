@@ -117,14 +117,29 @@ def register_infrastructure_locked(store, role, process):
 
 
 def unregister_dead_infrastructure_locked(store, role, process):
-    """Positive death on the retained identity, never heartbeat/TTL/PID cleanup."""
+    """Positive death on the retained identity, never heartbeat/TTL/PID cleanup.
+
+    Both refusals below are decided before the transaction opens, and neither
+    assert_held nor observe reads or writes the ledger, so the scope is a clean
+    rejection and POLICY may release its durable entry nonce. The ordering is
+    defined here, so the flag is set here; a caller cannot tell from the raised
+    code which refusals reached the ledger. This assumes the refusal leaves the
+    POLICY scope, which it does when the caller lets it propagate.
+
+    Everything from the transaction onward keeps the opposite treatment. A
+    rollback, a failed DELETE, an uncertain commit or a failed connection
+    cleanup leaves the entry nonce in place, because the ledger outcome is then
+    not known. store._transaction never sets this flag.
+    """
     guard = store._policy.assert_held()
     if role not in {"guardian", "helper", "supervisor"} or not isinstance(process, VerifiedProcess):
+        guard.clean_rejection = True
         raise LegacyMutationError("legacy_infrastructure_identity_required")
     observed = process.observe()
     identity = process.identity
     if (observed.status is not IdentityStatus.DEAD or observed.identity != identity or
             identity.logon_id != guard.binding.logon_id):
+        guard.clean_rejection = True
         raise LegacyMutationError("legacy_infrastructure_death_unverified")
     with store._transaction() as conn:
         store._policy.revalidate(conn, guard)

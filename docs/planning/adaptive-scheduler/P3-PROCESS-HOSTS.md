@@ -89,20 +89,20 @@ restore, because the supervisor restores only after a verified death.
 
 ### Supervisor host
 
-`start` at `supervisor_host.py:200` refuses when the supervisor process is
+`start` at `supervisor_host.py:207` refuses when the supervisor process is
 itself inside a Job, mints the guardian epoch through `mint_guardian_epoch` at
-`supervisor_host.py:83`, and creates the child with plain `CreateProcessW`
+`supervisor_host.py:90`, and creates the child with plain `CreateProcessW`
 semantics. There is no breakaway flag and no parent spoofing. The creation
 handle is kept and the `VerifiedProcess` witness is built from that handle
 through `duplicate_from_handle`, never from a reopened PID. See
 `sentinel/adaptive/identity.py:361`.
 
-`run_once` at `supervisor_host.py:304` ticks the attached `GuardianSupervisor`
+`run_once` at `supervisor_host.py:311` ticks the attached `GuardianSupervisor`
 and starts a replacement only after `IdentityStatus.DEAD`. UNKNOWN holds. A
 missing PID, a failed OpenProcess, an expired TTL and an abandoned mutex are
 never treated as death. A replacement is attempted only after `close()`
 succeeds, and only with a new epoch, which `_start_guardian` at
-`supervisor_host.py:240` checks before the child is created rather than after.
+`supervisor_host.py:247` checks before the child is created rather than after.
 The supervisor never restarts a workload.
 
 Attach follows the contract of `GuardianSupervisor.attach`. When capture
@@ -135,6 +135,95 @@ guardian was left running, and nothing can adopt it afterwards because the
 creation handle cannot outlive the supervisor process. A refusal during `start`
 after the child was created reports `guardian_created`, the pid and the epoch,
 and returns `EXIT_UNSETTLED` instead of `EXIT_REFUSED`.
+
+#### Releasing the dead guardian's registry row
+
+A guardian registers itself at startup through `_register` at
+`guardian_host.py:176` and cannot remove that row afterwards. The registry is
+capped at `MAX_INFRASTRUCTURE` 32 rows in
+`sentinel/adaptive/legacy_writer.py:22`, and `register_infrastructure_locked`
+raises `legacy_infrastructure_registry_full` beyond that, so enough guardian
+restarts would leave no guardian able to register at all.
+
+`_unregister` at `supervisor_host.py:404` removes it. It calls
+`unregister_dead_infrastructure_locked` from
+`sentinel/adaptive/legacy_writer.py:119` under the POLICY mutex, using the same
+prepare and hold pattern the guardian uses to register. The argument is the
+retained witness built from the creation handle, which is the only death
+evidence for that guardian anywhere on the host. That function re-verifies
+`IdentityStatus.DEAD` on the exact identity it deletes, and this host adds no
+check of its own, opens no PID and writes no SQL against the table.
+
+`_replace` at `supervisor_host.py:371` calls it after `supervisor.close()`
+succeeded and before any replacement is created, whether or not
+`max_guardians` allows one. The replacement record reports `registry_removed`
+and `registry_reason`; false with a null reason means the row was already
+absent. A refused or failed removal is reported and never blocks the
+replacement, and never leaves `run_once` as an exception.
+
+If `supervisor.close()` fails, the record keeps its old shape, no removal is
+attempted and the row stays. That is the conservative direction. An unsettled
+supervisor has not given up custody, the row can still be removed later, and
+nothing in this repository could put back a row removed too early.
+
+A refused removal releases POLICY again.
+`unregister_dead_infrastructure_locked` sets `guard.clean_rejection` before it
+raises `legacy_infrastructure_identity_required` at
+`sentinel/adaptive/legacy_writer.py:136` and
+`legacy_infrastructure_death_unverified` at
+`sentinel/adaptive/legacy_writer.py:142`, because both are decided before its
+transaction opens and neither `assert_held` nor `observe` reads or writes the
+ledger. `PolicyCoordinator.hold` at `sentinel/adaptive/policy.py:250` then
+clears the durable entry nonce on the way out, so the next guardian start can
+still register. The flag lives in the writer, where that ordering is defined;
+the supervisor host cannot tell from a raised code which refusals reached the
+ledger. `sentinel/adaptive/orphan_lifecycle.py:117` marks a clean rejection for
+the same reason.
+
+A failure at or after that transaction is treated the other way. A rollback, a
+failed DELETE, an uncertain commit or a failed connection cleanup leaves the
+entry nonce in place, because the ledger outcome is not known.
+`LifecycleStore._transaction` at `sentinel/adaptive/store.py:885` never sets the
+flag, unlike `_publication_transaction` at `sentinel/adaptive/store.py:966`.
+`prepare` at `sentinel/adaptive/policy.py:151` then refuses the next POLICY user
+of that data directory with `policy_scope_busy`, the replacement guardian's own
+registration included, and nothing self heals it. That is deliberate: an
+unknown write outcome is not something a later owner may clear for itself.
+
+`register_infrastructure_locked` has the same shape and still leaves its
+pre-transaction refusals holding the entry. It was out of scope here and is a
+follow-up.
+
+A guardian that exits cleanly reaches this same path. `main` at
+`guardian_host.py:384` returns after a bounded `--iterations` run or after an
+interrupt and its drain, and the process exits. The supervisor observes it
+through a handle wait, and `_WindowsBackend.wait` at
+`sentinel/adaptive/identity.py:334` reports `DEAD` for any signaled process
+whatever its exit code. `GuardianSupervisor.tick` at
+`sentinel/adaptive/supervisor.py:295` takes that observation at
+`sentinel/adaptive/supervisor.py:314` and returns its status, so `run_once`
+replaces the guardian and removes its row. A clean exit is therefore a guardian
+death here, and it always was. This change only adds the row removal to it.
+
+The one case that still leaves a row behind is the unattached window described
+above. `_retry_attach` at `supervisor_host.py:357` never reaches `_replace`, so
+a guardian that died while this supervisor could not attach keeps its registry
+row, along with everything else that window leaves unresolved.
+
+#### The supervisor's own row is an open owner decision
+
+The supervisor does not register itself, and this change did not make it. No
+process holds a death witness for the supervisor, so a supervisor row could
+never be removed by the rule this design accepts, and adding one would fill the
+capped registry with entries nobody can delete. Live self deregistration was
+not added either. A process removing its own row while it is alive is not a
+verified death, and it would drop the legacy writer's exclusion of that
+identity while the process is still running.
+
+The same problem will apply to a helper process unless the supervisor starts it
+and keeps its creation handle, which is what makes the guardian removable here.
+Neither the supervisor row nor the helper row is implemented in either
+direction. Both are owner decisions.
 
 ### Wrapper host
 
@@ -253,9 +342,11 @@ directory and asserts exactly that typed refusal, and that stdout stays empty.
    typing four values.
 3. A finalization path that releases a bound managed reservation after the
    execution is verifiably terminal.
-4. Guardian self deregistration. `unregister_dead_infrastructure_locked`
-   requires a DEAD identity, and `MAX_INFRASTRUCTURE` is 32, so a guardian that
-   exits cleanly leaves its registry entry behind.
+4. Infrastructure rows for the supervisor itself and for a future helper. The
+   supervisor now removes the dead guardian's row, as described above, and a
+   clean guardian exit goes through that same path. Nothing holds a death
+   witness for the supervisor or for a helper the supervisor did not create, so
+   neither row is written and neither is removable. Both are owner decisions.
 5. Supervisor attach against a fresh ledger refuses with
    `recovery_capture_binding_unverified` at
    `sentinel/adaptive/recovery_owner.py:102`, because

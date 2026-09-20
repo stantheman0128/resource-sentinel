@@ -201,7 +201,7 @@ class LaunchApi:
 
     def InitializeProcThreadAttributeList(self, _buffer, _count, _flags, size):
         size._obj.value = 64
-        return 1
+        return 0 if _buffer is None else 1
 
     def UpdateProcThreadAttribute(self, *_):
         return 1
@@ -239,6 +239,7 @@ class LaunchCreatedIdentityTests(unittest.TestCase):
             patch.object(native, "_opt_in"),
             patch.object(native, "require_supported_host"),
             patch.object(native.C, "get_last_error", return_value=122, create=True),
+            patch.object(native.C, "set_last_error", create=True),
         ):
             override.start()
             self.addCleanup(override.stop)

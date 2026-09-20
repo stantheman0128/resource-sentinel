@@ -35,27 +35,70 @@ def _retain_cleanup(error, owner):
 def retry_identity_cleanup(error: BaseException) -> None:
     """Retry handles retained by a failed identity operation, never its source.
 
-    A failed close leaves its owner attached to the original exception. Callers
-    retaining that failure can retry cleanup; successful earlier closes are
-    idempotent. This grants neither identity nor authority to an unverified handle.
+    A failed close leaves its owner attached to the original exception. Only a
+    known FALSE result can be retried. An uncertain completion is quarantined:
+    the numeric handle may already belong to a different object. Successful
+    earlier closes are idempotent. This grants no unverified identity/authority.
     """
     for owner in getattr(error, "_identity_handle_cleanup", ()):
         owner.close()
     error._identity_handle_cleanup = ()
 
 
+def _known_close_failure(error):
+    # These existing backend errors represent explicit failed Win32 results.
+    # Retain compatibility with the original portable backend's close_unavailable
+    # reason; the real backend always emits process_handle_close_failed for FALSE.
+    # An exception raised by the native invocation overrides this with unknown,
+    # even when that exception happens to be IdentityUnavailable itself.
+    return (isinstance(error, IdentityUnavailable)
+            and error.reason in {"process_handle_close_failed", "close_unavailable"}
+            and not getattr(error, "_native_close_outcome_unknown", False)
+            and (getattr(error, "_native_close_failed", False) is True or
+                 (type(error.win32_error) is int and 0 < error.win32_error <= 0xFFFFFFFF)))
+
+
+def _close_retained(owner):
+    """Close under the owner's lock; never reuse an uncertain numeric handle."""
+    if owner._close_outcome_unknown:
+        error = IdentityUnavailable("process_handle_close_outcome_unknown")
+        error._native_close_outcome_unknown = True
+        _retain_cleanup(error, owner)
+        raise error
+    if owner._handle is None:
+        return
+    # Publish quarantine before native entry, covering an interruption after a
+    # successful CloseHandle but before local ownership can be retired.
+    owner._close_outcome_unknown = True
+    try:
+        owner._backend.close(owner._handle)
+    except BaseException as error:
+        if _known_close_failure(error):
+            owner._close_outcome_unknown = False
+        else:
+            error._native_close_outcome_unknown = True
+        _retain_cleanup(error, owner)
+        raise
+    try:
+        owner._handle = None
+        owner._close_outcome_unknown = False
+    except BaseException as error:
+        error._native_close_outcome_unknown = True
+        _retain_cleanup(error, owner)
+        raise
+
+
 class _DuplicateCleanup:
-    """Own only the duplicate while its identity is still being verified."""
+    """Own only the newly opened/duplicated handle until identity is verified."""
 
     def __init__(self, backend, handle):
         self._backend, self._handle = backend, handle
         self._lock = threading.Lock()
+        self._close_outcome_unknown = False
 
     def close(self):
         with self._lock:
-            if self._handle is not None:
-                self._backend.close(self._handle)
-                self._handle = None
+            _close_retained(self)
 
 
 _DWORD = C.c_uint32
@@ -129,7 +172,18 @@ class _WindowsBackend:
         return copied.value
 
     def close(self, handle):
-        _check(self.kernel.CloseHandle(handle), "process_handle_close_failed")
+        try:
+            result = self.kernel.CloseHandle(handle)
+        except BaseException as error:
+            # Python/ctypes failure does not establish that CloseHandle failed.
+            # Preserve its exception and tell retained owners never to reclose.
+            error._native_close_outcome_unknown = True
+            raise
+        if not result:
+            error = IdentityUnavailable("process_handle_close_failed", C.get_last_error())
+            error._native_close_failed = True
+            error._native_close_outcome_unknown = False
+            raise error
 
     def identity(self, handle):
         pid = self.kernel.GetProcessId(handle)
@@ -218,6 +272,7 @@ class VerifiedProcess:
     def __init__(self, backend, handle, identity):
         self._backend, self._handle, self._identity = backend, handle, identity
         self._lock = threading.Lock()
+        self._close_outcome_unknown = False
 
     @property
     def identity(self) -> ProcessIdentity:
@@ -227,13 +282,19 @@ class VerifiedProcess:
     def _open(cls, pid, expected=None):
         backend = _backend()
         handle = backend.open_process(pid)
+        owner = _DuplicateCleanup(backend, handle)
         try:
             observed = backend.identity(handle)
             if observed.pid != pid or (expected is not None and observed != expected):
                 raise IdentityUnavailable("identity_mismatch")
-            return cls(backend, handle, observed)
-        except BaseException:
-            backend.close(handle)
+            result = cls(backend, handle, observed)
+            owner._handle = None
+            return result
+        except BaseException as error:
+            try:
+                owner.close()
+            except BaseException:
+                _retain_cleanup(error, owner)
             raise
 
     @classmethod
@@ -259,7 +320,8 @@ class VerifiedProcess:
 
         On failure the original is untouched. If closing the duplicate also
         fails, retain the original exception and call retry_identity_cleanup
-        when cleanup can be retried; no unverified VerifiedProcess is returned.
+        for a known failure; uncertain close completion stays quarantined. No
+        unverified VerifiedProcess is returned.
         """
         if (type(source_handle) is not int or
                 not 0 < source_handle < 1 << (8 * C.sizeof(C.c_void_p) - 1)):
@@ -289,6 +351,9 @@ class VerifiedProcess:
 
     def observe(self) -> IdentityObservation:
         with self._lock:
+            if self._close_outcome_unknown:
+                return IdentityObservation(self.identity, IdentityStatus.UNKNOWN,
+                                           "process_handle_close_outcome_unknown")
             if self._handle is None:
                 return IdentityObservation(self.identity, IdentityStatus.UNKNOWN, "identity_handle_closed")
             try:
@@ -307,7 +372,7 @@ class VerifiedProcess:
                 not 0 < job_handle < 1 << (8 * C.sizeof(C.c_void_p))):
             raise ValueError("invalid_job_handle")
         with self._lock:
-            if self._handle is None:
+            if self._handle is None or self._close_outcome_unknown:
                 return None
             try:
                 if self._backend.wait(self._handle) is not IdentityStatus.ALIVE:
@@ -323,16 +388,15 @@ class VerifiedProcess:
 
     def close(self):
         with self._lock:
-            if self._handle is not None:
-                try:
-                    self._backend.close(self._handle)
-                except BaseException as error:
-                    _retain_cleanup(error, self)
-                    raise
-                self._handle = None
+            _close_retained(self)
 
     def __enter__(self):
         with self._lock:
+            if self._close_outcome_unknown:
+                error = IdentityUnavailable("process_handle_close_outcome_unknown")
+                error._native_close_outcome_unknown = True
+                _retain_cleanup(error, self)
+                raise error
             if self._handle is None:
                 raise IdentityUnavailable("identity_handle_closed")
         return self

@@ -53,7 +53,10 @@ class IdentityBackend:
     def close(self, handle):
         self.calls.append(("close", handle))
         if handle in self.close_failures:
-            raise IdentityUnavailable("fixture_identity_close_failed")
+            # Model an explicit CloseHandle FALSE, not a lost native result.
+            error = IdentityUnavailable("process_handle_close_failed", 6)
+            error._native_close_failed = True
+            raise error
 
 
 class MutationBackend:
@@ -300,6 +303,29 @@ class NativeLegacyTests(unittest.TestCase):
         self.mutation.close_failures.clear()
         native.retry_legacy_cleanup(original)
         self.assertEqual(self.writes(), [])
+
+    def test_identity_cleanup_unknown_never_recloses_or_reenables_legacy_writer(self):
+        process = native.NativeLegacyProcess.open(IDENTITY)
+        original = RuntimeError("fixture_close_completion_lost")
+        with patch.object(self.identity, "close", side_effect=original) as close:
+            with self.assertRaises(RuntimeError) as failed:
+                process.close()
+            self.assertIs(failed.exception, original)
+            close.assert_called_once_with(800)
+        # The mutation handle has its own known completed cleanup. The duplicate
+        # may already be closed and reused; clearing a fixture failure cannot
+        # justify another native call through that numeric handle.
+        before = list(self.identity.calls)
+        self.assertIn(("close", 700), self.mutation.calls)
+        for _ in range(2):
+            with self.assertRaisesRegex(IdentityUnavailable, "process_handle_close_outcome_unknown"):
+                native.retry_legacy_cleanup(original)
+        self.assertEqual(self.identity.calls, before)
+        self.assertIsNone(process.alive())
+        with self.assertRaises(native.NativeLegacyError):
+            process.trim()
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.mutation.calls.count(("close", 700)), 1)
 
     def test_duplicate_initialization_cleanup_failure_is_retained_with_source_cleanup(self):
         self.identity.failure = "identity"

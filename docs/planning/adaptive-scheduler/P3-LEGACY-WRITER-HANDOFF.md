@@ -111,12 +111,14 @@ Private raw logs, hashes and preservation copies stay out of the repository.
 
 ## Next actual implementation gate
 
-S1's entry currently lacks a real continuous host-authority provider and bounded
-native machine sampler. Recovery also lacks the consumer that verifies all owned
-caps restored, reconciles accounting and observes five fresh uncapped samples
-before clearing RECOVERY_HOLD. These are implementation gaps, not failed Windows
-API results. The restore callback runs inside locks; the sample collection must
-run outside them before a final revalidated CAS.
+At the time of this slice, S1 lacked a continuous host-authority provider, native
+machine sampler and recovery consumer. The latter two have since been implemented
+in [the sampler slice](P1-MACHINE-SAMPLER.md) and
+[the S1 recovery consumer](P1-S1-RECOVERY-CONSUMER.md). Recovery sampling occurs
+outside the locks before a final revalidated CAS. The real continuous host
+authority and loaded-writer handoff remain missing; those are integration gaps,
+not failed Windows API results. The current phase status is recorded with the
+[shared native launcher](P3-NATIVE-LAUNCHER.md).
 
 Separately, tested Codex/Scheduled-Task/Explorer-dispatch/CI launch paths were
 observed inside a foreign Job with an unknown denominator. That is a host support

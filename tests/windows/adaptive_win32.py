@@ -20,6 +20,8 @@ import sys
 import time
 import uuid
 
+from sentinel.adaptive import native_launcher as _launcher
+
 OPT_IN = "SENTINEL_ADAPTIVE_WINDOWS_SPIKES"
 JOB_PREFIX = "Local\\ResourceSentinel.Test.Job."
 MUTEX_PREFIX = "Local\\ResourceSentinel.Test.Mutex."
@@ -36,11 +38,7 @@ class UnsupportedCapability(RuntimeError):
         super().__init__(f"{reason}; win32_error={win32_error}")
 
 
-class LaunchOutcomeUnknown(RuntimeError):
-    """CreateProcess succeeded, but verification failed. Never retry the command."""
-    def __init__(self, process, cause):
-        self.process = process  # held exact handle; caller must reconcile/close
-        super().__init__(f"process created once; verification failed: {cause}")
+LaunchOutcomeUnknown = _launcher.LaunchOutcomeUnknown
 
 
 class _SecurityAttributes(C.Structure):
@@ -100,25 +98,11 @@ class _ExtendedLimits(C.Structure):
                 ("PeakJobMemoryUsed", C.c_size_t)]
 
 
-class _StartupInfo(C.Structure):
-    _fields_ = [("cb", W.DWORD), ("lpReserved", W.LPWSTR),
-                ("lpDesktop", W.LPWSTR), ("lpTitle", W.LPWSTR),
-                ("dwX", W.DWORD), ("dwY", W.DWORD), ("dwXSize", W.DWORD),
-                ("dwYSize", W.DWORD), ("dwXCountChars", W.DWORD),
-                ("dwYCountChars", W.DWORD), ("dwFillAttribute", W.DWORD),
-                ("dwFlags", W.DWORD), ("wShowWindow", W.WORD),
-                ("cbReserved2", W.WORD), ("lpReserved2", C.POINTER(W.BYTE)),
-                ("hStdInput", W.HANDLE), ("hStdOutput", W.HANDLE),
-                ("hStdError", W.HANDLE)]
-
-
-class _StartupInfoEx(C.Structure):
-    _fields_ = [("StartupInfo", _StartupInfo), ("lpAttributeList", C.c_void_p)]
-
-
-class _ProcessInfo(C.Structure):
-    _fields_ = [("hProcess", W.HANDLE), ("hThread", W.HANDLE),
-                ("dwProcessId", W.DWORD), ("dwThreadId", W.DWORD)]
+# Shared ABI classes are required: ctypes validates pointer class identity,
+# not merely equal sizes, when the launcher uses this adapter's bound DLL.
+_StartupInfo = _launcher._StartupInfo
+_StartupInfoEx = _launcher._StartupInfoEx
+_ProcessInfo = _launcher._ProcessInfo
 
 
 class _ProcessBasicInfo(C.Structure):
@@ -148,7 +132,7 @@ def _api():
     _bind(k, "GetCurrentProcessId", W.DWORD)
     _bind(k, "CloseHandle", W.BOOL, W.HANDLE)
     _bind(k, "LocalFree", ptr, ptr)
-    _bind(k, "IsProcessInJob", W.BOOL, W.HANDLE, W.HANDLE, C.POINTER(W.BOOL))
+    _bind(k, "IsProcessInJob", W.BOOL, W.HANDLE, W.HANDLE, C.POINTER(_launcher._BOOL))
     _bind(k, "GetActiveProcessorGroupCount", W.WORD)
     _bind(k, "GetActiveProcessorCount", W.DWORD, W.WORD)
     _bind(k, "GetProcessAffinityMask", W.BOOL, W.HANDLE,
@@ -159,9 +143,9 @@ def _api():
           ptr, W.DWORD, C.POINTER(W.DWORD))
     _bind(k, "SetInformationJobObject", W.BOOL, W.HANDLE, C.c_int, ptr, W.DWORD)
     _bind(k, "OpenProcess", W.HANDLE, W.DWORD, W.BOOL, W.DWORD)
-    _bind(k, "GetProcessTimes", W.BOOL, W.HANDLE, C.POINTER(W.FILETIME),
-          C.POINTER(W.FILETIME), C.POINTER(W.FILETIME), C.POINTER(W.FILETIME))
-    _bind(k, "GetExitCodeProcess", W.BOOL, W.HANDLE, C.POINTER(W.DWORD))
+    _bind(k, "GetProcessTimes", W.BOOL, W.HANDLE, C.POINTER(_launcher._FileTime),
+          C.POINTER(_launcher._FileTime), C.POINTER(_launcher._FileTime), C.POINTER(_launcher._FileTime))
+    _bind(k, "GetExitCodeProcess", W.BOOL, W.HANDLE, C.POINTER(_launcher._DWORD))
     _bind(k, "WaitForSingleObject", W.DWORD, W.HANDLE, W.DWORD)
     _bind(k, "GetStdHandle", W.HANDLE, W.DWORD)
     _bind(k, "DuplicateHandle", W.BOOL, W.HANDLE, W.HANDLE, W.HANDLE,
@@ -222,7 +206,7 @@ def _timeout_ms(timeout):
 def require_supported_host():
     """Read-only capability preflight; unknown and any parent Job fail closed."""
     k, _, _ = _api()
-    in_job = W.BOOL()
+    in_job = _launcher._BOOL()
     if not k.IsProcessInJob(k.GetCurrentProcess(), None, C.byref(in_job)):
         raise UnsupportedCapability("parent Job membership unknown", C.get_last_error())
     if in_job.value:
@@ -369,7 +353,7 @@ class ProcessHandle:
         return cls.open(os.getpid())
 
     def identity(self):
-        created, exited, kernel, user = (W.FILETIME() for _ in range(4))
+        created, exited, kernel, user = (_launcher._FileTime() for _ in range(4))
         _check(_api()[0].GetProcessTimes(self.handle, C.byref(created), C.byref(exited),
                                         C.byref(kernel), C.byref(user)), "GetProcessTimes")
         birth = (created.dwHighDateTime << 32) | created.dwLowDateTime
@@ -406,7 +390,7 @@ class ProcessHandle:
         return int(info.InheritedFromUniqueProcessId)
 
     def is_in_job(self, job):
-        result = W.BOOL()
+        result = _launcher._BOOL()
         _check(_api()[0].IsProcessInJob(self.handle, job.handle, C.byref(result)),
                "IsProcessInJob")
         return bool(result.value)
@@ -422,7 +406,7 @@ class ProcessHandle:
     def exit_code(self):
         if not self.wait(0):
             return None
-        result = W.DWORD()
+        result = _launcher._DWORD()
         _check(_api()[0].GetExitCodeProcess(self.handle, C.byref(result)), "GetExitCodeProcess")
         return int(result.value)
 
@@ -631,62 +615,9 @@ def launch_in_job(job, application, command_line, *, cwd=None,
     """
     _opt_in()
     require_supported_host()
-    if not isinstance(application, str) or not os.path.isabs(application):
-        raise ValueError("application must be an explicit absolute path")
-    if not isinstance(command_line, str) or "\x00" in command_line or "\x00" in application:
-        raise ValueError("invalid command line/application")
-    if len(command_line.encode("utf-16-le")) // 2 + 1 > 32767:
-        raise ValueError("CreateProcessW command line exceeds 32767 UTF-16 code units")
-    k, _, _ = _api()
-    duplicates, attribute_buffer = [], None
-    initialized = False
-    try:
-        for supplied, selector in zip((stdin_handle, stdout_handle, stderr_handle), (-10, -11, -12)):
-            source = k.GetStdHandle(selector & 0xFFFFFFFF) if supplied is None else supplied
-            if isinstance(source, C.c_void_p):
-                source = source.value
-            if source in (None, 0, -1, _INVALID_HANDLE):
-                raise UnsupportedCapability("null/invalid standard handle; explicit stdio required")
-            copied = W.HANDLE()
-            _check(k.DuplicateHandle(k.GetCurrentProcess(), source, k.GetCurrentProcess(),
-                                    C.byref(copied), 0, True, 0x0002), "DuplicateHandle(stdio)")
-            duplicates.append(copied.value)
-        size = C.c_size_t()
-        k.InitializeProcThreadAttributeList(None, 2, 0, C.byref(size))
-        if C.get_last_error() != 122 or not 0 < size.value <= 65536:
-            raise UnsupportedCapability("attribute list sizing unsupported", C.get_last_error())
-        attribute_buffer = C.create_string_buffer(size.value)
-        _check(k.InitializeProcThreadAttributeList(attribute_buffer, 2, 0, C.byref(size)),
-               "InitializeProcThreadAttributeList")
-        initialized = True
-        jobs = (W.HANDLE * 1)(job.handle)
-        handles = (W.HANDLE * len(duplicates))(*duplicates)
-        _check(k.UpdateProcThreadAttribute(attribute_buffer, 0, 0x0002000D, jobs,
-                                          C.sizeof(jobs), None, None), "JOB_LIST attribute")
-        _check(k.UpdateProcThreadAttribute(attribute_buffer, 0, 0x00020002, handles,
-                                          C.sizeof(handles), None, None), "HANDLE_LIST attribute")
-        startup, info = _StartupInfoEx(), _ProcessInfo()
-        startup.StartupInfo.cb = C.sizeof(startup)
-        startup.StartupInfo.dwFlags = 0x00000100  # STARTF_USESTDHANDLES
-        startup.StartupInfo.hStdInput, startup.StartupInfo.hStdOutput, startup.StartupInfo.hStdError = duplicates
-        startup.lpAttributeList = C.cast(attribute_buffer, C.c_void_p)
-        mutable_command = C.create_unicode_buffer(command_line)
-        _check(k.CreateProcessW(application, mutable_command, None, None, True, 0x00080000,
-                               None, cwd, C.byref(startup), C.byref(info)), "CreateProcessW")
-        process = ProcessHandle(info.hProcess, info.dwProcessId)
-        k.CloseHandle(info.hThread)
-        try:
-            process.full_identity(expected_logon_id=job.logon_sid)
-            if not process.is_in_job(job):
-                raise RuntimeError("created process is not in expected Job")
-        except BaseException as exc:
-            raise LaunchOutcomeUnknown(process, exc) from exc
-        return process
-    finally:
-        if initialized:
-            k.DeleteProcThreadAttributeList(attribute_buffer)
-        for handle in duplicates:
-            k.CloseHandle(handle)
+    return _launcher.launch_in_job(job, application, command_line, cwd=cwd,
+        stdin_handle=stdin_handle, stdout_handle=stdout_handle, stderr_handle=stderr_handle,
+        backend=_launcher._WindowsBackend(kernel=_api()[0]))
 
 
 class NamedMutex:

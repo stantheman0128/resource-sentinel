@@ -53,6 +53,7 @@ class _Custody:
         self.manifest = self.mutex = None
         self.validated = self.terminal = self.closed = False
         self.completed = None
+        self.journal_cleanup_error = None
 
 
 class GuardianLifecycle:
@@ -68,7 +69,8 @@ class GuardianLifecycle:
     They are not wire/config inputs or substitutes for native acceptance gates.
     """
 
-    def __init__(self, store, journal, *, guardian=None, mutex_factory=None):
+    def __init__(self, store, journal, *, guardian=None, mutex_factory=None,
+                 install_evidence_provider=True):
         if getattr(store, "existing_path", False) is not True:
             raise LifecycleError("guardian_existing_registry_required")
         self.store, self.journal = store, journal
@@ -90,7 +92,8 @@ class GuardianLifecycle:
             raise
         # One provider dispatches by immutable execution ID. Individual owners
         # must never overwrite a shared store's provider with their own method.
-        self.store.evidence_provider = self.evidence_scope
+        if install_evidence_provider:
+            self.store.evidence_provider = self.evidence_scope
 
     @property
     def retained_execution_ids(self):
@@ -113,7 +116,14 @@ class GuardianLifecycle:
         return entry
 
     def _manifest(self, entry, row, *, terminal=False):
-        record = self.journal.read(entry.execution_id, creation_nonce=row["job_nonce"])
+        if entry.journal_cleanup_error is not None:
+            raise LifecycleError("guardian_journal_cleanup_unverified")
+        try:
+            record = self.journal.read(entry.execution_id, creation_nonce=row["job_nonce"])
+        except BaseException as error:
+            if hasattr(error, "_journal_cleanup_owner"):
+                entry.journal_cleanup_error = error
+            raise
         if (type(record) is not RecoveryManifest or record.guardian_identity != self.guardian.identity or
                 record.job_name != entry.job.name or record.creation_nonce != entry.job.nonce or
                 record.wrapper_identity != entry.wrapper.identity or record.root_identity != entry.root.identity or
@@ -159,7 +169,8 @@ class GuardianLifecycle:
     def _job_scope(self, entry):
         if entry.mutex is None:
             entry.mutex = self._mutex_factory(self.guardian.identity.logon_id,
-                job_mutex_instance(entry.execution_id, entry.job.nonce))
+                job_mutex_instance(entry.execution_id,
+                    entry.creation_nonce if hasattr(entry, "creation_nonce") else entry.job.nonce))
         with entry.mutex.acquire(timeout_ms=250) as lease:
             if lease.abandoned:
                 raise LifecycleError("guardian_job_mutex_abandoned")
@@ -198,7 +209,7 @@ class GuardianLifecycle:
                     yield
             self._pending_policy = None
 
-    def adopt_started(self, execution_id, *, job, wrapper, root):
+    def adopt_started(self, execution_id, *, job, wrapper, root, mutex=None):
         with self._lock:
             if execution_id in self._entries:
                 raise LifecycleError("guardian_custody_already_owned")
@@ -207,6 +218,7 @@ class GuardianLifecycle:
             if not isinstance(wrapper, VerifiedProcess) or not isinstance(root, VerifiedProcess):
                 raise LifecycleError("guardian_retained_identity_required")
             entry = _Custody(execution_id, job, wrapper, root)
+            entry.mutex = mutex
             self._entries[execution_id] = entry
             self.retry_adoption(execution_id)
 
@@ -346,7 +358,8 @@ class GuardianLifecycle:
     def close_terminal(self, execution_id):
         with self._lock:
             entry = self._entry(execution_id)
-            if not entry.terminal or self._scope_entry is not None or self._pending_policy is not None:
+            if (not entry.terminal or self._scope_entry is not None or self._pending_policy is not None or
+                    entry.journal_cleanup_error is not None):
                 raise LifecycleError("guardian_custody_unsettled")
             # Each object retains its own known-failure/unknown-close custody;
             # exceptions leave all references here rather than dropping them.

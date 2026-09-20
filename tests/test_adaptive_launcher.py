@@ -1,0 +1,690 @@
+"""Portable managed-wrapper orchestration with explicit in-process collaborators.
+
+No DLL, pipe, Job, process, SQLite database or runtime directory is opened.
+These cases establish wrapper ordering/custody, not Windows capability or a
+production readiness authority. Native and transport behavior have separate tests.
+"""
+import ctypes as C
+from dataclasses import replace
+from types import SimpleNamespace
+import unittest
+from unittest.mock import Mock, patch
+
+from sentinel.adaptive import launcher as module
+from sentinel.adaptive.contracts import Priority, ProcessIdentity, ResourceDemand, Role
+from sentinel.adaptive.launch_spec import LaunchSpec
+from sentinel.adaptive.launch_transport import LaunchResult
+from sentinel.adaptive.native_job import CpuState, JobAccess, JobLimits
+from sentinel.adaptive.native_launcher import LaunchOutcomeUnknown
+from sentinel.adaptive.pipe_windows import NativePipeEndpoint
+
+
+LOGON = "S-1-5-5-100-200"
+EXECUTION = "12345678-1234-4234-8234-123456789abc"
+INSTANCE = "12345678-1234-4234-8234-123456789abd"
+NONCE = "a" * 32
+JOB_NAME = f"Local\\ResourceSentinel.Job.{EXECUTION}.{NONCE}"
+GUARDIAN = "fixture-guardian"
+SPEC_HASH = "b" * 64
+REQUEST_KEY = "fixture-managed-request"
+WRAPPER = ProcessIdentity(500, 134343072000000001, LOGON)
+ROOT = ProcessIdentity(501, 134343072000000002, LOGON)
+SERVER = ProcessIdentity(502, 134343072000000003, LOGON)
+ENDPOINT = NativePipeEndpoint(LOGON, INSTANCE, SERVER)
+CMD = r"C:\Windows\System32\cmd.exe"
+SPEC = LaunchSpec(command='echo "private-command-marker" && echo %FIXTURE_VALUE% & exit /b 125',
+                  cwd=r"C:\private-cwd-marker\workspace", repo_identifier="fixture-repo",
+                  requested=ResourceDemand(1, 512 << 20, 768 << 20, 1),
+                  role=Role.BACKGROUND, priority=Priority.P2, admission_timeout_sec=0)
+STDIO = dict(stdin_handle=101, stdout_handle=102, stderr_handle=103)
+
+
+def result(state, revision, *, authorized=False, duplicate=False):
+    return LaunchResult(EXECUTION, SPEC_HASH, GUARDIAN, state, revision,
+                        JOB_NAME, NONCE, authorized, duplicate)
+
+
+class Admission:
+    def __init__(self, events):
+        self.events = events
+        self.value = SimpleNamespace(execution_id=EXECUTION, spec_hash=SPEC_HASH,
+            requested=SPEC.requested, role=SPEC.role, priority=SPEC.priority,
+            logon_id=LOGON, wrapper_identity=WRAPPER,
+            request=SimpleNamespace(request_key=REQUEST_KEY))
+        self.payloads = []
+        self.close_calls = 0
+        self.close_error = None
+
+    def snapshot(self):
+        return self.value
+
+    def snapshot_for_ledger(self, path):
+        self.events.append(("snapshot_for_ledger", path))
+        return self.value
+
+    def verify_launch_payload(self, *, command, cwd):
+        self.payloads.append((command, cwd))
+        if (command, cwd) != (SPEC.command, SPEC.cwd):
+            raise AssertionError("fixture received altered admission payload")
+
+    def close(self):
+        self.close_calls += 1
+        self.events.append(("admission.close",))
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class Coordinator:
+    db_path = "fixture-ledger-never-opened"
+
+    def __init__(self, events):
+        self.events = events
+        self.calls = []
+        self.responses = [dict(allowed=True, request_key=REQUEST_KEY,
+            execution_id=EXECUTION, state="RESERVED", state_revision=0,
+            reservation_id="fixture-reservation", launch_authorized=False)]
+        # The wrapper may observe root exit, but must never release this floor.
+        self.reservation_retained = True
+
+    def admit_managed(self, context, status, *, config):
+        self.calls.append((context, status, config))
+        self.events.append(("admit",))
+        value = self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+
+class Client:
+    def __init__(self, events):
+        self.events = events
+        self.calls = []
+        self.responses = {"prepare": result("PREPARED", 1),
+                          "claim": result("LAUNCHING", 2, authorized=True),
+                          "bind": result("RUNNING", 3)}
+
+    def _call(self, name, arguments):
+        self.calls.append((name, arguments))
+        self.events.append((name,))
+        value = self.responses[name]
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    def prepare_execution(self, **arguments):
+        return self._call("prepare", arguments)
+
+    def claim_launch(self, **arguments):
+        return self._call("claim", arguments)
+
+    def bind_root(self, **arguments):
+        return self._call("bind", arguments)
+
+
+class Readiness:
+    def __init__(self, events):
+        self.events = events
+        self.calls = []
+        self.fail_at = None
+        self.error = RuntimeError("fixture_readiness_unavailable")
+        self.return_value = None
+
+    def assert_launch_ready(self, context, row, endpoint):
+        self.calls.append((context, row, endpoint))
+        self.events.append(("ready", len(self.calls)))
+        if len(self.calls) == self.fail_at:
+            raise self.error
+        return self.return_value
+
+
+class Job:
+    def __init__(self, events):
+        self.events = events
+        self.name, self.nonce, self.logon_sid, self.access = JOB_NAME, NONCE, LOGON, JobAccess.LAUNCH
+        self.cpu, self.limits = CpuState(0, 10000), JobLimits(0, 0)
+        self.close_calls = 0
+        self.close_error = None
+
+    def query_cpu(self):
+        return self.cpu
+
+    def query_limits(self):
+        return self.limits
+
+    def close(self):
+        self.close_calls += 1
+        self.events.append(("job.close",))
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class Process:
+    def __init__(self, events):
+        self.events = events
+        self.handle, self.pid, self.root = 700, ROOT.pid, ROOT
+        self.member = True
+        self.exited, self.code = False, 125
+        self.wait_error = None
+        self.close_calls = 0
+        self.close_error = None
+
+    def full_identity(self, *, expected_logon_id):
+        self.events.append(("identity", expected_logon_id))
+        return self.root
+
+    def is_in_job(self, job):
+        self.events.append(("membership", job))
+        return self.member
+
+    def wait(self, timeout):
+        self.events.append(("wait", timeout))
+        if self.wait_error is not None:
+            raise self.wait_error
+        return self.exited
+
+    def exit_code(self):
+        self.events.append(("exit_code",))
+        return self.code
+
+    def close(self):
+        self.close_calls += 1
+        self.events.append(("process.close",))
+        if self.close_error is not None:
+            raise self.close_error
+        self.handle = None
+
+
+class Harness:
+    def __init__(self):
+        self.events = []
+        self.admission = Admission(self.events)
+        self.coordinator = Coordinator(self.events)
+        self.client, self.readiness = Client(self.events), Readiness(self.events)
+        self.job, self.process = Job(self.events), Process(self.events)
+        self.admission_factory = Mock(return_value=self.admission)
+        self.client_factory = Mock(return_value=self.client)
+        self.job_factory = Mock(side_effect=self.open_job)
+        self.native_launch = Mock(side_effect=self.launch)
+        self.resolver = Mock(return_value=CMD)
+
+    def open_job(self, *args, **kwargs):
+        self.events.append(("open_job",))
+        return self.job
+
+    def launch(self, *args, **kwargs):
+        self.events.append(("create",))
+        return self.process
+
+    def build(self, **overrides):
+        arguments = dict(coordinator=self.coordinator, endpoint=ENDPOINT, guardian_epoch=GUARDIAN,
+            readiness=self.readiness, admission_factory=self.admission_factory,
+            client_factory=self.client_factory, job_factory=self.job_factory,
+            launch=self.native_launch, cmd_resolver=self.resolver)
+        arguments.update(overrides)
+        return module.ManagedLauncher(SPEC, **arguments)
+
+    def admitted(self, **overrides):
+        launcher = self.build(**overrides)
+        launcher.admit_once({"fixture_status": True}, config={"fixture_config": True})
+        return launcher
+
+    def bound(self):
+        launcher = self.admitted()
+        launcher.launch_once(**STDIO)
+        return launcher
+
+
+class ManagedLauncherTests(unittest.TestCase):
+    def setUp(self):
+        guard = patch.object(C, "WinDLL", side_effect=AssertionError("portable launcher attempted DLL load"), create=True)
+        guard.start()
+        self.addCleanup(guard.stop)
+
+    def assert_sealed(self, launcher, harness, *, native_count):
+        self.assertEqual(launcher.phase, "UNCERTAIN")
+        calls = list(harness.client.calls)
+        with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_attempt_sealed"):
+            launcher.launch_once(**STDIO)
+        self.assertEqual(harness.client.calls, calls)
+        self.assertEqual(harness.native_launch.call_count, native_count)
+        self.assertEqual(harness.admission.close_calls, 0)
+        self.assertEqual(harness.job.close_calls, 0)
+        self.assertEqual(harness.process.close_calls, 0)
+        self.assertTrue(harness.coordinator.reservation_retained)
+
+    def test_queued_and_uncertain_admission_retries_keep_context_key_and_original_payload(self):
+        h = Harness()
+        allowed = dict(h.coordinator.responses[0])
+        original = OSError("fixture_admission_ack_lost")
+        h.coordinator.responses = [dict(allowed=False, request_key=REQUEST_KEY, reason="queued", position=1), original, allowed]
+        launcher = h.build()
+        self.assertEqual(launcher.admission_timeout_sec, 0)
+        first = launcher.admit_once({"sample": 1}, config={"version": 1})
+        self.assertFalse(first["allowed"])
+        self.assertEqual(launcher.phase, "QUEUED")
+        with self.assertRaises(OSError) as failed:
+            launcher.admit_once({"sample": 2}, config={"version": 1})
+        self.assertIs(failed.exception, original)
+        self.assertIs(original.launcher_owner, launcher)
+        self.assertEqual(launcher.phase, "ADMISSION_UNKNOWN")
+        self.assertTrue(launcher.admit_once({"sample": 3}, config={"version": 1})["allowed"])
+        self.assertTrue(launcher.admit_once({"sample": 4})["allowed"])
+        self.assertEqual(len(h.coordinator.calls), 3)
+        self.assertTrue(all(call[0] is h.admission for call in h.coordinator.calls))
+        h.admission_factory.assert_called_once_with(command=SPEC.command, cwd=SPEC.cwd,
+            repo_identifier=SPEC.repo_identifier, requested=SPEC.requested, role=SPEC.role, priority=SPEC.priority)
+        h.client_factory.assert_called_once_with(h.admission, ENDPOINT, guardian_epoch=GUARDIAN)
+        self.assertEqual(h.admission.close_calls, 0)
+        h.native_launch.assert_not_called()
+
+    def test_admission_response_binding_is_validated_before_any_launch(self):
+        for changes in ({"allowed": 1}, {"request_key": "other"}, {"execution_id": INSTANCE},
+                        {"state": "RUNNING"}, {"state_revision": True}, {"state_revision": -1},
+                        {"reservation_id": ""}, {"launch_authorized": True}):
+            with self.subTest(changes=changes):
+                h = Harness()
+                h.coordinator.responses[0].update(changes)
+                launcher = h.build()
+                with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_admission_response_invalid"):
+                    launcher.admit_once({})
+                self.assertEqual(launcher.phase, "ADMISSION_UNKNOWN")
+                with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_custody_unsettled"):
+                    launcher.close_local()
+                self.assertEqual(h.client.calls, [])
+                h.native_launch.assert_not_called()
+
+    def test_default_or_boolean_readiness_never_authorizes_launch(self):
+        for use_default in (True, False):
+            with self.subTest(default=use_default):
+                h = Harness()
+                h.readiness.return_value = True
+                launcher = h.admitted(readiness=None if use_default else h.readiness)
+                with self.assertRaises(module.ManagedLaunchError):
+                    launcher.launch_once(**STDIO)
+                self.assertEqual(launcher.phase, "RESERVED")
+                self.assertEqual(h.client.calls, [])
+                h.job_factory.assert_not_called()
+                h.native_launch.assert_not_called()
+                self.assertEqual(h.admission.close_calls, 0)
+
+    def test_invalid_local_inputs_fail_before_rpc_and_do_not_consume_attempt(self):
+        h = Harness()
+        launcher = h.admitted()
+        cases = ({"stdin_handle": True}, {"stdout_handle": 0}, {"stderr_handle": -1},
+                 {"timeout_ms": 0}, {"timeout_ms": 1001}, {"timeout_ms": True})
+        for changes in cases:
+            with self.subTest(changes=changes), self.assertRaises(module.ManagedLaunchError):
+                launcher.launch_once(**(STDIO | changes))
+        self.assertEqual(h.client.calls, [])
+        launcher.launch_once(**STDIO)
+        self.assertEqual(h.native_launch.call_count, 1)
+
+    def test_success_orders_three_guards_exact_claim_and_native_bind_without_raw_rpc_payload(self):
+        h = Harness()
+        launcher = h.admitted()
+        self.assertIs(launcher.launch_once(**STDIO, timeout_ms=800), h.process)
+        self.assertEqual(launcher.phase, "BOUND")
+        stages = [event for event in h.events if event[0] in {"ready", "prepare", "open_job", "claim", "create", "identity", "membership", "bind"}]
+        self.assertEqual([event[0] for event in stages],
+                         ["ready", "prepare", "open_job", "ready", "claim", "ready", "create", "identity", "membership", "bind"])
+        self.assertEqual([call[1]["state"] for call in h.readiness.calls], ["RESERVED", "PREPARED", "LAUNCHING"])
+        self.assertTrue(all(call[0] is h.admission and call[2] is ENDPOINT for call in h.readiness.calls))
+        h.job_factory.assert_called_once_with(JOB_NAME, NONCE, LOGON, access=JobAccess.LAUNCH)
+        h.native_launch.assert_called_once_with(h.job, CMD, f'"{CMD}" /d /s /c "{SPEC.command}"', cwd=SPEC.cwd, **STDIO)
+        prepare, claim, bind = [call[1] for call in h.client.calls]
+        self.assertEqual(prepare["expected_revision"], 0)
+        self.assertEqual(claim["expected_revision"], 1)
+        self.assertEqual(bind["expected_revision"], 2)
+        self.assertEqual(claim["job_nonce"], NONCE)
+        self.assertEqual(bind["job_nonce"], NONCE)
+        self.assertEqual(bind["root_identity"], ROOT)
+        self.assertEqual(bind["root_handle_locator"], 700)
+        self.assertEqual({call["timeout_ms"] for call in (prepare, claim, bind)}, {800})
+        self.assertEqual(len({call["request_id"] for call in (prepare, claim, bind)}), 3)
+        self.assertNotIn(SPEC.command, repr(h.client.calls))
+        self.assertNotIn(SPEC.cwd, repr(h.client.calls))
+        self.assertTrue(all(payload == (SPEC.command, SPEC.cwd) for payload in h.admission.payloads))
+        with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_attempt_sealed"):
+            launcher.launch_once(**STDIO)
+        self.assertEqual(h.native_launch.call_count, 1)
+
+    def test_each_readiness_failure_stops_the_next_mutation_and_only_initial_failure_can_retry(self):
+        for index in (1, 2, 3):
+            with self.subTest(index=index):
+                h = Harness()
+                h.readiness.fail_at = index
+                launcher = h.admitted()
+                with self.assertRaises(RuntimeError) as failed:
+                    launcher.launch_once(**STDIO)
+                self.assertIs(failed.exception, h.readiness.error)
+                self.assertEqual([call[0] for call in h.client.calls], {1: [], 2: ["prepare"], 3: ["prepare", "claim"]}[index])
+                h.native_launch.assert_not_called()
+                if index == 1:
+                    h.readiness.fail_at = None
+                    launcher.launch_once(**STDIO)
+                    self.assertEqual(h.native_launch.call_count, 1)
+                else:
+                    self.assertIs(failed.exception.launcher_owner, launcher)
+                    self.assert_sealed(launcher, h, native_count=0)
+
+    def test_prepare_or_claim_ack_loss_seals_attempt_without_create_or_cleanup(self):
+        for stage in ("prepare", "claim"):
+            with self.subTest(stage=stage):
+                h = Harness()
+                original = h.client.responses[stage] = OSError("fixture_mutation_ack_lost")
+                launcher = h.admitted()
+                with self.assertRaises(OSError) as failed:
+                    launcher.launch_once(**STDIO)
+                self.assertIs(failed.exception, original)
+                self.assertIs(original.launcher_owner, launcher)
+                self.assert_sealed(launcher, h, native_count=0)
+
+    def test_typed_ack_fields_and_untyped_reply_are_revalidated_at_every_stage(self):
+        changes = ({"execution_id": INSTANCE}, {"spec_hash": "c" * 64},
+                   {"guardian_epoch": "other-guardian"}, {"state": "RESERVED"},
+                   {"state_revision": 0}, {"state_revision": True}, {"job_name": "unowned-job"},
+                   {"job_nonce": "b" * 32}, {"launch_authorized": 1}, {"duplicate": 1})
+        for stage in ("prepare", "claim", "bind"):
+            for fields in (*changes, None):
+                with self.subTest(stage=stage, fields=fields):
+                    h = Harness()
+                    reply = replace(h.client.responses[stage])
+                    if fields is None:
+                        h.client.responses[stage] = reply.to_dict()
+                    else:
+                        for key, value in fields.items():
+                            object.__setattr__(reply, key, value)
+                        h.client.responses[stage] = reply
+                    launcher = h.admitted()
+                    with self.assertRaises(Exception) as failed:
+                        launcher.launch_once(**STDIO)
+                    self.assertIs(failed.exception.launcher_owner, launcher)
+                    self.assert_sealed(launcher, h, native_count=int(stage == "bind"))
+
+    def test_job_open_failure_or_binding_mismatch_never_claims_or_creates(self):
+        cases = ({"name": "other"}, {"nonce": "b" * 32}, {"logon_sid": "S-1-5-5-100-201"},
+                 {"access": JobAccess.OWNER}, {"cpu": CpuState(5, 4000)}, {"limits": JobLimits(1, 0)}, None)
+        for fields in cases:
+            with self.subTest(fields=fields):
+                h = Harness()
+                if fields is None:
+                    h.job_factory.side_effect = OSError("fixture_job_open_failed")
+                else:
+                    for key, value in fields.items():
+                        setattr(h.job, key, value)
+                launcher = h.admitted()
+                with self.assertRaises(Exception):
+                    launcher.launch_once(**STDIO)
+                self.assertEqual([call[0] for call in h.client.calls], ["prepare"])
+                self.assert_sealed(launcher, h, native_count=0)
+
+    def test_duplicate_or_unauthorized_claim_never_permits_create(self):
+        for duplicate in (False, True):
+            with self.subTest(duplicate=duplicate):
+                h = Harness()
+                h.client.responses["claim"] = result("LAUNCHING", 2, duplicate=duplicate)
+                launcher = h.admitted()
+                with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_claim_not_authorized"):
+                    launcher.launch_once(**STDIO)
+                self.assert_sealed(launcher, h, native_count=0)
+
+    def test_changed_cmd_resolution_after_claim_seals_without_create(self):
+        h = Harness()
+        h.resolver.side_effect = [CMD, r"C:\other\cmd.exe"]
+        launcher = h.admitted()
+        with self.assertRaisesRegex(module.ManagedLaunchError, "system_cmd_changed"):
+            launcher.launch_once(**STDIO)
+        self.assertEqual(h.resolver.call_args_list[0].args, (None,))
+        self.assertEqual(h.resolver.call_args_list[1].args, (CMD,))
+        self.assert_sealed(launcher, h, native_count=0)
+
+    def test_native_unknown_retains_exact_original_process_without_bind_or_second_create(self):
+        h = Harness()
+        original = LaunchOutcomeUnknown(h.process, RuntimeError("fixture_native_unknown"))
+        h.native_launch.side_effect = original
+        launcher = h.admitted()
+        with self.assertRaises(LaunchOutcomeUnknown) as failed:
+            launcher.launch_once(**STDIO)
+        self.assertIs(failed.exception, original)
+        self.assertIs(launcher.process, h.process)
+        self.assertIs(original.launcher_owner, launcher)
+        self.assertEqual([call[0] for call in h.client.calls], ["prepare", "claim"])
+        self.assert_sealed(launcher, h, native_count=1)
+
+    def test_native_exception_is_not_retried_or_given_an_invented_process(self):
+        h = Harness()
+        original = h.native_launch.side_effect = KeyboardInterrupt("fixture_native_interruption")
+        launcher = h.admitted()
+        with self.assertRaises(KeyboardInterrupt) as failed:
+            launcher.launch_once(**STDIO)
+        self.assertIs(failed.exception, original)
+        self.assertIsNone(launcher.process)
+        self.assert_sealed(launcher, h, native_count=1)
+
+    def test_root_identity_and_membership_must_be_verified_before_bind(self):
+        for root, pid, member in ((WRAPPER, WRAPPER.pid, True), (SERVER, SERVER.pid, True),
+                                  (replace(ROOT, logon_id="S-1-5-5-100-201"), ROOT.pid, True),
+                                  (ROOT, ROOT.pid + 1, True), (ROOT, ROOT.pid, False),
+                                  (ROOT, ROOT.pid, None), (ROOT, ROOT.pid, 1)):
+            with self.subTest(root=root, pid=pid, member=member):
+                h = Harness()
+                h.process.root, h.process.pid, h.process.member = root, pid, member
+                launcher = h.admitted()
+                with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_root_binding_unverified"):
+                    launcher.launch_once(**STDIO)
+                self.assertIs(launcher.process, h.process)
+                self.assertEqual([call[0] for call in h.client.calls], ["prepare", "claim"])
+                self.assert_sealed(launcher, h, native_count=1)
+
+    def test_bind_ack_loss_retains_root_and_reports_exit_without_transfer_ack(self):
+        h = Harness()
+        original = h.client.responses["bind"] = OSError("fixture_bind_ack_lost")
+        launcher = h.admitted()
+        with self.assertRaises(OSError) as failed:
+            launcher.launch_once(**STDIO)
+        self.assertIs(failed.exception, original)
+        self.assert_sealed(launcher, h, native_count=1)
+        h.process.exited = True
+        self.assertEqual(launcher.poll_root(), module.RootObservation(EXECUTION, True, 125, False))
+        with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_custody_unsettled"):
+            launcher.close_local()
+        self.assertEqual(h.process.close_calls, 0)
+        self.assertEqual(h.job.close_calls, 0)
+        self.assertTrue(h.coordinator.reservation_retained)
+
+    def test_reconcile_bind_replays_exact_original_request_without_repeating_launch_authority(self):
+        h = Harness()
+        h.client.responses["bind"] = OSError("fixture_bind_ack_lost")
+        launcher = h.admitted()
+        with self.assertRaises(OSError):
+            launcher.launch_once(**STDIO)
+        original_bind = dict(h.client.calls[-1][1])
+        readiness_count, resolver_count = len(h.readiness.calls), h.resolver.call_count
+        acknowledged = h.client.responses["bind"] = result("RUNNING", 3, duplicate=True)
+        self.assertIs(launcher.reconcile_bind(), acknowledged)
+        self.assertEqual([call[0] for call in h.client.calls], ["prepare", "claim", "bind", "bind"])
+        self.assertEqual(h.client.calls[-1][1], original_bind)
+        self.assertEqual(original_bind["root_identity"], ROOT)
+        self.assertEqual(original_bind["root_handle_locator"], 700)
+        self.assertEqual(original_bind["expected_revision"], 2)
+        self.assertEqual(len(h.readiness.calls), readiness_count)
+        self.assertEqual(h.resolver.call_count, resolver_count)
+        self.assertEqual(h.job_factory.call_count, 1)
+        self.assertEqual(h.native_launch.call_count, 1)
+        self.assertEqual(launcher.phase, "BOUND")
+        self.assertIs(launcher.reconcile_bind(), acknowledged)
+        self.assertEqual(len(h.client.calls), 4)
+        h.process.exited = True
+        self.assertEqual(launcher.poll_root(), module.RootObservation(EXECUTION, True, 125, True))
+        launcher.close_local()
+        self.assertEqual(launcher.phase, "CLOSED")
+        self.assertEqual((h.process.close_calls, h.job.close_calls, h.admission.close_calls), (1, 1, 1))
+        self.assertEqual(len(h.client.calls), 4)
+        self.assertEqual(h.native_launch.call_count, 1)
+        self.assertTrue(h.coordinator.reservation_retained)
+
+    def test_reconcile_bind_rejects_unknown_create_or_unverified_root_without_rpc_or_relaunch(self):
+        for unknown_create in (True, False):
+            with self.subTest(unknown_create=unknown_create):
+                h = Harness()
+                if unknown_create:
+                    h.native_launch.side_effect = LaunchOutcomeUnknown(h.process, RuntimeError("fixture_create_unknown"))
+                else:
+                    h.process.member = False
+                launcher = h.admitted()
+                with self.assertRaises((LaunchOutcomeUnknown, module.ManagedLaunchError)):
+                    launcher.launch_once(**STDIO)
+                calls = list(h.client.calls)
+                readiness_count, resolver_count = len(h.readiness.calls), h.resolver.call_count
+                with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_bind_reconciliation_unavailable"):
+                    launcher.reconcile_bind()
+                self.assertEqual(h.client.calls, calls)
+                self.assertEqual(len(h.readiness.calls), readiness_count)
+                self.assertEqual(h.resolver.call_count, resolver_count)
+                self.assert_sealed(launcher, h, native_count=1)
+
+    def test_bound_fast_exit_and_root_125_preserve_descendant_capacity_without_rpc(self):
+        h = Harness()
+        h.process.exited = True
+        h.client.responses["bind"] = result("DRAINING", 3)
+        launcher = h.bound()
+        calls = list(h.client.calls)
+        observation = launcher.poll_root()
+        self.assertEqual(observation, module.RootObservation(EXECUTION, True, 125, True))
+        self.assertTrue(h.coordinator.reservation_retained)
+        launcher.close_local()
+        launcher.close_local()
+        self.assertEqual(launcher.phase, "CLOSED")
+        self.assertEqual((h.process.close_calls, h.job.close_calls, h.admission.close_calls), (1, 1, 1))
+        self.assertEqual(h.client.calls, calls)
+        self.assertEqual(len(h.coordinator.calls), 1)
+        self.assertTrue(h.coordinator.reservation_retained)
+
+    def test_root_polling_unknown_or_inconsistent_values_never_synthesize_exit(self):
+        h = Harness()
+        launcher = h.bound()
+        self.assertEqual(launcher.poll_root(), module.RootObservation(EXECUTION, False, None, True))
+        original = h.process.wait_error = OSError("fixture_wait_unavailable")
+        with self.assertRaises(OSError) as failed:
+            launcher.poll_root()
+        self.assertIs(failed.exception, original)
+        self.assertIs(original.launcher_owner, launcher)
+        h.process.wait_error = None
+        for exited, code in ((1, 125), (True, None), (True, True), (True, -1), (True, 0x100000000)):
+            h.process.exited, h.process.code = exited, code
+            with self.subTest(exited=exited, code=code), self.assertRaises(module.ManagedLaunchError):
+                launcher.poll_root()
+        h.process.exited, h.process.code = True, 125
+        self.assertEqual(launcher.poll_root().exit_code, 125)
+        h.process.exited = False
+        with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_root_exit_changed"):
+            launcher.poll_root()
+        self.assertEqual(len(h.client.calls), 3)
+        self.assertTrue(h.coordinator.reservation_retained)
+
+    def test_unsubmitted_launcher_closes_only_local_admission_and_cannot_launch(self):
+        h = Harness()
+        launcher = h.build()
+        with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_not_admitted"):
+            launcher.launch_once(**STDIO)
+        with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_root_unavailable"):
+            launcher.poll_root()
+        launcher.close_local()
+        launcher.close_local()
+        self.assertEqual(launcher.phase, "CLOSED")
+        self.assertEqual(h.admission.close_calls, 1)
+        self.assertEqual(h.client.calls, [])
+        self.assertEqual(h.coordinator.calls, [])
+        h.native_launch.assert_not_called()
+        with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_closed_or_closing"):
+            launcher.admit_once({})
+
+    def test_denied_queued_reserved_and_running_contexts_cannot_close_or_release_custody(self):
+        for stage in ("denied", "queued", "reserved", "running"):
+            with self.subTest(stage=stage):
+                h = Harness()
+                if stage == "queued":
+                    h.coordinator.responses = [dict(allowed=False, request_key=REQUEST_KEY, position=1)]
+                elif stage == "denied":
+                    h.coordinator.responses = [dict(allowed=False, request_key=REQUEST_KEY, reason="managed_policy_mismatch")]
+                launcher = h.admitted()
+                if stage in {"queued", "denied"}:
+                    self.assertEqual(launcher.phase, "QUEUED" if stage == "queued" else "ADMISSION_DENIED")
+                if stage == "running":
+                    launcher.launch_once(**STDIO)
+                with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_custody_unsettled"):
+                    launcher.close_local()
+                self.assertEqual((h.process.close_calls, h.job.close_calls, h.admission.close_calls), (0, 0, 0))
+                self.assertTrue(h.coordinator.reservation_retained)
+
+    def test_independent_cleanup_preserves_primary_and_retries_only_local_owned_objects(self):
+        h = Harness()
+        launcher = h.bound()
+        h.process.exited = True
+        original = h.process.close_error = RuntimeError("fixture_process_cleanup_failed")
+        h.job.close_error = RuntimeError("fixture_job_cleanup_failed")
+        with self.assertRaises(RuntimeError) as failed:
+            launcher.close_local()
+        self.assertIs(failed.exception, original)
+        self.assertIs(original.launcher_owner, launcher)
+        self.assertTrue(original.__notes__)
+        self.assertEqual((h.process.close_calls, h.job.close_calls, h.admission.close_calls), (1, 1, 1))
+        h.process.close_error = h.job.close_error = None
+        launcher.close_local()
+        self.assertEqual(launcher.phase, "CLOSED")
+        self.assertEqual(h.admission.close_calls, 1)
+        self.assertEqual(len(h.client.calls), 3)
+        self.assertEqual(h.native_launch.call_count, 1)
+        self.assertTrue(h.coordinator.reservation_retained)
+
+    def test_admission_close_partial_failure_is_permanently_quarantined_without_second_call(self):
+        h = Harness()
+        launcher = h.bound()
+        h.process.exited = True
+        original = h.admission.close_error = RuntimeError("fixture_admission_close_unknown")
+        with self.assertRaises(RuntimeError) as failed:
+            launcher.close_local()
+        self.assertIs(failed.exception, original)
+        self.assertIs(original.launcher_owner, launcher)
+        h.admission.close_error = None
+        with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_admission_cleanup_unknown"):
+            launcher.close_local()
+        self.assertEqual(h.admission.close_calls, 1)
+        self.assertNotEqual(launcher.phase, "CLOSED")
+        self.assertEqual(len(h.client.calls), 3)
+        self.assertTrue(h.coordinator.reservation_retained)
+
+    def test_constructor_binding_or_client_failure_closes_context_and_preserves_primary(self):
+        h = Harness()
+        h.admission.value.logon_id = "S-1-5-5-100-201"
+        with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_admission_binding_mismatch"):
+            h.build()
+        self.assertEqual(h.admission.close_calls, 1)
+        h.client_factory.assert_not_called()
+        h = Harness()
+        original = h.client_factory.side_effect = RuntimeError("fixture_client_initialization_failed")
+        h.admission.close_error = OSError("fixture_constructor_cleanup_unknown")
+        with self.assertRaises(RuntimeError) as failed:
+            h.build()
+        self.assertIs(failed.exception, original)
+        self.assertTrue(original.__notes__)
+        self.assertIs(original.launcher_cleanup_error, h.admission.close_error)
+        owner = original.launcher_owner
+        with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_admission_cleanup_unknown"):
+            owner.close_local()
+        self.assertEqual(h.admission.close_calls, 1)
+        h.native_launch.assert_not_called()
+
+    def test_cmd_resolution_failure_happens_before_creating_admission_or_client(self):
+        h = Harness()
+        original = h.resolver.side_effect = module.ManagedLaunchError("system_cmd_unavailable")
+        with self.assertRaises(module.ManagedLaunchError) as failed:
+            h.build()
+        self.assertIs(failed.exception, original)
+        h.admission_factory.assert_not_called()
+        h.client_factory.assert_not_called()
+        h.native_launch.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

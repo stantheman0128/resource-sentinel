@@ -7,9 +7,10 @@
 與 [P2 admission-only 實作紀錄](P2-ADMISSION-ONLY.md)。
 以下「只做規劃」及 GPT Pro 提示是原規劃階段的歷史背景，不限制後續已授權的實作。
 
-最新實作見 [guardian lifecycle consumer](P3-GUARDIAN-LIFECYCLE.md)：
-正式 Job API、恢復 journal 與 guardian 的 root/child 清帳流程已接入程式。
-它仍需 mutation RPC、wrapper 啟動交接和 supervisor，P3 尚未完成。
+最新實作見 [authenticated wrapper launch](P3-AUTHENTICATED-LAUNCH.md)：
+wrapper 准入、Prepare／Claim／BindRoot RPC 與 guardian 持有權交接已接入程式，
+沿用 [guardian lifecycle consumer](P3-GUARDIAN-LIFECYCLE.md) 的 root/child 清帳流程。
+仍需正式服務啟動、supervisor、host authority 與完整恢復驗證，P3 尚未完成。
 完整階段表與環境限制見 [native launcher 與 gate 狀態](P3-NATIVE-LAUNCHER.md)；
 以下各次測試紀錄不是 P3–P6 的通過聲明。
 

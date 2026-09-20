@@ -106,6 +106,16 @@ run out and the expiry sweep restores the cap. The three pipes are served one
 after another, each with its own bounded deadline, which is a property of the
 loop and not a measured reaction time.
 
+`GuardianControl.apply` turns a `LifecycleError` into an acknowledgement. The
+host loop catches pipe, IPC and lifecycle errors from a served proposal and
+reports them. Any other exception out of `apply` is not caught and ends the
+guardian process, the same fail-stop choice the host makes for `control.tick`,
+so that a verified death lets the supervisor restore.
+
+The transport inherits the trust of `adaptive_infrastructure` and adds none.
+Whatever can write `sentinel.db` under the policy mutex can register a helper
+row.
+
 There is no resident helper host process: nothing
 enrolls Jobs, runs the sampler, drives the decision loop or holds an episode
 across ticks. There is no endpoint distribution or bootstrap, so nothing tells a

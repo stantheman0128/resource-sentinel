@@ -156,6 +156,10 @@ DENIED_MODULES = frozenset({
     "sentinel.adaptive.supervisor", "sentinel.adaptive.writers", "sentinel.adaptive.store",
     "sentinel.adaptive.ipc", "sentinel.adaptive.windows", "sentinel.adaptive.machine_sampler",
     "sentinel.adaptive.admission", "sentinel.adaptive.control_slot", "sentinel.adaptive.policy",
+    # The proposal path. A helper that could build or send a proposal would no
+    # longer be structurally unable to reach the guardian's actuator.
+    "sentinel.adaptive.proposal_builder", "sentinel.adaptive.control_transport",
+    "sentinel.adaptive.guardian_control", "sentinel.adaptive.guardian_host",
 })
 DENIED_NAMES = frozenset({
     "set_cpu_rate", "set_cpu_rate_unverified", "disable", "SetInformationJobObject",

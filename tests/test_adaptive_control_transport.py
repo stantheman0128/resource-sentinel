@@ -15,8 +15,9 @@ because a foreign parent Job blocks the supported host check.
 Every ledger mode write below is a fixture write into an isolated test database.
 Nothing here promotes a mode and no production configuration is read or changed.
 """
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import replace
+import sqlite3
 import struct
 import unittest
 from unittest.mock import patch
@@ -260,6 +261,48 @@ class ControlTransportTests(unittest.TestCase):
         with self.assertRaisesRegex(transport.ControlTransportError, "control_registry_unavailable"):
             self.serve()
         self.assertEqual(self.recorder.calls, [])
+
+    def damage_registry(self, statement, values=()):
+        """Write a row the table's own CHECK constraints would refuse.
+
+        A damaged ledger is the case under test, so the constraints are switched
+        off on this one fixture connection only.
+        """
+        with closing(sqlite3.connect(self.db)) as conn, conn:
+            conn.execute("PRAGMA ignore_check_constraints=ON")
+            self.assertEqual(conn.execute(statement, values).rowcount, 1)
+
+    def refuse_damaged_helper_row(self, assignment):
+        case = self.prepare()
+        self.damage_registry("UPDATE adaptive_infrastructure SET " + assignment +
+                             " WHERE role='helper'")
+        self.service_pipe(self.proposal(case))
+        with self.assertRaisesRegex(transport.ControlTransportError, "control_registry_invalid"):
+            self.serve()
+        self.assertEqual(self.recorder.calls, [])
+        self.assertEqual(self.pipe.writes, [])
+        self.assertEqual(self.pipe.reads, [])
+
+    def test_service_refuses_a_helper_row_with_another_schema_version(self):
+        self.refuse_damaged_helper_row("schema_version=2")
+
+    def test_service_refuses_a_helper_row_whose_creation_time_is_not_a_number(self):
+        self.refuse_damaged_helper_row("created_filetime_100ns='not-a-filetime'")
+
+    def test_service_refuses_a_helper_row_whose_pid_is_not_positive(self):
+        self.refuse_damaged_helper_row("pid=0")
+
+    def test_service_refuses_a_registry_that_names_the_guardian_as_the_helper(self):
+        case = self.prepare(helpers=0)
+        with self.policy_held():
+            self.assertTrue(register_infrastructure_locked(
+                self.store, "helper", self.processes.process(SERVER)))
+        self.service_pipe(self.proposal(case), peer=SERVER)
+        with self.assertRaisesRegex(transport.ControlTransportError,
+                                    "control_helper_identity_invalid"):
+            self.serve()
+        self.assertEqual(self.recorder.calls, [])
+        self.assertEqual(self.pipe.reads, [])
 
     def test_service_refuses_a_peer_that_is_not_the_registered_process(self):
         case = self.prepare()

@@ -35,6 +35,11 @@ production supervisor、完整 loaded-writer 交接及 native gate 尚未通過�
 測試全數通過，其中兩個是真正 Windows 取樣。這提供恢復流程所需的機器
 樣本；尚不代表完整 FastFrame、Job 控制能力或 P4 監控成本通過。
 
+[S1 recovery consumer](P1-S1-RECOVERY-CONSUMER.md) 已接入實際 owner 收尾：
+保留原始 Job custody，核對恢復、五筆新鮮樣本與共用帳本，再解除 barrier。
+原生 power notification 的註冊／解除已實測，完整 native Job／sleep recovery
+仍未通過；這不會解鎖尚缺實際 host authority 的 native 入口。
+
 使用者要求：先自行嚴格質疑方案，把資料放入 repo；由使用者交給 GPT Pro
 完成 plan，再交回 Codex 實作。本包不代表使用者已選定控制演算法、常駐服務或參數。
 

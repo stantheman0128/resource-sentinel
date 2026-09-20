@@ -56,7 +56,13 @@ class S1Runtime:
         self.store_factory = store_factory or LifecycleStore
         self.owners = []
         self.pending_admissions = []
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        from tests.windows.adaptive_recovery import S1Recovery
+        self._recovery = S1Recovery(self)
+
+    def _recover_before_close(self, owner):
+        with self._lock:
+            self._recovery.before_close(owner)
 
     def open_case(self, *, command, cwd, directory, requested, creation_nonce):
         from sentinel.adaptive.admission import ManagedAdmission
@@ -66,6 +72,7 @@ class S1Runtime:
             self.authority.assert_ready()
             if any(not owner._closed for owner in self.owners) or self.pending_admissions:
                 raise LifecycleError("previous_case_unsettled")
+            self._recovery.assert_entry()
             admission = ManagedAdmission.current(command=command, cwd=cwd,
                 repo_identifier="sentinel-p1-s1", requested=requested,
                 role=Role.BACKGROUND, priority=Priority.P2)
@@ -84,6 +91,7 @@ class S1Runtime:
             owner = S1ExecutionOwner(admission=admission, store=store,
                 authority=self.authority, directory=directory, native=self.native,
                 creation_nonce=creation_nonce)
+            owner._runtime = self
             self.owners.append(owner)
             self.pending_admissions.remove(admission)
             return owner
@@ -126,6 +134,9 @@ class S1ExecutionOwner:
         self._terminal = self._closed = False
         self._prepared = False
         self._control_pending = False
+        self._runtime = None
+        self._recovery_job_released = False
+        self._cleanup_started = False
         self.observation_started_at = time.monotonic()
         self.observation_deadline = self.observation_started_at + 120
         self._root = None
@@ -575,12 +586,17 @@ class S1ExecutionOwner:
                 raise
 
     def close(self):
+        # S1 recovery owns a five-window wait. It runs before acquiring this
+        # method's cleanup lock and before closing any native custody handle.
+        if not self._closed and self._runtime is not None:
+            self._runtime._recover_before_close(self)
         with self._lock:
             if self._closed:
                 return
             if not self._terminal:
                 self._retain()
                 raise LifecycleError("case_custody_not_settled")
+            self._cleanup_started = True
             # Retain each reference on a failed close, allowing exact cleanup
             # retry. A handle close is never the proof used by finalization.
             if self.process is not None:
@@ -593,6 +609,7 @@ class S1ExecutionOwner:
             self._grant_scope_handles.clear()
             if self.job is not None:
                 self.job.close()
+            self._recovery_job_released = True
             if self.mutex is not None:
                 self.mutex.close()
             self.admission.close()

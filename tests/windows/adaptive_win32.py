@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ctypes as C
 from ctypes import wintypes as W
+from functools import lru_cache
 import math
 import os
 import re
@@ -177,7 +178,6 @@ def _api():
           W.BOOL, W.LPCWSTR)
     _bind(k, "ReleaseMutex", W.BOOL, W.HANDLE)
     _bind(k, "GetConsoleProcessList", W.DWORD, C.POINTER(W.DWORD), W.DWORD)
-    _bind(k, "QueryInterruptTimePrecise", None, C.POINTER(C.c_uint64))
     _bind(a, "OpenProcessToken", W.BOOL, W.HANDLE, W.DWORD, C.POINTER(W.HANDLE))
     _bind(a, "GetTokenInformation", W.BOOL, W.HANDLE, C.c_int, ptr,
           W.DWORD, C.POINTER(W.DWORD))
@@ -445,10 +445,22 @@ def current_identity():
         process.close()
 
 
+@lru_cache(maxsize=1)
+def _realtime_api():
+    # Official API-set contract: kernel32 lacks the direct export on some
+    # Windows hosts. Do not silently replace this with a different clock.
+    # https://learn.microsoft.com/en-us/uwp/win32-and-com/win32-apis
+    realtime = C.WinDLL("api-ms-win-core-realtime-l1-1-1.dll", use_last_error=True)
+    _bind(realtime, "QueryInterruptTimePrecise", None, C.POINTER(C.c_uint64))
+    return realtime
+
+
 def interrupt_time_100ns():
     """Boot-relative interrupt time, including sleep, for test lease deadlines."""
-    value = C.c_uint64()
-    _api()[0].QueryInterruptTimePrecise(C.byref(value))
+    value = C.c_uint64((1 << 64) - 1)
+    _realtime_api().QueryInterruptTimePrecise(C.byref(value))
+    if value.value == (1 << 64) - 1:
+        raise UnsupportedCapability("precise interrupt time unavailable")
     return int(value.value)
 
 

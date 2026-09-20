@@ -30,6 +30,11 @@ priority／I/O／trim／restore 移入持有共用 POLICY 的 executor，並封�
 最後增加一個案例後補跑的 23 個測試亦通過。這仍是 source 與隔離測試證據；
 production supervisor、完整 loaded-writer 交接及 native gate 尚未通過。
 
+[原生唯讀 machine sampler](P1-MACHINE-SAMPLER.md) 已完成實作與實機驗證。
+第一次原生測試抓到精確時鐘的 DLL 載入錯誤，修正為官方 API-set 後，70 個
+測試全數通過，其中兩個是真正 Windows 取樣。這提供恢復流程所需的機器
+樣本；尚不代表完整 FastFrame、Job 控制能力或 P4 監控成本通過。
+
 使用者要求：先自行嚴格質疑方案，把資料放入 repo；由使用者交給 GPT Pro
 完成 plan，再交回 Codex 實作。本包不代表使用者已選定控制演算法、常駐服務或參數。
 

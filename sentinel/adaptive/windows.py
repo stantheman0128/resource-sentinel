@@ -304,8 +304,19 @@ class NativePolicyMutex:
                     self._handle = None
                 except BaseException as cleanup:
                     _cleanup_note(primary, "policy_mutex_handle_close_failed", cleanup)
+                    # The caller never receives this object. Keep it reachable
+                    # so its one native handle still has a cleanup owner.
+                    primary._policy_mutex_cleanup = (self,)
             if isinstance(primary, IdentityUnavailable):
-                raise NativePolicyMutexError("policy_mutex_identity_unavailable", primary.win32_error) from None
+                converted = NativePolicyMutexError("policy_mutex_identity_unavailable", primary.win32_error)
+                # Sanitizing the reason must not make an unclean failure look
+                # clean: carry retained owners and cleanup notes across.
+                for name in ("_identity_handle_cleanup", "_policy_mutex_cleanup"):
+                    if getattr(primary, name, ()):
+                        setattr(converted, name, getattr(primary, name))
+                for note in getattr(primary, "__notes__", ()):
+                    converted.add_note(note)
+                raise converted from None
             raise
 
     @property

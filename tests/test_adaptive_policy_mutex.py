@@ -334,6 +334,40 @@ class PolicyMutexTests(unittest.TestCase):
         self.assertEqual(self.backend.calls[-1], ("close", handle))
         self.assertEqual(self.backend.calls.count(("close", handle)), 1)
 
+    def test_constructor_close_failure_retains_partial_owner_on_original_error(self):
+        failure = RuntimeError("identity cleanup failed")
+        self.process.close_error = failure
+        self.backend.close_error = NativePolicyMutexError("policy_mutex_handle_close_failed", 6)
+        with self.assertRaises(RuntimeError) as caught:
+            NativePolicyMutex(LOGON, str(uuid4()))
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(failure.__notes__, ["policy_mutex_handle_close_failed win32=6"])
+        (partial,) = failure._policy_mutex_cleanup
+        handle = next(call[1] for call in self.backend.calls if call[0] == "create")
+        self.assertEqual(partial._handle, handle)
+        # The retained owner can finish the one close that failed; no second
+        # native object was created on the way.
+        self.backend.close_error = None
+        partial.close()
+        self.assertIsNone(partial._handle)
+        self.assertEqual(sum(call[0] == "create" for call in self.backend.calls), 1)
+
+    def test_sanitized_identity_failure_keeps_retained_owners_and_notes(self):
+        retained = object()
+        failure = IdentityUnavailable("private diagnostic", 5)
+        failure._identity_handle_cleanup = (retained,)
+        self.process.close_error = failure
+        self.backend.close_error = NativePolicyMutexError("policy_mutex_handle_close_failed", 6)
+        with self.assertRaises(NativePolicyMutexError) as caught:
+            NativePolicyMutex(LOGON, str(uuid4()))
+        error = caught.exception
+        self.assertEqual(error.reason, "policy_mutex_identity_unavailable")
+        self.assertEqual(error._identity_handle_cleanup, (retained,))
+        self.assertEqual(error.__notes__, ["policy_mutex_handle_close_failed win32=6"])
+        (partial,) = error._policy_mutex_cleanup
+        self.backend.close_error = None
+        partial.close()
+
     def test_foreign_process_cannot_use_or_close_retained_handle(self):
         mutex = self.mutex()
         with patch.object(native.os, "getpid", return_value=mutex._creator_pid + 1):

@@ -85,6 +85,7 @@ class AdaptivePolicyScopeTests(unittest.TestCase):
 
     def setUp(self):
         fixtures.AdaptiveLifecycleTests.setUp(self)
+        self.preparation_policy = self.policy
         self.events = []
         self.policy = ObservedPolicy(self)
         self.evidence_active = False
@@ -121,8 +122,12 @@ class AdaptivePolicyScopeTests(unittest.TestCase):
         target = store or self.store
         spec = self.spec()
         self.allocate(spec)
-        registered = target.prepare_registration(spec, caller=fixtures.WRAPPER, now=fixtures.NOW)
-        row = target.mark_prepared(spec.execution_id, caller=fixtures.WRAPPER, expected_revision=0)
+        # Publication now acquires POLICY too. Set up the real persisted binding
+        # with an explicit neutral provider; observe/fault only the later claim.
+        # Do not erase initialized binding state or reset the observed counters.
+        with patch.object(target._policy, "provider", self.preparation_policy):
+            registered = target.prepare_registration(spec, caller=fixtures.WRAPPER, now=fixtures.NOW)
+            row = target.mark_prepared(spec.execution_id, caller=fixtures.WRAPPER, expected_revision=0)
         args = dict(caller=fixtures.WRAPPER, expected_revision=row["state_revision"],
                     claim_token=registered["claim_token"], spec_hash=spec.spec_hash,
                     guardian_epoch="fixture-guardian")
@@ -133,11 +138,12 @@ class AdaptivePolicyScopeTests(unittest.TestCase):
         self.assertEqual((row["state"], row["claim_consumed"], row["launch_in_flight"]), ("PREPARED", 0, 0))
         self.assertIsNotNone(self.connection().execute("SELECT 1 FROM reservations WHERE id=?", (spec.reservation.id,)).fetchone())
 
-    def assert_new_store_still_blocked(self, nonce):
+    def assert_new_store_still_blocked(self, nonce, spec, args):
         provider = ObservedPolicy(self)
         new_store = LifecycleStore(self.db, evidence_provider=fixture_evidence_provider(self.verifier),
                                    policy_provider=provider)
-        spec, args = self.prepared(new_store)
+        # This execution was prepared before the uncertain operation. Creating
+        # it here would itself need POLICY and never reach the claim under test.
         with self.assertRaisesRegex(LifecycleError, "policy_scope_busy"):
             new_store.claim_launch(spec.execution_id, **args)
         self.assertEqual(provider.holds, 0)
@@ -174,6 +180,7 @@ class AdaptivePolicyScopeTests(unittest.TestCase):
 
     def test_synthetic_evidence_does_not_implicitly_enable_policy_fixture(self):
         spec, args = self.prepared()
+        before = self.runtime()
         default = LifecycleStore(self.db, evidence_provider=fixture_evidence_provider(self.verifier))
         with patch("sentinel.adaptive.policy.NativePolicyProvider.current_logon",
                    side_effect=PolicyError("policy_test_native_unavailable")) as identity:
@@ -181,6 +188,7 @@ class AdaptivePolicyScopeTests(unittest.TestCase):
                 default.claim_launch(spec.execution_id, **args)
         identity.assert_called_once()
         self.assertEqual(self.policy.holds, 0)
+        self.assertEqual(self.runtime(), before)
         self.assert_unclaimed(spec)
 
     def test_malformed_partial_or_other_logon_binding_cannot_reach_wait(self):
@@ -203,13 +211,14 @@ class AdaptivePolicyScopeTests(unittest.TestCase):
             self.store.claim_launch(spec.execution_id, **args)
         self.assertEqual(self.policy.holds, 0)
 
-    def test_current_logon_mismatch_cannot_pin_binding_or_wait(self):
+    def test_current_logon_mismatch_cannot_rebind_or_wait(self):
         spec, args = self.prepared()
+        before = self.runtime()
         self.policy.logon_id = "S-1-5-5-9-9"
         with self.assertRaisesRegex(LifecycleError, "policy_logon_mismatch"):
             self.store.claim_launch(spec.execution_id, **args)
         self.assertEqual(self.policy.holds, 0)
-        self.assertIsNone(self.runtime()["policy_instance_id"])
+        self.assertEqual(self.runtime(), before)
         self.assert_unclaimed(spec)
 
     def test_initialized_binding_erasure_cannot_create_another_mutex_identity(self):
@@ -228,14 +237,28 @@ class AdaptivePolicyScopeTests(unittest.TestCase):
         self.assertIsNone(runtime["policy_entry_nonce"])
         self.assert_unclaimed(next_spec)
 
-    def test_populated_binding_with_uninitialized_marker_cannot_reach_wait(self):
-        spec, args = self.prepared()
+    def test_populated_binding_with_uninitialized_marker_cannot_publish_or_wait(self):
+        # Exercise genuinely uninitialized storage before first publication;
+        # never reset a live binding merely to recreate the former fixture.
+        initial = self.runtime()
+        self.assertEqual(initial["policy_binding_initialized"], 0)
+        for field in ("policy_instance_id", "policy_logon_id", "policy_entry_nonce"):
+            self.assertIsNone(initial[field])
+        spec = self.spec()
+        self.allocate(spec)
         self.connection().execute("UPDATE adaptive_runtime SET policy_instance_id=?,policy_logon_id=?",
                                   (str(uuid4()), fixtures.WRAPPER.logon_id))
+        before = self.runtime()
+        allocation = dict(self.connection().execute("SELECT * FROM reservations WHERE id=?",
+                                                    (spec.reservation.id,)).fetchone())
         with self.assertRaisesRegex(LifecycleError, "policy_binding_invalid"):
-            self.store.claim_launch(spec.execution_id, **args)
+            self.store.prepare_registration(spec, caller=fixtures.WRAPPER, now=fixtures.NOW)
         self.assertEqual(self.policy.holds, 0)
-        self.assert_unclaimed(spec)
+        self.assertEqual(self.runtime(), before)
+        self.assertIsNone(self.connection().execute("SELECT 1 FROM managed_executions WHERE execution_id=?",
+                                                   (spec.execution_id,)).fetchone())
+        self.assertEqual(dict(self.connection().execute("SELECT * FROM reservations WHERE id=?",
+                                                       (spec.reservation.id,)).fetchone()), allocation)
 
     def test_missing_binding_marker_column_cannot_reach_wait(self):
         spec, args = self.prepared()
@@ -247,13 +270,14 @@ class AdaptivePolicyScopeTests(unittest.TestCase):
 
     def test_nonce_persistence_failure_prevents_native_wait(self):
         spec, args = self.prepared()
+        before = self.runtime()
         self.connection().execute("""CREATE TRIGGER fail_policy_entry BEFORE UPDATE OF policy_entry_nonce ON adaptive_runtime
             WHEN NEW.policy_entry_nonce IS NOT NULL BEGIN SELECT RAISE(ABORT,'fixture prewait failure'); END""")
         with self.assertRaisesRegex(sqlite3.IntegrityError, "fixture prewait failure"):
             self.store.claim_launch(spec.execution_id, **args)
         self.assertEqual(self.policy.holds, 0)
         self.assertIsNone(self.runtime()["policy_entry_nonce"])
-        self.assertIsNone(self.runtime()["policy_instance_id"])
+        self.assertEqual(self.runtime(), before)
         self.assert_unclaimed(spec)
 
     def test_positive_timeout_clears_own_nonce_and_can_retry_original_claim(self):
@@ -296,6 +320,7 @@ class AdaptivePolicyScopeTests(unittest.TestCase):
 
     def test_release_failure_after_commit_cannot_ack_or_reissue_launch(self):
         spec, args = self.prepared()
+        standby, standby_args = self.prepared()
         self.policy.exit_error = NativePolicyMutexError("policy_mutex_release_failed")
         with self.assertRaisesRegex(LifecycleError, "policy_mutex_release_failed"):
             self.store.claim_launch(spec.execution_id, **args)
@@ -307,7 +332,7 @@ class AdaptivePolicyScopeTests(unittest.TestCase):
         self.assertFalse(retry["launch_authorized"])
         self.assertTrue(retry["duplicate"])
         self.assertEqual(self.policy.holds, calls)
-        self.assert_new_store_still_blocked(nonce)
+        self.assert_new_store_still_blocked(nonce, standby, standby_args)
 
     def test_handle_close_failure_retains_nonce_despite_completed_release(self):
         spec, args = self.prepared()
@@ -398,7 +423,7 @@ class AdaptivePolicyScopeTests(unittest.TestCase):
         self.assertEqual(self.runtime()["admission_barrier"], "NONE")
         self.assert_unclaimed(spec)
         self.connection().execute("DROP TRIGGER fail_recovery_hold")
-        self.assert_new_store_still_blocked(nonce)
+        self.assert_new_store_still_blocked(nonce, spec, args)
 
     def test_nonce_clear_write_failure_is_not_a_success_ack(self):
         spec, args = self.prepared()

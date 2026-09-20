@@ -14,6 +14,7 @@ import math
 import os
 import re
 import sqlite3
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -203,6 +204,7 @@ class Coordinator:
         db_path: str | os.PathLike[str] | None = None,
         pid_identity: Callable[[int], tuple[bool | None, float]] | None = None,
         local_host_id: str | None = None,
+        policy_provider=None,
     ) -> None:
         self.local_host_id = local_host_identity() if local_host_id is None else local_host_id
         if not isinstance(self.local_host_id, str) or not self.local_host_id.strip():
@@ -211,20 +213,26 @@ class Coordinator:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = Path(db_path) if db_path else self.data_dir / "sentinel.db"
         self.pid_identity = pid_identity or _default_pid_identity
+        self._managed_policy_provider = policy_provider
+        self._managed_store = None
+        self._managed_store_lock = threading.Lock()
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
-        conn.row_factory = sqlite3.Row
         try:
+            conn.row_factory = sqlite3.Row
             check_schema_version(conn)
             conn.execute("PRAGMA busy_timeout=10000")
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA foreign_keys=ON")
             return conn
-        except BaseException:
-            conn.close()
+        except BaseException as primary:
+            try:
+                conn.close()
+            except BaseException:
+                primary.add_note("coordinator_connection_cleanup_failed")
             raise
 
     @contextmanager
@@ -234,6 +242,100 @@ class Coordinator:
             yield conn
         finally:
             conn.close()
+
+    def _managed_lifecycle_store(self):
+        # Legacy admission does not initialize or acquire a native policy
+        # provider. Explicit fixture injection is the only synthetic seam.
+        from sentinel.adaptive.store import LifecycleStore
+        with self._managed_store_lock:
+            if self._managed_store is None:
+                self._managed_store = LifecycleStore(
+                    self.db_path, policy_provider=self._managed_policy_provider,
+                    local_host_id=self.local_host_id)
+            return self._managed_store
+
+    @staticmethod
+    def _commit_admission(conn, transaction):
+        if transaction is not None:
+            # A COMMIT error can be a lost acknowledgement. A later successful
+            # rollback must never turn that uncertainty into a clean rejection.
+            transaction["commit_attempted"] = True
+        conn.execute("COMMIT")
+
+    @contextmanager
+    def _admission_db(self, managed, context):
+        if managed is None:
+            with self._db() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                yield conn, None, True, None
+            return
+
+        from sentinel.adaptive.policy import PolicyBusy, PolicyError
+        from sentinel.adaptive.store import LifecycleError
+        policy = self._managed_lifecycle_store()._policy
+        logon = policy.current_logon()
+        if logon != managed.wrapper_identity.logon_id:
+            raise PolicyError("policy_logon_mismatch")
+        deadline = time.monotonic() + 1.0
+        while True:
+            try:
+                guard = policy.prepare(logon)
+                break
+            except PolicyBusy as error:
+                if getattr(error, "__notes__", ()) or time.monotonic() >= deadline:
+                    raise
+                # No native scope or database connection survives this wait.
+                time.sleep(min(.01, max(0, deadline - time.monotonic())))
+        with policy.hold(guard):
+            # Native identity and canonical ledger checks remain outside the
+            # capacity transaction. Contention has not consumed first submission.
+            try:
+                snapshot, first_submission = context.begin_submission(db_path=self.db_path)
+            except BaseException as primary:
+                # No capacity transaction or publication has begun. A retained
+                # context's rejection does not leave a new launch outcome.
+                if not getattr(primary, "__notes__", ()):
+                    guard.clean_rejection = True
+                raise
+            if snapshot is not managed:
+                guard.clean_rejection = True
+                raise LifecycleError("managed_admission_context_changed")
+            transaction = {"commit_attempted": False}
+            try:
+                conn = self._connect()
+            except BaseException as primary:
+                # _connect preserves the original error and flags an unverified
+                # close. No capacity transaction has begun on this path.
+                if not getattr(primary, "__notes__", ()):
+                    guard.clean_rejection = True
+                raise
+            rolled_back = False
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                policy.assert_held(guard)
+                policy.revalidate(conn, guard)
+                yield conn, policy, first_submission, transaction
+                if conn.in_transaction:
+                    raise LifecycleError("managed_admission_transaction_unfinished")
+            except BaseException as primary:
+                try:
+                    conn.rollback()
+                    rolled_back = not conn.in_transaction
+                except BaseException:
+                    primary.add_note("managed_admission_rollback_failed")
+                try:
+                    conn.close()
+                except BaseException:
+                    primary.add_note("managed_admission_connection_cleanup_failed")
+                if (rolled_back and not transaction["commit_attempted"] and
+                        not getattr(primary, "__notes__", ())):
+                    guard.clean_rejection = True
+                raise
+            else:
+                try:
+                    conn.close()
+                except BaseException:
+                    raise LifecycleError("managed_admission_connection_cleanup_failed") from None
 
     def _init_db(self) -> None:
         with self._db() as conn:
@@ -438,9 +540,9 @@ class Coordinator:
         from sentinel.adaptive.admission import ManagedAdmission
         if type(context) is not ManagedAdmission:
             raise TypeError("managed_admission_context_required")
-        snapshot, first_submission = context.begin_submission(db_path=self.db_path)
+        snapshot = context.snapshot()
         return self._admit(snapshot.request, status, config=config, now=now,
-                           managed=snapshot, first_submission=first_submission)
+                           managed=snapshot, managed_context=context)
 
     def _admit(
         self,
@@ -450,7 +552,7 @@ class Coordinator:
         config: dict[str, Any] | None = None,
         now: float | None = None,
         managed=None,
-        first_submission: bool = True,
+        managed_context=None,
     ) -> dict[str, Any]:
         req = request.normalized()
         cfg = self._config(config, local_host_id=self.local_host_id)
@@ -472,35 +574,34 @@ class Coordinator:
         except (OSError, sqlite3.Error):
             pass  # unreadable exemption state never grants a bypass
         result: dict[str, Any]
-        with self._db() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self._admission_db(managed, managed_context) as (conn, policy, first_submission, transaction):
             self._cleanup_locked(conn, now, cfg, observations)
             legacy_blocker = legacy_lifecycle_blocker(conn) if not v2 else None
             if managed is not None:
                 replay = retry_managed_admission(conn, managed, local_context=cfg)
                 if replay is not None:
-                    conn.execute("COMMIT")
+                    self._commit_admission(conn, transaction)
                     return replay
             queued_existing = conn.execute("SELECT * FROM queue WHERE request_key=?", (req.request_key,)).fetchone()
             if managed is None and queued_existing and queued_existing["managed_execution_id"] is not None:
-                conn.execute("COMMIT")
+                self._commit_admission(conn, transaction)
                 return {"allowed": False, "reason": "managed_request_requires_context", "request_key": req.request_key}
             existing = conn.execute("SELECT * FROM reservations WHERE request_key=?", (req.request_key,)).fetchone()
             if existing:
                 if managed is not None:
-                    conn.execute("COMMIT")
+                    self._commit_admission(conn, transaction)
                     return {"allowed": False, "reason": "legacy_reservation_cannot_be_adopted",
                             "request_key": req.request_key}
                 if allocation_is_bound(conn, "direct", existing["id"]):
-                    conn.execute("COMMIT")
+                    self._commit_admission(conn, transaction)
                     return {"allowed": False, "reason": "managed_reservation_requires_exact_claim",
                             "request_key": req.request_key, "reservation_id": existing["id"]}
                 if legacy_blocker:
-                    conn.execute("COMMIT")
+                    self._commit_admission(conn, transaction)
                     return {"allowed": False, "reason": legacy_blocker,
                             "request_key": req.request_key, "reservation_id": existing["id"]}
                 if existing["spec_hash"] != req.spec_hash:
-                    conn.execute("COMMIT")
+                    self._commit_admission(conn, transaction)
                     return {
                         "allowed": False, "reason": "request_spec_mismatch",
                         "request_key": req.request_key, "reservation_id": existing["id"],
@@ -509,7 +610,7 @@ class Coordinator:
                     "UPDATE reservations SET heartbeat_at=?,expires_at=?,tool_use_id=?,writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?",
                     (now, now + float(cfg["reservation_ttl_min"]) * 60, req.tool_use_id, existing["id"]),
                 )
-                conn.execute("COMMIT")
+                self._commit_admission(conn, transaction)
                 self._mirror()
                 return {"allowed": True, "reservation_id": existing["id"], "reused": True, "request_key": req.request_key}
             handoffs = conn.execute(
@@ -520,7 +621,7 @@ class Coordinator:
                             if not allocation_is_bound(conn, "direct", row["id"])), None)
             if managed is None and not legacy_blocker and handoff and handoff["spec_hash"] == req.spec_hash:
                 conn.execute("UPDATE reservations SET tool_use_id=?,heartbeat_at=?,writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?", (req.tool_use_id, now, handoff["id"]))
-                conn.execute("COMMIT")
+                self._commit_admission(conn, transaction)
                 self._mirror()
                 return {"allowed": True, "reservation_id": handoff["id"], "reused": True, "request_key": handoff["request_key"]}
 
@@ -534,13 +635,13 @@ class Coordinator:
                     (managed is not None and (queued_existing["managed_execution_id"] != managed.execution_id or
                                               queued_existing["managed_binding_hash"] != managed.binding_hash or
                                               any(queued_existing[key] != value for key, value in immutable_queue.items())))):
-                conn.execute("COMMIT")
+                self._commit_admission(conn, transaction)
                 return {
                     "allowed": False, "reason": "request_spec_mismatch",
                     "request_key": req.request_key,
                 }
             if managed is not None and not first_submission and queued_existing is None:
-                conn.execute("COMMIT")
+                self._commit_admission(conn, transaction)
                 return {"allowed": False, "reason": "managed_request_missing", "request_key": req.request_key}
 
             conn.execute(
@@ -646,14 +747,14 @@ class Coordinator:
                 conn.execute("DELETE FROM queue WHERE request_key=?", (req.request_key,))
                 result = {"allowed": True, "reservation_id": reservation_id, "reused": False, "request_key": req.request_key}
                 if managed is not None:
-                    result = commit_managed_admission(conn, managed, reservation_id, now=now, local_context=cfg)
+                    result = commit_managed_admission(conn, managed, reservation_id, now=now, local_context=cfg, policy_coordinator=policy)
                 if exemption:
                     result.update(reason="user_exemption", exemption_id=exemption["id"], exemption_expires_at=exemption["expires_at"])
             else:
                 result = {"allowed": False, "reason": reason, "position": position, "request_key": req.request_key}
                 if cfg.get("admission_policy") == "resource-v2":
                     result.update(policy="resource-v2", blockers=details)
-            conn.execute("COMMIT")
+            self._commit_admission(conn, transaction)
         self._mirror()
         return result
 

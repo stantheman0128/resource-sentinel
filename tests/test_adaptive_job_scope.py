@@ -233,6 +233,59 @@ class AdaptiveJobScopeTests(unittest.TestCase):
                 with self.assertRaisesRegex(LifecycleError, "job_scope_evidence_mismatch"):
                     self.store.mark_prepared(spec.execution_id, caller=fixtures.WRAPPER, expected_revision=row["state_revision"])
                 self.assertEqual(self.store.query(spec.execution_id), row)
+                self.assertIsNone(self.runtime()["policy_entry_nonce"])
+        self.transform = lambda proof: proof
+        prepared = self.store.mark_prepared(spec.execution_id, caller=fixtures.WRAPPER,
+                                            expected_revision=row["state_revision"])
+        self.assertEqual(prepared["state"], "PREPARED")
+
+    def test_named_scope_rejection_with_evidence_cleanup_failure_keeps_nonce(self):
+        spec, _, row = self.scoped()
+        self.creation[spec.execution_id] = "created"
+        self.transform = lambda proof: replace(proof, job_nonce=uuid4().hex)
+        self.cleanup_error = RuntimeError("synthetic_scope_cleanup")
+        with self.assertRaisesRegex(LifecycleError, "job_scope_evidence_mismatch") as caught:
+            self.store.mark_prepared(spec.execution_id, caller=fixtures.WRAPPER,
+                                     expected_revision=row["state_revision"])
+        self.assertIn("lifecycle_evidence_cleanup_failed", caught.exception.__notes__)
+        self.assertEqual(self.store.query(spec.execution_id), row)
+        self.assertIsNotNone(self.runtime()["policy_entry_nonce"])
+        self.assertIsNone(self.store._policy.current_guard())
+
+    def test_provider_error_text_cannot_certify_prepublication_rejection(self):
+        spec, _, row = self.scoped()
+        self.creation[spec.execution_id] = "created"
+
+        class FailingScope:
+            def __enter__(self):
+                raise LifecycleError("job_scope_evidence_mismatch")
+
+            def __exit__(self, *args):
+                raise AssertionError("failed entry has no scope to exit")
+
+        self.store.evidence_provider = lambda *args: FailingScope()
+        with self.assertRaisesRegex(LifecycleError, "job_scope_evidence_mismatch"):
+            self.store.mark_prepared(spec.execution_id, caller=fixtures.WRAPPER,
+                                     expected_revision=row["state_revision"])
+        self.assertEqual(self.store.query(spec.execution_id), row)
+        self.assertIsNotNone(self.runtime()["policy_entry_nonce"])
+        self.assertIsNone(self.store._policy.current_guard())
+
+    def test_after_yield_error_cannot_impersonate_evidence_validation(self):
+        spec, _, row = self.scoped()
+        self.creation[spec.execution_id] = "created"
+        primary = LifecycleError("job_scope_evidence_mismatch")
+        with self.assertRaises(LifecycleError) as caught:
+            with self.store._publication_scope(fixtures.WRAPPER) as publication:
+                with self.store._evidence_scope("prepare", row, fixtures.WRAPPER,
+                                                publication=publication):
+                    # No publication transaction has certified a rollback;
+                    # matching error text in the yielded body proves nothing.
+                    raise primary
+        self.assertIs(caught.exception, primary)
+        self.assertFalse(publication[0].clean_rejection)
+        self.assertEqual(self.store.query(spec.execution_id), row)
+        self.assertIsNotNone(self.runtime()["policy_entry_nonce"])
 
     def test_preparation_cannot_claim_empty_before_native_create_attempt(self):
         spec, _, row = self.scoped()

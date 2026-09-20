@@ -29,8 +29,10 @@ class ManagedAdmissionTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.directory = Path(self.temp.name)
-        self.coordinator = Coordinator(self.directory, pid_identity=lambda pid: (None, 0.0))
         self.process = FakeCurrentProcess()
+        self.policy = FixturePolicyProvider(self.process.identity.logon_id)
+        self.coordinator = Coordinator(self.directory, pid_identity=lambda pid: (None, 0.0),
+                                       policy_provider=self.policy)
         override = patch("sentinel.adaptive.admission.VerifiedProcess.current", return_value=self.process)
         override.start()
         self.addCleanup(override.stop)
@@ -121,7 +123,7 @@ class ManagedAdmissionTests(unittest.TestCase):
                 original_cpu_disabled=True, durable_manifest=True, legacy_exclusion=True,
                 active_process_count=0, process_ids=())
         store = LifecycleStore(self.coordinator.db_path, evidence_provider=fixture_evidence_provider(verifier),
-                               policy_provider=FixturePolicyProvider(snapshot.wrapper_identity.logon_id))
+                               policy_provider=self.policy)
         prepared = store.mark_prepared(result["execution_id"], caller=snapshot.wrapper_identity, expected_revision=0)
         args = dict(caller=snapshot.wrapper_identity, claim_token=context.launch_claim_token(),
                     spec_hash=snapshot.spec_hash, guardian_epoch="synthetic-guardian",

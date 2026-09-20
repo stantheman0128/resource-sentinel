@@ -281,8 +281,10 @@ class S1ExecutionOwnerTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name)
-        self.coordinator = Coordinator(self.directory, pid_identity=lambda pid: (None, 0.0))
         self.current_process = FakeCurrentProcess()
+        self.policy = FixturePolicyProvider(self.current_process.identity.logon_id)
+        self.coordinator = Coordinator(self.directory, pid_identity=lambda pid: (None, 0.0),
+                                       policy_provider=self.policy)
         current = patch("sentinel.adaptive.admission.VerifiedProcess.current",
                         return_value=self.current_process)
         current.start()
@@ -296,7 +298,6 @@ class S1ExecutionOwnerTests(unittest.TestCase):
         self.assertTrue(admitted["allowed"], admitted)
         self.execution_id = admitted["execution_id"]
         self.reservation_id = admitted["reservation_id"]
-        self.policy = FixturePolicyProvider(self.current_process.identity.logon_id)
         self.store = LifecycleStore(self.coordinator.db_path, policy_provider=self.policy)
         self.events = []
         self.authority = SyntheticRuntimeAuthority(self.events)
@@ -355,10 +356,12 @@ class S1ExecutionOwnerTests(unittest.TestCase):
         # any authority over this fixture's already admitted execution.
         directory = self.directory / "runtime-ledger"
         directory.mkdir()
-        coordinator = Coordinator(directory, pid_identity=lambda pid: (None, 0.0))
+        runtime_policy = FixturePolicyProvider(self.current_process.identity.logon_id)
+        coordinator = Coordinator(directory, pid_identity=lambda pid: (None, 0.0),
+                                  policy_provider=runtime_policy)
         runtime = S1Runtime(coordinator=coordinator, authority=self.authority,
             native=self.native, store_factory=lambda path: LifecycleStore(path,
-                policy_provider=FixturePolicyProvider(self.current_process.identity.logon_id)))
+                policy_provider=runtime_policy))
         def release_synthetic_references():
             for admission in runtime.pending_admissions:
                 admission.close()

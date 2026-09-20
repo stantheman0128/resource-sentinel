@@ -87,7 +87,8 @@ class NativeCancelProtocolTests(unittest.TestCase):
         self.assertFalse(context._cancel_sealed)
         self.assertIsNone(context._cancel_target)
         self.assertIsNotNone(context._claim_token)
-        copied_coordinator = Coordinator(self.directory, db_path=copied, pid_identity=lambda pid: (None, 0.0))
+        copied_coordinator = Coordinator(self.directory, db_path=copied, pid_identity=lambda pid: (None, 0.0),
+                                         policy_provider=self.policy)
         from tests.test_adaptive_coordinator import CONFIG, status
         with self.assertRaisesRegex(ManagedAdmissionUnavailable, "managed_admission_ledger_mismatch"):
             copied_coordinator.admit_managed(context, status(now=NOW), config=CONFIG, now=NOW)

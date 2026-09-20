@@ -528,7 +528,8 @@ def retry_managed_admission(conn: sqlite3.Connection, admission, *, local_contex
     return _admission_result(row, admission.request.request_key, reused=True)
 
 
-def commit_managed_admission(conn: sqlite3.Connection, admission, reservation_id: str, *, now: float, local_context) -> dict[str, Any]:
+def commit_managed_admission(conn: sqlite3.Connection, admission, reservation_id: str, *, now: float,
+                             local_context, policy_coordinator=None) -> dict[str, Any]:
     """Bind a new direct reservation inside its admission transaction.
 
     The self-wrapper context is authenticated before acquiring the transaction.
@@ -536,6 +537,16 @@ def commit_managed_admission(conn: sqlite3.Connection, admission, reservation_id
     """
     if not conn.in_transaction:
         raise LifecycleError("transaction_required")
+    from .policy import PolicyCoordinator, PolicyError
+    if type(policy_coordinator) is not PolicyCoordinator:
+        raise LifecycleError("policy_scope_not_held")
+    try:
+        guard = policy_coordinator.assert_held()
+        if guard.binding.logon_id != admission.wrapper_identity.logon_id:
+            raise PolicyError("policy_logon_mismatch")
+        policy_coordinator.revalidate(conn, guard)
+    except PolicyError as error:
+        raise LifecycleError(str(error)) from error
     _check_version(conn)
     allocation = conn.execute("SELECT * FROM reservations WHERE id=?", (reservation_id,)).fetchone()
     if (allocation is None or allocation["execution_id"] != admission.execution_id or
@@ -819,6 +830,75 @@ class LifecycleStore:
                     primary.add_note("lifecycle_transaction_rollback_failed")
                 raise
 
+    @contextmanager
+    def _publication_scope(self, caller):
+        """Serialize first wrapper and Job metadata publication with POLICY.
+
+        A caller already holding this exact store's current-thread scope lends
+        it; this method never releases or re-enters borrowed ownership. Native
+        waiting and evidence collection precede the publication transaction.
+        """
+        from .policy import PolicyBusy, PolicyError
+        from .windows import NativePolicyMutexError
+        try:
+            guard = self._policy.current_guard()
+            if guard is not None:
+                self._policy.assert_held(guard)
+                if guard.binding.logon_id != caller.logon_id:
+                    raise PolicyError("policy_logon_mismatch")
+                yield guard, False
+                return
+            logon = self._policy.current_logon()
+            if logon != caller.logon_id:
+                raise PolicyError("policy_logon_mismatch")
+            deadline = time.monotonic() + 1.0
+            while True:
+                try:
+                    guard = self._policy.prepare(logon)
+                    break
+                except PolicyBusy as error:
+                    if getattr(error, "__notes__", ()) or time.monotonic() >= deadline:
+                        raise
+                    time.sleep(min(.01, max(0, deadline - time.monotonic())))
+            with self._policy.hold(guard):
+                yield guard, True
+        except (PolicyError, NativePolicyMutexError) as error:
+            translated = LifecycleError(str(error))
+            for note in getattr(error, "__notes__", ()):
+                translated.add_note(note)
+            raise translated from error
+
+    @contextmanager
+    def _publication_transaction(self, guard, owns_scope):
+        # Separate from _transaction so only this publication's positively
+        # rolled-back pre-commit rejection can release its durable entry nonce.
+        commit_attempted = False
+        rolled_back = False
+        connection_entered = False
+        try:
+            with self._connection() as conn:
+                connection_entered = True
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    _check_version(conn)
+                    self._policy.assert_held(guard)
+                    self._policy.revalidate(conn, guard)
+                    yield conn
+                    commit_attempted = True
+                    conn.commit()
+                except BaseException as primary:
+                    try:
+                        conn.rollback()
+                        rolled_back = not conn.in_transaction
+                    except BaseException:
+                        primary.add_note("lifecycle_transaction_rollback_failed")
+                    raise
+        except BaseException as primary:
+            if (owns_scope and (rolled_back or not connection_entered) and not commit_attempted and
+                    not getattr(primary, "__notes__", ())):
+                guard.clean_rejection = True
+            raise
+
     @staticmethod
     def _public(row: Mapping[str, Any]) -> dict[str, Any]:
         return {key: row[key] for key in row.keys() if key not in {"claim_token_hash", "ipc_auth_key"}}
@@ -921,7 +1001,7 @@ class LifecycleStore:
             raise LifecycleError("caller_identity_mismatch")
 
     @contextmanager
-    def _evidence_scope(self, operation: str, row: Mapping[str, Any], caller: ProcessIdentity):
+    def _evidence_scope(self, operation: str, row: Mapping[str, Any], caller: ProcessIdentity, *, publication=None):
         """Verify before SQLite; retain evidence authority through commit/rollback.
 
         The trusted provider acquires and validates native resources in enter,
@@ -942,28 +1022,44 @@ class LifecycleStore:
         if not callable(enter) or not callable(leave):
             raise LifecycleError("invalid_lifecycle_evidence_scope")
         evidence = enter(scope)
+        decision_error = None
         try:
-            if (not isinstance(evidence, LifecycleEvidence) or evidence.operation != operation or
-                    evidence.execution_id != row["execution_id"] or evidence.state_revision != row["state_revision"] or
-                    evidence.caller != caller or not isinstance(evidence.observation_id, str) or not evidence.observation_id):
-                raise LifecycleError("invalid_lifecycle_evidence")
-            if "job_nonce" in row.keys() and row["job_nonce"] is not None and (
-                    evidence.job_nonce != row["job_nonce"] or evidence.job_name != row["job_name"] or
-                    evidence.guardian_epoch != row["guardian_epoch"]):
-                raise LifecycleError("job_scope_evidence_mismatch")
-            if operation != "register_scope" and evidence.job_nonce is not None and (
-                    "job_nonce" not in row.keys() or row["job_nonce"] is None):
-                # A new native provider cannot silently fall into the older
-                # nonce-less synthetic seam and skip pre-Create registration.
-                raise LifecycleError("job_scope_not_registered")
+            try:
+                if (not isinstance(evidence, LifecycleEvidence) or evidence.operation != operation or
+                        evidence.execution_id != row["execution_id"] or evidence.state_revision != row["state_revision"] or
+                        evidence.caller != caller or not isinstance(evidence.observation_id, str) or not evidence.observation_id):
+                    raise LifecycleError("invalid_lifecycle_evidence")
+                if "job_nonce" in row.keys() and row["job_nonce"] is not None and (
+                        evidence.job_nonce != row["job_nonce"] or evidence.job_name != row["job_name"] or
+                        evidence.guardian_epoch != row["guardian_epoch"]):
+                    raise LifecycleError("job_scope_evidence_mismatch")
+                if operation != "register_scope" and evidence.job_nonce is not None and (
+                        "job_nonce" not in row.keys() or row["job_nonce"] is None):
+                    # A new native provider cannot silently fall into the older
+                    # nonce-less synthetic seam and skip pre-Create registration.
+                    raise LifecycleError("job_scope_not_registered")
+            except LifecycleError as error:
+                # Only validation performed here, before yielding to the
+                # publication body, proves that no publication was attempted.
+                decision_error = error
+                raise
             yield evidence
         except BaseException as primary:
+            cleaned = False
             try:
-                # Ignore __exit__'s suppression request. Evidence cleanup has
-                # no authority to convert a failed decision into a success.
-                leave(scope, type(primary), primary, primary.__traceback__)
+                # Suppression cannot turn failure into success or certify a
+                # clean publication rejection. Retain its uncertainty as a note.
+                suppressed = leave(scope, type(primary), primary, primary.__traceback__)
+                if suppressed:
+                    primary.add_note("lifecycle_evidence_cleanup_unverified")
+                cleaned = not suppressed and not getattr(primary, "__notes__", ())
             except BaseException:
                 primary.add_note("lifecycle_evidence_cleanup_failed")
+            if (publication is not None and publication[1] and
+                    primary is decision_error and cleaned):
+                # The retained evidence scope has positively closed; no writer
+                # transaction was entered and no commit ACK can be uncertain.
+                publication[0].clean_rejection = True
             raise
         else:
             try:
@@ -1003,73 +1099,75 @@ class LifecycleStore:
         row = _registration_row(spec, now)
         # Every attempt authenticates caller, including retries; a public spec is
         # not evidence that the process/session or parent membership is real.
-        with self._evidence_scope("register", row, caller) as proof:
-            raw_token = secrets.token_urlsafe(32)
-            row["claim_token_hash"] = hashlib.sha256(raw_token.encode("ascii")).hexdigest()
-            with self._transaction() as conn:
-                previous = conn.execute("SELECT * FROM managed_executions WHERE execution_id=?", (spec.execution_id,)).fetchone()
-                if previous is not None:
-                    immutable = [key for key in row if key not in {"created_at", "heartbeat_at", "state", "state_revision", "claim_token_hash"} and not key.startswith("floor_")]
-                    if any(previous[key] != row[key] for key in immutable):
-                        raise LifecycleError("execution_spec_mismatch")
-                    if previous["state"] not in TERMINAL_STATES:
-                        self._require_allocation(conn, spec.execution_id)
-                    return {**self._public(previous), "claim_token": None, "registered": False}
-                if kind == "parent":
-                    parent = self._get(conn, spec.parent_execution_id)
-                    if parent["logon_id"] != row["logon_id"] or parent["state"] not in {"RUNNING", "DRAINING"} or not proof.parent_membership:
-                        raise LifecycleError("parent_membership_unverified")
-                    ancestor = parent
-                    visited = {spec.execution_id}
-                    for _ in range(128):
-                        if ancestor["execution_id"] in visited:
-                            raise LifecycleError("parent_cycle")
-                        visited.add(ancestor["execution_id"])
-                        if ancestor["logon_id"] != row["logon_id"] or ancestor["state"] not in {"RUNNING", "DRAINING"}:
+        self._caller(row, caller)
+        with self._publication_scope(caller) as publication:
+            with self._evidence_scope("register", row, caller, publication=publication) as proof:
+                raw_token = secrets.token_urlsafe(32)
+                row["claim_token_hash"] = hashlib.sha256(raw_token.encode("ascii")).hexdigest()
+                with self._publication_transaction(*publication) as conn:
+                    previous = conn.execute("SELECT * FROM managed_executions WHERE execution_id=?", (spec.execution_id,)).fetchone()
+                    if previous is not None:
+                        immutable = [key for key in row if key not in {"created_at", "heartbeat_at", "state", "state_revision", "claim_token_hash"} and not key.startswith("floor_")]
+                        if any(previous[key] != row[key] for key in immutable):
+                            raise LifecycleError("execution_spec_mismatch")
+                        if previous["state"] not in TERMINAL_STATES:
+                            self._require_allocation(conn, spec.execution_id)
+                        return {**self._public(previous), "claim_token": None, "registered": False}
+                    if kind == "parent":
+                        parent = self._get(conn, spec.parent_execution_id)
+                        if parent["logon_id"] != row["logon_id"] or parent["state"] not in {"RUNNING", "DRAINING"} or not proof.parent_membership:
                             raise LifecycleError("parent_membership_unverified")
-                        if ancestor["allocation_kind"] != "parent":
-                            break
-                        ancestor = self._get(conn, ancestor["parent_execution_id"])
+                        ancestor = parent
+                        visited = {spec.execution_id}
+                        for _ in range(128):
+                            if ancestor["execution_id"] in visited:
+                                raise LifecycleError("parent_cycle")
+                            visited.add(ancestor["execution_id"])
+                            if ancestor["logon_id"] != row["logon_id"] or ancestor["state"] not in {"RUNNING", "DRAINING"}:
+                                raise LifecycleError("parent_membership_unverified")
+                            if ancestor["allocation_kind"] != "parent":
+                                break
+                            ancestor = self._get(conn, ancestor["parent_execution_id"])
+                        else:
+                            raise LifecycleError("parent_depth_exceeded")
+                        if any(row["requested_" + resource] > parent["requested_" + resource] for resource in spec.requested.to_dict()):
+                            raise LifecycleError("nested_budget_upgrade_required")
                     else:
-                        raise LifecycleError("parent_depth_exceeded")
-                    if any(row["requested_" + resource] > parent["requested_" + resource] for resource in spec.requested.to_dict()):
-                        raise LifecycleError("nested_budget_upgrade_required")
-                else:
-                    table = _TABLES[kind]
-                    if not _has_table(conn, table):
-                        raise LifecycleError("allocation_not_found")
-                    allocation = conn.execute(f"SELECT * FROM {table} WHERE id=?", (spec.reservation.id,)).fetchone()
-                    if allocation is None:
-                        raise LifecycleError("allocation_not_found")
-                    if allocation_is_bound(conn, kind, spec.reservation.id):
-                        raise LifecycleError("allocation_already_bound")
-                    if allocation["spec_hash"] != spec.spec_hash:
-                        raise LifecycleError("reservation_spec_mismatch")
-                    if allocation["expires_at"] <= now:
-                        raise LifecycleError("reservation_expired")
-                    physical = allocation["physical_bytes"]
-                    physical = int(float(allocation["ram_gib"]) * (1 << 30)) if physical is None else physical
-                    commit = allocation["commit_bytes"] if allocation["commit_bytes"] is not None else physical
-                    io = allocation["io_slots"] if allocation["io_slots"] is not None else 1
-                    if (allocation["cpu_units"], physical, commit, io) != (spec.requested.cpu_units, spec.requested.physical_bytes, spec.requested.commit_bytes, spec.requested.io_slots):
-                        raise LifecycleError("reservation_resource_mismatch")
-                    if kind == "routed":
-                        if allocation["task_id"] != spec.task_id:
-                            raise LifecycleError("allocation_task_mismatch")
-                        worker = conn.execute("SELECT capabilities_json FROM workers WHERE id=?", (allocation["worker_id"],)).fetchone()
-                        try:
-                            capabilities = json.loads(worker[0]) if worker is not None else None
-                        except (TypeError, ValueError):
-                            capabilities = None
-                        if resolve_worker_locality(capabilities, self._local_context) != "local":
-                            raise LifecycleError("nonlocal_allocation")
-                    conn.execute(f"UPDATE {table} SET execution_id=?,lifecycle_managed=1,physical_bytes=?,commit_bytes=?,writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?",
-                                 (spec.execution_id, physical, commit, spec.reservation.id))
-                names = ",".join(row)
-                conn.execute(f"INSERT INTO managed_executions({names}) VALUES({','.join('?' for _ in row)})", tuple(row.values()))
-                self._require_allocation(conn, spec.execution_id)
-                _bump_registry(conn)
-                return {**self._public(self._get(conn, spec.execution_id)), "claim_token": raw_token, "registered": True}
+                        table = _TABLES[kind]
+                        if not _has_table(conn, table):
+                            raise LifecycleError("allocation_not_found")
+                        allocation = conn.execute(f"SELECT * FROM {table} WHERE id=?", (spec.reservation.id,)).fetchone()
+                        if allocation is None:
+                            raise LifecycleError("allocation_not_found")
+                        if allocation_is_bound(conn, kind, spec.reservation.id):
+                            raise LifecycleError("allocation_already_bound")
+                        if allocation["spec_hash"] != spec.spec_hash:
+                            raise LifecycleError("reservation_spec_mismatch")
+                        if allocation["expires_at"] <= now:
+                            raise LifecycleError("reservation_expired")
+                        physical = allocation["physical_bytes"]
+                        physical = int(float(allocation["ram_gib"]) * (1 << 30)) if physical is None else physical
+                        commit = allocation["commit_bytes"] if allocation["commit_bytes"] is not None else physical
+                        io = allocation["io_slots"] if allocation["io_slots"] is not None else 1
+                        if (allocation["cpu_units"], physical, commit, io) != (spec.requested.cpu_units, spec.requested.physical_bytes, spec.requested.commit_bytes, spec.requested.io_slots):
+                            raise LifecycleError("reservation_resource_mismatch")
+                        if kind == "routed":
+                            if allocation["task_id"] != spec.task_id:
+                                raise LifecycleError("allocation_task_mismatch")
+                            worker = conn.execute("SELECT capabilities_json FROM workers WHERE id=?", (allocation["worker_id"],)).fetchone()
+                            try:
+                                capabilities = json.loads(worker[0]) if worker is not None else None
+                            except (TypeError, ValueError):
+                                capabilities = None
+                            if resolve_worker_locality(capabilities, self._local_context) != "local":
+                                raise LifecycleError("nonlocal_allocation")
+                        conn.execute(f"UPDATE {table} SET execution_id=?,lifecycle_managed=1,physical_bytes=?,commit_bytes=?,writer_protocol=1,writer_revision=writer_revision+1 WHERE id=?",
+                                     (spec.execution_id, physical, commit, spec.reservation.id))
+                    names = ",".join(row)
+                    conn.execute(f"INSERT INTO managed_executions({names}) VALUES({','.join('?' for _ in row)})", tuple(row.values()))
+                    self._require_allocation(conn, spec.execution_id)
+                    _bump_registry(conn)
+                    return {**self._public(self._get(conn, spec.execution_id)), "claim_token": raw_token, "registered": True}
 
     def register_job_scope(self, execution_id: str, *, caller: ProcessIdentity,
                            expected_revision: int, guardian_epoch: str,
@@ -1153,32 +1251,34 @@ class LifecycleStore:
     def mark_prepared(self, execution_id: str, *, caller: ProcessIdentity, expected_revision: int) -> dict[str, Any]:
         snapshot = self.query(execution_id)
         self._require_revision(snapshot, expected_revision)
-        with self._evidence_scope("prepare", snapshot, caller) as proof:
-            if (not proof.guardian_epoch or not proof.job_name or not proof.original_cpu_disabled or
-                    not proof.durable_manifest or not proof.legacy_exclusion or type(proof.active_process_count) is not int or
-                    proof.active_process_count != 0 or proof.process_ids != () or proof.job_creation_never_attempted):
-                raise LifecycleError("job_preparation_unverified")
-            with self._transaction() as conn:
-                row = self._get(conn, execution_id)
-                self._require_revision(row, expected_revision)
-                if row["state"] != "RESERVED" or row["allocation_kind"] == "parent":
-                    raise LifecycleError("invalid_lifecycle_transition")
-                self._require_allocation(conn, execution_id)
-                enrolled = conn.execute("""SELECT count(*) FROM managed_executions
-                    WHERE allocation_kind IN ('direct','routed') AND job_name IS NOT NULL
-                      AND execution_id!=?
-                      AND state NOT IN ('FINISHED','CANCELLED_BEFORE_START','START_FAILED')""", (execution_id,)).fetchone()[0]
-                if enrolled >= MAX_ENROLLED_JOBS:
-                    raise LifecycleError("managed_job_limit_reached")
-                if row["job_nonce"] is not None and (row["job_name"] != proof.job_name or
-                        row["job_nonce"] != proof.job_nonce or row["guardian_epoch"] != proof.guardian_epoch):
-                    raise LifecycleError("job_scope_evidence_mismatch")
-                runtime = conn.execute("SELECT * FROM adaptive_runtime WHERE singleton=1").fetchone()
-                if runtime["active_logon_id"] not in {"", row["logon_id"]} or runtime["guardian_epoch"] not in {"", proof.guardian_epoch}:
-                    raise LifecycleError("guardian_identity_mismatch")
-                conn.execute("UPDATE adaptive_runtime SET active_logon_id=?,guardian_epoch=? WHERE singleton=1", (row["logon_id"], proof.guardian_epoch))
-                return self._public(self._cas(conn, execution_id, expected_revision, {"state": "PREPARED", "job_name": proof.job_name,
-                                    "guardian_epoch": proof.guardian_epoch, "coverage": "job_contained"}))
+        self._caller(snapshot, caller)
+        with self._publication_scope(caller) as publication:
+            with self._evidence_scope("prepare", snapshot, caller, publication=publication) as proof:
+                with self._publication_transaction(*publication) as conn:
+                    if (not proof.guardian_epoch or not proof.job_name or not proof.original_cpu_disabled or
+                            not proof.durable_manifest or not proof.legacy_exclusion or type(proof.active_process_count) is not int or
+                            proof.active_process_count != 0 or proof.process_ids != () or proof.job_creation_never_attempted):
+                        raise LifecycleError("job_preparation_unverified")
+                    row = self._get(conn, execution_id)
+                    self._require_revision(row, expected_revision)
+                    if row["state"] != "RESERVED" or row["allocation_kind"] == "parent":
+                        raise LifecycleError("invalid_lifecycle_transition")
+                    self._require_allocation(conn, execution_id)
+                    enrolled = conn.execute("""SELECT count(*) FROM managed_executions
+                        WHERE allocation_kind IN ('direct','routed') AND job_name IS NOT NULL
+                          AND execution_id!=?
+                          AND state NOT IN ('FINISHED','CANCELLED_BEFORE_START','START_FAILED')""", (execution_id,)).fetchone()[0]
+                    if enrolled >= MAX_ENROLLED_JOBS:
+                        raise LifecycleError("managed_job_limit_reached")
+                    if row["job_nonce"] is not None and (row["job_name"] != proof.job_name or
+                            row["job_nonce"] != proof.job_nonce or row["guardian_epoch"] != proof.guardian_epoch):
+                        raise LifecycleError("job_scope_evidence_mismatch")
+                    runtime = conn.execute("SELECT * FROM adaptive_runtime WHERE singleton=1").fetchone()
+                    if runtime["active_logon_id"] not in {"", row["logon_id"]} or runtime["guardian_epoch"] not in {"", proof.guardian_epoch}:
+                        raise LifecycleError("guardian_identity_mismatch")
+                    conn.execute("UPDATE adaptive_runtime SET active_logon_id=?,guardian_epoch=? WHERE singleton=1", (row["logon_id"], proof.guardian_epoch))
+                    return self._public(self._cas(conn, execution_id, expected_revision, {"state": "PREPARED", "job_name": proof.job_name,
+                                        "guardian_epoch": proof.guardian_epoch, "coverage": "job_contained"}))
 
     def claim_launch(self, execution_id: str, *, caller: ProcessIdentity, claim_token: str, spec_hash: str, guardian_epoch: str, expected_revision: int) -> dict[str, Any]:
         from .policy import PolicyBusy, PolicyError

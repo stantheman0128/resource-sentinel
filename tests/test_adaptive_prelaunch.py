@@ -463,7 +463,8 @@ class AdaptivePrelaunchTests(unittest.TestCase):
             operation(spec, 0)
 
     def test_routed_registration_accepts_canonical_local_without_legacy_flag(self):
-        store = LifecycleStore(self.db, evidence_provider=fixture_evidence_provider(self.verifier), local_host_id="fixture-host")
+        store = LifecycleStore(self.db, evidence_provider=fixture_evidence_provider(self.verifier),
+                               local_host_id="fixture-host", policy_provider=self.policy)
         spec = self.spec(kind=AllocationKind.ROUTED)
         self.allocate(spec)
         self.connection().execute("UPDATE workers SET capabilities_json=?,writer_protocol=1,writer_revision=writer_revision+1",
@@ -474,7 +475,8 @@ class AdaptivePrelaunchTests(unittest.TestCase):
         self.assertEqual(self.allocation(spec)["execution_id"], spec.execution_id)
 
     def test_routed_registration_rejects_conflicting_or_remote_locality(self):
-        store = LifecycleStore(self.db, evidence_provider=fixture_evidence_provider(self.verifier), local_host_id="fixture-host")
+        store = LifecycleStore(self.db, evidence_provider=fixture_evidence_provider(self.verifier),
+                               local_host_id="fixture-host", policy_provider=self.policy)
         spec = self.spec(kind=AllocationKind.ROUTED)
         self.allocate(spec)
         before = self.allocation(spec)
@@ -498,7 +500,8 @@ class AdaptivePrelaunchTests(unittest.TestCase):
                 conn.close()
             return "fixture-host"
         with patch("sentinel.adaptive.store.local_host_identity", side_effect=host_identity) as observe:
-            store = LifecycleStore(self.db, evidence_provider=fixture_evidence_provider(self.verifier))
+            store = LifecycleStore(self.db, evidence_provider=fixture_evidence_provider(self.verifier),
+                                   policy_provider=self.policy)
             spec = self.spec(kind=AllocationKind.ROUTED)
             self.allocate(spec)
             self.connection().execute("UPDATE workers SET capabilities_json=?,writer_protocol=1,writer_revision=writer_revision+1",

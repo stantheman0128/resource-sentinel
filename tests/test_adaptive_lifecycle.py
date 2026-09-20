@@ -130,7 +130,7 @@ class AdaptiveLifecycleTests(unittest.TestCase):
     def test_default_store_refuses_self_reported_native_registration(self):
         spec = self.spec()
         self.allocate(spec)
-        default = LifecycleStore(self.db)
+        default = LifecycleStore(self.db, policy_provider=self.policy)
         with self.assertRaisesRegex(LifecycleError, "native_lifecycle_evidence_unavailable"):
             default.prepare_registration(spec, caller=WRAPPER, now=NOW)
         self.assertFalse(allocation_is_bound(self.connection(), "direct", spec.reservation.id))

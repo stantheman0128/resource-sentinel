@@ -254,8 +254,11 @@ class AdaptiveEvidenceScopeTests(unittest.TestCase):
             self.assertEqual([event for _, event in events],
                              ["enter", "verified", "commit_enter", "committed", "exit"])
             self.assertEqual(len({operation for operation, _ in events}), 1)
+        # Three registrations, one preparation and one launch claim each own
+        # POLICY. Each has its separate durable entry and clear transaction;
+        # none replaces the actual lifecycle commits asserted above.
         self.assertEqual(self.policy_events,
-                         [("policy_metadata", "commit_enter"), ("policy_metadata", "committed")] * 2)
+                         [("policy_metadata", "commit_enter"), ("policy_metadata", "committed")] * 10)
         self.assertIsNone(self.provider.active)
 
     def test_policy_metadata_cannot_disguise_a_mutation_without_evidence(self):
@@ -270,6 +273,19 @@ class AdaptiveEvidenceScopeTests(unittest.TestCase):
             sqlite3.Connection.rollback(conn)
         self.assertEqual(self.provider.events, [])
         self.assertEqual(self.policy_events, [])
+
+    def test_prepublication_rejection_with_suppressing_cleanup_keeps_nonce(self):
+        spec, _ = self.registered()
+        before = self.store.query(spec.execution_id)
+        self.provider.modify_evidence = lambda proof: replace(proof, state_revision=99)
+        self.provider.suppress = True
+        with self.assertRaisesRegex(LifecycleError, "invalid_lifecycle_evidence") as caught:
+            self.store.mark_prepared(spec.execution_id, caller=fixtures.WRAPPER,
+                                     expected_revision=0)
+        self.assertIn("lifecycle_evidence_cleanup_unverified", caught.exception.__notes__)
+        self.assertEqual(self.store.query(spec.execution_id), before)
+        self.assertIsNotNone(self.connection().execute(
+            "SELECT policy_entry_nonce FROM adaptive_runtime").fetchone()[0])
 
     def test_body_failure_rolls_back_before_cleanup_and_preserves_exact_exception(self):
         spec, _ = self.registered()

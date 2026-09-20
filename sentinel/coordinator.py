@@ -31,6 +31,7 @@ from sentinel.adaptive.store import (
     allocation_is_bound, check_schema_version, commit_managed_admission,
     hold_expired_allocations, migrate_schema, retry_managed_admission,
 )
+from sentinel.adaptive.capacity_schema import reservation_lease
 
 
 PRIORITY_RANK = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
@@ -727,21 +728,23 @@ class Coordinator:
                 allowed = True
 
             if allowed:
+                lease_duration, lease_deadline = reservation_lease(cfg["reservation_ttl_min"], now)
                 reservation_id = uuid.uuid4().hex
                 conn.execute(
                     """INSERT INTO reservations
                     (id,request_key,owner_pid,owner_started,tool_use_id,repo,command_signature,command_text,
                      resource_class,priority,priority_rank,cpu_units,ram_gib,io_slots,created_at,
                      heartbeat_at,expires_at,spec_hash,commit_bytes,execution_id,lifecycle_managed,managed_spec_hash,
-                     writer_protocol,writer_revision)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,0)""",
+                     lease_duration_sec,writer_protocol,writer_revision)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,0)""",
                     (
                         reservation_id, req.request_key, req.owner_pid, req.owner_started, req.tool_use_id,
                         req.repo, req.command_signature, redact_command(req.command), req.resource_class, req.priority,
                         PRIORITY_RANK[req.priority], req.cpu_units, req.ram_gib, req.io_slots, now, now,
-                        now + float(cfg["reservation_ttl_min"]) * 60, req.spec_hash, req.commit_bytes,
+                        lease_deadline, req.spec_hash, req.commit_bytes,
                         managed.execution_id if managed is not None else None, 1 if managed is not None else 0,
                         managed.spec_hash if managed is not None else None,
+                        lease_duration,
                     ),
                 )
                 conn.execute("DELETE FROM queue WHERE request_key=?", (req.request_key,))

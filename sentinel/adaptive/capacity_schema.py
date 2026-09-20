@@ -6,6 +6,7 @@ This adds no reservation ledger and performs no locality or allocation backfill.
 """
 from __future__ import annotations
 
+import math
 import sqlite3
 
 
@@ -28,6 +29,7 @@ CREATE TABLE IF NOT EXISTS reservations (
     created_at REAL NOT NULL,
     heartbeat_at REAL NOT NULL,
     expires_at REAL NOT NULL,
+    lease_duration_sec REAL,
     spec_hash TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS executions (
@@ -84,6 +86,7 @@ CREATE TABLE IF NOT EXISTS worker_reservations (
     created_at REAL NOT NULL,
     heartbeat_at REAL NOT NULL,
     expires_at REAL NOT NULL,
+    lease_duration_sec REAL,
     metadata_json TEXT NOT NULL,
     FOREIGN KEY(worker_id) REFERENCES workers(id)
 );
@@ -107,7 +110,7 @@ CREATE TABLE IF NOT EXISTS routed_executions (
 """
 
 _ADDITIONS = {
-    "reservations": {"spec_hash": "TEXT NOT NULL DEFAULT ''"},
+    "reservations": {"spec_hash": "TEXT NOT NULL DEFAULT ''", "lease_duration_sec": "REAL"},
     "workers": {
         "capacity_scope": "TEXT NOT NULL DEFAULT 'SHARED_POOL'",
         "capacity_pool": "TEXT NOT NULL DEFAULT ''",
@@ -118,6 +121,7 @@ _ADDITIONS = {
         "capacity_scope": "TEXT NOT NULL DEFAULT 'SHARED_POOL'",
         "capacity_pool": "TEXT NOT NULL DEFAULT ''",
         "spec_hash": "TEXT NOT NULL DEFAULT ''",
+        "lease_duration_sec": "REAL",
     },
     "routed_executions": {
         "capacity_scope": "TEXT NOT NULL DEFAULT 'SHARED_POOL'",
@@ -141,6 +145,45 @@ _INDEXES = (
     "CREATE INDEX IF NOT EXISTS idx_worker_res_pool ON worker_reservations(capacity_pool, expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_worker_res_worker ON worker_reservations(worker_id)",
 )
+
+
+def reservation_lease(ttl_min, now) -> tuple[float, float]:
+    """Capture a fresh allocation's configured period; never infer old periods."""
+    try:
+        if type(ttl_min) not in (int, float) or type(now) not in (int, float):
+            raise ValueError
+        duration = float(ttl_min) * 60.0
+        deadline = now + duration
+        if (not math.isfinite(now) or now < 0 or not math.isfinite(duration) or duration <= 0 or
+                not math.isfinite(deadline) or deadline <= now):
+            raise ValueError
+    except (ValueError, OverflowError):
+        raise ValueError("invalid_reservation_ttl") from None
+    return duration, deadline
+
+
+def _lease_guards(conn: sqlite3.Connection) -> None:
+    # NULL means an older writer did not capture its original configuration.
+    # Neither migration nor renewal may fill it from mutable timestamps. These
+    # guards preserve that provenance while accepting ordinary legacy INSERTs.
+    for table in ("reservations", "worker_reservations"):
+        invalid = """NEW.lease_duration_sec IS NOT NULL AND
+            (typeof(NEW.lease_duration_sec) NOT IN ('integer','real') OR
+             NOT (NEW.lease_duration_sec > 0 AND NEW.lease_duration_sec <= 1.7976931348623157e308))"""
+        conn.execute(f"""CREATE TRIGGER IF NOT EXISTS {table}_lease_insert_guard
+            BEFORE INSERT ON {table} WHEN {invalid}
+            BEGIN SELECT RAISE(ABORT,'invalid_reservation_lease'); END""")
+        conn.execute(f"""CREATE TRIGGER IF NOT EXISTS {table}_lease_replace_guard
+            BEFORE INSERT ON {table} WHEN EXISTS (
+                SELECT 1 FROM {table} previous WHERE previous.id=NEW.id
+                  AND previous.lease_duration_sec IS NOT NEW.lease_duration_sec)
+            BEGIN SELECT RAISE(ABORT,'immutable_reservation_lease'); END""")
+        conn.execute(f"""CREATE TRIGGER IF NOT EXISTS {table}_lease_update_guard
+            BEFORE UPDATE ON {table}
+            WHEN NEW.lease_duration_sec IS NOT OLD.lease_duration_sec OR ({invalid}) OR EXISTS (
+                SELECT 1 FROM {table} previous WHERE previous.rowid<>OLD.rowid AND previous.id=NEW.id
+                  AND previous.lease_duration_sec IS NOT NEW.lease_duration_sec)
+            BEGIN SELECT RAISE(ABORT,'immutable_reservation_lease'); END""")
 
 
 def prepare_capacity_schema(conn: sqlite3.Connection) -> None:
@@ -168,3 +211,4 @@ def prepare_capacity_schema(conn: sqlite3.Connection) -> None:
             raise ValueError("capacity_schema_incomplete")
     for statement in _INDEXES:
         conn.execute(statement)
+    _lease_guards(conn)

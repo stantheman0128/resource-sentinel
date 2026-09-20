@@ -684,8 +684,11 @@ class GuardianLaunchTests(unittest.TestCase):
         self.assertFalse(result.terminal)
         self.assert_retained(case)
         after = self.allocation(case)
-        for key in ("id", "expires_at", "cpu_units", "physical_bytes", "commit_bytes", "io_slots"):
+        for key in ("id", "lease_duration_sec", "cpu_units", "physical_bytes", "commit_bytes", "io_slots"):
             self.assertEqual(after[key], before[key])
+        # The verified guardian renews the same allocation while the child
+        # survives; its original period and resource floor remain unchanged.
+        self.assertEqual(after["expires_at"], before["expires_at"] + 10)
         case.job.members.clear()
         done = self.owner.lifecycle.reconcile(case.snapshot.execution_id, now=NOW + 20)
         self.assertTrue(done.terminal)

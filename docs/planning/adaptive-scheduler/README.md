@@ -7,7 +7,11 @@
 與 [P2 admission-only 實作紀錄](P2-ADMISSION-ONLY.md)。
 以下「只做規劃」及 GPT Pro 提示是原規劃階段的歷史背景，不限制後續已授權的實作。
 
-最新實作見 [authenticated wrapper launch](P3-AUTHENTICATED-LAUNCH.md)：
+最新已測實作另含 [guardian lifecycle 續租](P3-LIFECYCLE-RENEWAL.md)：
+保存原始固定租期、以 retained Job 證據續租、過期維持 HOLD，並封住 legacy routed
+heartbeat 對已納管工作的續租入口。這仍不代表完整 P3 gate 通過。
+
+[Authenticated wrapper launch](P3-AUTHENTICATED-LAUNCH.md)：
 wrapper 准入、Prepare／Claim／BindRoot RPC 與 guardian 持有權交接已接入程式，
 沿用 [guardian lifecycle consumer](P3-GUARDIAN-LIFECYCLE.md) 的 root/child 清帳流程。
 仍需正式服務啟動、supervisor、host authority 與完整恢復驗證，P3 尚未完成。

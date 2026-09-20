@@ -29,6 +29,7 @@ from sentinel.adaptive.store import (
 )
 from sentinel.coordinator import legacy_lifecycle_blocker
 from sentinel.adaptive.writers import writer_obligations_present
+from sentinel.adaptive.capacity_schema import reservation_lease
 
 
 ACTIVE_STATES = {"AVAILABLE", "BUSY"}
@@ -600,21 +601,23 @@ class Maintainer:
                 return {"reserved": False, "reason": "no_compatible_worker", "rejected": rejected}
 
             worker = min(candidates, key=lambda item: item[0])[1]
+            lease_duration, lease_deadline = reservation_lease(ttl_min, now)
             reservation_id = uuid.uuid4().hex
             conn.execute(
                 """INSERT INTO worker_reservations
                 (id,task_id,worker_id,failure_domain,capacity_scope,capacity_pool,spec_hash,
                  ram_gib,cpu_units,disk_gib,created_at,heartbeat_at,expires_at,metadata_json,
-                 physical_bytes,commit_bytes,io_slots,writer_protocol,writer_revision)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,0)""",
+                 physical_bytes,commit_bytes,io_slots,lease_duration_sec,writer_protocol,writer_revision)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,0)""",
                 (
                     reservation_id, t.id, worker["id"], worker["failure_domain"],
                     worker["capacity_scope"], worker["capacity_pool"], spec_hash, t.ram_gib,
-                    t.cpu_units, t.disk_gib, now, now, now + ttl_min * 60,
+                    t.cpu_units, t.disk_gib, now, now, lease_deadline,
                     json.dumps(self._safe_metadata(t.metadata), separators=(",", ":")),
                     math.ceil(t.ram_gib * 2**30),
                     math.ceil(t.ram_gib * 2**30) if t.commit_bytes is None else t.commit_bytes,
                     t.io_slots,
+                    lease_duration,
                 ),
             )
             conn.execute("COMMIT")
@@ -684,6 +687,17 @@ class Maintainer:
         now = time.time() if now is None else now
         with self._db() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT id FROM worker_reservations WHERE task_id=?", (task_id,)).fetchone()
+            if row is not None and (allocation_is_bound(conn, "routed", row["id"]) or
+                    conn.execute("""SELECT 1 FROM managed_executions WHERE reservation_id=? AND
+                        (allocation_kind IS NULL OR allocation_kind NOT IN ('direct','routed')) LIMIT 1""",
+                        (row["id"],)).fetchone() is not None):
+                # A session/task label is not proof of the retained native Job.
+                # Only the guardian's fenced lifecycle heartbeat may renew it.
+                # A malformed competing backreference cannot hide that duty;
+                # valid direct/routed identifiers retain separate namespaces.
+                conn.execute("COMMIT")
+                return False
             cur = conn.execute(
                 "UPDATE worker_reservations SET heartbeat_at=?,expires_at=?,writer_protocol=1,writer_revision=writer_revision+1 WHERE task_id=?",
                 (now, now + ttl_min * 60, task_id),

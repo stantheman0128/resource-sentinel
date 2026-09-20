@@ -1366,8 +1366,10 @@ class LifecycleStore:
         manifest and root custody under policy then Job mutation fences. Data
         supplied here is not authority; the default provider remains unavailable.
         Even positive empty membership only refreshes observation timestamps.
-        State, holds, floors, launch flags and expires_at never change here; this
-        slice does not claim complete TTL renewal or recovery reconciliation.
+        Only a healthy, still-unexpired RUNNING/DRAINING allocation with a
+        durably captured original lease period receives a renewed deadline.
+        Unknown old periods are never inferred. Expiry records uncertainty;
+        observations never clear holds, lower floors or prove work is finished.
         """
         from .policy import PolicyError
 
@@ -1406,15 +1408,41 @@ class LifecycleStore:
                         if (type(previous) not in (int, float) or not math.isfinite(previous) or
                                 previous < 0 or now < previous):
                             raise LifecycleError("heartbeat_clock_regression")
+                    allocation = source["allocation"]
+                    expires_at = allocation.get("expires_at")
+                    duration = allocation.get("lease_duration_sec")
+                    try:
+                        valid_expiry = (type(expires_at) in (int, float) and math.isfinite(expires_at) and expires_at >= 0)
+                        valid_duration = (duration is None or
+                            (type(duration) in (int, float) and math.isfinite(duration) and duration > 0))
+                    except OverflowError:
+                        valid_expiry = valid_duration = False
+                    if not valid_expiry or not valid_duration:
+                        raise LifecycleError("allocation_lease_invalid")
+                    deadline = expires_at
+                    updates = {"heartbeat_at": now}
+                    if expires_at <= now:
+                        # Preserve the missed-health interval even when this
+                        # native observation beats a legacy cleanup sweep. A
+                        # single CAS records it with the heartbeat; no gap is
+                        # erased by extending the elapsed deadline first.
+                        if row["state"] not in {"START_UNKNOWN", "UNCERTAIN_HOLD"}:
+                            updates["state"] = "START_UNKNOWN" if row["launch_in_flight"] else "UNCERTAIN_HOLD"
+                            updates["hold_reason"] = row["hold_reason"] or "reservation_expired"
+                    elif (duration is not None and row["state"] in {"RUNNING", "DRAINING"} and
+                          row["hold_reason"] is None):
+                        renewal = now + duration
+                        if not math.isfinite(renewal) or renewal <= now:
+                            raise LifecycleError("allocation_lease_invalid")
+                        deadline = max(expires_at, renewal)
                     table = _TABLES[row["allocation_kind"]]
-                    updated = conn.execute(f"""UPDATE {table} SET heartbeat_at=?,
+                    updated = conn.execute(f"""UPDATE {table} SET heartbeat_at=?,expires_at=?,
                         writer_protocol=1,writer_revision=writer_revision+1
                         WHERE id=? AND execution_id=? AND lifecycle_managed=1""",
-                        (now, row["reservation_id"], row["execution_id"]))
+                        (now, deadline, row["reservation_id"], row["execution_id"]))
                     if updated.rowcount != 1:
                         raise LifecycleError("allocation_binding_missing")
-                    result = self._public(self._cas(conn, row["execution_id"], expected["state_revision"],
-                                                   {"heartbeat_at": now}))
+                    result = self._public(self._cas(conn, row["execution_id"], expected["state_revision"], updates))
             return result
         except (PolicyError, sqlite3.Error) as error:
             translated = LifecycleError(str(error) if isinstance(error, PolicyError) else "coverage_registry_unavailable")

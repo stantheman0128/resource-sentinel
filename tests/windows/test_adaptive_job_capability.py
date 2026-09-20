@@ -264,7 +264,7 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
         if errors:
             owner._retain()
         record["cleanup_errors"] = errors
-        record["handles_closed"] = job.handle is None and (process is None or process.handle is None)
+        record["handles_closed"] = job.closed and (process is None or process.handle is None)
         if errors:
             record["status"] = "cleanup_failed"
         elif record["status"] == "running":
@@ -478,7 +478,7 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
             finally:
                 # A failed observation-handle reopen must not lose restoration
                 # or accounting ownership. Use the original retained handle.
-                cleanup_job = job if job.handle is not None else owner.job
+                cleanup_job = job if not job.closed else owner.job
                 self._cleanup(owner, cleanup_job, process, directory, record, deadline)
             completed.append(iteration)
         _write_json(self.evidence / "effect-summary.json", {

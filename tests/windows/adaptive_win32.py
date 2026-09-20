@@ -21,6 +21,7 @@ import time
 import uuid
 
 from sentinel.adaptive import native_launcher as _launcher
+from sentinel.adaptive import native_job as _job
 
 OPT_IN = "SENTINEL_ADAPTIVE_WINDOWS_SPIKES"
 JOB_PREFIX = "Local\\ResourceSentinel.Test.Job."
@@ -465,10 +466,29 @@ def console_process_ids():
 
 
 class OwnedJob:
-    def __init__(self, handle, name, nonce, logon_sid):
-        self.handle, self.name, self.nonce = handle, name, nonce
-        self.logon_sid = logon_sid
-        self.security = None
+    """S1 opt-in adapter over the shared production Job mechanism.
+
+    The fixture keeps its gate and legacy diagnostic dictionaries. Its explicit
+    OWNER role serves the fixture's combined launcher/controller process only;
+    production consumers request separate LAUNCH, QUERY or CONTROL handles.
+    """
+    def __init__(self, native):
+        self._native = native
+        self.name, self.nonce, self.logon_sid = native.name, native.nonce, native.logon_sid
+        # NativeJob returns only after exact owner/DACL readback and noninheritance.
+        self.security = {"owner_matches_current_user": True, "protected_dacl": True,
+                         "ace_count": 1, "allowed_logon_sid": self.logon_sid,
+                         "access_mask": _job._DACL_ACCESS}
+
+    @property
+    def handle(self):
+        if self._native.closed:
+            return None
+        return self._native.handle
+
+    @property
+    def closed(self):
+        return self._native.closed
 
     @classmethod
     def create(cls, nonce=None):
@@ -476,66 +496,26 @@ class OwnedJob:
         require_supported_host()
         nonce = _nonce(nonce or uuid.uuid4().hex)
         name = JOB_PREFIX + nonce
-        security = _LogonSecurity()
-        k, _, _ = _api()
-        try:
-            C.set_last_error(0)
-            handle = k.CreateJobObjectW(C.byref(security.attributes), name)
-            error = C.get_last_error()
-            _check(handle, "CreateJobObjectW")
-            if error == 183:
-                k.CloseHandle(handle)
-                raise ValueError("test Job name collision; existing object not adopted")
-            job = cls(handle, name, nonce, security.logon_sid)
-            try:
-                job.security = _verify_object_security(handle, security.logon_sid, 0x1F003F)
-                if job.query_limits() != {"limit_flags": 0, "ui_restrictions": 0}:
-                    raise UnsupportedCapability("new Job unexpectedly has non-CPU limits")
-                if job.query_cpu()["flags"] != 0:
-                    raise UnsupportedCapability("new Job unexpectedly has CPU control")
-                return job
-            except BaseException:
-                job.close()
-                raise
-        finally:
-            security.close()
+        return cls(_job.NativeJob.create(name, nonce, _logon_sid(), access=_job.JobAccess.OWNER))
 
     @classmethod
     def open(cls, name, nonce):
         if name != JOB_PREFIX + _nonce(nonce):
             raise ValueError("name/nonce does not identify an owned test Job")
-        k, _, _ = _api()
-        handle = k.OpenJobObjectW(0x0001 | 0x0002 | 0x0004 | 0x00020000, False, name)
-        _check(handle, "OpenJobObjectW")
-        try:
-            job = cls(handle, name, nonce, _logon_sid())
-            job.security = _verify_object_security(handle, job.logon_sid, 0x1F003F)
-            return job
-        except BaseException:
-            k.CloseHandle(handle)
-            raise
-
-    def _query(self, information_class, result):
-        _check(_api()[0].QueryInformationJobObject(self.handle, information_class,
-               C.byref(result), C.sizeof(result), None), "QueryInformationJobObject")
-        return result
+        return cls(_job.NativeJob.open(name, nonce, _logon_sid(), access=_job.JobAccess.OWNER))
 
     def query_cpu(self):
-        info = self._query(15, _CpuInfo())
-        return {"flags": int(info.ControlFlags), "rate_bp": int(info.CpuRate)}
+        info = self._native.query_cpu()
+        return {"flags": info.flags, "rate_bp": info.rate_bp}
 
     def query_limits(self):
-        info = self._query(9, _ExtendedLimits())
-        ui = self._query(4, W.DWORD())
-        return {"limit_flags": int(info.BasicLimitInformation.LimitFlags),
-                "ui_restrictions": int(ui.value)}
+        info = self._native.query_limits()
+        return {"limit_flags": info.limit_flags, "ui_restrictions": info.ui_restrictions}
 
     def set_cpu_rate(self, rate_bp):
-        self.set_cpu_rate_unverified(rate_bp)
-        observed = self.query_cpu()
-        if observed != {"flags": ENABLE | HARD_CAP, "rate_bp": rate_bp}:
-            raise RuntimeError(f"CPU set readback mismatch: {observed}")
-        return observed
+        _opt_in()
+        info = self._native.set_cpu_rate(rate_bp)
+        return {"flags": info.flags, "rate_bp": info.rate_bp}
 
     def set_cpu_rate_unverified(self, rate_bp):
         """S3 durable-intent fault injection only: Set boundary before Query.
@@ -544,48 +524,21 @@ class OwnedJob:
         must retain its intent for restore even if killed before readback.
         """
         _opt_in()
-        if isinstance(rate_bp, bool) or not isinstance(rate_bp, int) or not 1 <= rate_bp <= 10000:
-            raise ValueError("CPU hard-cap rate must be integer basis points in 1..10000")
-        info = _CpuInfo(ENABLE | HARD_CAP, rate_bp)
-        _check(_api()[0].SetInformationJobObject(self.handle, 15, C.byref(info), C.sizeof(info)),
-               "SetInformationJobObject(CPU hard cap)")
+        self._native.set_cpu_rate_unverified(rate_bp)
 
     def disable(self):
         _opt_in()
-        # rate=0 is invalid. With ENABLE clear the union's returned value is not
-        # required to be 0 or 10000; the behavioral effect needs a separate test.
-        info = _CpuInfo(0, 10000)
-        _check(_api()[0].SetInformationJobObject(self.handle, 15, C.byref(info), C.sizeof(info)),
-               "SetInformationJobObject(CPU disabled)")
-        observed = self.query_cpu()
-        if observed["flags"] & ENABLE:
-            raise RuntimeError(f"CPU disable readback remains enabled: {observed}")
-        return observed
+        info = self._native.disable()
+        return {"flags": info.flags, "rate_bp": info.rate_bp}
 
     def accounting(self):
-        info = self._query(1, _BasicAccounting())
-        return {"cpu_seconds": (info.TotalUserTime + info.TotalKernelTime) / 10_000_000,
-                "active_processes": int(info.ActiveProcesses),
-                "total_processes": int(info.TotalProcesses)}
+        info = self._native.accounting()
+        return {"cpu_seconds": info.cpu_100ns / 10_000_000,
+                "active_processes": info.active_processes,
+                "total_processes": info.total_processes}
 
     def active_pids(self):
-        count = 64
-        for _ in range(4):
-            class ProcessList(C.Structure):
-                _fields_ = [("assigned", W.DWORD), ("listed", W.DWORD),
-                            ("pids", C.c_size_t * count)]
-            info = ProcessList()
-            ok = _api()[0].QueryInformationJobObject(self.handle, 3, C.byref(info),
-                                                    C.sizeof(info), None)
-            if ok and info.assigned <= info.listed <= count:
-                return [int(pid) for pid in info.pids[:info.listed]]
-            error = C.get_last_error()
-            if not ok and error != 234:  # ERROR_MORE_DATA: bounded retry
-                _check(False, "QueryInformationJobObject(ProcessIdList)")
-            count = max(count * 2, int(info.assigned))
-            if count > 4096:
-                break
-        raise UnsupportedCapability("Job membership exceeds bounded stable snapshot")
+        return list(self._native.active_pids())
 
     def wait_empty(self, timeout):
         _timeout_ms(timeout)
@@ -600,9 +553,7 @@ class OwnedJob:
 
     def close(self):
         """Only close this handle. Never claim that closing clears OS limits."""
-        if self.handle:
-            _check(_api()[0].CloseHandle(self.handle), "CloseHandle(Job)")
-            self.handle = None
+        self._native.close()
 
 
 def launch_in_job(job, application, command_line, *, cwd=None,

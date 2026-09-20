@@ -16,7 +16,7 @@ class S1OwnerIntegrationTests(unittest.TestCase):
         self.directory = Path(temporary.name)
         self.case = s1.WindowsJobCapabilitySpike("test_00_fixture_self_stops_and_job_has_no_other_limits")
         self.events = []
-        self.job = SimpleNamespace(handle=11, query_cpu=Mock(return_value={"flags": 0, "rate_bp": 0}),
+        self.job = SimpleNamespace(handle=11, closed=False, query_cpu=Mock(return_value={"flags": 0, "rate_bp": 0}),
             wait_empty=Mock(return_value=True), active_pids=Mock(return_value=[]))
         self.owner = SimpleNamespace(restore=Mock(side_effect=lambda: self.events.append("restore")),
             finalize=Mock(side_effect=self.finalize), close=Mock(side_effect=self.close),
@@ -30,6 +30,7 @@ class S1OwnerIntegrationTests(unittest.TestCase):
     def close(self):
         self.events.append("close")
         self.job.handle = None
+        self.job.closed = True
 
     def cleanup(self):
         self.case._cleanup(self.owner, self.job, None, self.directory, self.record,

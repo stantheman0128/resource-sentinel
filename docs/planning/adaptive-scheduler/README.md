@@ -18,6 +18,12 @@ unknown inherited Job 是另一項尚未通過的 native 環境條件。
 驗證同一帳本的 exact allocation 與保留額度，再呼叫 host callback；237 項
 針對性測試通過。這不代表日常主機上所有舊 consumers 的 runtime 交接已完成。
 
+最新 [control coordination 實作與證據](P3-CONTROL-COORDINATION.md) 已接上真正的
+豁免寫入、單一持久控制名額及 S1 限速期間的 fresh-grant 檢查；388 項針對性
+測試通過，日常 runtime 未部署。這是 P3 的部分依賴，不能當成正式 guardian、
+legacy writer handoff、native P1 或 P3–P6 的完整通過。側邊資源研究的採納／
+延後範圍亦記在同一份證據文件，不新增估計器作為本 MVP 的前置。
+
 使用者要求：先自行嚴格質疑方案，把資料放入 repo；由使用者交給 GPT Pro
 完成 plan，再交回 Codex 實作。本包不代表使用者已選定控制演算法、常駐服務或參數。
 

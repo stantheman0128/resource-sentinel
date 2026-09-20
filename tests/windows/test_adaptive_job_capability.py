@@ -369,12 +369,15 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
         finally:
             self._cleanup(owner, job, process, directory, record, deadline)
 
-    def _window(self, job, deadline):
+    def _window(self, job, deadline, *, capped_owner=None):
         start = time.monotonic()
         self.assertLessEqual(start + WINDOW_SECONDS, deadline,
                              "insufficient time for a complete fixed window before case deadline")
         initial = job.accounting()
-        time.sleep(WINDOW_SECONDS)
+        if capped_owner is None:
+            time.sleep(WINDOW_SECONDS)
+        else:
+            capped_owner.wait_capped(WINDOW_SECONDS)
         final = job.accounting()
         elapsed = time.monotonic() - start
         return {"elapsed_seconds": elapsed,
@@ -437,7 +440,7 @@ class WindowsJobCapabilitySpike(unittest.TestCase):
                 }, durable=True)
                 record["applied"] = owner.set_cpu_rate(2500)
                 self.assertEqual(record["applied"], {"flags": ENABLE | HARD_CAP, "rate_bp": 2500})
-                record["capped"] = self._window(job, deadline)
+                record["capped"] = self._window(job, deadline, capped_owner=owner)
                 self.assertAlmostEqual(record["capped"]["cpu_units"], target,
                     delta=tolerance, msg="actual Job CPU does not match known denominator")
                 # Drop only the observation handle. The execution owner keeps

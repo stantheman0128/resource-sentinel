@@ -732,7 +732,8 @@ class S1ExecutionOwnerTests(unittest.TestCase):
         self.running()
         self.owner.set_cpu_rate(2500)
         self.make_empty()
-        with self.assertRaisesRegex(LifecycleError, "restore_unverified"):
+        self.assertTrue(self.owner._control_pending)
+        with self.assertRaisesRegex(LifecycleError, "case_control_recovery_unverified"):
             self.owner.finalize()
         self.assert_floor_retained()
         self.assertFalse(self.owner.job.closed)
@@ -742,9 +743,11 @@ class S1ExecutionOwnerTests(unittest.TestCase):
         self.owner.set_cpu_rate(2500)
         self.make_empty()
         # Synthetic native Query changes without a matching journal update.
-        # Finalization must inspect both sources, not trust a disabled flag.
+        # A disabled flag cannot clear the owner's pending recovery obligation.
+        # Verified restore/journal/slot acknowledgement must settle it first.
         self.owner.job.control = {"flags": 0, "rate_bp": 0}
-        with self.assertRaisesRegex(LifecycleError, "restore_unverified"):
+        self.assertTrue(self.owner._control_pending)
+        with self.assertRaisesRegex(LifecycleError, "case_control_recovery_unverified"):
             self.owner.finalize()
         self.assert_floor_retained()
 

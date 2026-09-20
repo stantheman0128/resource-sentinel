@@ -39,8 +39,20 @@ class S1Runtime:
     default native preflight still rejects because this host has no such owner.
     """
     def __init__(self, *, coordinator, authority, native, store_factory=None):
+        from pathlib import Path
         from sentinel.adaptive.store import LifecycleStore
-        self.coordinator, self.authority, self.native = coordinator, authority, native
+        from sentinel.exemptions import Exemptions
+        from tests.windows.adaptive_control_authority import S1ControlAuthority
+
+        ledger = Path(coordinator.db_path).resolve()
+        if isinstance(authority, S1ControlAuthority):
+            if authority.ledger_path != ledger:
+                raise LifecycleError("control_authority_ledger_mismatch")
+            control = authority
+        else:
+            control = S1ControlAuthority(data_dir=ledger.parent,
+                exemptions=Exemptions(ledger.parent), host=authority)
+        self.coordinator, self.authority, self.native = coordinator, control, native
         self.store_factory = store_factory or LifecycleStore
         self.owners = []
         self.pending_admissions = []
@@ -113,6 +125,7 @@ class S1ExecutionOwner:
         self._create_attempted = self._launch_attempted = self._sealed = False
         self._terminal = self._closed = False
         self._prepared = False
+        self._control_pending = False
         self.observation_started_at = time.monotonic()
         self.observation_deadline = self.observation_started_at + 120
         self._root = None
@@ -120,6 +133,7 @@ class S1ExecutionOwner:
         self._recovery_guard = None
         self._last_borrowed_guard = None
         self._probe_handles = []
+        self._grant_scope_handles = []
         self.store.evidence_provider = self.evidence_scope
         # A new owner can only adopt its own exact admitted, unused execution.
         row = self.store.query(self.execution_id)
@@ -333,14 +347,16 @@ class S1ExecutionOwner:
             raise LifecycleError("case_identity_mismatch")
         with self.mutation_scope():
             self._assert_row(row)
-            self._assert_covered(row)
+            if operation != "control_restore":
+                self._assert_covered(row)
             named = row["job_name"] is not None or operation == "register_scope"
             count, members = None, None
             current, settled, durable, initial = False, False, False, False
             excluded = False
             if self.job is not None:
-                count = self.job.accounting()["active_processes"]
-                members = tuple(self.job.active_pids())
+                if operation != "control_restore":
+                    count = self.job.accounting()["active_processes"]
+                    members = tuple(self.job.active_pids())
                 control = self.query_cpu_control()
                 manifest = self._read_manifest()
                 current = control.mode is CpuControlMode.DISABLED
@@ -348,8 +364,9 @@ class S1ExecutionOwner:
                     manifest.last_applied is None or manifest.last_applied.mode is CpuControlMode.DISABLED)
                 durable = True
                 initial = manifest.original == DISABLED and control == DISABLED
-                self.authority.assert_excluded(row)
-                excluded = True
+                if operation != "control_restore":
+                    self.authority.assert_excluded(row)
+                    excluded = True
             elif self.record is not None:
                 manifest = self._read_manifest()
                 durable = True
@@ -439,11 +456,16 @@ class S1ExecutionOwner:
         target = CpuControl(CpuControlMode.HARD_CAP, rate_bp)
         try:
             with self.mutation_scope():
+                if time.monotonic() >= self.observation_deadline:
+                    raise LifecycleError("case_observation_deadline_expired")
                 row = self.store.query(self.execution_id)
                 self._assert_row(row)
                 self._assert_covered(row)
                 self.authority.assert_excluded(row)
+                self._control_pending = True
                 self.authority.authorize_control(self, target)
+                if time.monotonic() >= self.observation_deadline:
+                    raise LifecycleError("case_observation_deadline_expired")
                 previous = self._read_manifest()
                 observed = self.query_cpu_control()
                 if previous.pending_intent is not None or observed != (previous.last_applied or previous.original):
@@ -455,6 +477,36 @@ class S1ExecutionOwner:
                 self._publish(last_applied=target, pending_intent=None)
                 return result
         except BaseException:
+            self._retain()
+            raise
+
+    def wait_capped(self, seconds):
+        """Wait outside locks, checking fresh authority at most every 250 ms.
+
+        Polling is a test-host consumer, not a claimed production RPC/guardian
+        response bound. Individual native/DB calls may add latency. Any failed
+        check invalidates this window and attempts restoration.
+        """
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not 0 < seconds <= 120:
+            raise LifecycleError("case_window_invalid")
+        end = time.monotonic() + seconds
+        try:
+            if end > self.observation_deadline:
+                raise LifecycleError("case_observation_deadline_expired")
+            while True:
+                with self.mutation_scope():
+                    if time.monotonic() >= self.observation_deadline:
+                        raise LifecycleError("case_observation_deadline_expired")
+                    self.authority.observe_control(self)
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    return
+                time.sleep(min(.25, remaining))
+        except BaseException as primary:
+            try:
+                self.restore()
+            except BaseException:
+                primary.add_note("case_window_restore_unverified")
             self._retain()
             raise
 
@@ -486,6 +538,7 @@ class S1ExecutionOwner:
                 if manifest.pending_intent is not None or manifest.last_applied not in (None, DISABLED):
                     self._publish(last_applied=DISABLED, pending_intent=None)
                 self.authority.control_restored(self)
+                self._control_pending = False
                 return result
         except BaseException:
             self._retain()
@@ -495,6 +548,8 @@ class S1ExecutionOwner:
         with self._lock:
             self._sealed = True
             try:
+                if self._control_pending:
+                    raise LifecycleError("case_control_recovery_unverified")
                 row = self.store.query(self.execution_id)
                 self._assert_row(row)
                 # A committed claim can lose its ACK before the native call.
@@ -533,6 +588,9 @@ class S1ExecutionOwner:
             for probe in self._probe_handles:
                 probe.close()
             self._probe_handles.clear()
+            for handle in self._grant_scope_handles:
+                handle.close()
+            self._grant_scope_handles.clear()
             if self.job is not None:
                 self.job.close()
             if self.mutex is not None:

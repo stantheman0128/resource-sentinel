@@ -920,6 +920,8 @@ class PendingIntent(Contract):
 @dataclass(frozen=True)
 class RecoveryManifest(Contract):
     execution_id: str
+    reservation: ReservationRef
+    spec_hash: str
     job_name: str
     creation_nonce: str
     wrapper_identity: ProcessIdentity
@@ -937,6 +939,10 @@ class RecoveryManifest(Contract):
     def __post_init__(self):
         _version(self.schema_version)
         _uuid(self.execution_id, "execution_id")
+        _typed(self.reservation, ReservationRef, "reservation")
+        if self.reservation.kind is AllocationKind.PARENT:
+            raise ContractViolation("reservation: nested subspan cannot own a Job")
+        _hash(self.spec_hash, "spec_hash")
         if not isinstance(self.creation_nonce, str) or not re.fullmatch(r"[0-9a-f]{32}", self.creation_nonce):
             raise ContractViolation("creation_nonce: random 128-bit nonce required")
         # The nonce is part of the name, preventing execution-name reuse.
@@ -983,6 +989,7 @@ class RecoveryManifest(Contract):
     @classmethod
     def from_dict(cls, value: dict):
         data = _object(value, cls)
+        data["reservation"] = ReservationRef.from_dict(data["reservation"])
         for name in ("wrapper_identity", "guardian_identity"):
             data[name] = ProcessIdentity.from_dict(data[name])
         if data["root_identity"] is not None:

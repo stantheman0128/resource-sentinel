@@ -67,7 +67,8 @@ def proposal(**changes):
 
 def manifest(**changes):
     nonce = "f" * 32
-    values = dict(execution_id=EXECUTION, job_name=f"Local\\ResourceSentinel.Job.{EXECUTION}.{nonce}",
+    values = dict(execution_id=EXECUTION, reservation=ReservationRef(AllocationKind.DIRECT, "reserved-a"),
+                  spec_hash="a" * 64, job_name=f"Local\\ResourceSentinel.Job.{EXECUTION}.{nonce}",
                   creation_nonce=nonce, wrapper_identity=IDENTITY,
                   root_identity=ProcessIdentity(4200, 134343072010000002, "logon-a"),
                   guardian_identity=ProcessIdentity(4300, 134343072020000003, "logon-a"),
@@ -301,6 +302,8 @@ class ControlAndRecoveryTests(unittest.TestCase):
     def test_manifest_integrity_detects_state_floor_nonce_identity_tampering(self):
         record = manifest().to_dict()
         for name, value in (("manifest_seq", 2), ("creation_nonce", "e" * 32),
+                            ("spec_hash", "b" * 64),
+                            ("reservation", ReservationRef(AllocationKind.ROUTED, "other").to_dict()),
                             ("allocated_floor", DEMAND.to_dict() | {"physical_bytes": 1}),
                             ("guardian_identity", IDENTITY.to_dict()),
                             ("last_applied", CAP.to_dict())):
@@ -313,6 +316,17 @@ class ControlAndRecoveryTests(unittest.TestCase):
                         {"pending_intent": PendingIntent(ACTION, CAP, DISABLED)}):
             with self.subTest(changes=tuple(changes)), self.assertRaises(ContractViolation):
                 manifest(**changes)
+
+    def test_manifest_requires_exact_nonparent_allocation_and_spec_binding(self):
+        for changes in ({"reservation": ReservationRef(AllocationKind.PARENT, PARENT)},
+                        {"reservation": None}, {"spec_hash": "not-a-digest"}):
+            with self.subTest(fields=tuple(changes)), self.assertRaises(ContractViolation):
+                manifest(**changes)
+        for name in ("reservation", "spec_hash"):
+            value = manifest().to_dict()
+            del value[name]
+            with self.subTest(missing=name), self.assertRaises(ContractViolation):
+                RecoveryManifest.from_dict(value)
 
     def test_error_records_are_codes_not_raw_diagnostics(self):
         with self.assertRaises(ContractViolation):

@@ -103,11 +103,13 @@ no report, no measured records exist
 These are places where plan section 11.3 states no number. The harness does not
 invent one, so a human has to judge the outcome or the plan has to be amended.
 
-- No numeric threshold for A0 to A1. The harness reports the measured cost and
-  returns NO_THRESHOLD_DEFINED.
-- No tolerance for the A0 to B regression veto. The harness treats any median
-  degradation of foreground p95 or makespan as a regression, which is the
-  strictest reading.
+- No numeric threshold for A0 to A1. The harness now applies clarification C1,
+  which reuses the plan 11.3 neutral rule of 5 percent. See
+  AB-THRESHOLD-CLARIFICATION.md.
+- No tolerance for the A0 to B regression veto. The harness now applies
+  clarification C2, which reads the veto with the plan's own scenario
+  tolerances. See AB-THRESHOLD-CLARIFICATION.md. Both comparisons still report
+  NOT_MEASURED, because no data has been collected.
 - No threshold for the unmanaged CPU pressure, mixed role and mixed duration
   scenarios.
 - "Minimum headroom" is listed without saying whether it is physical or commit.

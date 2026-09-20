@@ -15,6 +15,7 @@ from tests.benchmarks.adaptive_ab import (
     EvidenceSource, FixedConditions, MIN_PAIRS_PER_SCENARIO, OrderPosition, PairedRun,
     Preconditions, RunMetrics, RunRecord, ScenarioClass, Variant, Verdict, analyze_comparison,
     build_schedule, check_a0_b_regression, check_cpu_contention, check_neutral_scenario,
+    check_observer_cost,
     median, overall_verdict, paired_differences, parse_evidence_source, percentile, pair_records,
     precondition_failures, relative_changes, render_report, schedule_order_counts, spread,
 )
@@ -319,16 +320,110 @@ class NeutralThresholdBoundaryTests(unittest.TestCase):
         self.assertIs(checks["no unrelated cap applied"].status, CheckStatus.FAIL)
 
 
+class ObserverCostTests(unittest.TestCase):
+    """Clarification C1: A0 to A1 held to the plan 11.3 neutral rule of 5 percent."""
+
+    def names(self, baseline, treatment):
+        checks = check_observer_cost(pairs_of([baseline] * 3, [treatment] * 3))
+        return {check.name: check for check in checks}
+
+    def test_cost_within_five_percent_passes(self):
+        at_limit = self.names((100.0, 100.0, 100.0), (105.0, 105.0, 100.0))
+        self.assertIs(at_limit["foreground p95 degradation median"].status, CheckStatus.PASS)
+        self.assertIs(at_limit["makespan degradation median"].status, CheckStatus.PASS)
+
+    def test_cost_beyond_five_percent_fails(self):
+        over = self.names((100.0, 100.0, 100.0), (105.1, 105.1, 100.0))
+        self.assertIs(over["foreground p95 degradation median"].status, CheckStatus.FAIL)
+        self.assertIs(over["makespan degradation median"].status, CheckStatus.FAIL)
+
+    def test_monitor_cpu_is_not_judged_without_a_job_count(self):
+        checks = self.names((100.0, 100.0, 100.0), (100.0, 100.0, 100.0))
+        monitor = checks["monitor CPU units median (A1)"]
+        self.assertIs(monitor.status, CheckStatus.NOT_APPLICABLE)
+        self.assertIn("enrolled Job count", monitor.detail)
+
+    def test_every_check_names_the_clarification(self):
+        checks = self.names((100.0, 100.0, 100.0), (100.0, 100.0, 100.0))
+        for check in checks.values():
+            self.assertIn("clarification C1 (not in plan 11.3)", check.detail)
+
+    def test_measured_cost_within_the_rule_is_promote_eligible(self):
+        records = dataset(10, Variant.A0, Variant.A1, treatment_p95=100.0,
+                          treatment_makespan=100.0, treatment_units=100.0)
+        analysis = analyze_comparison(records, Comparison.A0_A1, CPU_SCENARIO,
+                                      ScenarioClass.CPU_CONTENTION)
+        self.assertIs(analysis.verdict, Verdict.PROMOTE_ELIGIBLE)
+
+    def test_synthetic_observer_cost_is_not_measured(self):
+        records = dataset(10, Variant.A0, Variant.A1, treatment_p95=100.0,
+                          treatment_makespan=100.0, treatment_units=100.0,
+                          source=EvidenceSource.SYNTHETIC)
+        analysis = analyze_comparison(records, Comparison.A0_A1, CPU_SCENARIO,
+                                      ScenarioClass.CPU_CONTENTION)
+        self.assertIs(analysis.verdict, Verdict.NOT_MEASURED)
+
+
 class A0ToBVetoTests(unittest.TestCase):
+    def names(self, baseline, treatment, scenario_class=ScenarioClass.CPU_CONTENTION,
+              scenario=CPU_SCENARIO):
+        pairs = pairs_of([baseline] * 3, [treatment] * 3, scenario_class, scenario)
+        return {check.name: check for check in check_a0_b_regression(pairs, scenario_class)}
+
     def test_regression_against_a0_vetoes(self):
-        checks = {check.name: check for check in check_a0_b_regression(
-            pairs_of([(100.0, 100.0, 100.0)] * 3, [(100.1, 100.0, 100.0)] * 3))}
+        checks = self.names((100.0, 100.0, 100.0), (100.1, 100.0, 100.0))
         self.assertIs(checks["A0 to B foreground p95 change median"].status, CheckStatus.FAIL)
 
     def test_no_regression_passes(self):
-        checks = {check.name: check for check in check_a0_b_regression(
-            pairs_of([(100.0, 100.0, 100.0)] * 3, [(90.0, 99.0, 100.0)] * 3))}
+        checks = self.names((100.0, 100.0, 100.0), (90.0, 99.0, 100.0))
         self.assertTrue(all(check.status is CheckStatus.PASS for check in checks.values()))
+
+    def test_cpu_scenario_allows_the_plan_batch_tolerance(self):
+        checks = self.names((100.0, 100.0, 100.0), (90.0, 110.0, 100.0))
+        self.assertTrue(all(check.status is CheckStatus.PASS for check in checks.values()))
+
+    def test_cpu_scenario_rejects_makespan_beyond_fifteen_percent(self):
+        checks = self.names((100.0, 100.0, 100.0), (90.0, 120.0, 100.0))
+        self.assertIs(checks["A0 to B makespan degradation median"].status, CheckStatus.FAIL)
+        self.assertIs(checks["A0 to B foreground p95 change median"].status, CheckStatus.PASS)
+
+    def test_cpu_scenario_rejects_throughput_drop_beyond_ten_percent(self):
+        checks = self.names((100.0, 100.0, 100.0), (90.0, 110.0, 89.0))
+        self.assertIs(checks["A0 to B throughput drop median"].status, CheckStatus.FAIL)
+
+    def test_worse_interaction_fails_even_with_an_acceptable_batch_cost(self):
+        checks = self.names((100.0, 100.0, 100.0), (101.0, 110.0, 100.0))
+        self.assertIs(checks["A0 to B foreground p95 change median"].status, CheckStatus.FAIL)
+
+    def test_neutral_scenario_rejects_makespan_beyond_five_percent(self):
+        checks = self.names((100.0, 100.0, 100.0), (90.0, 106.0, 100.0),
+                            ScenarioClass.IO_BOUND, NEUTRAL_SCENARIO)
+        self.assertIs(checks["A0 to B makespan degradation median"].status, CheckStatus.FAIL)
+        self.assertNotIn("A0 to B throughput drop median", checks)
+
+    def test_neutral_scenario_within_five_percent_passes(self):
+        checks = self.names((100.0, 100.0, 100.0), (90.0, 105.0, 100.0),
+                            ScenarioClass.IO_BOUND, NEUTRAL_SCENARIO)
+        self.assertTrue(all(check.status is CheckStatus.PASS for check in checks.values()))
+
+    def test_unlisted_scenario_class_is_not_judged(self):
+        checks = self.names((100.0, 100.0, 100.0), (90.0, 110.0, 100.0),
+                            ScenarioClass.MIXED_ROLES, "mixed_roles")
+        self.assertTrue(all(check.status is CheckStatus.NOT_APPLICABLE
+                            for check in checks.values()))
+
+    def test_every_check_names_the_clarification(self):
+        checks = self.names((100.0, 100.0, 100.0), (90.0, 110.0, 100.0))
+        for check in checks.values():
+            self.assertIn("clarification C2 (not in plan 11.3)", check.detail)
+
+    def test_synthetic_a0_to_b_is_not_measured(self):
+        records = dataset(10, Variant.A0, Variant.B, treatment_p95=90.0,
+                          treatment_makespan=110.0, treatment_units=100.0,
+                          source=EvidenceSource.SYNTHETIC)
+        analysis = analyze_comparison(records, Comparison.A0_B, CPU_SCENARIO,
+                                      ScenarioClass.CPU_CONTENTION)
+        self.assertIs(analysis.verdict, Verdict.NOT_MEASURED)
 
     def test_veto_reaches_the_verdict_even_when_a1_to_b_wins(self):
         records = dataset(10, Variant.A0, Variant.B, treatment_p95=110.0,
@@ -389,12 +484,12 @@ class VerdictTests(unittest.TestCase):
                                       ScenarioClass.CPU_CONTENTION)
         self.assertIs(analysis.verdict, Verdict.NO_PROBLEM_TO_CONTROL)
 
-    def test_observer_cost_comparison_has_no_plan_threshold(self):
-        records = dataset(10, Variant.A0, Variant.A1, treatment_p95=100.0,
+    def test_observer_cost_beyond_the_clarified_rule_fails(self):
+        records = dataset(10, Variant.A0, Variant.A1, treatment_p95=106.0,
                           treatment_makespan=100.0, treatment_units=100.0)
         analysis = analyze_comparison(records, Comparison.A0_A1, CPU_SCENARIO,
                                       ScenarioClass.CPU_CONTENTION)
-        self.assertIs(analysis.verdict, Verdict.NO_THRESHOLD_DEFINED)
+        self.assertIs(analysis.verdict, Verdict.FAIL)
 
     def test_unlisted_scenario_class_has_no_plan_threshold(self):
         records = dataset(10, Variant.A1, Variant.B, scenario="mixed_roles",
@@ -420,10 +515,13 @@ class VerdictTests(unittest.TestCase):
             dataset(10, Variant.A0, Variant.A1, treatment_p95=100.0, treatment_makespan=100.0,
                     treatment_units=100.0),
             Comparison.A0_A1, CPU_SCENARIO, ScenarioClass.CPU_CONTENTION)
+        # Mixed roles is a scenario class the plan states no tolerance for, so this
+        # A0 to B comparison is the one without a threshold.
         a0b = analyze_comparison(
             dataset(10, Variant.A0, Variant.B, treatment_p95=80.0, treatment_makespan=99.0,
-                    treatment_units=100.0),
-            Comparison.A0_B, CPU_SCENARIO, ScenarioClass.CPU_CONTENTION)
+                    treatment_units=100.0, scenario="mixed_roles",
+                    scenario_class=ScenarioClass.MIXED_ROLES),
+            Comparison.A0_B, "mixed_roles", ScenarioClass.MIXED_ROLES)
         self.assertIs(overall_verdict([a1b, a0a1, a0b]), Verdict.NO_THRESHOLD_DEFINED)
         synthetic = analyze_comparison(
             dataset(10, Variant.A1, Variant.B, source=EvidenceSource.SYNTHETIC),

@@ -16,16 +16,21 @@ turn fabricated numbers into a pass:
   - one synthetic record anywhere in a comparison forces the verdict
     NOT_MEASURED, whatever the numbers say;
   - fewer than ten valid pairs, or a missing variant, forces INSUFFICIENT_DATA;
-  - a comparison the plan gives no number for reports NO_THRESHOLD_DEFINED
-    rather than a pass;
+  - a comparison that neither the plan nor the labelled clarification gives a
+    number for reports NO_THRESHOLD_DEFINED rather than a pass;
   - a scenario where A1 foreground p95 is already below twenty milliseconds
     reports NO_PROBLEM_TO_CONTROL, which is the plan's "沒有足夠需要控制的問題";
   - no verdict value means "A/B complete". The best available value means the
     thresholds this plan names were met by measured paired data, nothing more.
 
-Every threshold constant below is quoted from plan section 11.3. Where the plan
-names no number, this module says so in the check detail instead of inventing
-one; those gaps are listed in PLAN_GAPS.
+Every threshold constant below is quoted from plan section 11.3. Plan 11.3
+leaves the A0 to A1 and A0 to B comparisons without numbers of their own, so
+those two reuse plan numbers under the labelled clarification C1 and C2 recorded
+in docs/planning/adaptive-scheduler/AB-THRESHOLD-CLARIFICATION.md. No number in
+this module is new. Checks produced under the clarification name it in their
+detail text, so a report reader can tell a plan threshold from a clarified one.
+Where neither the plan nor the clarification gives a number, this module says so
+in the check detail instead of inventing one; those gaps are listed in PLAN_GAPS.
 """
 
 from __future__ import annotations
@@ -198,12 +203,20 @@ NEUTRAL_MAX_MEDIAN_DEGRADATION = 0.05
 # state names match sentinel.adaptive.decision.ControllerState.
 CAPPED_STATE_NAMES = ("CAPPED_L1", "CAPPED_L2")
 
+CLARIFICATION_LABEL_C1 = "clarification C1 (not in plan 11.3)"
+CLARIFICATION_LABEL_C2 = "clarification C2 (not in plan 11.3)"
+
 PLAN_GAPS = (
-    "Plan 11.3 gives no numeric threshold for A0 to A1; that comparison reports "
-    "NO_THRESHOLD_DEFINED and its measured cost is printed for a human to judge.",
+    "Plan 11.3 gives no numeric threshold of its own for A0 to A1. Clarification "
+    "C1 holds that comparison to the plan 11.3 neutral rule of 5 percent, because "
+    "A1 sets no cap. The monitor CPU rows of plan 11.2 are keyed on enrolled Job "
+    "count, which the run record does not carry, so that one check stays "
+    "NOT_APPLICABLE.",
     "Plan 11.3 says only 「A0→B若總體成本／互動效果倒退…仍不promotion」 with no "
-    "tolerance, so the A0 to B veto here triggers on any median degradation of "
-    "foreground p95 or makespan, which is the strictest reading.",
+    "tolerance. Clarification C2 reads that veto with the plan's own scenario "
+    "tolerances: foreground p95 may not get worse than the live baseline, and the "
+    "batch cost is held to 15 percent makespan and 10 percent throughput in CPU "
+    "rule scenarios or to 5 percent in neutral rule scenarios.",
     "Plan 11.3 names no threshold for the unmanaged CPU pressure, mixed role and "
     "mixed duration scenarios; those report NO_THRESHOLD_DEFINED.",
     "Plan 11.3 lists 「minimum headroom」 without saying whether it is physical or "
@@ -710,50 +723,105 @@ def check_neutral_scenario(pairs: Sequence[PairedRun]) -> tuple[ThresholdCheck, 
 
 
 def check_observer_cost(pairs: Sequence[PairedRun]) -> tuple[ThresholdCheck, ...]:
-    """A0 to A1. Plan section 11.3 names no number here, so nothing is judged."""
+    """A0 to A1 under clarification C1: A1 sets no cap, so the neutral rule applies.
+
+    Plan 11.3 names no A0 to A1 number. C1 reuses the plan's own neutral rule of
+    5 percent, because a variant that never caps anything should look like the
+    neutral scenarios. The plan 11.2 monitor CPU rows are keyed on enrolled Job
+    count, which the run record schema does not carry, so that row is reported
+    without a judgement.
+    """
     if not pairs:
         raise BenchmarkDataError("check_observer_cost: no pairs")
     base_p95, treat_p95 = _metric_values(pairs, "foreground_p95_ms")
+    p95_degradation = median(relative_changes(base_p95, treat_p95))
     base_makespan, treat_makespan = _metric_values(pairs, "makespan_s")
+    makespan_degradation = median(relative_changes(base_makespan, treat_makespan))
+    detail = (f"{CLARIFICATION_LABEL_C1}: A1 sets no cap, so it is held to the plan 11.3 "
+              "neutral rule of at most 5 percent")
     return (
         ThresholdCheck(
-            "foreground p95 change median",
-            CheckStatus.NOT_APPLICABLE, median(relative_changes(base_p95, treat_p95)), None,
-            "plan 11.3 states no A0 to A1 threshold; reported for human judgement"),
+            "foreground p95 degradation median",
+            CheckStatus.PASS if p95_degradation <= NEUTRAL_MAX_MEDIAN_DEGRADATION
+            else CheckStatus.FAIL,
+            p95_degradation, NEUTRAL_MAX_MEDIAN_DEGRADATION, detail),
         ThresholdCheck(
-            "makespan change median",
-            CheckStatus.NOT_APPLICABLE, median(relative_changes(base_makespan, treat_makespan)), None,
-            "plan 11.3 states no A0 to A1 threshold; reported for human judgement"),
+            "makespan degradation median",
+            CheckStatus.PASS if makespan_degradation <= NEUTRAL_MAX_MEDIAN_DEGRADATION
+            else CheckStatus.FAIL,
+            makespan_degradation, NEUTRAL_MAX_MEDIAN_DEGRADATION, detail),
         ThresholdCheck(
             "monitor CPU units median (A1)",
             CheckStatus.NOT_APPLICABLE,
             median([pair.treatment.metrics.monitor_cpu_units for pair in pairs]), None,
-            "plan 11.2 holds the monitoring cost thresholds; they are not A/B thresholds"),
+            f"{CLARIFICATION_LABEL_C1}: the plan 11.2 monitor CPU rows are keyed on "
+            "enrolled Job count, which the run record does not carry, so this is "
+            "reported for human judgement"),
     )
 
 
-def check_a0_b_regression(pairs: Sequence[PairedRun]) -> tuple[ThresholdCheck, ...]:
+def check_a0_b_regression(pairs: Sequence[PairedRun],
+                          scenario_class: ScenarioClass) -> tuple[ThresholdCheck, ...]:
     """Plan section 11.3 veto: if A0 to B regresses overall, B is not promoted.
 
-    The plan gives no tolerance for 倒退, so any median degradation of foreground
-    p95 or of makespan vetoes, which is the strictest reading of that sentence.
+    The plan gives no tolerance for 倒退. Clarification C2 reads the veto with the
+    plan's own scenario tolerances, because capping a background Job raises its
+    makespan by design and a zero tolerance on makespan would veto every B. The
+    interaction side keeps a zero tolerance: B may not make foreground p95 worse
+    than the live baseline a person already has. Scenario classes the plan lists
+    no tolerance for are reported without a judgement.
     """
     if not pairs:
         raise BenchmarkDataError("check_a0_b_regression: no pairs")
+    _typed(scenario_class, ScenarioClass, "scenario_class")
     base_p95, treat_p95 = _metric_values(pairs, "foreground_p95_ms")
     p95_change = median(relative_changes(base_p95, treat_p95))
     base_makespan, treat_makespan = _metric_values(pairs, "makespan_s")
     makespan_change = median(relative_changes(base_makespan, treat_makespan))
-    detail = ("plan 11.3 veto, no numeric tolerance stated, so any median degradation "
-              "counts as a regression")
-    return (
+
+    if scenario_class not in CPU_RULE_SCENARIOS and scenario_class not in NEUTRAL_RULE_SCENARIOS:
+        detail = (f"{CLARIFICATION_LABEL_C2}: plan 11.3 states no tolerance for this "
+                  "scenario class, so the veto is reported for human judgement")
+        return (
+            ThresholdCheck("A0 to B foreground p95 change median",
+                           CheckStatus.NOT_APPLICABLE, p95_change, None, detail),
+            ThresholdCheck("A0 to B makespan change median",
+                           CheckStatus.NOT_APPLICABLE, makespan_change, None, detail),
+        )
+
+    p95_detail = (f"{CLARIFICATION_LABEL_C2}: B may not make foreground p95 worse than the "
+                  "live A0 baseline, so the tolerance here stays zero")
+    checks = [
         ThresholdCheck("A0 to B foreground p95 change median",
                        CheckStatus.PASS if p95_change <= 0.0 else CheckStatus.FAIL,
-                       p95_change, 0.0, detail),
-        ThresholdCheck("A0 to B makespan change median",
-                       CheckStatus.PASS if makespan_change <= 0.0 else CheckStatus.FAIL,
-                       makespan_change, 0.0, detail),
-    )
+                       p95_change, 0.0, p95_detail),
+    ]
+    if scenario_class in CPU_RULE_SCENARIOS:
+        base_units, treat_units = _metric_values(pairs, "completed_units_per_min")
+        throughput_drop = median([-change for change in relative_changes(base_units, treat_units)])
+        checks.append(ThresholdCheck(
+            "A0 to B makespan degradation median",
+            CheckStatus.PASS if makespan_change <= CPU_MAKESPAN_MAX_MEDIAN_DEGRADATION
+            else CheckStatus.FAIL,
+            makespan_change, CPU_MAKESPAN_MAX_MEDIAN_DEGRADATION,
+            f"{CLARIFICATION_LABEL_C2}: the plan 11.3 CPU scenario batch tolerance of "
+            "15 percent, applied to the A0 baseline"))
+        checks.append(ThresholdCheck(
+            "A0 to B throughput drop median",
+            CheckStatus.PASS if throughput_drop <= CPU_THROUGHPUT_MAX_MEDIAN_DROP
+            else CheckStatus.FAIL,
+            throughput_drop, CPU_THROUGHPUT_MAX_MEDIAN_DROP,
+            f"{CLARIFICATION_LABEL_C2}: the plan 11.3 CPU scenario throughput tolerance of "
+            "10 percent, applied to the A0 baseline"))
+    else:
+        checks.append(ThresholdCheck(
+            "A0 to B makespan degradation median",
+            CheckStatus.PASS if makespan_change <= NEUTRAL_MAX_MEDIAN_DEGRADATION
+            else CheckStatus.FAIL,
+            makespan_change, NEUTRAL_MAX_MEDIAN_DEGRADATION,
+            f"{CLARIFICATION_LABEL_C2}: the plan 11.3 neutral tolerance of 5 percent, "
+            "applied to the A0 baseline"))
+    return tuple(checks)
 
 
 # --- analysis and verdict ----------------------------------------------------
@@ -784,6 +852,9 @@ def analyze_comparison(
     Verdict precedence: synthetic evidence first, then data sufficiency, then the
     plan's "no problem worth controlling" rule, then missing thresholds, then the
     threshold results. A threshold result can never outrank an evidence problem.
+
+    The A0 to B checks need the scenario class, because clarification C2 reads the
+    plan's veto with that scenario's own tolerances.
     """
     _typed(comparison, Comparison, "comparison")
     _text(scenario, "scenario")
@@ -812,7 +883,7 @@ def analyze_comparison(
         elif comparison is Comparison.A0_A1:
             checks = check_observer_cost(pairs)
         elif comparison is Comparison.A0_B:
-            checks = check_a0_b_regression(pairs)
+            checks = check_a0_b_regression(pairs, scenario_class)
 
     verdict = _verdict(comparison, scenario_class, pairs, relevant, evidence, checks,
                        min_pairs, notes)

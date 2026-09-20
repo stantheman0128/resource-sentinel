@@ -247,6 +247,19 @@ def migrate_schema(conn: sqlite3.Connection, *, in_transaction: bool = False) ->
             # No nonce is manufactured for a legacy provider's existing Job.
             # New native owners must register a fresh scope before OS creation.
             conn.execute("ALTER TABLE managed_executions ADD COLUMN job_nonce TEXT")
+        # Three fixed operation slots per execution, not a capacity ledger or
+        # unbounded response cache. No claim secret, raw payload or handle is
+        # persisted. An uncertain first insert never grants an OS side effect.
+        conn.execute("""CREATE TABLE IF NOT EXISTS adaptive_launch_requests (
+            execution_id TEXT NOT NULL,
+            operation TEXT NOT NULL CHECK(operation IN ('PrepareExecution','ClaimLaunch','BindRoot')),
+            request_id TEXT NOT NULL UNIQUE,
+            payload_hash TEXT NOT NULL,
+            spec_hash TEXT NOT NULL,
+            guardian_epoch TEXT NOT NULL,
+            PRIMARY KEY(execution_id,operation),
+            FOREIGN KEY(execution_id) REFERENCES managed_executions(execution_id)
+        )""")
         from .control_slot import ControlSlotError, migrate_control_slot_schema
         try:
             migrate_control_slot_schema(conn)
@@ -707,6 +720,27 @@ def _get_ipc_auth_record(db_path, execution_id: str, *, timeout_ms: int = 250) -
         return _ipc_auth_record(conn, execution_id)
 
 
+def _revalidate_launch_auth(conn, execution_id, caller, expected_auth):
+    """Bind an already authenticated native-peer request to this DB snapshot.
+
+    This internal record is not authentication or launch authority by itself.
+    The IPC service must retain its verified native peer and operation-specific
+    proof; ClaimLaunch additionally requires the original separate claim token.
+    """
+    if (type(expected_auth) is not _IpcAuthRecord or
+            expected_auth.execution_id != execution_id or
+            type(caller) is not ProcessIdentity or expected_auth.wrapper_identity != caller or
+            type(expected_auth.ipc_auth_key) is not bytes or len(expected_auth.ipc_auth_key) != 32):
+        raise LifecycleError("ipc_auth_binding_changed")
+    actual = _ipc_auth_record(conn, execution_id)
+    names = ("execution_id", "spec_hash", "wrapper_identity", "allocation_kind",
+             "reservation_id", "admission_binding_hash")
+    if (any(getattr(actual, name) != getattr(expected_auth, name) for name in names) or
+            not hmac.compare_digest(actual.ipc_auth_key, expected_auth.ipc_auth_key)):
+        raise LifecycleError("ipc_auth_binding_changed")
+    return actual
+
+
 def authenticated_query(db_path, execution_id: str, expected_record: _IpcAuthRecord, *,
                         timeout_ms: int = 250) -> dict[str, Any]:
     """Read one sanitized execution after service-side native/MAC verification.
@@ -955,6 +989,124 @@ class LifecycleStore:
         with self._connection() as conn:
             _check_version(conn)
             return self._public(self._get(conn, execution_id))
+
+    def _require_authenticated_allocation(self, conn, row):
+        if row["allocation_kind"] != "direct" or row["parent_execution_id"] is not None:
+            raise LifecycleError("authenticated_direct_allocation_required")
+        self._require_allocation(conn, row["execution_id"])
+        if (conn.execute("SELECT count(*) FROM reservations WHERE execution_id=? OR id=?",
+                         (row["execution_id"], row["reservation_id"])).fetchone()[0] != 1 or
+                conn.execute("SELECT count(*) FROM worker_reservations WHERE execution_id=?",
+                             (row["execution_id"],)).fetchone()[0] != 0 or
+                conn.execute("""SELECT count(*) FROM managed_executions WHERE execution_id=? OR
+                    (reservation_id=? AND (allocation_kind='direct' OR allocation_kind IS NULL OR
+                                          allocation_kind NOT IN ('direct','routed')))""",
+                             (row["execution_id"], row["reservation_id"])).fetchone()[0] != 1):
+            raise LifecycleError("authenticated_allocation_not_unique")
+
+    def _launch_snapshot(self, execution_id, caller, expected_auth, *, guard=None):
+        if expected_auth is None:
+            return self.query(execution_id)
+        with self._connection() as conn:
+            conn.execute("BEGIN")
+            _check_version(conn)
+            if guard is not None:
+                self._policy.revalidate(conn, guard)
+            _revalidate_launch_auth(conn, execution_id, caller, expected_auth)
+            row = self._get(conn, execution_id)
+            if row["state"] not in TERMINAL_STATES:
+                self._require_authenticated_allocation(conn, row)
+            return self._public(row)
+
+    @staticmethod
+    def _launch_ack(row, expected_auth, *, duplicate=False):
+        public = LifecycleStore._public(row)
+        if expected_auth is not None:
+            public.update(duplicate=duplicate, launch_authorized=False)
+        return public
+
+    def assert_authenticated_allocation(self, expected_row: Mapping[str, Any], *,
+                                        caller: ProcessIdentity, expected_auth: _IpcAuthRecord) -> None:
+        """Read-only pre-Job custody after service-side native/MAC verification.
+
+        This requires no wrapper-local ManagedAdmission object or fabricated
+        manifest. Authentication material, exact expected row and actual unique
+        allocation are checked in one snapshot. It grants no launch permission.
+        """
+        if (not isinstance(expected_row, Mapping) or type(expected_row.get("state_revision")) is not int or
+                type(expected_auth) is not _IpcAuthRecord or
+                expected_row.get("execution_id") != expected_auth.execution_id):
+            raise LifecycleError("authenticated_expected_row_invalid")
+        try:
+            ledger_path = self._existing_ledger_path or Path(self.db_path).resolve()
+        except (OSError, TypeError, ValueError, RuntimeError):
+            raise LifecycleError("coverage_registry_unavailable") from None
+        with _coverage_read_transaction(ledger_path) as conn:
+            _revalidate_launch_auth(conn, expected_auth.execution_id, caller, expected_auth)
+            row = self._get(conn, expected_auth.execution_id)
+            self._require_revision(row, expected_row["state_revision"])
+            public = self._public(row)
+            if any(key not in expected_row or expected_row[key] != value for key, value in public.items()):
+                raise LifecycleError("authenticated_expected_row_mismatch")
+            self._require_authenticated_allocation(conn, row)
+
+    def record_launch_request_locked(self, execution_id: str, operation: str, request_id: str,
+                                     payload_hash: str, *, caller: ProcessIdentity,
+                                     expected_auth: _IpcAuthRecord, guardian_epoch: str) -> bool:
+        """Record one immutable request before OS side effects; never authorize them.
+
+        The trusted transport hashes its complete typed request, including its
+        operation, revision and binding fields. A key/digest change cannot
+        overwrite an earlier attempt. True acknowledges an exact retry; neither
+        result reconstructs a lost native creation/launch capability.
+        """
+        from .policy import PolicyError
+
+        if (type(operation) is not str or operation not in {"PrepareExecution", "ClaimLaunch", "BindRoot"} or
+                type(caller) is not ProcessIdentity or
+                type(payload_hash) is not str or not re.fullmatch(r"[0-9a-f]{64}", payload_hash) or
+                type(guardian_epoch) is not str or not re.fullmatch(r"[A-Za-z0-9_.:@-]{1,128}", guardian_epoch)):
+            raise LifecycleError("invalid_launch_request")
+        try:
+            if type(request_id) is not str or UUID(request_id).int == 0 or str(UUID(request_id)) != request_id:
+                raise ValueError
+        except (ValueError, AttributeError):
+            raise LifecycleError("invalid_launch_request") from None
+        try:
+            guard = self._policy.assert_held()
+            if guard.binding.logon_id != caller.logon_id:
+                raise LifecycleError("policy_logon_mismatch")
+            with self._transaction() as conn:
+                runtime = self._policy.revalidate(conn, guard)
+                auth = _revalidate_launch_auth(conn, execution_id, caller, expected_auth)
+                row = self._get(conn, execution_id)
+                if (row["guardian_epoch"] not in {"", guardian_epoch} or
+                        runtime["guardian_epoch"] not in {"", guardian_epoch} or
+                        (operation != "PrepareExecution" and row["guardian_epoch"] != guardian_epoch)):
+                    raise LifecycleError("guardian_identity_mismatch")
+                values = (execution_id, operation, request_id, payload_hash, auth.spec_hash, guardian_epoch)
+                recorded = conn.execute("""SELECT execution_id,operation,request_id,payload_hash,spec_hash,guardian_epoch
+                    FROM adaptive_launch_requests WHERE (execution_id=? AND operation=?) OR request_id=? LIMIT 2""",
+                    (execution_id, operation, request_id)).fetchall()
+                if recorded:
+                    if len(recorded) != 1 or tuple(recorded[0]) != values:
+                        raise LifecycleError("launch_request_mismatch")
+                    if row["state"] not in TERMINAL_STATES:
+                        self._require_authenticated_allocation(conn, row)
+                    return True
+                if (row["state"] not in {"RESERVED", "PREPARED", "LAUNCHING", "RUNNING", "DRAINING",
+                                          "START_UNKNOWN", "UNCERTAIN_HOLD"} or
+                        (operation == "PrepareExecution" and row["state"] != "RESERVED") or
+                        (operation == "ClaimLaunch" and row["state"] != "PREPARED") or
+                        (operation == "BindRoot" and row["state"] not in {"LAUNCHING", "START_UNKNOWN"})):
+                    raise LifecycleError("invalid_lifecycle_transition")
+                self._require_authenticated_allocation(conn, row)
+                conn.execute("""INSERT INTO adaptive_launch_requests
+                    (execution_id,operation,request_id,payload_hash,spec_hash,guardian_epoch)
+                    VALUES(?,?,?,?,?,?)""", values)
+                return False
+        except PolicyError as error:
+            raise LifecycleError(str(error)) from error
 
     def assert_admission_covered(self, admission, expected_row: Mapping[str, Any]) -> None:
         """Verify one direct admission's retained ledger custody, read-only.
@@ -1456,7 +1608,8 @@ class LifecycleStore:
 
     def register_job_scope(self, execution_id: str, *, caller: ProcessIdentity,
                            expected_revision: int, guardian_epoch: str,
-                           job_name: str, job_nonce: str) -> dict[str, Any]:
+                           job_name: str, job_nonce: str,
+                           expected_auth: _IpcAuthRecord | None = None) -> dict[str, Any]:
         """Persist one native creation responsibility before creating any Job.
 
         The trusted owner already holds this store's POLICY scope and retains
@@ -1493,7 +1646,16 @@ class LifecycleStore:
             guard = self._policy.assert_held()
         except PolicyError as error:
             raise LifecycleError(str(error)) from error
-        snapshot = self.query(execution_id)
+        if type(caller) is not ProcessIdentity or guard.binding.logon_id != caller.logon_id:
+            raise LifecycleError("policy_logon_mismatch")
+        snapshot = self._launch_snapshot(execution_id, caller, expected_auth, guard=guard)
+        if expected_auth is not None and snapshot["job_name"] is not None:
+            # Durable scope is a replay ACK, never a reconstructed capability
+            # to create/recreate a named object after an uncertain outcome.
+            if (snapshot["state"] in TERMINAL_STATES or snapshot["job_name"] != job_name or
+                    snapshot["job_nonce"] != job_nonce or snapshot["guardian_epoch"] != guardian_epoch):
+                raise LifecycleError("job_scope_already_registered")
+            return self._launch_ack(snapshot, expected_auth, duplicate=True)
         self._require_revision(snapshot, expected_revision)
         self._caller(snapshot, caller)
         if guard.binding.logon_id != caller.logon_id:
@@ -1508,6 +1670,8 @@ class LifecycleStore:
             self._policy.assert_held(guard)
             with self._transaction() as conn:
                 runtime = self._policy.revalidate(conn, guard)
+                if expected_auth is not None:
+                    _revalidate_launch_auth(conn, execution_id, caller, expected_auth)
                 row = self._get(conn, execution_id)
                 self._require_revision(row, expected_revision)
                 self._caller(row, caller)
@@ -1522,7 +1686,10 @@ class LifecycleStore:
                 if (runtime["active_logon_id"] not in {"", row["logon_id"]} or
                         runtime["guardian_epoch"] not in {"", guardian_epoch}):
                     raise LifecycleError("guardian_identity_mismatch")
-                self._require_allocation(conn, execution_id)
+                if expected_auth is not None:
+                    self._require_authenticated_allocation(conn, row)
+                else:
+                    self._require_allocation(conn, execution_id)
                 enrolled = conn.execute("""SELECT count(*) FROM managed_executions
                     WHERE allocation_kind IN ('direct','routed') AND job_name IS NOT NULL
                       AND state NOT IN ('FINISHED','CANCELLED_BEFORE_START','START_FAILED')""").fetchone()[0]
@@ -1530,22 +1697,35 @@ class LifecycleStore:
                     raise LifecycleError("managed_job_limit_reached")
                 conn.execute("UPDATE adaptive_runtime SET active_logon_id=?,guardian_epoch=? WHERE singleton=1",
                              (row["logon_id"], guardian_epoch))
-                return self._public(self._cas(conn, execution_id, expected_revision,
-                    {"job_name": job_name, "job_nonce": job_nonce, "guardian_epoch": guardian_epoch}))
+                return self._launch_ack(self._cas(conn, execution_id, expected_revision,
+                    {"job_name": job_name, "job_nonce": job_nonce, "guardian_epoch": guardian_epoch}), expected_auth)
 
-    def mark_prepared(self, execution_id: str, *, caller: ProcessIdentity, expected_revision: int) -> dict[str, Any]:
-        snapshot = self.query(execution_id)
-        self._require_revision(snapshot, expected_revision)
+    def mark_prepared(self, execution_id: str, *, caller: ProcessIdentity, expected_revision: int,
+                      expected_auth: _IpcAuthRecord | None = None) -> dict[str, Any]:
+        snapshot = self._launch_snapshot(execution_id, caller, expected_auth)
+        replay = expected_auth is not None and snapshot["state"] == "PREPARED"
+        if not replay:
+            self._require_revision(snapshot, expected_revision)
         self._caller(snapshot, caller)
         with self._publication_scope(caller) as publication:
             with self._evidence_scope("prepare", snapshot, caller, publication=publication) as proof:
                 with self._publication_transaction(*publication) as conn:
+                    if expected_auth is not None:
+                        _revalidate_launch_auth(conn, execution_id, caller, expected_auth)
                     if (not proof.guardian_epoch or not proof.job_name or not proof.original_cpu_disabled or
                             not proof.durable_manifest or not proof.legacy_exclusion or type(proof.active_process_count) is not int or
                             proof.active_process_count != 0 or proof.process_ids != () or proof.job_creation_never_attempted):
                         raise LifecycleError("job_preparation_unverified")
                     row = self._get(conn, execution_id)
-                    self._require_revision(row, expected_revision)
+                    self._require_revision(row, snapshot["state_revision"] if replay else expected_revision)
+                    if expected_auth is not None:
+                        self._require_authenticated_allocation(conn, row)
+                    if replay:
+                        if (row["state"] != "PREPARED" or row["job_name"] != proof.job_name or
+                                row["job_nonce"] != proof.job_nonce or row["guardian_epoch"] != proof.guardian_epoch or
+                                row["coverage"] != "job_contained"):
+                            raise LifecycleError("job_scope_evidence_mismatch")
+                        return self._launch_ack(row, expected_auth, duplicate=True)
                     if row["state"] != "RESERVED" or row["allocation_kind"] == "parent":
                         raise LifecycleError("invalid_lifecycle_transition")
                     self._require_allocation(conn, execution_id)
@@ -1562,10 +1742,116 @@ class LifecycleStore:
                     if runtime["active_logon_id"] not in {"", row["logon_id"]} or runtime["guardian_epoch"] not in {"", proof.guardian_epoch}:
                         raise LifecycleError("guardian_identity_mismatch")
                     conn.execute("UPDATE adaptive_runtime SET active_logon_id=?,guardian_epoch=? WHERE singleton=1", (row["logon_id"], proof.guardian_epoch))
-                    return self._public(self._cas(conn, execution_id, expected_revision, {"state": "PREPARED", "job_name": proof.job_name,
-                                        "guardian_epoch": proof.guardian_epoch, "coverage": "job_contained"}))
+                    return self._launch_ack(self._cas(conn, execution_id, expected_revision, {"state": "PREPARED", "job_name": proof.job_name,
+                                        "guardian_epoch": proof.guardian_epoch, "coverage": "job_contained"}), expected_auth)
 
-    def claim_launch(self, execution_id: str, *, caller: ProcessIdentity, claim_token: str, spec_hash: str, guardian_epoch: str, expected_revision: int) -> dict[str, Any]:
+    @staticmethod
+    def _claim_digest(claim_token):
+        if type(claim_token) is not str or not 32 <= len(claim_token) <= 128 or not claim_token.isascii():
+            raise LifecycleError("invalid_claim_token")
+        return hashlib.sha256(claim_token.encode("ascii")).hexdigest()
+
+    def _authenticate_claim(self, row, caller, token_hash, spec_hash, guardian_epoch):
+        self._caller(row, caller)
+        if (type(row["claim_token_hash"]) is not str or
+                not hmac.compare_digest(row["claim_token_hash"], token_hash) or row["spec_hash"] != spec_hash):
+            raise LifecycleError("claim_binding_mismatch")
+        if row["guardian_epoch"] != guardian_epoch or not guardian_epoch:
+            raise LifecycleError("guardian_identity_mismatch")
+
+    def _authenticated_claim_snapshot(self, execution_id, *, caller, token_hash, spec_hash,
+                                      guardian_epoch, expected_revision, expected_auth, guard=None):
+        # The key, token binding, duplicate flag and allocation share one
+        # snapshot. A stale credential cannot authorize even a read-only ACK.
+        with self._connection() as conn:
+            conn.execute("BEGIN")
+            _check_version(conn)
+            if guard is not None:
+                self._policy.revalidate(conn, guard)
+            _revalidate_launch_auth(conn, execution_id, caller, expected_auth)
+            row = self._get(conn, execution_id)
+            self._authenticate_claim(row, caller, token_hash, spec_hash, guardian_epoch)
+            if row["state"] not in TERMINAL_STATES:
+                self._require_authenticated_allocation(conn, row)
+            if row["claim_consumed"]:
+                return self._public(row), True
+            self._require_revision(row, expected_revision)
+            if row["state"] != "PREPARED" or row["launch_sealed"]:
+                raise LifecycleError("invalid_lifecycle_transition")
+            runtime = conn.execute("SELECT guardian_epoch,admission_barrier FROM adaptive_runtime WHERE singleton=1").fetchone()
+            if runtime is None or runtime[0] != guardian_epoch or runtime[1] != "NONE":
+                raise LifecycleError("launch_barrier_active")
+            return self._public(row), False
+
+    def claim_launch_locked(self, execution_id: str, *, caller: ProcessIdentity, claim_token: str,
+                            spec_hash: str, guardian_epoch: str, expected_revision: int,
+                            expected_auth: _IpcAuthRecord) -> dict[str, Any]:
+        """Consume the wrapper's one-use token under this store's held POLICY.
+
+        The authenticated service retains its native peer, guardian and Job
+        fence. This method neither obtains another POLICY nonce nor substitutes
+        the query credential for the separate original launch token. Any lost
+        commit/evidence-cleanup ACK must be reconciled as consumed, never retried
+        as permission to create another root process.
+        """
+        from .policy import PolicyError
+
+        token_hash = self._claim_digest(claim_token)
+        try:
+            guard = self._policy.assert_held()
+            if type(caller) is not ProcessIdentity or guard.binding.logon_id != caller.logon_id:
+                raise LifecycleError("policy_logon_mismatch")
+            snapshot, duplicate = self._authenticated_claim_snapshot(execution_id,
+                caller=caller, token_hash=token_hash, spec_hash=spec_hash, guardian_epoch=guardian_epoch,
+                expected_revision=expected_revision, expected_auth=expected_auth, guard=guard)
+            if duplicate:
+                return self._launch_ack(snapshot, expected_auth, duplicate=True)
+            with self._evidence_scope("claim", snapshot, caller) as proof:
+                if proof.guardian_epoch != guardian_epoch:
+                    raise LifecycleError("guardian_identity_mismatch")
+                self._policy.assert_held(guard)
+                with self._transaction() as conn:
+                    runtime = self._policy.revalidate(conn, guard)
+                    _revalidate_launch_auth(conn, execution_id, caller, expected_auth)
+                    row = self._get(conn, execution_id)
+                    self._authenticate_claim(row, caller, token_hash, spec_hash, guardian_epoch)
+                    if row["state"] not in TERMINAL_STATES:
+                        self._require_authenticated_allocation(conn, row)
+                    if row["claim_consumed"]:
+                        result = self._launch_ack(row, expected_auth, duplicate=True)
+                    else:
+                        self._require_revision(row, expected_revision)
+                        if row["state"] != "PREPARED" or row["launch_sealed"]:
+                            raise LifecycleError("invalid_lifecycle_transition")
+                        if runtime["guardian_epoch"] != guardian_epoch or runtime["admission_barrier"] != "NONE":
+                            raise LifecycleError("launch_barrier_active")
+                        updated = self._cas(conn, execution_id, expected_revision,
+                            {"state": "LAUNCHING", "claim_consumed": 1, "launch_in_flight": 1})
+                        result = {**self._public(updated), "launch_authorized": True, "duplicate": False}
+            # Evidence must exit successfully before returning new authority.
+            # The caller still owns POLICY and its outer per-Job/native scope.
+            return result
+        except PolicyError as error:
+            translated = LifecycleError(str(error))
+            for note in getattr(error, "__notes__", ()):
+                translated.add_note(note)
+            raise translated from error
+
+    def claim_launch(self, execution_id: str, *, caller: ProcessIdentity, claim_token: str, spec_hash: str,
+                     guardian_epoch: str, expected_revision: int,
+                     expected_auth: _IpcAuthRecord | None = None) -> dict[str, Any]:
+        if expected_auth is not None:
+            token_hash = self._claim_digest(claim_token)
+            snapshot, duplicate = self._authenticated_claim_snapshot(execution_id,
+                caller=caller, token_hash=token_hash, spec_hash=spec_hash, guardian_epoch=guardian_epoch,
+                expected_revision=expected_revision, expected_auth=expected_auth)
+            if duplicate:
+                return self._launch_ack(snapshot, expected_auth, duplicate=True)
+            with self._publication_scope(caller):
+                result = self.claim_launch_locked(execution_id, caller=caller, claim_token=claim_token,
+                    spec_hash=spec_hash, guardian_epoch=guardian_epoch, expected_revision=expected_revision,
+                    expected_auth=expected_auth)
+            return result
         from .policy import PolicyBusy, PolicyError
         from .windows import NativePolicyMutexError
 
@@ -1973,20 +2259,51 @@ class LifecycleStore:
                 return self._finish_before_start(conn, row, expected_revision=expected_revision,
                                                  state="START_FAILED", now=now)
 
-    def bind_root(self, execution_id: str, *, caller: ProcessIdentity, expected_revision: int) -> dict[str, Any]:
-        snapshot = self.query(execution_id)
-        self._require_revision(snapshot, expected_revision)
+    def bind_root(self, execution_id: str, *, caller: ProcessIdentity, expected_revision: int,
+                  expected_auth: _IpcAuthRecord | None = None) -> dict[str, Any]:
+        snapshot = self._launch_snapshot(execution_id, caller, expected_auth)
+        replay = (expected_auth is not None and snapshot["state"] in {"RUNNING", "DRAINING", "UNCERTAIN_HOLD"} and
+                  snapshot["root_pid"] is not None and snapshot["claim_consumed"] and
+                  snapshot["launch_sealed"] and not snapshot["launch_in_flight"])
+        if not replay:
+            self._require_revision(snapshot, expected_revision)
         with self._evidence_scope("bind_root", snapshot, caller) as proof:
             if (not isinstance(proof.root, ProcessIdentity) or proof.root.logon_id != caller.logon_id or
                     proof.guardian_epoch != snapshot["guardian_epoch"] or proof.job_name != snapshot["job_name"] or not proof.launch_sealed):
                 raise LifecycleError("root_binding_unverified")
+            guard = None
+            if expected_auth is not None:
+                from .policy import PolicyError
+                try:
+                    guard = self._policy.assert_held()
+                    if guard.binding.logon_id != caller.logon_id:
+                        raise PolicyError("policy_logon_mismatch")
+                except PolicyError as error:
+                    raise LifecycleError(str(error)) from error
             with self._transaction() as conn:
+                if expected_auth is not None:
+                    self._policy.revalidate(conn, guard)
+                    _revalidate_launch_auth(conn, execution_id, caller, expected_auth)
                 row = self._get(conn, execution_id)
-                self._require_revision(row, expected_revision)
+                self._require_revision(row, snapshot["state_revision"] if replay else expected_revision)
+                if expected_auth is not None:
+                    self._require_authenticated_allocation(conn, row)
+                else:
+                    self._require_allocation(conn, execution_id)
+                if replay:
+                    # The immutable request journal belongs to the service;
+                    # the store additionally verifies current native root
+                    # custody and the surviving allocation. An old request
+                    # revision cannot regress DRAINING/HOLD or repeat a CAS.
+                    if (row["root_pid"] != proof.root.pid or
+                            row["root_created_filetime_100ns"] != str(proof.root.created_filetime_100ns) or
+                            row["logon_id"] != proof.root.logon_id):
+                        raise LifecycleError("root_binding_unverified")
+                    return self._launch_ack(row, expected_auth, duplicate=True)
                 if row["state"] not in {"LAUNCHING", "START_UNKNOWN"} or not row["launch_in_flight"]:
                     raise LifecycleError("invalid_lifecycle_transition")
-                return self._public(self._cas(conn, execution_id, expected_revision, {"state": "RUNNING", "root_pid": proof.root.pid,
-                    "root_created_filetime_100ns": str(proof.root.created_filetime_100ns), "launch_in_flight": 0, "launch_sealed": 1}))
+                return self._launch_ack(self._cas(conn, execution_id, expected_revision, {"state": "RUNNING", "root_pid": proof.root.pid,
+                    "root_created_filetime_100ns": str(proof.root.created_filetime_100ns), "launch_in_flight": 0, "launch_sealed": 1}), expected_auth)
 
     def mark_root_exited(self, execution_id: str, *, caller: ProcessIdentity, expected_revision: int, exit_code: int) -> dict[str, Any]:
         if type(exit_code) is not int or not -(1 << 31) <= exit_code < (1 << 32):

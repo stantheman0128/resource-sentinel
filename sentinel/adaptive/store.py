@@ -41,6 +41,15 @@ class LifecycleError(RuntimeError):
     """Stable error codes suitable for a sanitized caller response."""
 
 
+class ControlSlotRejected(LifecycleError):
+    """This slot attempt was rejected and its rollback/cleanup verified.
+
+    This is not reconciliation of any earlier uncertain attempt using the same
+    episode ID. A caller may mark never-acquired only for its initial attempt;
+    it must preserve previously acquired or uncertain episode responsibility.
+    """
+
+
 class SchemaVersionError(LifecycleError):
     pass
 
@@ -235,6 +244,11 @@ def migrate_schema(conn: sqlite3.Connection, *, in_transaction: bool = False) ->
             # No nonce is manufactured for a legacy provider's existing Job.
             # New native owners must register a fresh scope before OS creation.
             conn.execute("ALTER TABLE managed_executions ADD COLUMN job_nonce TEXT")
+        from .control_slot import ControlSlotError, migrate_control_slot_schema
+        try:
+            migrate_control_slot_schema(conn)
+        except ControlSlotError as error:
+            raise SchemaVersionError(str(error)) from error
         migrate_writer_fence(conn)
         if not in_transaction:
             conn.commit()
@@ -357,7 +371,8 @@ class LifecycleEvidence:
     job_creation_never_attempted: bool = False
 
     def __post_init__(self):
-        if self.operation not in {"register", "register_scope", "prepare", "claim", "bind_root", "root_exited", "finalize", "cancel", "start_failed"}:
+        if self.operation not in {"register", "register_scope", "prepare", "claim", "bind_root", "root_exited", "finalize", "cancel", "start_failed",
+                                  "control_begin", "control_restore"}:
             raise ValueError("invalid_evidence_operation")
         for name in ("execution_id", "observation_id"):
             value = getattr(self, name)
@@ -1275,6 +1290,116 @@ class LifecycleStore:
         except (PolicyError, NativePolicyMutexError) as error:
             raise LifecycleError(str(error)) from error
 
+    def query_control_slot_locked(self) -> dict[str, Any] | None:
+        """Read the exact slot under borrowed POLICY; unknown is never empty."""
+        from .control_slot import ControlSlotError, query_locked
+        from .policy import PolicyError
+
+        try:
+            guard = self._policy.assert_held()
+            try:
+                ledger_path = Path(self.db_path).resolve()
+            except (OSError, TypeError, ValueError, RuntimeError):
+                raise LifecycleError("control_slot_registry_unavailable") from None
+            with _coverage_read_transaction(ledger_path) as conn:
+                runtime = self._policy.revalidate(conn, guard)
+                try:
+                    result = query_locked(conn, runtime, guard)
+                except ControlSlotError as error:
+                    # Convert this module's deliberate domain rejection before
+                    # the generic reader sanitizes ValueError from decoding.
+                    # Missing/unknown storage remains a rejection, never None.
+                    raise LifecycleError(str(error)) from error
+            self._policy.assert_held(guard)
+            return result
+        except (ControlSlotError, PolicyError) as error:
+            raise LifecycleError(str(error)) from error
+
+    def begin_control_slot_locked(self, execution_id: str, *, caller: ProcessIdentity,
+                                  expected_revision: int, slot_id: str,
+                                  exemption_revision: int) -> dict[str, Any]:
+        """Reserve one control responsibility before intent or native Set.
+
+        The trusted caller already holds POLICY, authenticates fresh exemption
+        state under that lock and retains its native Job evidence fence through
+        this call. exemption_revision records that external observation; this
+        method does not authenticate the separate grant authority. It returns
+        no Set/renewal authority, including on exact lost-ACK replay. The current
+        wrapper binding plus original guardian epoch is P1 provenance, not a
+        substitute for authenticating a separate production guardian process.
+        """
+        from .control_slot import ControlSlotError, begin_locked, require_evidence
+        from .policy import PolicyError
+
+        decision_error = None
+        try:
+            guard = self._policy.assert_held()
+            snapshot = self.query(execution_id)
+            self._require_revision(snapshot, expected_revision)
+            self._caller(snapshot, caller)
+            if guard.binding.logon_id != caller.logon_id:
+                raise LifecycleError("policy_logon_mismatch")
+            with self._evidence_scope("control_begin", snapshot, caller) as proof:
+                require_evidence(snapshot, proof, restoring=False)
+                self._policy.assert_held(guard)
+                with self._transaction() as conn:
+                    try:
+                        runtime = self._policy.revalidate(conn, guard)
+                        row = self._get(conn, execution_id)
+                        self._require_revision(row, expected_revision)
+                        self._caller(row, caller)
+                        require_evidence(row, proof, restoring=False)
+                        self._require_allocation(conn, execution_id)
+                        result = begin_locked(conn, row, runtime, guard, proof,
+                            slot_id=slot_id, exemption_revision=exemption_revision)
+                    except (ControlSlotError, LifecycleError, PolicyError) as error:
+                        # Mark only the exact synchronous decision exception.
+                        # Commit/rollback, connection and evidence cleanup all
+                        # finish before its classification below can be used.
+                        decision_error = error
+                        raise
+            return result
+        except (ControlSlotError, LifecycleError, PolicyError) as error:
+            if error is decision_error and not getattr(error, "__notes__", ()):
+                raise ControlSlotRejected(str(error)) from error
+            if isinstance(error, LifecycleError):
+                raise
+            raise LifecycleError(str(error)) from error
+
+    def release_control_slot_locked(self, execution_id: str, *, caller: ProcessIdentity,
+                                    expected_revision: int, slot_id: str) -> dict[str, Any]:
+        """Record verified restoration, retaining the host recovery barrier.
+
+        Restore the owned native cap before calling this method: unreadable DB,
+        changed eligibility or grant authority cannot authorize retaining that
+        cap. Only the already held evidence scope's current disabled Query and
+        settled exact durable manifest permit this bookkeeping transition. No
+        fresh-sample counter or barrier-clear shortcut is provided here.
+        """
+        from .control_slot import ControlSlotError, release_locked, require_evidence
+        from .policy import PolicyError
+
+        try:
+            guard = self._policy.assert_held()
+            snapshot = self.query(execution_id)
+            self._require_revision(snapshot, expected_revision)
+            self._caller(snapshot, caller)
+            if guard.binding.logon_id != caller.logon_id:
+                raise LifecycleError("policy_logon_mismatch")
+            with self._evidence_scope("control_restore", snapshot, caller) as proof:
+                require_evidence(snapshot, proof, restoring=True)
+                self._policy.assert_held(guard)
+                with self._transaction() as conn:
+                    runtime = self._policy.revalidate(conn, guard)
+                    row = self._get(conn, execution_id)
+                    self._require_revision(row, expected_revision)
+                    self._caller(row, caller)
+                    require_evidence(row, proof, restoring=True)
+                    result = release_locked(conn, row, runtime, guard, slot_id=slot_id)
+            return result
+        except (ControlSlotError, PolicyError) as error:
+            raise LifecycleError(str(error)) from error
+
     def enter_recovery_hold(self, *, expected_registry_revision: int,
                             reason: str = "recovery_unverified") -> dict[str, Any]:
         """Persist a conservative barrier under POLICY; never clear or tighten.
@@ -1550,8 +1675,14 @@ class LifecycleStore:
     @staticmethod
     def _archive_allocation(conn: sqlite3.Connection, row: Mapping[str, Any], now: float,
                             *, outcome: str = "managed_finished") -> None:
+        from .control_slot import ControlSlotError, require_archive_clear
+
         if outcome not in {"managed_finished", "managed_cancelled_before_start", "managed_start_failed"}:
             raise LifecycleError("invalid_archive_outcome")
+        try:
+            require_archive_clear(conn, row)
+        except ControlSlotError as error:
+            raise LifecycleError(str(error)) from error
         table = _TABLES[row["allocation_kind"]]
         allocation = conn.execute(f"SELECT * FROM {table} WHERE id=? AND execution_id=? AND lifecycle_managed=1", (row["reservation_id"], row["execution_id"])).fetchone()
         if allocation is None:

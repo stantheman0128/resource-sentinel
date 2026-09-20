@@ -147,6 +147,7 @@ class _WindowsBackend:
         _bind(k, "GetProcessId", _DWORD, _HANDLE)
         _bind(k, "GetProcessTimes", _BOOL, _HANDLE, *([C.POINTER(_FileTime)] * 4))
         _bind(k, "WaitForSingleObject", _DWORD, _HANDLE, _DWORD)
+        _bind(k, "GetExitCodeProcess", _BOOL, _HANDLE, C.POINTER(_DWORD))
         _bind(k, "IsProcessInJob", _BOOL, _HANDLE, _HANDLE, C.POINTER(_BOOL))
         _bind(k, "CloseHandle", _BOOL, _HANDLE)
         _bind(k, "LocalFree", C.c_void_p, C.c_void_p)
@@ -255,6 +256,12 @@ class _WindowsBackend:
                "membership_unknown")
         return bool(member.value)
 
+    def exit_code(self, handle):
+        code = _DWORD()
+        _check(self.kernel.GetExitCodeProcess(handle, C.byref(code)),
+               "process_exit_code_unavailable")
+        return int(code.value)
+
 
 @lru_cache(maxsize=1)
 def _backend():
@@ -360,6 +367,40 @@ class VerifiedProcess:
                 return IdentityObservation(self.identity, self._backend.wait(self._handle))
             except IdentityUnavailable as error:
                 return IdentityObservation(self.identity, IdentityStatus.UNKNOWN, error.reason)
+
+    def exit_code(self) -> int:
+        """Read an exited process's DWORD from the same retained exact handle.
+
+        WaitForSingleObject must first confirm termination. The value 259 is
+        then a legitimate exit code, not a liveness test. Limited query rights
+        suffice for GetExitCodeProcess; SYNCHRONIZE supplies the prior wait.
+        The owner lock prevents close/reuse across both native observations.
+        This neither proves a Job empty nor authorizes releasing its capacity.
+        """
+        with self._lock:
+            if self._close_outcome_unknown:
+                error = IdentityUnavailable("process_handle_close_outcome_unknown")
+                error._native_close_outcome_unknown = True
+                _retain_cleanup(error, self)
+                raise error
+            if self._handle is None:
+                raise IdentityUnavailable("identity_handle_closed")
+            try:
+                state = self._backend.wait(self._handle)
+            except Exception:
+                raise IdentityUnavailable("process_exit_unverified") from None
+            if state is not IdentityStatus.DEAD:
+                raise IdentityUnavailable("process_exit_unverified")
+            try:
+                code = self._backend.exit_code(self._handle)
+            except Exception as error:
+                win32 = getattr(error, "win32_error", None)
+                if type(win32) is not int or not 0 <= win32 <= 0xFFFFFFFF:
+                    win32 = None
+                raise IdentityUnavailable("process_exit_code_unavailable", win32) from None
+            if type(code) is not int or not 0 <= code <= 0xFFFFFFFF:
+                raise IdentityUnavailable("process_exit_code_invalid")
+            return code
 
     def is_in_job(self, job_handle: int | None) -> bool | None:
         """Same-process-handle query; None result means unknown, never false.

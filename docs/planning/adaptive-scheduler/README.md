@@ -7,11 +7,13 @@
 與 [P2 admission-only 實作紀錄](P2-ADMISSION-ONLY.md)。
 以下「只做規劃」及 GPT Pro 提示是原規劃階段的歷史背景，不限制後續已授權的實作。
 
-最新完整階段狀態見 [native launcher 與 gate 狀態](P3-NATIVE-LAUNCHER.md)。
-其中明確分開尚未完成的 production 接線、日常 writer 交接，以及已確認的
-Windows parent-Job 支援限制；以下各次測試紀錄不是 P3–P6 的通過聲明。
+最新實作見 [guardian lifecycle consumer](P3-GUARDIAN-LIFECYCLE.md)：
+正式 Job API、恢復 journal 與 guardian 的 root/child 清帳流程已接入程式。
+它仍需 mutation RPC、wrapper 啟動交接和 supervisor，P3 尚未完成。
+完整階段表與環境限制見 [native launcher 與 gate 狀態](P3-NATIVE-LAUNCHER.md)；
+以下各次測試紀錄不是 P3–P6 的通過聲明。
 
-2026-09-20 最新整合：[S1 execution owner](P1-S1-EXECUTION-OWNER.md)
+2026-09-20 前期整合：[S1 execution owner](P1-S1-EXECUTION-OWNER.md)
 已串接準入、建立前登記、單次 launch claim、恢復與清帳；
 481 項測試通過。這是 test-only 實作與帳本整合證據，
 native P1 與完整 P3–P6 仍未完成。`continuous_admission_provider_unavailable`

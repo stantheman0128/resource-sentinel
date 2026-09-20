@@ -25,7 +25,10 @@ from sentinel.accounting import (
     AccountingError, local_host_identity, resolve_worker_locality,
     validate_active_allocation,
 )
-from .contracts import AllocationKind, ExecutionSpec, ProcessIdentity, ReservationRef, MAX_ENROLLED_JOBS
+from .contracts import (
+    AllocationKind, ContractViolation, ExecutionSpec, ProcessIdentity, RecoveryManifest,
+    ReservationRef, ResourceDemand, MAX_ENROLLED_JOBS,
+)
 from .capacity_schema import prepare_capacity_schema
 from .writers import migrate_writer_fence
 
@@ -345,6 +348,11 @@ class LifecycleEvidence:
     active applied cap. Both require the same retained policy then Job mutation
     fences, through terminal CAS/archive commit or rollback; no writer may
     invalidate either observation while SQLite waits or the release commits.
+
+    A heartbeat authenticates the actual retained guardian rather than claiming
+    the wrapper is alive. Its provider retains policy/Job fences, durable exact
+    manifest, root identity and consistent current Job count/list through the
+    observation transaction. Even an empty observation grants no release.
     """
     operation: str
     execution_id: str
@@ -372,7 +380,7 @@ class LifecycleEvidence:
 
     def __post_init__(self):
         if self.operation not in {"register", "register_scope", "prepare", "claim", "bind_root", "root_exited", "finalize", "cancel", "start_failed",
-                                  "control_begin", "control_restore"}:
+                                  "control_begin", "control_restore", "heartbeat"}:
             raise ValueError("invalid_evidence_operation")
         for name in ("execution_id", "observation_id"):
             value = getattr(self, name)
@@ -779,8 +787,15 @@ def authenticated_query(db_path, execution_id: str, expected_record: _IpcAuthRec
 
 class LifecycleStore:
     def __init__(self, db_path: str | Path, *, evidence_provider: Callable[[str, Mapping[str, Any], ProcessIdentity], ContextManager[LifecycleEvidence]] | None = None,
-                 local_host_id: str | None = None, policy_provider=None):
-        self.db_path = Path(db_path)
+                 local_host_id: str | None = None, policy_provider=None, existing_path: bool = False):
+        if type(existing_path) is not bool:
+            raise ValueError("invalid_existing_path_mode")
+        self.existing_path = existing_path
+        try:
+            self.db_path = Path(db_path).resolve() if existing_path else Path(db_path)
+        except (OSError, TypeError, ValueError, RuntimeError):
+            raise LifecycleError("coverage_registry_unavailable") from None
+        self._existing_ledger_path = self.db_path if existing_path else None
         self.evidence_provider = (_unavailable_evidence_provider
                                   if evidence_provider is None else evidence_provider)
         # Capture the actual host once before acquiring any SQLite transaction.
@@ -790,6 +805,8 @@ class LifecycleStore:
             raise ValueError("local_host_id must be a nonempty string")
         self._local_context = {"local_host_id": self.local_host_id}
         with self._connection() as conn:
+            if existing_path and not _check_version(conn):
+                raise LifecycleError("coverage_registry_unavailable")
             migrate_schema(conn)
         from .policy import PolicyCoordinator
         # This is an explicit fixture seam independent of lifecycle evidence.
@@ -797,8 +814,20 @@ class LifecycleStore:
         self._policy = PolicyCoordinator(self, policy_provider)
 
     @contextmanager
-    def _connection(self):
-        conn = sqlite3.connect(self.db_path, timeout=5, isolation_level=None)
+    def _connection(self, *, existing_path: Path | None = None):
+        # A retained guardian must not recreate a disappeared ledger, or switch
+        # relative-path targets while waiting for native evidence. Ordinary
+        # constructors retain their existing create/migrate behavior.
+        pinned = self._existing_ledger_path if existing_path is None else existing_path
+        if self._existing_ledger_path is not None and pinned != self._existing_ledger_path:
+            raise LifecycleError("coverage_registry_unavailable")
+        target = self.db_path if pinned is None else pinned.as_uri() + "?mode=rw"
+        try:
+            conn = sqlite3.connect(target, uri=pinned is not None, timeout=5, isolation_level=None)
+        except sqlite3.Error:
+            if pinned is not None:
+                raise LifecycleError("coverage_registry_unavailable") from None
+            raise
         try:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA foreign_keys=ON")
@@ -816,11 +845,14 @@ class LifecycleStore:
                 raise LifecycleError("lifecycle_connection_cleanup_failed") from None
 
     @contextmanager
-    def _transaction(self):
-        with self._connection() as conn:
+    def _transaction(self, *, existing_path: Path | None = None):
+        connection = self._connection() if existing_path is None else self._connection(existing_path=existing_path)
+        with connection as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
-                _check_version(conn)
+                present = _check_version(conn)
+                if (existing_path is not None or self.existing_path) and not present:
+                    raise LifecycleError("coverage_registry_unavailable")
                 yield conn
                 conn.commit()
             except BaseException as primary:
@@ -910,7 +942,16 @@ class LifecycleStore:
             raise LifecycleError("execution_not_found")
         return row
 
-    def query(self, execution_id: str) -> dict[str, Any]:
+    def query(self, execution_id: str, *, existing_path: bool = False) -> dict[str, Any]:
+        if type(existing_path) is not bool:
+            raise ValueError("invalid_existing_path_mode")
+        if existing_path or self.existing_path:
+            try:
+                ledger_path = self._existing_ledger_path or Path(self.db_path).resolve()
+            except (OSError, TypeError, ValueError, RuntimeError):
+                raise LifecycleError("coverage_registry_unavailable") from None
+            with _coverage_read_transaction(ledger_path) as conn:
+                return self._public(self._get(conn, execution_id))
         with self._connection() as conn:
             _check_version(conn)
             return self._public(self._get(conn, execution_id))
@@ -995,13 +1036,249 @@ class LifecycleStore:
                 raise LifecycleError("coverage_allocation_binding_mismatch")
 
     @staticmethod
+    def _retained_inputs(expected_row: Mapping[str, Any], manifest: RecoveryManifest):
+        """Validate retained data without treating it as native authority."""
+        if type(manifest) is not RecoveryManifest:
+            raise LifecycleError("retained_manifest_invalid")
+        try:
+            # Revalidate nested contracts and the checksum before using a
+            # retained object; a manifest hash proves integrity, not custody.
+            manifest = RecoveryManifest.from_dict(manifest.to_dict())
+        except (ContractViolation, TypeError, ValueError, OverflowError):
+            raise LifecycleError("retained_manifest_invalid") from None
+        resource_keys = ("cpu_units", "physical_bytes", "commit_bytes", "io_slots")
+        names = (
+            "execution_id", "task_id", "session_id", "principal_id", "logon_id",
+            "allocation_kind", "reservation_id", "parent_execution_id", "spec_hash",
+            "admission_binding_hash", "wrapper_pid", "wrapper_created_filetime_100ns",
+            "role", "priority", "state", "state_revision", "coverage", "job_name", "job_nonce",
+            "guardian_epoch", "root_pid", "root_created_filetime_100ns", "root_outcome",
+            "claim_consumed", "launch_in_flight", "launch_sealed", "hold_reason",
+        ) + tuple(prefix + key for prefix in ("requested_", "floor_") for key in resource_keys)
+        if not isinstance(expected_row, Mapping) or any(name not in expected_row for name in names):
+            raise LifecycleError("retained_expected_row_invalid")
+        expected = {name: expected_row[name] for name in names}
+        if (type(expected["state_revision"]) is not int or expected["state_revision"] < 0 or
+                any(type(expected[name]) is not int or expected[name] not in {0, 1}
+                    for name in ("claim_consumed", "launch_in_flight", "launch_sealed"))):
+            raise LifecycleError("retained_expected_row_invalid")
+        try:
+            wrapper = ProcessIdentity.from_dict({"pid": expected["wrapper_pid"],
+                "created_filetime_100ns": expected["wrapper_created_filetime_100ns"],
+                "logon_id": expected["logon_id"]})
+            root = None
+            if expected["root_pid"] is not None or expected["root_created_filetime_100ns"] is not None:
+                root = ProcessIdentity.from_dict({"pid": expected["root_pid"],
+                    "created_filetime_100ns": expected["root_created_filetime_100ns"],
+                    "logon_id": expected["logon_id"]})
+            ResourceDemand.from_dict({key: expected["requested_" + key] for key in resource_keys})
+            floor = ResourceDemand.from_dict({key: expected["floor_" + key] for key in resource_keys})
+        except (ContractViolation, TypeError, ValueError, OverflowError):
+            raise LifecycleError("retained_expected_row_invalid") from None
+        if (expected["execution_id"] != manifest.execution_id or
+                expected["spec_hash"] != manifest.spec_hash or
+                expected["allocation_kind"] != manifest.reservation.kind.value or
+                expected["reservation_id"] != manifest.reservation.id or
+                expected["parent_execution_id"] is not None or
+                expected["job_name"] != manifest.job_name or expected["job_nonce"] != manifest.creation_nonce or
+                expected["guardian_epoch"] != manifest.guardian_epoch or
+                wrapper != manifest.wrapper_identity or root != manifest.root_identity or
+                floor != manifest.allocated_floor):
+            raise LifecycleError("retained_manifest_mismatch")
+        return expected, manifest
+
+    def _validate_retained_allocation(self, conn, expected, manifest):
+        row = self._get(conn, manifest.execution_id)
+        self._require_revision(row, expected["state_revision"])
+        if any(row[name] != value for name, value in expected.items()):
+            raise LifecycleError("retained_expected_row_mismatch")
+        if row["state"] not in {"RESERVED", "PREPARED", "LAUNCHING", "RUNNING", "DRAINING",
+                                "START_UNKNOWN", "UNCERTAIN_HOLD"}:
+            raise LifecycleError("retained_execution_inactive")
+        if row["allocation_kind"] not in _TABLES or row["parent_execution_id"] is not None:
+            raise LifecycleError("retained_top_level_required")
+        runtime = conn.execute("SELECT guardian_epoch,active_logon_id FROM adaptive_runtime WHERE singleton=1").fetchone()
+        if (runtime is None or runtime["guardian_epoch"] != manifest.guardian_epoch or
+                runtime["active_logon_id"] != manifest.wrapper_identity.logon_id):
+            raise LifecycleError("retained_guardian_epoch_mismatch")
+        try:
+            source = validate_active_allocation(conn, manifest.execution_id, local_context=self._local_context)
+        except AccountingError as error:
+            raise LifecycleError(str(error)) from error
+        kind = row["allocation_kind"]
+        table = _TABLES[kind]
+        other = _TABLES["routed" if kind == "direct" else "direct"]
+        if (source["execution_id"] != manifest.execution_id or
+                conn.execute(f"SELECT count(*) FROM {table} WHERE execution_id=? OR id=?",
+                    (manifest.execution_id, row["reservation_id"])).fetchone()[0] != 1 or
+                conn.execute(f"SELECT count(*) FROM {other} WHERE execution_id=?",
+                    (manifest.execution_id,)).fetchone()[0] != 0 or
+                conn.execute("""SELECT count(*) FROM managed_executions WHERE execution_id=? OR
+                    (reservation_id=? AND (allocation_kind=? OR allocation_kind IS NULL OR
+                                          allocation_kind NOT IN ('direct','routed')))""",
+                    (manifest.execution_id, row["reservation_id"], kind)).fetchone()[0] != 1):
+            raise LifecycleError("retained_allocation_not_unique")
+        return row, source
+
+    def assert_retained_allocation(self, expected_row: Mapping[str, Any],
+                                   manifest: RecoveryManifest) -> None:
+        """Internal read-only ledger custody check for a retained guardian.
+
+        No current/alive wrapper is required. The manifest must match the exact
+        committed allocation, Job scope and floor in one read snapshot. This
+        proves no host cohort, native liveness, containment or guardian authority;
+        those remain the retained provider's independent responsibilities.
+        Missing/unknown storage is never recreated, repaired or treated as free.
+        """
+        expected, manifest = self._retained_inputs(expected_row, manifest)
+        try:
+            ledger_path = self._existing_ledger_path or Path(self.db_path).resolve()
+        except (OSError, TypeError, ValueError, RuntimeError):
+            raise LifecycleError("coverage_registry_unavailable") from None
+        with _coverage_read_transaction(ledger_path) as conn:
+            self._validate_retained_allocation(conn, expected, manifest)
+
+    def assert_retained_terminal(self, expected_row: Mapping[str, Any],
+                                 manifest: RecoveryManifest) -> None:
+        """Reconcile a committed FINISHED result after a lost finalization ACK.
+
+        This is a separate read-only ledger proof, never an active allocation
+        fallback or another release. Native empty/disabled/settled verification
+        must still be repeated under the retained guardian's own fences before
+        it relinquishes custody. The direct archive has no spec hash; neither
+        archive stores physical/Commit bytes. Only actually persisted fields
+        are compared; the exact managed row retains immutable binding.
+        """
+        expected, manifest = self._retained_inputs(expected_row, manifest)
+        finished = expected_row.get("finished_at")
+        try:
+            valid_finished = type(finished) in (int, float) and math.isfinite(finished) and finished >= 0
+        except OverflowError:
+            valid_finished = False
+        if not valid_finished:
+            raise LifecycleError("retained_terminal_unverified")
+        expected["finished_at"] = finished
+        try:
+            ledger_path = self._existing_ledger_path or Path(self.db_path).resolve()
+        except (OSError, TypeError, ValueError, RuntimeError):
+            raise LifecycleError("coverage_registry_unavailable") from None
+        with _coverage_read_transaction(ledger_path) as conn:
+            row = self._get(conn, manifest.execution_id)
+            self._require_revision(row, expected["state_revision"])
+            if any(row[name] != value for name, value in expected.items()):
+                raise LifecycleError("retained_expected_row_mismatch")
+            kind = row["allocation_kind"]
+            if (row["state"] != "FINISHED" or row["launch_sealed"] != 1 or row["launch_in_flight"] != 0 or
+                    kind not in _TABLES or row["parent_execution_id"] is not None):
+                raise LifecycleError("retained_terminal_unverified")
+            table = _TABLES[kind]
+            other = _TABLES["routed" if kind == "direct" else "direct"]
+            if (conn.execute(f"SELECT count(*) FROM {table} WHERE execution_id=? OR id=?",
+                    (manifest.execution_id, row["reservation_id"])).fetchone()[0] != 0 or
+                    conn.execute(f"SELECT count(*) FROM {other} WHERE execution_id=?",
+                    (manifest.execution_id,)).fetchone()[0] != 0 or
+                    conn.execute("""SELECT count(*) FROM managed_executions WHERE execution_id=? OR
+                        (reservation_id=? AND (allocation_kind=? OR allocation_kind IS NULL OR
+                                              allocation_kind NOT IN ('direct','routed')))""",
+                        (manifest.execution_id, row["reservation_id"], kind)).fetchone()[0] != 1):
+                raise LifecycleError("retained_terminal_unverified")
+            archive_table = "executions" if kind == "direct" else "routed_executions"
+            # LIMIT 2 bounds the proof and distinguishes exactly one archive
+            # from duplicate/reused reservation history without choosing a row.
+            # Do not fetch legacy command labels or private routed metadata.
+            columns = "outcome,ended_at,cpu_units,started_at,ram_gib," + (
+                "io_slots" if kind == "direct" else "task_id,spec_hash")
+            archives = conn.execute(f"SELECT {columns} FROM {archive_table} WHERE reservation_id=? LIMIT 2",
+                                    (row["reservation_id"],)).fetchall()
+            if len(archives) != 1:
+                raise LifecycleError("retained_terminal_unverified")
+            archive = archives[0]
+            if (archive["outcome"] != "managed_finished" or archive["ended_at"] != finished or
+                    archive["cpu_units"] != row["requested_cpu_units"] or
+                    (kind == "direct" and archive["io_slots"] != row["requested_io_slots"]) or
+                    (kind == "routed" and (archive["task_id"] != row["task_id"] or
+                                           archive["spec_hash"] != row["spec_hash"]))):
+                raise LifecycleError("retained_terminal_unverified")
+            for name in ("started_at", "ram_gib"):
+                value = archive[name]
+                if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+                    raise LifecycleError("retained_terminal_unverified")
+            if archive["started_at"] > finished:
+                raise LifecycleError("retained_terminal_unverified")
+
+    def heartbeat_retained_allocation(self, expected_row: Mapping[str, Any], manifest: RecoveryManifest,
+                                      *, caller: ProcessIdentity, now: float | None = None) -> dict[str, Any]:
+        """Internal guardian observation, with native fences held through commit.
+
+        The provider must authenticate the actual guardian and retain exact Job,
+        manifest and root custody under policy then Job mutation fences. Data
+        supplied here is not authority; the default provider remains unavailable.
+        Even positive empty membership only refreshes observation timestamps.
+        State, holds, floors, launch flags and expires_at never change here; this
+        slice does not claim complete TTL renewal or recovery reconciliation.
+        """
+        from .policy import PolicyError
+
+        expected, manifest = self._retained_inputs(expected_row, manifest)
+        if type(caller) is not ProcessIdentity or caller != manifest.guardian_identity:
+            raise LifecycleError("guardian_identity_mismatch")
+        now = time.time() if now is None else now
+        try:
+            valid_now = type(now) in (int, float) and math.isfinite(now) and now >= 0
+        except OverflowError:
+            valid_now = False
+        if not valid_now:
+            raise ValueError("invalid_time")
+        try:
+            ledger_path = self._existing_ledger_path or Path(self.db_path).resolve()
+        except (OSError, TypeError, ValueError, RuntimeError):
+            raise LifecycleError("coverage_registry_unavailable") from None
+        try:
+            with self._evidence_scope("heartbeat", expected, caller, guardian=manifest.guardian_identity) as proof:
+                if (proof.job_name != manifest.job_name or proof.job_nonce != manifest.creation_nonce or
+                        proof.guardian_epoch != manifest.guardian_epoch or not proof.durable_manifest or
+                        type(proof.active_process_count) is not int or proof.process_ids is None or
+                        proof.active_process_count != len(proof.process_ids) or
+                        proof.root != manifest.root_identity or
+                        proof.launch_sealed != bool(expected["launch_sealed"]) or
+                        (expected["state"] in {"RUNNING", "DRAINING"} and
+                         (not proof.launch_sealed or expected["launch_in_flight"]))):
+                    raise LifecycleError("heartbeat_evidence_unverified")
+                guard = self._policy.assert_held()
+                if guard.binding.logon_id != caller.logon_id:
+                    raise LifecycleError("policy_logon_mismatch")
+                with self._transaction(existing_path=ledger_path) as conn:
+                    self._policy.revalidate(conn, guard)
+                    row, source = self._validate_retained_allocation(conn, expected, manifest)
+                    for previous in (row["heartbeat_at"], source["allocation"].get("heartbeat_at")):
+                        if (type(previous) not in (int, float) or not math.isfinite(previous) or
+                                previous < 0 or now < previous):
+                            raise LifecycleError("heartbeat_clock_regression")
+                    table = _TABLES[row["allocation_kind"]]
+                    updated = conn.execute(f"""UPDATE {table} SET heartbeat_at=?,
+                        writer_protocol=1,writer_revision=writer_revision+1
+                        WHERE id=? AND execution_id=? AND lifecycle_managed=1""",
+                        (now, row["reservation_id"], row["execution_id"]))
+                    if updated.rowcount != 1:
+                        raise LifecycleError("allocation_binding_missing")
+                    result = self._public(self._cas(conn, row["execution_id"], expected["state_revision"],
+                                                   {"heartbeat_at": now}))
+            return result
+        except (PolicyError, sqlite3.Error) as error:
+            translated = LifecycleError(str(error) if isinstance(error, PolicyError) else "coverage_registry_unavailable")
+            for note in getattr(error, "__notes__", ()):
+                translated.add_note(note)
+            raise translated from None
+
+    @staticmethod
     def _caller(row: Mapping[str, Any], caller: ProcessIdentity) -> None:
         if not isinstance(caller, ProcessIdentity) or (caller.pid != row["wrapper_pid"] or
                 str(caller.created_filetime_100ns) != row["wrapper_created_filetime_100ns"] or caller.logon_id != row["logon_id"]):
             raise LifecycleError("caller_identity_mismatch")
 
     @contextmanager
-    def _evidence_scope(self, operation: str, row: Mapping[str, Any], caller: ProcessIdentity, *, publication=None):
+    def _evidence_scope(self, operation: str, row: Mapping[str, Any], caller: ProcessIdentity, *, publication=None,
+                        guardian: ProcessIdentity | None = None):
         """Verify before SQLite; retain evidence authority through commit/rollback.
 
         The trusted provider acquires and validates native resources in enter,
@@ -1015,7 +1292,15 @@ class LifecycleStore:
         suppress or replace a transaction/body error. Cleanup failure after a
         successful commit is reported, but cannot undo the committed operation.
         """
-        self._caller(row, caller)
+        if operation == "heartbeat":
+            # This private branch changes the claimed actor only. The retained
+            # provider must still authenticate that guardian natively; neither
+            # a serialized identity nor a manifest checksum can authorize it.
+            if (type(guardian) is not ProcessIdentity or caller != guardian or
+                    guardian.logon_id != row["logon_id"]):
+                raise LifecycleError("guardian_identity_mismatch")
+        else:
+            self._caller(row, caller)
         scope = self.evidence_provider(operation, self._public(row), caller)
         enter = getattr(type(scope), "__enter__", None)
         leave = getattr(type(scope), "__exit__", None)

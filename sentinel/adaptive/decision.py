@@ -101,9 +101,9 @@ def _typed(value, cls, name):
 class PolicyProfile:
     """Calibration starting points from plan section 6.1, shaped by section 13.1.
 
-    Construction validates internal consistency only. The MVP gate that keeps
-    mode at off lives in validate_policy_profile, so a shadow recorder can build
-    a profile in memory without a config file claiming to enable control.
+    Construction validates internal consistency only. The gate that keeps a
+    config file away from enforce lives in validate_policy_profile, so an
+    enforce profile can still be built in memory by a trace or a test.
     """
 
     mode: Mode
@@ -208,8 +208,11 @@ class PolicyProfile:
 def validate_policy_profile(payload: dict) -> PolicyProfile:
     """Validate a config object; unknown keys and non-MVP values are rejected.
 
-    Plan section 13.1 requires more than type checks, and keeps this MVP at
-    mode off. A config file is therefore not allowed to enable control here.
+    Plan section 13.1 requires more than type checks. Modes off and shadow are
+    selectable from config because neither one applies a cap. Enforce is not:
+    plan section 11.4 promotes through an isolated canary and then explicit
+    limited enrollment, which is a guardian acknowledged ledger operation, so a
+    config file must never be able to turn control on.
     """
     if type(payload) is not dict:
         raise ContractViolation("profile: object required")
@@ -217,9 +220,9 @@ def validate_policy_profile(payload: dict) -> PolicyProfile:
     if set(payload) != expected:
         raise ContractViolation("profile: missing or unknown keys")
     data = dict(payload)
-    if data["mode"] != Mode.OFF.value:
-        raise ContractViolation("mode: only off is supported in this phase")
-    data["mode"] = Mode.OFF
+    if data["mode"] not in (Mode.OFF.value, Mode.SHADOW.value):
+        raise ContractViolation("mode: only off and shadow are selectable from config")
+    data["mode"] = Mode(data["mode"])
     for name, enum_type in (("eligible_roles", Role), ("eligible_priorities", Priority)):
         value = data[name]
         if type(value) is not list or not value or len(value) > 8:

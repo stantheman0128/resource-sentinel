@@ -23,11 +23,11 @@ would both burn the budget and feed the controller stale windows.
 Nothing in this module emits an admission or capacity number. A rate that fell
 because something was capped is recorded as a measurement and nothing else.
 
-Mode: decision.validate_policy_profile accepts only mode off today, so a config
-file cannot reach shadow. Until that changes, a caller enables shadow with the
-explicit in-process shadow flag below, which is a test and development seam and
-is deliberately unreachable from configuration. No thread, no scheduled task and
-no CLI entry point exists here; a caller owns the cadence and calls tick().
+Mode: decision.validate_policy_profile accepts off and shadow from a config
+file and rejects enforce, so configuration can reach shadow and nothing more. A
+caller can also enable shadow with the explicit in-process shadow flag below,
+which is a test and development seam. No thread, no scheduled task and no CLI
+entry point exists here; a caller owns the cadence and calls tick().
 """
 
 from __future__ import annotations

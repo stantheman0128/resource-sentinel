@@ -110,8 +110,15 @@ class ConfigValidationTests(unittest.TestCase):
         data.update(changes)
         return data
 
-    def test_non_off_mode_is_rejected(self):
-        for mode in ("shadow", "enforce", "on", "OFF", 1, None):
+    def test_off_and_shadow_modes_are_accepted(self):
+        for mode, expected in (("off", Mode.OFF), ("shadow", Mode.SHADOW)):
+            with self.subTest(mode=mode):
+                loaded = validate_policy_profile(self.payload(mode=mode))
+                self.assertIs(loaded.mode, expected)
+
+    def test_enforce_and_unknown_modes_are_rejected(self):
+        # Plan section 11.4 promotes past shadow through the ledger, not a config edit.
+        for mode in ("enforce", "on", "OFF", "Shadow", "", 1, None, ["shadow"]):
             with self.subTest(mode=mode), self.assertRaises(ContractViolation):
                 validate_policy_profile(self.payload(mode=mode))
 

@@ -183,20 +183,61 @@ therefore prove the death, or an explicit operator step. Adding a column, a
 table, a heartbeat or a TTL sweep would put a removal rule where an authority
 record belongs, so this slice did not add one.
 
+### What the supervisor now does about the gap
+
+The first of those two options now exists, behind an option that is off by
+default. `sentinel/adaptive/supervisor_host.py` takes `--helper-profile`. With
+that option it starts one helper child of its own,
+`py -m sentinel.adaptive.helper_host --data-dir <directory> --profile <file>`,
+through the same plain `CreateProcessW` path it uses for the guardian. It keeps
+the creation handle and builds the `VerifiedProcess` witness from that handle
+with `duplicate_from_handle`, never from a reopened PID. That witness is the
+death evidence the removal has always needed and that no process held before.
+
+Each iteration observes that witness once. Only `IdentityStatus.DEAD` leads
+anywhere. On a verified death `_replace_helper` at
+`sentinel/adaptive/supervisor_host.py:562` calls
+`unregister_dead_infrastructure_locked(store, "helper", process)` under one
+POLICY prepare and hold, and the writer re-verifies death on the same witness
+before it deletes anything. A replacement helper follows when the removal did
+not fail and the helper budget allows. A removal that failed leaves the row in
+place, so no replacement is started, because a replacement would refuse with
+`helper_host_registry_occupied` against the row that is still there. The
+iteration record carries the removal outcome and the reason it refused.
+
+Without `--helper-profile` nothing about the supervisor changes. No helper child
+is created, no helper key appears in any of its records, and the helper host
+itself is not changed at all by this.
+
+What is still open. A supervisor that exits leaves the guardian row and the
+helper row behind with no witness left anywhere on the host, which is the same
+restart gap reached from a different direction. The supervisor does not register
+itself and has no witness of its own, so nothing observes the supervisor. A
+helper that anything else started stays unremovable here, because this
+supervisor holds no handle for it. Nothing native ran for any of it. The claims
+above describe wiring and refusals that the tests exercise against an isolated
+ledger, and the host capability preflight refuses on this machine before a real
+child could be created.
+
 ## What is not delivered
 
 There is no endpoint, no client and no connection to a guardian. This host never
 builds a `ControlProposal` and never sends one, so nothing it observes can reach
 the guardian's actuator even if a guardian were running.
 
-There is no supervisor for this process: nothing starts it, restarts it, or
-notices that it exited. There is no scheduled task, no hook and no script that
-runs it, and none was changed.
+Nothing starts this process in production. The supervisor host can start and
+witness one helper when it is given `--helper-profile`, as described above, but
+that option is off by default and nothing selects it.
+`scripts/adaptive-supervisor.ps1` is a thin entry point that runs the supervisor
+host in the foreground and passes `-HelperProfile` through. It registers no
+scheduled task, has no default data directory and nothing calls it. No scheduled
+task, hook or existing script was changed.
 
 There is no per-Job memory attribution, so the memory fields stay unknown and the
 decision layer sees them as unknown.
 
-There is no deregistration, as described above.
+This host still performs no deregistration of its own. The only removal is the
+supervisor's, on a verified death, as described above.
 
 There is no way to select enforce. There is no kill, suspend, trim, priority
 change or rate limit anywhere in this module, and no RAM hard cap.

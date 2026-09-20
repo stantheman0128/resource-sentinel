@@ -101,13 +101,19 @@ Job 內，`require_supported_host()` 會拒絕，所以 native 測試一項都�
    迴圈，輸出只含計數與穩定代碼的成本紀錄。它選不到 enforce，不建立 proposal，
    不連 guardian。這台機器上它同樣以 `host_foreign_parent_job` 拒絕啟動，所以計畫 P4
    要的 1、10、50 個 Job 成本分布一筆都還沒量。
+9. supervisor host 加上 `--helper-profile` 之後會自己建立一個 helper 子行程，保留它的
+   creation handle 當作死亡 witness。witness 觀察到 DEAD 才會在 POLICY 之下移除 helper
+   的登記列，移除沒有失敗、預算也允許時才啟動替代者。沒給這個選項時 supervisor 的
+   行為和所有紀錄都不變。`scripts/adaptive-supervisor.ps1` 是計畫 P3 表列的入口，
+   只在前景執行 supervisor host 並傳回它的 exit code，不註冊 Scheduled Task，兩個
+   目錄都必填、沒有預設值，裡面沒有任何停止子行程的路徑。
 
 已知缺口，都還沒有程式：
 
 1. 沒有會送出 proposal 的 helper。shadow helper host 只觀察，enforce 模式依計畫要等
-   P5 的 capability 核可，B 組因此仍然不能量測。helper 結束後它的登記列會留著，
-   下一次啟動會以 `helper_host_registry_occupied` 拒絕，要由擁有者決定誰來見證
-   helper 的死亡。
+   P5 的 capability 核可，B 組因此仍然不能量測。不是由 supervisor 建立的 helper，
+   結束後登記列仍會留著，下一次啟動會以 `helper_host_registry_occupied` 拒絕。
+   supervisor 自己結束時，guardian 和 helper 的列也都會留下，主機上不再有任何 witness。
 2. 沒有 endpoint 發現機制。wrapper 與 helper 要連哪個 guardian，目前只能由操作者
    手動傳入 pid、creation FILETIME、instance id 與 epoch。
 3. 除了行程收到 interrupt 之外沒有正式的停止訊號。
@@ -116,6 +122,11 @@ Job 內，`require_supported_host()` 會拒絕，所以 native 測試一項都�
    `RecoveryOwner.capture` 要求 guardian 為 ALIVE。
 6. guardian 在 supervisor attach 成功之前就結束時，它的登記列不會被移除，因為那條路徑
    到不了 `_replace`。registry 上限是 32 列。
+7. 計畫 P3 與 P4 表列在 `scripts/sentinelctl.py` 的 `run-managed`、`adaptive-status`、
+   `adaptive-recover` 與 mode、drain、audit 命令都還沒寫，目前只有唯讀的
+   `adaptive-query`。這個檔案在工作目錄裡帶著
+   另一項任務尚未提交的修改，這一輪無法乾淨分離，所以沒有動它。缺口 4 的釋放路徑
+   會動到 `sentinel/coordinator.py`，原因相同。
 
 需要 repo 擁有者裁決、程式目前一律 fail closed 的事項：
 
@@ -128,15 +139,17 @@ Job 內，`require_supported_host()` 會拒絕，所以 native 測試一項都�
    `ipc_auth_key`，registry 的欄位也是固定的，所以傳輸層目前只用 OS 驗證的 peer
    加上每次請求的 server nonce，沒有共享密鑰。這樣是否滿足計畫的 token 要求，
    需要擁有者確認；若要真正的共享密鑰，得先決定由誰簽發、存在哪一筆紀錄。
-4. helper 和 supervisor 的登記列由誰見證死亡。計畫的方向看起來是 supervisor 啟動
-   helper 並保留它的 creation handle，這一段還沒有程式。
+4. supervisor 自己由誰見證。supervisor 不登記自己，也沒有任何行程持有它的 witness，
+   它結束之後留下的 guardian 列和 helper 列就沒有人能移除。另外，helper 的列移除失敗
+   之後，supervisor host 不會重試移除，也不會再啟動 helper，之後每一輪只回報 absent；
+   這是比照 guardian 路徑的保守做法，要不要改成每輪重試由擁有者決定。
 5. `register_infrastructure_locked` 的兩個提前拒絕會留下 POLICY entry nonce，之後每一次
    `prepare` 都會得到 `policy_scope_busy`，沒有東西會清掉它。guardian 和 helper 的啟動
    路徑都會經過這裡。移除函式上同樣形狀的問題已經修掉，這一個沒動：兩條啟動路徑在
    同一個 scope 裡都先執行過 `initialize_registry_locked`，拒絕發生時帳本已經被碰過，
    不能直接當成 clean rejection。
 
-整棵 adaptive 測試樹最後一次執行是 2026-09-21：79 個模組、1911 個測試、0 失敗、
+整棵 adaptive 測試樹最後一次執行是 2026-09-21：80 個模組、1936 個測試、0 失敗、
 0 錯誤、0 略過，經 `scripts/invoke-sentinel.ps1` 正常准入。傳輸層的未登記呼叫者
 檢查沒有紅燈證據，因為產生紅燈必須先拿掉一道安全檢查，該次執行被權限分類器拒絕，
 之後沒有繞過。這是 source 行為的證據，

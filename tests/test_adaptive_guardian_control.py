@@ -145,6 +145,34 @@ class GuardianControlTests(unittest.TestCase):
         return made[0] if cases == 1 else tuple(made)
 
     @contextmanager
+    def recording_journal(self, case, *, failures=frozenset()):
+        """Record every real journal publish into the Job's own call recorder.
+
+        The wrapper belongs to this test and the Job records its own Set,
+        disable and Query calls, so the resulting order comes from recorders the
+        production code never appends to. ``failures`` holds the 1-based publish
+        attempts that raise instead of reaching the real journal.
+        """
+        original = self.journal.publish
+        attempts = []
+
+        def publish(manifest, **kwargs):
+            if manifest.pending_intent is not None:
+                kind = "intent"
+            elif manifest.last_applied == DISABLED:
+                kind = "restore"
+            else:
+                kind = "settle"
+            attempts.append(kind)
+            case.job.calls.append(("publish", kind))
+            if len(attempts) in failures:
+                raise RecoveryJournalError("manifest_write_unavailable")
+            return original(manifest, **kwargs)
+
+        with patch.object(self.journal, "publish", publish):
+            yield attempts
+
+    @contextmanager
     def policy_held(self):
         guard = self.store._policy.prepare(fixture.fixtures.WRAPPER.logon_id)
         with self.store._policy.hold(guard):
@@ -241,7 +269,8 @@ class GuardianControlTests(unittest.TestCase):
     def test_apply_orders_intent_then_set_then_query_then_ack_then_audit(self):
         case = self.start()
         proposal = self.proposal(case)
-        ack = self.control.apply(proposal, now_tick_100ns=self.ticks)
+        with self.recording_journal(case) as attempts:
+            ack = self.control.apply(proposal, now_tick_100ns=self.ticks)
         self.assertEqual(ack.result, ApplyResult.APPLIED)
         self.assertEqual((ack.applied_flags, ack.applied_rate_bp), (5, 2500))
         self.assertEqual(ack.applied_validity, Validity.VALID)
@@ -254,6 +283,23 @@ class GuardianControlTests(unittest.TestCase):
         self.assertLess(stages.index("intent"), stages.index("set"))
         self.assertLess(stages.index("set"), stages.index("query"))
         self.assertLess(stages.index("query"), stages.index("audit"))
+        # The same order proven from recorders the code under test does not
+        # write: the Job's own call list, and this test's wrapper around the
+        # real journal publish. Only two publications happen, and the Set sits
+        # between them with a capped readback of its own after it.
+        self.assertEqual(attempts, ["intent", "settle"])
+        calls = case.job.calls
+        sets = [index for index, call in enumerate(calls) if call[0] == "set"]
+        self.assertEqual(len(sets), 1)
+        self.assertEqual(calls[sets[0]], ("set", 2500))
+        intent = calls.index(("publish", "intent"))
+        settle = calls.index(("publish", "settle"))
+        self.assertLess(intent, sets[0])
+        self.assertLess(sets[0], settle)
+        capped = [index for index, call in enumerate(calls) if call == ("query", 5)]
+        self.assertTrue(capped)
+        self.assertTrue(all(index > sets[0] for index in capped))
+        self.assertTrue(any(index < settle for index in capped))
         self.assertEqual(case.job.sets, 1)
         self.assertEqual(self.slot()["slot_state"], "HELD")
         self.assertEqual(self.runtime()["admission_barrier"], "CONTROLLING")
@@ -459,6 +505,58 @@ class GuardianControlTests(unittest.TestCase):
         self.assertIsNone(record.pending_intent)
         self.assertEqual(record.last_applied, DISABLED)
 
+    def test_settle_failure_after_a_good_set_withdraws_the_cap(self):
+        case = self.start()
+        with self.recording_journal(case, failures={2}) as attempts:
+            ack = self.control.apply(self.proposal(case), now_tick_100ns=self.ticks)
+        self.assertEqual(ack.result, ApplyResult.UNVERIFIED)
+        self.assertEqual(ack.reason, "control_settle_failed")
+        self.assertIsNone(ack.action_id)
+        self.assertIsNone(ack.lease_deadline_tick_100ns)
+        self.assertEqual(ack.applied_validity, Validity.UNKNOWN)
+        self.assertEqual(attempts, ["intent", "settle", "restore"])
+        # From the Job's own recorder: one cap Set, then the withdrawal.
+        self.assertEqual([call for call in case.job.calls if call[0] in {"set", "disable"}],
+                         [("set", 2500), ("disable", None)])
+        self.assertEqual(case.job.sets, 2)
+        self.assertEqual(case.job.query_cpu().flags, 0)
+        self.assertEqual(self.slot()["slot_state"], "RESTORED")
+        self.assertEqual(self.runtime()["admission_barrier"], "RECOVERY_HOLD")
+        record = self.journal.read(case.spec.execution_id, creation_nonce=case.record.creation_nonce)
+        self.assertIsNone(record.pending_intent)
+        self.assertEqual(record.last_applied, DISABLED)
+        self.assertEqual([row["action_state"] for row in self.actions()], ["RESTORED"])
+
+    def test_a_failed_settle_and_restore_is_never_renewed_and_the_sweep_retries(self):
+        case = self.start()
+        with self.recording_journal(case, failures={2, 3}) as attempts:
+            ack = self.control.apply(self.proposal(case), now_tick_100ns=self.ticks)
+        self.assertEqual(ack.result, ApplyResult.UNVERIFIED)
+        self.assertEqual(ack.reason, "control_settle_failed")
+        self.assertEqual(attempts, ["intent", "settle", "restore"])
+        self.assertEqual(self.actions(), [])
+        # Nothing was verified and settled, so a later higher sequence is
+        # refused outright instead of inheriting a fresh lease.
+        self.ticks += TICKS_PER_SECOND
+        later = self.control.apply(self.proposal(case, seq=2, sample_seq=2,
+            window_end=self.ticks, decision=self.ticks), now_tick_100ns=self.ticks)
+        self.assertEqual(later.result, ApplyResult.REJECTED)
+        self.assertEqual(later.reason, "control_episode_unverified")
+        self.assertIsNone(later.lease_deadline_tick_100ns)
+        self.assertEqual(self.actions(), [])
+        # With the journal answering again the sweep completes the withdrawal.
+        outcomes = self.control.tick(self.ticks)
+        self.assertEqual(len(outcomes), 1)
+        self.assertEqual(outcomes[0][1], "lease_expired")
+        self.assertTrue(outcomes[0][2].native_disabled)
+        self.assertTrue(outcomes[0][2].slot_released)
+        self.assertEqual([call for call in case.job.calls if call[0] in {"set", "disable"}],
+                         [("set", 2500), ("disable", None)])
+        self.assertEqual(case.job.query_cpu().flags, 0)
+        self.assertEqual(self.slot()["slot_state"], "RESTORED")
+        self.assertEqual(self.runtime()["admission_barrier"], "RECOVERY_HOLD")
+        self.assertEqual([row["action_state"] for row in self.actions()], ["RESTORED"])
+
     # --- lease expiry, restore and the barrier -------------------------------
 
     def test_tick_restores_on_lease_expiry_and_leaves_recovery_hold(self):
@@ -484,9 +582,23 @@ class GuardianControlTests(unittest.TestCase):
         self.apply_cap(case)
         # Fixture write to this isolated database.
         self.sql("UPDATE adaptive_runtime SET mode='shadow'")
+        before = len(case.job.calls)
         outcomes = self.control.tick(self.ticks)
         self.assertEqual(outcomes[0][1], "control_mode_unavailable")
         self.assertEqual(self.runtime()["admission_barrier"], "RECOVERY_HOLD")
+        # From the Job's own recorder: the withdrawal is one native disable and
+        # no cap Set. The mode leaving canary does not suppress that disable.
+        self.assertEqual([call for call in case.job.calls[before:]
+                          if call[0] in {"set", "disable"}], [("disable", None)])
+        self.assertEqual(case.job.query_cpu().flags, 0)
+
+    def test_tick_with_mode_off_and_no_episode_never_touches_the_job(self):
+        case = self.start(mode="off")
+        before = list(case.job.calls)
+        self.assertEqual(self.control.tick(self.ticks), ())
+        self.assertEqual(case.job.calls, before)
+        self.assertEqual(case.job.sets, 0)
+        self.assertEqual(self.runtime()["admission_barrier"], "NONE")
 
     def test_exemption_granted_mid_cap_forces_restore(self):
         case = self.start()
@@ -522,12 +634,28 @@ class GuardianControlTests(unittest.TestCase):
         return self.control.clear_admission_barrier(case.spec.execution_id,
             now_tick_100ns=self.ticks if now is None else now)
 
+    def observed_set(self, case, *, count=5, gap=TICKS_PER_SECOND):
+        """Record real samples through the consumer's own entry point.
+
+        Each frame is paired with the guardian's own disabled Query inside
+        ``observe_uncapped``, so nothing is written into the sample buffer here.
+        """
+        start = self.boundary(case)
+        for index in range(count):
+            self.ticks = start + (index + 1) * gap
+            frame = decisions.frame(10 + index, self.ticks, 8.0,
+                                    jobs=(decisions.job(case.spec.execution_id),))
+            self.control.observe_uncapped(case.spec.execution_id, frame)
+        return tuple(self.control._samples[case.spec.execution_id])
+
     def test_five_fresh_uncapped_samples_after_the_restore_clear_the_barrier(self):
         case = self.restored_case()
-        samples = self.uncapped_set(case)
+        samples = self.observed_set(case)
+        self.assertEqual(len(samples), 5)
         self.ticks = samples[-1].window_end_tick_100ns + TICKS_PER_SECOND
         revision = self.runtime()["registry_revision"]
-        result = self.clear(case, samples)
+        result = self.control.clear_admission_barrier(case.spec.execution_id,
+                                                      now_tick_100ns=self.ticks)
         self.assertEqual(result["admission_barrier"], "NONE")
         self.assertEqual(result["registry_revision"], revision + 1)
         self.assertEqual(self.runtime()["admission_barrier"], "NONE")

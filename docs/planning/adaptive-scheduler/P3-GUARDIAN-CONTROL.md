@@ -41,8 +41,21 @@ Plan section 8.3 fixes the order, and the recovery journal's own
 7. One batched audit commit into `adaptive_actions`.
 
 The test `test_apply_orders_intent_then_set_then_query_then_ack_then_audit`
-asserts this sequence from the synthetic backend's own call log, not from the
-code's structure.
+asserts this sequence twice over. The first assertion reads the consumer's own
+call log. The second reads two recorders the code under test never writes to:
+the synthetic Job's own list of Set, disable and Query calls, and a wrapper the
+test installs around the real journal `publish`. A native Set the consumer
+forgot to log, or one issued before the durable intent, fails that second
+assertion.
+
+A fault at any step after the native Set ends in compare-and-restore, and that
+includes a failure to publish the settled manifest at step 5. The acknowledgement
+is then `UNVERIFIED` with reason `control_settle_failed`, the cap is withdrawn,
+and no `APPLIED` row reaches `adaptive_actions`. If the withdrawal also fails
+because the journal is still unwritable, the episode keeps no lease, so the next
+`tick(now)` retries the restore. A later proposal for that episode is refused as
+`control_episode_unverified` instead of being renewed, because a cap that was
+never verified and durably settled is never acknowledged or extended.
 
 ### Lock order
 
@@ -85,6 +98,13 @@ id is refused as `decision_seq_replayed`. An older sequence is refused as
 
 Exemptions are only ever read. Nothing in this consumer grants, extends, revokes
 or ignores one, and no code path here can change a ledger mode.
+
+Under ledger mode `off` or `shadow` no cap is ever applied and no lease is ever
+renewed. A controller holding no open episode never touches the Job at all. A
+cap already held when the mode leaves `canary` or `limited` is a separate case:
+it is withdrawn through compare-and-restore, and that withdrawal is one native
+`disable`. The restore direction stays available in every mode, because leaving
+a cap in place because the mode changed would be the unsafe reading.
 
 ## Restore
 
@@ -134,7 +154,8 @@ policy coordinator, the recovery journal and the exemption ledger are the
 production modules against real temporary SQLite files and real journal files.
 The Job, the processes, the mutexes, the host authority and the grant scope
 evaluator are explicitly labelled in-process fixtures. The Job answers queries
-and counts every Set; it contains nothing and kills nothing.
+and counts every Set, and it records its own call order for the tests that check
+what the consumer actually did to a Job. It contains nothing and kills nothing.
 
 Every ledger mode write in that module is a fixture write into an isolated test
 database, marked as such at each site.
@@ -163,6 +184,9 @@ database, marked as such at each site.
   does not say whose samples count once the Job is gone. That is a plan
   clarification for the repository owner, listed in `ACCEPTANCE-RESULTS.md`.
   Nothing here relaxes the rule to get past it.
-- The default grant scope evaluator proves nothing and therefore refuses every
-  proposal. A real deployment must supply one backed by native process and job
-  membership evidence.
+- The default grant scope evaluator proves nothing. It answers `UNKNOWN` for
+  every lease it is shown, so a proposal is refused as `exemption_scope_unknown`
+  whenever at least one active exemption lease exists. With no active lease
+  there is nothing to evaluate and the proposal carries on to the other checks.
+  A real deployment must supply an evaluator backed by native process and job
+  membership evidence before any grant can be proven unrelated to a capped Job.

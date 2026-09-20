@@ -124,6 +124,11 @@ landed, named all 70 modules the same way: 1629 tests, 0 failures, 0 errors,
 0 skips, 190.1 s. The added modules are portable or read-only. None of them sets
 a CPU control, and none is native evidence for a P4, P5 or P6 gate.
 
+A third run the same day, after the orphan drain and the guardian control
+consumer, named all 72 modules: 1700 tests, 0 failures, 0 errors, 0 skips,
+178.5 s. Every Job, process and mutex in the added tests is a synthetic
+in-process fixture, so this run is not native evidence either.
+
 `tests/test_adaptive_p3_flow.py` runs flow A to H on one isolated ledger with the
 production consumers: `Coordinator.admit_managed`, `ManagedAdmission`,
 `GuardianLaunchOwner`, its `GuardianLifecycle`, the formal `RecoveryJournal`,
@@ -229,8 +234,16 @@ and one assertion that a ledger rejection keeps the POLICY entry nonce. The
 first rerun failed one test, `run 71 failures 1 errors 0 skipped 0`: the
 finished scope did not retire because the drain stamped wall time on a ledger
 seeded with a fixture clock. With `tick(now=...)` the same four modules gave
-`run 71 failures 0 errors 0 skipped 0`. The earlier custody tests are still not red-verified by execution. That
-claim rests on reading the old code path.
+`run 71 failures 0 errors 0 skipped 0`. The earlier custody tests are still not
+red-verified by execution. That claim rests on reading the old code path.
+
+A separate read-and-run verification pass then reran the drain, flow, supervisor
+and guardian control modules: `run 77 failures 0 errors 0 skipped 0`. It found no
+counterexample to the five drain claims. It also probed a case no repository test
+covers: a slot whose `execution_id` is not a UUID after a completed drain gives
+`supervisor_inventory_slot_unknown`, and `close()` refuses with
+`supervisor_custody_unsettled`. The pass ran single threaded on synthetic
+backends, so it says nothing about a real race or a native Job.
 
 Supervisor lock tests take a real exclusive file lock. The ledger is WAL, so a
 plain `BEGIN EXCLUSIVE` does not block readers; the blocker uses
@@ -281,8 +294,10 @@ pass. Promotion remains stopped for this unresolved all-witness-loss contract.
   collector kill subtree. No task or global startup entry was installed.
 - Durable instance provenance for a new process with no captured POLICY binding,
   and an accepted exact-death contract when every native witness is gone.
-- Clearing the admission barrier from `RECOVERY_HOLD` back to `NONE`, with the
-  fresh uncapped samples that decision needs.
+- Clearing the admission barrier for a Job that has already finished. The
+  guardian can clear `RECOVERY_HOLD` for a live Job with fresh uncapped samples;
+  see P3-GUARDIAN-CONTROL.md. A Job finished by the orphan drain produces no
+  samples, so its barrier stays, and plan 7.4 needs an owner decision first.
 - Separate durable recovery ownership transfer for a scope that must keep
   running, followed by lifecycle adoption, child accounting and original lease
   handling. The drain finishes a scope; it does not adopt one.

@@ -328,7 +328,15 @@ class GuardianControl:
             # An unreadable or mismatched readback is never an applied ACK.
             self._fault(proposal, entry, episode, "control_readback_mismatch", None)
             return self._unverified(proposal, "control_readback_mismatch")
-        self._settle_intent(entry, record, observed)
+        try:
+            self._settle_intent(entry, record, observed)
+        except BaseException as error:
+            # Without the settled manifest the cap is live while the journal
+            # still shows a pending intent. It is withdrawn through the same
+            # compare-and-restore the Set and Query faults use, and nothing is
+            # acknowledged as applied.
+            self._fault(proposal, entry, episode, "control_settle_failed", error)
+            return self._unverified(proposal, "control_settle_failed")
         episode.lease_deadline_tick_100ns = lease
         episode.applied = observed
         ack = ApplyAck(proposal.request_id, action_id, proposal.execution_id,
@@ -346,6 +354,11 @@ class GuardianControl:
 
     def _renew_locked(self, proposal, entry, episode, row, now):
         """Extend the lease of the same execution, slot and epoch. No Set."""
+        if episode.applied is None or episode.lease_deadline_tick_100ns is None:
+            # A cap that was never verified and durably settled is not a cap
+            # this consumer may acknowledge or extend. Such an episode is
+            # restored by the next sweep, never renewed here.
+            raise LifecycleError("control_episode_unverified")
         if proposal.decision_seq <= episode.decision_seq:
             raise LifecycleError("decision_seq_stale")
         if (proposal.policy_epoch != episode.policy_epoch or

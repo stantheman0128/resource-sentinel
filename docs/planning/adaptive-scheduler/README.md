@@ -56,6 +56,43 @@ production supervisor、完整 loaded-writer 交接及 native gate 尚未通過�
 原生 power notification 的註冊／解除已實測，完整 native Job／sleep recovery
 仍未通過；這不會解鎖尚缺實際 host authority 的 native 入口。
 
+## 2026-09-20 接手紀錄：交還 Codex 前的現況
+
+這一輪由 Claude 接手既有實作，沒有重寫架構。以下每一項都只有可攜測試證據，
+Job、程序與 mutex 都是測試內標明的 synthetic backend。這台開發機的程序位於外層
+Job 內，`require_supported_host()` 會拒絕，所以 native 測試一項都沒跑，P3 到 P6
+沒有任何 gate 通過，adaptive 維持 off。
+
+已入庫的程式與對應文件：
+
+1. P3 流程 A 到 H 在同一份隔離帳本上用 production consumers 跑完，見
+   [retained supervisor](P3-RETAINED-SUPERVISOR.md)。H 步驟由 supervisor 行程內的
+   `OrphanDrainOwner` 完成：guardian 確認死亡並還原後，Job 經現場查詢確認為空才
+   釋放控制名額並結案。它不接管 scope，不改寫 `guardian_identity` 與
+   `guardian_epoch`，barrier 停在 `RECOVERY_HOLD`。
+2. guardian 端的 ControlProposal consumer 見 [guardian control](P3-GUARDIAN-CONTROL.md)。
+   順序依計畫 8.3：佔名額、寫入 durable intent、Set、Query、結算 manifest、回 ACK、
+   批次稽核。帳本模式為 off 或 shadow 時 Set 次數為零。租約到期由 `tick()` 自行還原。
+3. P4 的決策層、shadow helper 與 Job sampler 只有 source，沒有呼叫端把它接到 guardian。
+   設定檔現在可選 off 與 shadow，選不到 enforce。
+4. P5 的故障證據工具與唯讀成本探針、P6 的配對 A/B harness 已入庫。
+   [驗收結果](ACCEPTANCE-RESULTS.md) 仍是空白範本，結論是 NOT_MEASURED。
+   計畫 11.3 沒給數字的兩個比較，以 [門檻澄清](AB-THRESHOLD-CLARIFICATION.md)
+   沿用計畫既有數字，並標明是澄清。
+
+需要 repo 擁有者裁決、程式目前一律 fail closed 的事項：
+
+1. 計畫 7.4 沒說受控 Job 已經結束時，要用誰的五筆未限速樣本清除 barrier。
+   現況是 Job 先結束或由 orphan drain 結案時，barrier 會一直停在 `RECOVERY_HOLD`。
+   這一點在 canary 之前必須決定。
+2. `cancel` 與 `start_failed` 兩種狀態缺 guardian 證據，無法退場，細節在
+   retained supervisor 文件的 remaining gates。
+3. helper 到 guardian 的 ControlProposal 傳輸尚未存在，B 組因此還不能量測。
+
+整棵 adaptive 測試樹最後一次執行：72 個模組、1700 個測試、0 失敗、0 錯誤、
+0 略過，經 `scripts/invoke-sentinel.ps1` 正常准入。這是 source 行為的證據，
+不是任何 native gate 的通過聲明。
+
 使用者要求：先自行嚴格質疑方案，把資料放入 repo；由使用者交給 GPT Pro
 完成 plan，再交回 Codex 實作。本包不代表使用者已選定控制演算法、常駐服務或參數。
 

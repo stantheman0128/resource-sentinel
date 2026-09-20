@@ -295,7 +295,9 @@ class GuardianSupervisor:
     def tick(self, *, now=None):
         """One bounded pass; invoke repeatedly from the independent host.
 
-        ``now`` is only the ledger timestamp a drain records as finished_at.
+        ``now`` only stamps the ledger rows a drain closes: finished_at on the
+        execution and its descendants, and ended_at on the archive row. It is
+        never evidence of liveness, emptiness or death.
 
         Unavailable DB may still allow withdrawal for previously observed
         scopes, while inventory_verified stays false. A readable contradiction

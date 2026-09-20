@@ -169,6 +169,9 @@ class RecoveryJournal:
     create precedes Job creation, so its disabled original is a required baseline,
     not proof that a native Job exists or has been queried. Guardian identity and
     epoch remain immutable creation provenance; they do not assert current life.
+    Initial-create acknowledgement recovery additionally requires the trusted
+    scope's assert_job_creation_unattempted() to verify its irreversible native
+    creation flag remains false. A file read alone never supplies that proof.
     """
 
     def __init__(self, directory, *, publisher=None):
@@ -312,6 +315,40 @@ class RecoveryJournal:
             raise RecoveryJournalError("manifest_already_exists")
         return self._publish(record, encoded, writer_scope, previous=None)
 
+    @staticmethod
+    def _initial_reaffirm_scope(scope, record):
+        RecoveryJournal._scope(scope, record)
+        assertion = getattr(scope, "assert_job_creation_unattempted", None)
+        if not callable(assertion):
+            raise RecoveryJournalError("manifest_job_creation_unverified")
+        try:
+            result = assertion()
+        except Exception:
+            raise RecoveryJournalError("manifest_job_creation_unverified") from None
+        if result is not None:
+            raise RecoveryJournalError("manifest_job_creation_unverified")
+        RecoveryJournal._scope(scope, record)
+
+    def reaffirm_initial(self, record, *, writer_scope):
+        """Durably republish exact initial evidence after a lost create ACK.
+
+        This is only an in-process continuation before *any* native Job creation
+        attempt. The retained scope must positively establish that fact while
+        holding both writer fences. There is no Job to query, no sequence/control
+        transition, and no authority to recover a pending intent through this
+        operation. Missing evidence requires separate create reconciliation.
+        """
+        encoded = _record(record)
+        if (record.manifest_seq != 0 or record.root_identity is not None or
+                record.last_applied is not None or record.pending_intent is not None):
+            raise RecoveryJournalError("manifest_initial_state_invalid")
+        self._initial_reaffirm_scope(writer_scope, record)
+        old = self.read(record.execution_id, creation_nonce=record.creation_nonce)
+        if old != record:
+            raise RecoveryJournalError("manifest_sequence_conflict")
+        return self._publish(record, encoded, writer_scope, previous=old,
+                             reaffirm_initial=True)
+
     def publish(self, record, *, expected_seq, expected_hash, writer_scope):
         encoded = _record(record)
         if (type(expected_seq) is not int or not 0 <= expected_seq < UINT64_MAX or
@@ -345,14 +382,17 @@ class RecoveryJournal:
             raise RecoveryJournalError("manifest_temporary_changed")
         os.unlink(path)
 
-    def _publish(self, record, encoded, scope, *, previous):
+    def _publish(self, record, encoded, scope, *, previous, reaffirm_initial=False):
         target = self._path(record.execution_id)
         temporary = self._directory / ("." + record.execution_id + "." + uuid4().hex + ".tmp")
         temporary_id = None
         primary = None
         publishing = published = False
+        check_scope = self._initial_reaffirm_scope if reaffirm_initial else self._scope
         try:
             self._check_directory()
+            if reaffirm_initial:
+                check_scope(scope, record)
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
             with _binary_file(temporary, flags, "wb") as stream:
                 temporary_id = _safe_stat(os.fstat(stream.fileno()))
@@ -361,26 +401,30 @@ class RecoveryJournal:
                 stream.flush()
                 os.fsync(stream.fileno())
             self._check_directory()
-            self._scope(scope, record)
+            check_scope(scope, record)
             if _safe_stat(os.lstat(temporary)) != temporary_id:
                 raise RecoveryJournalError("manifest_temporary_changed")
             if previous is not None:
                 current = self.read(record.execution_id, creation_nonce=record.creation_nonce)
                 if current != previous:
                     raise RecoveryJournalError("manifest_sequence_conflict")
-                # Fsync may have blocked. Confirm the same retained Job state
-                # again under the owner fences before publishing a new intent
-                # or retiring the previous one. No control is written here.
-                self._control_transition(previous, record, scope)
-            self._scope(scope, record)
+                # Fsync may have blocked. Normal revisions must reconfirm the
+                # actual Job before publishing/retiring an intent. An exact
+                # initial reaffirm instead rechecks never-attempted creation
+                # through check_scope; it has no native Job to query.
+                if not reaffirm_initial:
+                    self._control_transition(previous, record, scope)
+            check_scope(scope, record)
             self._check_directory()
             publishing = True
             if self._publisher(temporary, target, replace=previous is not None) is not None:
                 raise RecoveryJournalError("manifest_publication_unverified")
             published = True
-            self._scope(scope, record)
+            check_scope(scope, record)
             if self.read(record.execution_id, creation_nonce=record.creation_nonce) != record:
                 raise RecoveryJournalError("manifest_publication_unverified")
+            if reaffirm_initial:
+                check_scope(scope, record)
             return record
         except FileExistsError as error:
             if publishing and (previous is not None or

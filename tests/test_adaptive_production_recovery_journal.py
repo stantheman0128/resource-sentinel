@@ -39,6 +39,8 @@ class HeldScope:
         self.valid = True
         self.observed = DISABLED
         self.queries = 0
+        self.create_attempted = False
+        self.creation_checks = 0
         self.set_cpu_control = Mock(side_effect=AssertionError("fixture_control_write_forbidden"))
 
     @contextmanager
@@ -65,6 +67,12 @@ class HeldScope:
         self.assert_held()
         self.queries += 1
         return self.observed
+
+    def assert_job_creation_unattempted(self):
+        self.assert_held()
+        self.creation_checks += 1
+        if self.create_attempted:
+            raise RuntimeError("fixture_native_creation_already_attempted")
 
 
 def record():
@@ -210,6 +218,232 @@ class ProductionRecoveryJournalTests(unittest.TestCase):
                 self.journal.create(self.base, writer_scope=self.scope)
         self.assertFalse(caught.exception.publication_may_have_occurred)
         self.assertEqual(self.path.read_bytes(), original)
+
+    def test_initial_lost_ack_requires_durable_exact_reaffirm_before_continuing(self):
+        real_publish = self.journal._publisher
+        continue_creation = Mock()
+        def publish_then_fail(*args, **kwargs):
+            real_publish(*args, **kwargs)
+            raise OSError("private-initial-ack-lost")
+        with patch.object(self.journal, "_publisher", side_effect=publish_then_fail):
+            with self.scope.held(), self.assertRaises(ERROR) as caught:
+                self.journal.create(self.base, writer_scope=self.scope)
+                continue_creation()
+        self.assertTrue(caught.exception.publication_may_have_occurred)
+        self.assertEqual(self.read(), self.base)
+        continue_creation.assert_not_called()
+        original_bytes = self.path.read_bytes()
+        events = []
+        real_fsync, real_read = journal_module.os.fsync, self.journal.read
+        def fsync(descriptor):
+            events.append(("fsync", self.scope.creation_checks))
+            return real_fsync(descriptor)
+        def publish(temporary, target, *, replace):
+            self.assertTrue(replace)
+            events.append(("publish", self.scope.creation_checks))
+            return real_publish(temporary, target, replace=replace)
+        def read(*args, **kwargs):
+            events.append(("read", self.scope.creation_checks))
+            return real_read(*args, **kwargs)
+        with patch.object(journal_module.os, "fsync", side_effect=fsync):
+            with patch.object(self.journal, "_publisher", side_effect=publish) as publisher:
+                with patch.object(self.journal, "read", side_effect=read):
+                    with patch.object(self.scope, "query_cpu_control", side_effect=AssertionError("no_future_job")) as query:
+                        with self.scope.held():
+                            result = self.journal.reaffirm_initial(self.base, writer_scope=self.scope)
+                            continue_creation()
+        self.assertEqual(result, self.base)
+        self.assertEqual(self.path.read_bytes(), original_bytes)
+        self.assertEqual([kind for kind, _ in events], ["read", "fsync", "read", "publish", "read"])
+        self.assertGreater(events[3][1], events[1][1])
+        self.assertGreater(self.scope.creation_checks, events[-1][1])
+        publisher.assert_called_once()
+        query.assert_not_called()
+        self.scope.set_cpu_control.assert_not_called()
+        continue_creation.assert_called_once_with()
+
+    def test_reaffirm_missing_file_never_becomes_initial_create(self):
+        with patch.object(self.journal, "_publisher") as publisher:
+            with self.scope.held(), self.assertRaises(ERROR) as caught:
+                self.journal.reaffirm_initial(self.base, writer_scope=self.scope)
+        self.assertEqual(caught.exception.reason, "manifest_not_found")
+        self.assertFalse(caught.exception.publication_may_have_occurred)
+        publisher.assert_not_called()
+        self.assertEqual(list(self.directory.iterdir()), [])
+
+    def test_reaffirm_rejects_noninitial_records_before_publication(self):
+        self.create()
+        for changes in ({"manifest_seq": 1}, {"root_identity": ROOT},
+                        {"last_applied": DISABLED},
+                        {"pending_intent": PendingIntent(str(uuid4()), DISABLED, CAP)}):
+            candidate = successor(self.base, **{"manifest_seq": 0, **changes})
+            with self.subTest(fields=tuple(changes)), patch.object(self.journal, "_publisher") as publisher:
+                with self.scope.held(), self.assertRaises(ERROR) as caught:
+                    self.journal.reaffirm_initial(candidate, writer_scope=self.scope)
+            self.assertEqual(caught.exception.reason, "manifest_initial_state_invalid")
+            publisher.assert_not_called()
+            self.assertEqual(self.read(), self.base)
+        with self.scope.held(), self.assertRaises(ERROR):
+            self.journal.reaffirm_initial(self.base.to_dict(), writer_scope=self.scope)
+
+    def test_reaffirm_requires_exact_entire_initial_record_not_only_sequence(self):
+        self.create()
+        for changes in ({"reservation": ReservationRef(AllocationKind.ROUTED, "other")},
+                        {"spec_hash": "b" * 64}, {"guardian_epoch": "other-epoch"},
+                        {"wrapper_identity": ROOT}, {"guardian_identity": ROOT},
+                        {"allocated_floor": ResourceDemand(3.0, 2 << 20, 3 << 20, 1)}):
+            candidate = successor(self.base, manifest_seq=0, **changes)
+            matching_scope = HeldScope(candidate)
+            with self.subTest(fields=tuple(changes)), patch.object(self.journal, "_publisher") as publisher:
+                with matching_scope.held(), self.assertRaises(ERROR) as caught:
+                    self.journal.reaffirm_initial(candidate, writer_scope=matching_scope)
+            self.assertEqual(caught.exception.reason, "manifest_sequence_conflict")
+            publisher.assert_not_called()
+            self.assertEqual(self.read(), self.base)
+
+    def test_reaffirm_requires_held_exact_scope_and_positive_never_attempted_proof(self):
+        self.create()
+        with self.assertRaises(ERROR):
+            self.journal.reaffirm_initial(self.base, writer_scope=self.scope)
+        wrong_scope = HeldScope(self.base)
+        wrong_scope.spec_hash = "b" * 64
+        with wrong_scope.held(), self.assertRaises(ERROR):
+            self.journal.reaffirm_initial(self.base, writer_scope=wrong_scope)
+        for assertion in (None, Mock(return_value=False), Mock(return_value=True),
+                          Mock(side_effect=RuntimeError("private-native-state"))):
+            with self.subTest(assertion=type(assertion).__name__):
+                with patch.object(self.scope, "assert_job_creation_unattempted", assertion):
+                    with patch.object(self.journal, "_publisher") as publisher:
+                        with self.scope.held(), self.assertRaises(ERROR) as caught:
+                            self.journal.reaffirm_initial(self.base, writer_scope=self.scope)
+                self.assertEqual(caught.exception.reason, "manifest_job_creation_unverified")
+                self.assertNotIn("private-", str(caught.exception))
+                publisher.assert_not_called()
+        self.scope.create_attempted = True
+        with self.scope.held(), self.assertRaises(ERROR) as caught:
+            self.journal.reaffirm_initial(self.base, writer_scope=self.scope)
+        self.assertFalse(caught.exception.publication_may_have_occurred)
+        self.assertEqual(self.read(), self.base)
+        self.assertEqual(self.scope.queries, 0)
+
+    def test_reaffirm_rechecks_never_attempted_and_writer_scope_after_fsync(self):
+        self.create()
+        real_fsync = journal_module.os.fsync
+        for changed in ("creation", "scope"):
+            self.scope.create_attempted, self.scope.valid = False, True
+            def fsync(descriptor):
+                real_fsync(descriptor)
+                if changed == "creation":
+                    self.scope.create_attempted = True
+                else:
+                    self.scope.valid = False
+            with self.subTest(changed=changed), patch.object(journal_module.os, "fsync", side_effect=fsync):
+                with patch.object(self.journal, "_publisher") as publisher:
+                    with self.scope.held(), self.assertRaises(ERROR) as caught:
+                        self.journal.reaffirm_initial(self.base, writer_scope=self.scope)
+            self.assertFalse(caught.exception.publication_may_have_occurred)
+            publisher.assert_not_called()
+            self.assertEqual(self.read(), self.base)
+            self.assertEqual(list(self.directory.iterdir()), [self.path])
+
+    def test_reaffirm_rechecks_exact_canonical_record_after_fsync(self):
+        self.create()
+        winner = successor(self.base, root_identity=ROOT)
+        real_fsync = journal_module.os.fsync
+        def fsync(descriptor):
+            real_fsync(descriptor)
+            self.path.write_text(winner.to_json(), encoding="utf-8")
+        with patch.object(journal_module.os, "fsync", side_effect=fsync):
+            with patch.object(self.journal, "_publisher") as publisher:
+                with self.scope.held(), self.assertRaises(ERROR) as caught:
+                    self.journal.reaffirm_initial(self.base, writer_scope=self.scope)
+        self.assertEqual(caught.exception.reason, "manifest_sequence_conflict")
+        self.assertFalse(caught.exception.publication_may_have_occurred)
+        publisher.assert_not_called()
+        self.assertEqual(self.read(), winner)
+
+    def test_reaffirm_rechecks_native_creation_after_publisher_and_readback(self):
+        self.create()
+        real_publish, real_read = self.journal._publisher, self.journal.read
+        for phase in ("publisher", "readback"):
+            self.scope.create_attempted = False
+            published = False
+            continue_creation = Mock()
+            def publish(*args, **kwargs):
+                nonlocal published
+                result = real_publish(*args, **kwargs)
+                published = True
+                if phase == "publisher":
+                    self.scope.create_attempted = True
+                return result
+            def read(*args, **kwargs):
+                result = real_read(*args, **kwargs)
+                if phase == "readback" and published:
+                    self.scope.create_attempted = True
+                return result
+            with self.subTest(phase=phase), patch.object(self.journal, "_publisher", side_effect=publish):
+                with patch.object(self.journal, "read", side_effect=read):
+                    with self.scope.held(), self.assertRaises(ERROR) as caught:
+                        self.journal.reaffirm_initial(self.base, writer_scope=self.scope)
+                        continue_creation()
+            self.assertTrue(caught.exception.publication_may_have_occurred)
+            self.assertEqual(caught.exception.reason, "manifest_job_creation_unverified")
+            continue_creation.assert_not_called()
+            self.assertEqual(self.read(), self.base)
+        self.assertEqual(self.scope.queries, 0)
+
+    def test_reaffirm_flush_failure_never_publishes_or_changes_initial_record(self):
+        self.create()
+        with patch.object(journal_module.os, "fsync", side_effect=OSError("private-flush-failure")):
+            with patch.object(self.journal, "_publisher") as publisher:
+                with self.scope.held(), self.assertRaises(ERROR) as caught:
+                    self.journal.reaffirm_initial(self.base, writer_scope=self.scope)
+        self.assertFalse(caught.exception.publication_may_have_occurred)
+        self.assertNotIn("private-", str(caught.exception))
+        publisher.assert_not_called()
+        self.assertEqual(self.read(), self.base)
+        self.assertEqual(list(self.directory.iterdir()), [self.path])
+
+    def test_reaffirm_lost_ack_does_not_authorize_creation_and_can_be_reaffirmed(self):
+        self.create()
+        real_publish = self.journal._publisher
+        for result in ("lost-ack", "false-return"):
+            def publish(*args, **kwargs):
+                real_publish(*args, **kwargs)
+                if result == "lost-ack":
+                    raise OSError("private-reaffirm-ack-lost")
+                return False
+            continue_creation = Mock()
+            with self.subTest(result=result), patch.object(self.journal, "_publisher", side_effect=publish):
+                with self.scope.held(), self.assertRaises(ERROR) as caught:
+                    self.journal.reaffirm_initial(self.base, writer_scope=self.scope)
+                    continue_creation()
+            self.assertTrue(caught.exception.publication_may_have_occurred)
+            continue_creation.assert_not_called()
+            self.assertEqual(self.read(), self.base)
+            with self.scope.held():
+                self.assertEqual(self.journal.reaffirm_initial(self.base, writer_scope=self.scope), self.base)
+        self.assertEqual(self.scope.queries, 0)
+
+    def test_reaffirm_failed_readback_cannot_report_success(self):
+        self.create()
+        real_publish, real_read = self.journal._publisher, self.journal.read
+        published = False
+        def publish(*args, **kwargs):
+            nonlocal published
+            result = real_publish(*args, **kwargs)
+            published = True
+            return result
+        def read(*args, **kwargs):
+            if published:
+                raise ERROR("manifest_read_unavailable")
+            return real_read(*args, **kwargs)
+        with patch.object(self.journal, "_publisher", side_effect=publish):
+            with patch.object(self.journal, "read", side_effect=read):
+                with self.scope.held(), self.assertRaises(ERROR) as caught:
+                    self.journal.reaffirm_initial(self.base, writer_scope=self.scope)
+        self.assertTrue(caught.exception.publication_may_have_occurred)
+        self.assertEqual(self.read(), self.base)
 
     def test_exact_cas_and_one_step_increment_are_required(self):
         old = self.create()

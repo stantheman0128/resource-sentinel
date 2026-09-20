@@ -260,9 +260,12 @@ def migrate_schema(conn: sqlite3.Connection, *, in_transaction: bool = False) ->
             PRIMARY KEY(execution_id,operation),
             FOREIGN KEY(execution_id) REFERENCES managed_executions(execution_id)
         )""")
-        from .control_slot import ControlSlotError, migrate_control_slot_schema
+        from .control_slot import (
+            ControlSlotError, migrate_control_actions_schema, migrate_control_slot_schema,
+        )
         try:
             migrate_control_slot_schema(conn)
+            migrate_control_actions_schema(conn)
         except ControlSlotError as error:
             raise SchemaVersionError(str(error)) from error
         migrate_writer_fence(conn)
@@ -2095,6 +2098,80 @@ class LifecycleStore:
                     self._caller(row, caller)
                     require_evidence(row, proof, restoring=True)
                     result = release_locked(conn, row, runtime, guard, slot_id=slot_id)
+            return result
+        except (ControlSlotError, PolicyError) as error:
+            raise LifecycleError(str(error)) from error
+
+    def record_control_actions_locked(self, execution_id: str, *, caller: ProcessIdentity,
+                                      expected_revision: int, actions) -> int:
+        """Commit one batch of control audit rows; never a capacity write.
+
+        The caller already holds POLICY and has acknowledged each action against
+        its own native Query. This ledger only records what was decided and what
+        the readback showed, so nothing here grants, extends or releases capacity
+        and a capped Job's lowered CPU never becomes admission headroom.
+        """
+        from .control_slot import ControlSlotError, record_actions_locked
+        from .policy import PolicyError
+
+        try:
+            guard = self._policy.assert_held()
+            with self._transaction() as conn:
+                self._policy.revalidate(conn, guard)
+                row = self._get(conn, execution_id)
+                self._require_revision(row, expected_revision)
+                self._caller(row, caller)
+                if guard.binding.logon_id != caller.logon_id:
+                    raise LifecycleError("policy_logon_mismatch")
+                record_actions_locked(conn, row, actions)
+            return len(actions)
+        except (ControlSlotError, PolicyError) as error:
+            raise LifecycleError(str(error)) from error
+
+    def clear_recovery_hold_locked(self, execution_id: str, *, caller: ProcessIdentity,
+                                   expected_revision: int, expected_registry_revision: int,
+                                   slot_id: str, uncapped_samples, now_tick_100ns: int,
+                                   required_samples: int, sample_max_age_ms: int) -> dict[str, Any]:
+        """Clear RECOVERY_HOLD only on complete evidence (plan section 7.4).
+
+        Every precondition is proven, not asserted: the retained evidence scope
+        shows a current disabled native Query and a settled durable manifest, the
+        slot is RESTORED for this exact execution, the accounting this store
+        already recognises revalidates, the durable action ledger holds a
+        completed restore boundary, and the required count of fresh uncapped
+        samples was observed after it. There is no TTL, force flag or operator
+        bypass; any missing piece raises and the barrier stays held.
+        """
+        from .control_slot import ControlSlotError, clear_locked, query_locked, require_evidence
+        from .policy import PolicyError
+
+        if type(expected_registry_revision) is not int or expected_registry_revision < 0:
+            raise ValueError("invalid_registry_revision")
+        try:
+            guard = self._policy.assert_held()
+            snapshot = self.query(execution_id)
+            self._require_revision(snapshot, expected_revision)
+            self._caller(snapshot, caller)
+            if guard.binding.logon_id != caller.logon_id:
+                raise LifecycleError("policy_logon_mismatch")
+            with self._evidence_scope("control_restore", snapshot, caller) as proof:
+                require_evidence(snapshot, proof, restoring=True)
+                self._policy.assert_held(guard)
+                with self._transaction() as conn:
+                    runtime = self._policy.revalidate(conn, guard)
+                    if runtime["registry_revision"] != expected_registry_revision:
+                        raise LifecycleError("registry_revision_conflict")
+                    row = self._get(conn, execution_id)
+                    self._require_revision(row, expected_revision)
+                    self._caller(row, caller)
+                    require_evidence(row, proof, restoring=True)
+                    self._require_allocation(conn, execution_id)
+                    slot = query_locked(conn, runtime, guard)
+                    if slot is None or slot["slot_id"] != slot_id:
+                        raise LifecycleError("control_slot_binding_mismatch")
+                    result = clear_locked(conn, row, runtime, guard, samples=uncapped_samples,
+                        now_tick_100ns=now_tick_100ns, required_samples=required_samples,
+                        sample_max_age_ms=sample_max_age_ms)
             return result
         except (ControlSlotError, PolicyError) as error:
             raise LifecycleError(str(error)) from error

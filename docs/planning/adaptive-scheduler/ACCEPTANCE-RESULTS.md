@@ -117,6 +117,16 @@ invent one, so a human has to judge the outcome or the plan has to be amended.
 - No sample size is named above which a statistical guarantee may be claimed, so
   every result is reported as a small sample.
 
+One gap sits outside section 11.3 and blocks B before any measurement. Plan
+section 7.4 clears the admission barrier only after five fresh uncapped samples,
+and it does not say whose samples count once the capped Job is gone. The
+implemented clear needs an active allocation and samples of that same Job, so a
+Job that finishes first, or one finished by the orphan drain after its guardian
+died, leaves the barrier at `RECOVERY_HOLD` with no path back to `NONE`. The code
+fails closed and nothing was relaxed. The repository owner has to decide what
+evidence clears the barrier for a finished Job before any canary runs. See
+P3-GUARDIAN-CONTROL.md.
+
 ## Sign off
 
 Sign off is blocked. It stays blocked until measured A1 and B records exist, the

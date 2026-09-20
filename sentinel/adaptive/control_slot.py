@@ -7,6 +7,7 @@ pure validation inside its existing short transaction.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 import sqlite3
 from uuid import UUID
@@ -19,6 +20,7 @@ class ControlSlotError(ValueError):
 
 
 _MAX_INT = (1 << 63) - 1
+_TICKS_PER_MS = 10_000
 _TERMINAL = {"FINISHED", "CANCELLED_BEFORE_START", "START_FAILED"}
 _FIELDS = (
     "singleton", "schema_version", "slot_id", "slot_revision", "slot_state",
@@ -30,6 +32,13 @@ _BINDINGS = (
     "execution_id", "job_name", "job_nonce", "guardian_epoch", "logon_id",
     "owner_pid", "owner_created_filetime_100ns", "policy_instance_id", "policy_logon_id",
 )
+_ACTION_FIELDS = (
+    "guardian_epoch", "execution_id", "decision_seq", "action_id", "sample_seq",
+    "action_state", "desired_mode", "desired_rate_bp", "applied_flags", "applied_rate_bp",
+    "applied_tick_100ns", "lease_deadline_tick_100ns", "intervention_deadline_tick_100ns",
+    "reason", "win32_error",
+)
+_ACTION_STATES = ("INTENDED", "APPLIED", "RENEWED", "RESTORED", "UNVERIFIED", "FAILED", "CONFLICT")
 
 
 def _integer(value, *, minimum=0):
@@ -75,6 +84,88 @@ def migrate_control_slot_schema(conn):
     columns = {row[1] for row in conn.execute("PRAGMA table_info(adaptive_control_slot)")}
     if columns != set(_FIELDS):
         raise ControlSlotError("control_slot_schema_unsupported")
+
+
+def migrate_control_actions_schema(conn):
+    """Add the bounded control audit ledger inside the caller-owned transaction.
+
+    Plan section 7.6 keeps one row per decision, so a retry at the same sequence
+    cannot append a second action. Nothing here records capacity: a capped Job's
+    reduced CPU is never written as released admission.
+    """
+    _transaction(conn)
+    found = conn.execute("SELECT type FROM sqlite_master WHERE name='adaptive_actions'").fetchone()
+    if found is not None and found[0] != "table":
+        raise ControlSlotError("control_actions_schema_unsupported")
+    conn.execute("""CREATE TABLE IF NOT EXISTS adaptive_actions (
+        guardian_epoch TEXT NOT NULL,
+        execution_id TEXT NOT NULL,
+        decision_seq INTEGER NOT NULL CHECK(typeof(decision_seq)='integer' AND decision_seq>=0),
+        action_id TEXT NOT NULL,
+        sample_seq INTEGER NOT NULL CHECK(typeof(sample_seq)='integer' AND sample_seq>=0),
+        action_state TEXT NOT NULL CHECK(action_state IN
+            ('INTENDED','APPLIED','RENEWED','RESTORED','UNVERIFIED','FAILED','CONFLICT')),
+        desired_mode TEXT NOT NULL CHECK(desired_mode IN ('disabled','hard_cap')),
+        desired_rate_bp INTEGER,
+        applied_flags INTEGER,
+        applied_rate_bp INTEGER,
+        applied_tick_100ns INTEGER,
+        lease_deadline_tick_100ns INTEGER,
+        intervention_deadline_tick_100ns INTEGER,
+        reason TEXT NOT NULL,
+        win32_error INTEGER,
+        PRIMARY KEY(guardian_epoch,execution_id,decision_seq),
+        CHECK(action_state NOT IN ('APPLIED','RENEWED') OR (applied_flags=5 AND applied_rate_bp>=1
+            AND applied_tick_100ns>=1 AND lease_deadline_tick_100ns>=1
+            AND lease_deadline_tick_100ns<=intervention_deadline_tick_100ns)),
+        CHECK(action_state!='RESTORED' OR (applied_flags IS NOT NULL AND applied_flags%2=0
+            AND applied_tick_100ns>=1 AND lease_deadline_tick_100ns IS NULL)),
+        FOREIGN KEY(execution_id) REFERENCES managed_executions(execution_id)
+    )""")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(adaptive_actions)")}
+    if columns != set(_ACTION_FIELDS):
+        raise ControlSlotError("control_actions_schema_unsupported")
+
+
+@dataclass(frozen=True)
+class ControlAction:
+    """One decision's audit row, written after its acknowledgement."""
+
+    guardian_epoch: str
+    execution_id: str
+    decision_seq: int
+    action_id: str
+    sample_seq: int
+    action_state: str
+    desired_mode: str
+    desired_rate_bp: int | None
+    applied_flags: int | None
+    applied_rate_bp: int | None
+    applied_tick_100ns: int | None
+    lease_deadline_tick_100ns: int | None
+    intervention_deadline_tick_100ns: int | None
+    reason: str
+    win32_error: int | None
+
+
+@dataclass(frozen=True)
+class UncappedSample:
+    """One frame the guardian itself observed while its own Job carried no cap.
+
+    A JobFrame has no capped flag, so uncapped is the controller's knowledge and
+    not a wire field. observed_tick_100ns is the guardian's own native Query for
+    this frame; cpu_units is carried for the record and is never, on its own,
+    evidence that a restriction was removed.
+    """
+
+    execution_id: str
+    sampler_epoch: str
+    clock_epoch: str
+    sample_seq: int
+    window_start_tick_100ns: int
+    window_end_tick_100ns: int
+    observed_tick_100ns: int
+    cpu_units: float
 
 
 def read_slot(conn):
@@ -285,6 +376,143 @@ def release_locked(conn, row, runtime, guard, *, slot_id):
         raise ControlSlotError("control_slot_revision_conflict")
     return _result(slot | {"slot_state": "RESTORED", "slot_revision": slot["slot_revision"] + 1},
         dict(runtime) | {"admission_barrier": "RECOVERY_HOLD", "registry_revision": runtime["registry_revision"] + 1}, duplicate=False)
+
+
+def record_actions_locked(conn, row, actions):
+    """Append the batched audit rows for one execution; never a capacity write.
+
+    A RESTORED row is the durable boundary a later barrier clear measures its
+    fresh samples against, so it is accepted only while this execution's slot is
+    already RESTORED. A repeated sequence is a primary key conflict, not a
+    second action.
+    """
+    _transaction(conn)
+    if type(actions) is not tuple or not 1 <= len(actions) <= 64:
+        raise ControlSlotError("invalid_control_action")
+    slot = None
+    for action in actions:
+        if type(action) is not ControlAction:
+            raise ControlSlotError("invalid_control_action")
+        if (action.execution_id != row["execution_id"] or action.guardian_epoch != row["guardian_epoch"] or
+                not _uuid(action.action_id) or not _integer(action.decision_seq) or
+                not _integer(action.sample_seq) or action.action_state not in _ACTION_STATES or
+                action.desired_mode not in {"disabled", "hard_cap"} or
+                not _text(action.reason, 128) or
+                not re.fullmatch(r"[A-Za-z0-9_.:@-]+", action.reason)):
+            raise ControlSlotError("invalid_control_action")
+        for name, minimum, maximum in (("desired_rate_bp", 1, 10000), ("applied_flags", 0, (1 << 32) - 1),
+                                       ("applied_rate_bp", 0, 10000), ("applied_tick_100ns", 1, _MAX_INT),
+                                       ("lease_deadline_tick_100ns", 1, _MAX_INT),
+                                       ("intervention_deadline_tick_100ns", 1, _MAX_INT),
+                                       ("win32_error", 0, (1 << 32) - 1)):
+            value = getattr(action, name)
+            if value is not None and not (_integer(value, minimum=minimum) and value <= maximum):
+                raise ControlSlotError("invalid_control_action")
+        if action.action_state == "RESTORED":
+            slot = read_slot(conn) if slot is None else slot
+            if (slot is None or slot["execution_id"] != row["execution_id"] or
+                    slot["slot_state"] != "RESTORED"):
+                raise ControlSlotError("control_slot_unrestored")
+        try:
+            conn.execute("INSERT INTO adaptive_actions(" + ",".join(_ACTION_FIELDS) + ") VALUES(" +
+                         ",".join("?" for _ in _ACTION_FIELDS) + ")",
+                         tuple(getattr(action, name) for name in _ACTION_FIELDS))
+        except sqlite3.IntegrityError:
+            raise ControlSlotError("control_action_replayed") from None
+        except sqlite3.Error:
+            raise ControlSlotError("control_actions_unavailable") from None
+
+
+def _restore_boundary(conn, row):
+    """The durable tick of this execution's own completed restore Query."""
+    try:
+        found = conn.execute("""SELECT action_state,applied_tick_100ns FROM adaptive_actions
+            WHERE guardian_epoch=? AND execution_id=? ORDER BY decision_seq DESC LIMIT 1""",
+            (row["guardian_epoch"], row["execution_id"])).fetchone()
+    except sqlite3.Error:
+        raise ControlSlotError("control_actions_unavailable") from None
+    if found is None or found[0] != "RESTORED" or not _integer(found[1], minimum=1):
+        # A later intent, applied cap or unresolved fault is never a boundary.
+        raise ControlSlotError("control_restore_boundary_missing")
+    return found[1]
+
+
+def _uncapped_samples(row, samples, *, boundary, now_tick_100ns, required, max_age_ms):
+    """Count only distinct, in-order, post-restore observations that are fresh.
+
+    Freshness is judged when each frame was observed, because five samples one
+    interval apart cannot all sit inside one freshness window at clear time. The
+    newest sample must still be fresh now, so a stalled sampler cannot release
+    admission with an old set. A usage drop alone counts for nothing here.
+    """
+    if type(samples) is not tuple or len(samples) < required:
+        raise ControlSlotError("uncapped_samples_insufficient")
+    age = max_age_ms * _TICKS_PER_MS
+    previous = None
+    for sample in samples:
+        if type(sample) is not UncappedSample:
+            raise ControlSlotError("uncapped_samples_invalid")
+        if (sample.execution_id != row["execution_id"] or not _integer(sample.sample_seq) or
+                not _integer(sample.window_start_tick_100ns, minimum=1) or
+                not _integer(sample.window_end_tick_100ns, minimum=1) or
+                not _integer(sample.observed_tick_100ns, minimum=1) or
+                type(sample.cpu_units) not in (int, float) or not 0 <= sample.cpu_units <= 4096 or
+                not _text(sample.sampler_epoch, 128) or not _text(sample.clock_epoch, 128)):
+            raise ControlSlotError("uncapped_samples_invalid")
+        if not (sample.window_start_tick_100ns < sample.window_end_tick_100ns <=
+                sample.observed_tick_100ns <= now_tick_100ns):
+            raise ControlSlotError("uncapped_samples_invalid")
+        if previous is not None and (sample.sample_seq <= previous.sample_seq or
+                sample.window_end_tick_100ns <= previous.window_end_tick_100ns or
+                sample.sampler_epoch != previous.sampler_epoch or
+                sample.clock_epoch != previous.clock_epoch):
+            raise ControlSlotError("uncapped_samples_invalid")
+        if sample.window_start_tick_100ns < boundary:
+            raise ControlSlotError("uncapped_samples_precede_restore")
+        if sample.observed_tick_100ns - sample.window_end_tick_100ns > age:
+            raise ControlSlotError("uncapped_samples_stale")
+        previous = sample
+    if now_tick_100ns - previous.window_end_tick_100ns > age:
+        raise ControlSlotError("uncapped_samples_stale")
+
+
+def clear_locked(conn, row, runtime, guard, *, samples, now_tick_100ns,
+                 required_samples, sample_max_age_ms):
+    """Clear RECOVERY_HOLD by compare-and-swap, or keep it (plan section 7.4).
+
+    Every condition is evidence: the slot is RESTORED for this exact execution,
+    the caller's retained scope already proved a disabled Query and a settled
+    manifest, the store already revalidated this execution's allocation, the
+    durable audit ledger holds the restore boundary, and the required count of
+    fresh uncapped samples was observed after it. There is no TTL, force flag or
+    operator bypass; anything missing raises and the barrier stays.
+    """
+    _transaction(conn)
+    if (not _integer(now_tick_100ns, minimum=1) or type(required_samples) is not int or
+            not 1 <= required_samples <= 64 or type(sample_max_age_ms) is not int or
+            not 1 <= sample_max_age_ms <= 60_000):
+        raise ControlSlotError("invalid_control_slot_request")
+    slot = query_locked(conn, runtime, guard)
+    if slot is None:
+        raise ControlSlotError("control_slot_missing")
+    binding = _binding(row, guard)
+    if any(slot[key] != value for key, value in binding.items()):
+        raise ControlSlotError("control_slot_binding_mismatch")
+    if slot["slot_state"] != "RESTORED":
+        raise ControlSlotError("control_slot_unrestored")
+    if runtime["admission_barrier"] != "RECOVERY_HOLD":
+        raise ControlSlotError("control_barrier_not_held")
+    _uncapped_samples(row, samples, boundary=_restore_boundary(conn, row),
+                      now_tick_100ns=now_tick_100ns, required=required_samples,
+                      max_age_ms=sample_max_age_ms)
+    if runtime["registry_revision"] >= _MAX_INT:
+        raise ControlSlotError("control_slot_revision_exhausted")
+    if conn.execute("""UPDATE adaptive_runtime SET admission_barrier='NONE',registry_revision=registry_revision+1
+        WHERE singleton=1 AND registry_revision=? AND admission_barrier='RECOVERY_HOLD'""",
+        (runtime["registry_revision"],)).rowcount != 1:
+        raise ControlSlotError("control_slot_revision_conflict")
+    return _result(slot, dict(runtime) | {"admission_barrier": "NONE",
+        "registry_revision": runtime["registry_revision"] + 1}, duplicate=False)
 
 
 def require_archive_clear(conn, row):

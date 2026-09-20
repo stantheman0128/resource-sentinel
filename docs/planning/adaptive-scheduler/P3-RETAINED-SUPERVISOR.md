@@ -124,7 +124,7 @@ landed, named all 70 modules the same way: 1629 tests, 0 failures, 0 errors,
 0 skips, 190.1 s. The added modules are portable or read-only. None of them sets
 a CPU control, and none is native evidence for a P4, P5 or P6 gate.
 
-`tests/test_adaptive_p3_flow.py` runs flow A to G on one isolated ledger with the
+`tests/test_adaptive_p3_flow.py` runs flow A to H on one isolated ledger with the
 production consumers: `Coordinator.admit_managed`, `ManagedAdmission`,
 `GuardianLaunchOwner`, its `GuardianLifecycle`, the formal `RecoveryJournal`,
 `PolicyCoordinator.hold` and `GuardianSupervisor.attach` with the real
@@ -147,25 +147,90 @@ fixture evidence provider and a fixture mode value, because production supplies
 no `control_begin` evidence and no mode switch. None of this is evidence of Windows launch, containment,
 crash, CPU effect or restore timing, and no such number is claimed.
 
-Flow step H is not delivered. No production entry point lets a legitimate owner
-take over lifecycle accounting after guardian death. The flow test pins the
-current safe behavior: a replacement guardian identity is refused with
-`guardian_custody_binding_mismatch`, it cannot reconcile the empty Job into
-`FINISHED`, and the allocation stays held. That means a Job whose guardian died
-keeps its allocation and its supervisor slot until the ownership transition
-listed below exists.
+## Flow step H: the orphan drain
 
-The flow test also shows the wider cost. After the restore the control slot is
-still `HELD` and the admission barrier is still `CONTROLLING`, which is correct
-for a restore-only owner. `accounting.py` refuses every non-exempt admission
-while the barrier is not `NONE`, so a guardian that dies while it holds the slot
-blocks new non-exempt work on the host until a legitimate lifecycle owner
-releases the slot. Nothing in production can take the slot today, so the daily
-runtime is unaffected, but the ownership transition has to exist before any
-canary.
+Step H is delivered as a restore-only drain. `sentinel/adaptive/orphan_lifecycle.py`
+adds `OrphanDrainOwner`. It lives in the supervisor process and is built from the
+`RecoveryOwner` that already holds the exact guardian handle, the reopened Job,
+the settled manifest and the immutable creator epoch. It installs itself as the
+ledger `evidence_provider` for `control_restore` and `finalize` only, and refuses
+every other operation with `orphan_evidence_operation_unsupported`. Each pass
+re-verifies guardian death, re-reads the manifest, re-queries native CPU control
+and re-reads Job accounting inside the recovery-instance, POLICY and per-Job
+fences, then releases the control slot through `release_control_slot_locked` and
+finishes the scope through `finalize_if_empty`. `GuardianSupervisor.tick()` runs
+that pass for every scope whose restore settled in the same tick and reports
+`slot_released_executions`, `finalized_executions` and
+`drain_unresolved_executions`.
 
-Not red-verified: the new custody tests were not shown failing against the old
-code by execution. That claim rests on reading the old code path.
+Nothing is released early. While the Job still holds a process the drain returns
+without touching the ledger, so the slot stays `HELD`, the barrier stays
+`CONTROLLING` and the allocation stays live. A root exit, a lease expiry, a
+withdrawn cap or a closed handle is never read as an empty Job. The drain owner
+is not a guardian. It has no begin, tighten, heartbeat, launch or adopt
+operation, it never writes `guardian_identity` or `guardian_epoch`, and a
+replacement guardian identity is still refused with
+`guardian_custody_binding_mismatch`.
+
+The POLICY level is taken once, by the store's own `PolicyCoordinator`, and
+`RecoveryOwner._scope` accepts it through a new `policy_scope` argument. The
+design direction for this slice assumed a Windows mutex is reentrant for one
+thread, so the drain could nest its own POLICY acquisition inside the recovery
+owner's. That is wrong here. `NativePolicyMutex._wait` refuses a second
+acquisition of one name on one thread with `policy_mutex_recursive_entry`,
+through a process-global name set, so the two handles cannot both be held.
+Delegating the level keeps the documented order of recovery-instance, POLICY,
+per-Job and then one short transaction, and no fence was relaxed to fit.
+
+What step H still does not do. It does not clear the admission barrier: after a
+drain the barrier is `RECOVERY_HOLD` and never `NONE`, and the five fresh
+uncapped samples a clear needs belong to a separate owner. It does not know the
+root exit code, so it never calls `mark_root_exited` and invents no substitute;
+`finalize_if_empty` does not ask for that code. It carries no native evidence.
+Every backend in these tests is synthetic, and the native tests stay blocked on
+this host by `require_supported_host()`, which refuses a foreign parent Job.
+
+One inventory rule changed with the drain. `release_control_slot_locked` leaves
+the slot row as the durable `RESTORED` boundary, and `_read_inventory` used to
+refuse any slot whose execution was no longer live, with
+`supervisor_inventory_slot_unknown`. That refusal is sticky. Once the first slot
+holding scope finished, by this drain or by a living guardian, the supervisor
+stopped restoring every other scope. The check now accepts one case: a slot in
+state `RESTORED` whose execution has a `FINISHED` ledger row. That row owes no
+cap, because `finalize_if_empty` commits only on a native CPU disabled proof. A
+`HELD` slot, a malformed slot, or a `RESTORED` slot that names an unknown
+execution outside the live set is still refused, and the flow test asserts both
+refusals. After the drain the scope retires on the next tick and `close()`
+succeeds while the barrier stays `RECOVERY_HOLD`.
+
+`tick()` takes an optional `now`, used only as the `finished_at` a drain
+records. The retirement proof compares `finished_at` with the archived
+`started_at`, so a ledger seeded on a fixture clock needs the same clock at the
+finish. A production host passes nothing and the store uses wall time.
+
+`accounting.py` refuses every non-exempt admission while the barrier is not
+`NONE`. A guardian that dies holding the slot therefore still blocks new
+non-exempt work on the host after the drain, because `RECOVERY_HOLD` blocks
+exactly as `CONTROLLING` does. The drain closes the accounting side, not the
+admission side. The barrier clear has to exist before any canary.
+
+Step H evidence, 2026-09-20, this host, through `scripts/invoke-sentinel.ps1`
+(`-Priority P2 -CpuUnits 1 -RamGiB 1`). Four modules were named:
+`tests/test_adaptive_orphan_lifecycle.py` (new, eleven cases),
+`tests/test_adaptive_p3_flow.py`, `tests/test_adaptive_supervisor.py` and
+`tests/test_adaptive_recovery_owner.py`. Red first, with `_drain_scopes`
+disabled in `tick()`: `run 69 failures 2 errors 0 skipped 0`, the two failures
+being the new step H test and the extended step F fence assertion. With the
+production call restored: `run 69 failures 0 errors 0 skipped 0`, 27.1 s. The
+eleven new cases pass in both runs because they drive `OrphanDrainOwner`
+directly, which is the point of keeping the flow test as the production path
+check. A review pass then added the inventory rule above, its two refusal tests
+and one assertion that a ledger rejection keeps the POLICY entry nonce. The
+first rerun failed one test, `run 71 failures 1 errors 0 skipped 0`: the
+finished scope did not retire because the drain stamped wall time on a ledger
+seeded with a fixture clock. With `tick(now=...)` the same four modules gave
+`run 71 failures 0 errors 0 skipped 0`. The earlier custody tests are still not red-verified by execution. That
+claim rests on reading the old code path.
 
 Supervisor lock tests take a real exclusive file lock. The ledger is WAL, so a
 plain `BEGIN EXCLUSIVE` does not block readers; the blocker uses
@@ -216,8 +281,11 @@ pass. Promotion remains stopped for this unresolved all-witness-loss contract.
   collector kill subtree. No task or global startup entry was installed.
 - Durable instance provenance for a new process with no captured POLICY binding,
   and an accepted exact-death contract when every native witness is gone.
-- Separate durable recovery ownership transfer, followed by lifecycle adoption,
-  child accounting, original lease handling and full barrier/slot reconciliation.
+- Clearing the admission barrier from `RECOVERY_HOLD` back to `NONE`, with the
+  fresh uncapped samples that decision needs.
+- Separate durable recovery ownership transfer for a scope that must keep
+  running, followed by lifecycle adoption, child accounting and original lease
+  handling. The drain finishes a scope; it does not adopt one.
 - Guardian evidence for `cancel` and `start_failed` on a named Job. Without it a
   prepared Job whose launch positively failed before user code keeps its
   allocation and its supervisor slot. Retirement of those two states follows

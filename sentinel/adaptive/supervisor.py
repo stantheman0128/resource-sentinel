@@ -15,6 +15,7 @@ import threading
 from uuid import UUID
 
 from .contracts import CpuControl, CpuControlMode, IdentityObservation, IdentityStatus, RecoveryManifest
+from .orphan_lifecycle import OrphanDrainOwner
 from .policy import PolicyBinding
 from .recovery_journal import RecoveryJournalError
 from .recovery_owner import RecoveryOwner
@@ -58,6 +59,12 @@ class SupervisionResult:
     restored_executions: tuple[str, ...]
     unresolved_executions: tuple[str, ...]
     inventory_error: str | None
+    # Drain outcomes for a dead guardian's Jobs. Slot release and finalization
+    # are separate facts: neither implies the other, and neither clears the
+    # admission barrier, which stays RECOVERY_HOLD for a later owner.
+    slot_released_executions: tuple[str, ...] = ()
+    finalized_executions: tuple[str, ...] = ()
+    drain_unresolved_executions: tuple[str, ...] = ()
 
 
 class GuardianSupervisor:
@@ -67,10 +74,12 @@ class GuardianSupervisor:
     finalization evidence checked by ``_prove_retired``. A terminal row whose
     proof is missing or contradictory stays an obligation and keeps its slot.
 
-    No result asserts that accounting is finalized or that normal mode can
-    restart. Restore results only describe native disable plus journal
-    settlement; allocations, exclusion and control-slot reconciliation remain
-    owned by the lifecycle recovery protocol. All error owners are retained.
+    Restore results describe native disable plus journal settlement only. The
+    separate drain pass may then release this execution's control slot and
+    finish a natively empty Job through the formal store operations. No result
+    asserts that normal mode can restart: the admission barrier stays
+    RECOVERY_HOLD, legacy exclusion is untouched, and a Job that still holds a
+    process keeps its allocation. All error owners are retained.
     """
 
     def __init__(self, store, recovery, *, journal=None):
@@ -87,6 +96,8 @@ class GuardianSupervisor:
         self._inventory_error = None
         self._integrity_error = None
         self._errors = {}
+        self._drain = None
+        self._drain_errors = {}
         self._closed = False
 
     @classmethod
@@ -117,6 +128,21 @@ class GuardianSupervisor:
     def errors(self):
         with self._lock:
             return tuple(self._errors.items())
+
+    @property
+    def drain_errors(self):
+        with self._lock:
+            return tuple(self._drain_errors.items())
+
+    def _drain_owner(self):
+        """Build the restore-only drain owner once, for a real recovery owner.
+
+        Any other recovery object has no exact death witness, no retained Job
+        handle and no settled manifest, so no drain is attempted through it.
+        """
+        if self._drain is None and isinstance(self.recovery, RecoveryOwner):
+            self._drain = OrphanDrainOwner(self.store, self.recovery)
+        return self._drain
 
     def _require_open(self):
         if self._closed:
@@ -171,10 +197,21 @@ class GuardianSupervisor:
                 "SELECT rowid AS position," + columns + """typeof(state)='text' AND state='FINISHED'
                 AND rowid>? ORDER BY rowid LIMIT ?""", (self._cursor, _RETIRE_BATCH + 1)).fetchall()]
             slot = conn.execute("""SELECT CASE WHEN typeof(execution_id)='text'
-                AND length(execution_id)=36 THEN execution_id END AS execution_id
+                AND length(execution_id)=36 THEN execution_id END AS execution_id,
+                CASE WHEN typeof(slot_state)='text' THEN slot_state END AS slot_state
                 FROM adaptive_control_slot LIMIT 2""").fetchall()
-            if len(slot) > 1 or slot and slot[0]["execution_id"] not in live:
+            if len(slot) > 1:
                 raise LifecycleError("supervisor_inventory_slot_unknown")
+            if slot and slot[0]["execution_id"] not in live:
+                # The ledger keeps a RESTORED slot row as a durable boundary
+                # after its scope finishes, so that row owes no cap and may name
+                # a FINISHED execution. A HELD, malformed or unknown slot
+                # outside the live set is still a cap nobody here can restore.
+                if slot[0]["slot_state"] != "RESTORED" or conn.execute(
+                        """SELECT 1 FROM managed_executions WHERE execution_id=?
+                        AND typeof(state)='text' AND state='FINISHED'""",
+                        (slot[0]["execution_id"],)).fetchone() is None:
+                    raise LifecycleError("supervisor_inventory_slot_unknown")
             return live, page
 
     def _prove_retired(self, execution, nonce):
@@ -255,8 +292,10 @@ class GuardianSupervisor:
                 self._integrity_error = error
             raise
 
-    def tick(self):
+    def tick(self, *, now=None):
         """One bounded pass; invoke repeatedly from the independent host.
+
+        ``now`` is only the ledger timestamp a drain records as finished_at.
 
         Unavailable DB may still allow withdrawal for previously observed
         scopes, while inventory_verified stays false. A readable contradiction
@@ -275,6 +314,7 @@ class GuardianSupervisor:
                     observation.identity != self.recovery.guardian_identity):
                 raise LifecycleError("supervisor_guardian_observation_invalid")
             restored, unresolved = [], []
+            released, finalized, undrained = [], [], []
             if observation.status is IdentityStatus.DEAD and self._integrity_error is None:
                 for execution, nonce in self._known.items():
                     try:
@@ -287,11 +327,36 @@ class GuardianSupervisor:
                     except Exception as error:
                         self._errors[execution] = error
                         unresolved.append(execution)
+                self._drain_scopes(restored, released, finalized, undrained, now)
             elif observation.status is not IdentityStatus.ALIVE or not verified:
                 unresolved.extend(self._known)
             return SupervisionResult(observation.status, verified, tuple(self._known),
                 tuple(restored), tuple(unresolved), None if verified else
-                "supervisor_inventory_unverified")
+                "supervisor_inventory_unverified", tuple(released), tuple(finalized),
+                tuple(undrained))
+
+    def _drain_scopes(self, restored, released, finalized, undrained, now):
+        """Finish the ledger side of each scope whose restore just settled.
+
+        A non-empty Job is not a failure here: the drain simply reports that it
+        released nothing. Native custody is given up only after the formal
+        FINISHED commit archived the allocation, and never on a refusal.
+        """
+        drain = self._drain_owner()
+        if drain is None:
+            return
+        for execution in restored:
+            try:
+                result = drain.drain(execution, creation_nonce=self._known[execution], now=now)
+                if result.slot_released:
+                    released.append(execution)
+                if result.finalized:
+                    self.recovery.close_verified(execution)
+                    finalized.append(execution)
+                self._drain_errors.pop(execution, None)
+            except Exception as error:
+                self._drain_errors[execution] = error
+                undrained.append(execution)
 
     def close(self):
         """Stop only a supervisor with no enrolled recovery obligations.
@@ -303,7 +368,8 @@ class GuardianSupervisor:
         with self._lock:
             if self._closed:
                 return
-            if self._known or self._errors or self._inventory_error is not None:
+            if (self._known or self._errors or self._drain_errors or
+                    self._inventory_error is not None):
                 raise LifecycleError("supervisor_custody_unsettled")
             self.recovery.close()
             self._closed = True

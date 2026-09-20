@@ -197,12 +197,18 @@ class RecoveryOwner:
                 primary.add_note("recovery_fence_cleanup_unverified")
 
     @contextmanager
-    def _scope(self, entry):
+    def _scope(self, entry, *, policy_scope=None):
         if not self._captured or self._capture_error is not None or self._closed:
             raise LifecycleError("recovery_capture_unverified")
         self._dead()
         with self._mutex(self._instance_mutex, self._instance_binding):
-            with self._mutex(self._policy_mutex, self.binding):
+            # A cooperating writer that needs the store's own PolicyGuard takes
+            # the POLICY level itself and passes the factory in. One name cannot
+            # be held twice on one thread: NativePolicyMutex refuses that with
+            # policy_mutex_recursive_entry, so this owner must not also hold its
+            # handle while that guard is live. The order is unchanged.
+            with (self._mutex(self._policy_mutex, self.binding) if policy_scope is None
+                  else policy_scope()):
                 self._dead()
                 job_binding = PolicyBinding(job_mutex_instance(entry.execution_id, entry.nonce), self.binding.logon_id)
                 if entry.mutex is None:

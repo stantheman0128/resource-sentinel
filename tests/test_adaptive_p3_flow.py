@@ -341,7 +341,12 @@ class P3FlowTests(unittest.TestCase):
         self.assertIn(("guardian", job_fence), self.kernel.events[:marker])
         self.assertEqual(self.kernel.events[marker:], [
             ("recovery", supervisor.recovery._instance_binding.name),
-            ("recovery", supervisor.recovery.binding.name), ("recovery", job_fence)])
+            ("recovery", supervisor.recovery.binding.name), ("recovery", job_fence),
+            # The drain probe repeats the same order. Only the POLICY level
+            # moves to the ledger's own coordinator, because one thread cannot
+            # hold that name twice, and the Job is not empty so it stops there.
+            ("recovery", supervisor.recovery._instance_binding.name),
+            ("supervisor", supervisor.recovery.binding.name), ("recovery", job_fence)])
         state = self.kernel.jobs[created.job_name]
         self.assertEqual((state.disables, state.flags), (["recovery"], 0))
 
@@ -366,12 +371,93 @@ class P3FlowTests(unittest.TestCase):
         self.assertEqual(state.disables, ["recovery"])
         self.assertEqual(self.manifest(case), settled)
 
-    def test_h_gap_no_production_owner_can_finish_the_lifecycle_after_guardian_death(self):
-        """H is NOT delivered. This pins what the missing transition must replace.
+    def test_h_orphan_drain_finishes_the_empty_job_and_leaves_the_barrier_held(self):
+        """H: the supervisor process completes the ledger after guardian death.
 
-        The child ends naturally, yet nothing may settle the allocation: a
-        replacement guardian is refused because the manifest creator is
-        immutable, and the restore-only owner has no accounting authority.
+        The drain owner presents control_restore and finalize evidence built
+        from custody it already holds. It never adopts the scope, so the
+        manifest creator stays immutable and the barrier stays RECOVERY_HOLD.
+        """
+        case = self.started_with_child()
+        execution = case.snapshot.execution_id
+        supervisor = self.attach()
+        self.root_exits(case)
+        self.owner.lifecycle.reconcile(execution, now=NOW + 10)
+        self.synthetic_cap_without_ack(case)
+        self.guardian_dies()
+
+        # The child still runs, so restore withdraws the cap and nothing else.
+        tick = supervisor.tick()
+        self.assertEqual((tick.restored_executions, tick.slot_released_executions,
+                          tick.finalized_executions, tick.drain_unresolved_executions),
+                         ((execution,), (), (), ()))
+        self.assertEqual(self.row(case)["state"], "DRAINING")
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("""SELECT slot_state,admission_barrier
+                FROM adaptive_control_slot,adaptive_runtime""").fetchone(), ("HELD", "CONTROLLING"))
+
+        # The child ends. The same production tick now finishes the lifecycle.
+        case.job.members.clear()
+        # The fixture ledger runs on its own clock, so finished_at follows it.
+        tick = supervisor.tick(now=NOW + 40)
+        self.assertEqual((tick.slot_released_executions, tick.finalized_executions,
+                          tick.drain_unresolved_executions), ((execution,), (execution,), ()))
+        self.assertEqual(self.row(case)["state"], "FINISHED")
+        self.assertIsNone(self.allocation(case))
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("""SELECT slot_state,admission_barrier
+                FROM adaptive_control_slot,adaptive_runtime""").fetchone(),
+                ("RESTORED", "RECOVERY_HOLD"))
+            self.assertEqual(conn.execute("SELECT count(*) FROM executions WHERE outcome='managed_finished'")
+                             .fetchone()[0], 1)
+        settled = self.manifest(case)
+        self.assertEqual((settled.guardian_identity, settled.guardian_epoch), (GUARDIAN, EPOCH))
+        self.assertEqual(self.kernel.jobs[case.job.name].disables, ["recovery"])
+        self.assertEqual(supervisor.recovery.retained_execution_ids, ())
+        # The RESTORED row is a boundary that owes no cap, so the inventory
+        # verifies again and the scope retires. The barrier is not this
+        # supervisor's to clear and stays held.
+        tick = supervisor.tick()
+        self.assertEqual((tick.inventory_verified, tick.known_executions), (True, ()))
+        supervisor.close()
+        with closing(sqlite3.connect(self.db)) as conn:
+            self.assertEqual(conn.execute("SELECT admission_barrier FROM adaptive_runtime").fetchone()[0],
+                             "RECOVERY_HOLD")
+
+    def drained_to_finished(self):
+        case = self.started_with_child()
+        supervisor = self.attach()
+        self.root_exits(case)
+        self.owner.lifecycle.reconcile(case.snapshot.execution_id, now=NOW + 10)
+        self.synthetic_cap_without_ack(case)
+        self.guardian_dies()
+        case.job.members.clear()
+        self.assertEqual(supervisor.tick(now=NOW + 40).finalized_executions, (case.snapshot.execution_id,))
+        return supervisor
+
+    def test_h_a_held_slot_that_names_a_finished_scope_is_still_refused(self):
+        supervisor = self.drained_to_finished()
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("UPDATE adaptive_control_slot SET slot_state='HELD'")
+            conn.commit()
+        self.assertFalse(supervisor.tick().inventory_verified)
+        with self.assertRaisesRegex(LifecycleError, "supervisor_custody_unsettled"):
+            supervisor.close()
+
+    def test_h_a_restored_slot_that_names_an_unknown_scope_is_still_refused(self):
+        supervisor = self.drained_to_finished()
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute("UPDATE adaptive_control_slot SET execution_id=?", (str(uuid4()),))
+            conn.commit()
+        self.assertFalse(supervisor.tick().inventory_verified)
+        with self.assertRaisesRegex(LifecycleError, "supervisor_custody_unsettled"):
+            supervisor.close()
+
+    def test_h_replacement_guardian_identity_stays_refused_forever(self):
+        """Only the drain owner may finish; a successor guardian never adopts.
+
+        The manifest creator is immutable, so a new identity is refused however
+        empty the Job is. Nothing below drains, so the scope stays DRAINING.
         """
         case = self.started_with_child()
         execution = case.snapshot.execution_id
@@ -396,7 +482,11 @@ class P3FlowTests(unittest.TestCase):
         self.assertEqual(self.row(case)["state"], "DRAINING")
         self.assertIsNotNone(self.allocation(case))
         self.assertEqual(self.manifest(case).guardian_identity, GUARDIAN)
+        # The drain owner is not a guardian either: it offers no adoption,
+        # begin, tighten or heartbeat, only the two restore-side operations.
         self.assertFalse(hasattr(supervisor.recovery, "finalize_if_empty"))
+        self.assertFalse(any(hasattr(supervisor._drain_owner(), name) for name in
+                             ("adopt_started", "reconcile", "begin_control_slot_locked", "set_cpu")))
 
     def test_living_guardian_finishes_once_and_the_scope_retires_from_the_concurrent_bound(self):
         case = self.started_with_child()

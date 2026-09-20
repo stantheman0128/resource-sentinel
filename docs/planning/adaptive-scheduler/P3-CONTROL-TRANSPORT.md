@@ -116,12 +116,13 @@ The transport inherits the trust of `adaptive_infrastructure` and adds none.
 Whatever can write `sentinel.db` under the policy mutex can register a helper
 row.
 
-There is no resident helper host process: nothing
-enrolls Jobs, runs the sampler, drives the decision loop or holds an episode
-across ticks. There is no endpoint distribution or bootstrap, so nothing tells a
-helper which endpoint instance to connect to. There is no restore path over the
-wire, by the design note above. Nothing registers a helper in
-`adaptive_infrastructure` outside tests.
+A resident helper host now exists, see [helper host](P4-HELPER-HOST.md). It runs
+in shadow mode only. It registers a helper row, enrolls Jobs and runs the sampler
+and the decision loop, and it never builds or sends a proposal. So nothing uses
+this transport yet: no process holds an episode across ticks on the sending
+side, and no enforce capable helper exists. There is no endpoint distribution or
+bootstrap, so nothing tells a helper which endpoint instance to connect to. There
+is no restore path over the wire, by the design note above.
 
 No native evidence. This machine runs inside a foreign parent Job, so the native
 host check refuses and the native pipe path cannot execute here at all. Every

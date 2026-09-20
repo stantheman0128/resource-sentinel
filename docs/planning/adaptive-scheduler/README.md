@@ -90,20 +90,32 @@ Job 內，`require_supported_host()` 會拒絕，所以 native 測試一項都�
    [control transport](P3-CONTROL-TRANSPORT.md)。呼叫者必須是 `adaptive_infrastructure`
    裡該 logon 唯一登記為 helper 的行程，先以 OS 驗證的 pipe peer 確認身分，
    之後才讀取請求內容。服務本身不讀模式、不快取 ACK，所有安全判斷仍在
-   `GuardianControl`。guardian host 已在第三條 pipe 上提供這個服務；helper 端還沒有
-   常駐行程，所以實際上仍沒有任何東西會送出 proposal。
+   `GuardianControl`。guardian host 已在第三條 pipe 上提供這個服務；目前唯一的 helper
+   行程只跑 shadow，所以實際上仍沒有任何東西會送出 proposal。
+7. supervisor host 在確認 guardian 死亡、`supervisor.close()` 成功之後，會在 POLICY 之下
+   把那個 guardian 的 `adaptive_infrastructure` 列移除，見 process hosts 文件。移除函式
+   自己會在保留的 witness 上再驗一次 DEAD。supervisor 和 helper 的列沒有人持有死亡
+   witness，所以不會被移除。
+8. 常駐的 shadow helper host，見 [helper host](P4-HELPER-HOST.md)。它登記 helper 列，
+   以 `JobAccess.QUERY` 開啟帳本上同 logon、`job_contained` 的 Job，跑 sampler 和決策
+   迴圈，輸出只含計數與穩定代碼的成本紀錄。它選不到 enforce，不建立 proposal，
+   不連 guardian。這台機器上它同樣以 `host_foreign_parent_job` 拒絕啟動，所以計畫 P4
+   要的 1、10、50 個 Job 成本分布一筆都還沒量。
 
 已知缺口，都還沒有程式：
 
-1. 沒有常駐 helper host。沒有東西登記 helper、跑 sampler、驅動決策迴圈或跨 tick
-   持有 episode，B 組因此仍然不能量測。
+1. 沒有會送出 proposal 的 helper。shadow helper host 只觀察，enforce 模式依計畫要等
+   P5 的 capability 核可，B 組因此仍然不能量測。helper 結束後它的登記列會留著，
+   下一次啟動會以 `helper_host_registry_occupied` 拒絕，要由擁有者決定誰來見證
+   helper 的死亡。
 2. 沒有 endpoint 發現機制。wrapper 與 helper 要連哪個 guardian，目前只能由操作者
    手動傳入 pid、creation FILETIME、instance id 與 epoch。
 3. 除了行程收到 interrupt 之外沒有正式的停止訊號。
 4. wrapper 被拒絕之後，已綁定的 reservation 沒有釋放路徑，細節在 process hosts 文件。
 5. guardian 在 supervisor 第一次 attach 成功之前死亡時無法被接管，因為
    `RecoveryOwner.capture` 要求 guardian 為 ALIVE。
-6. guardian 結束時不會把自己從 `adaptive_infrastructure` 移除。
+6. guardian 在 supervisor attach 成功之前就結束時，它的登記列不會被移除，因為那條路徑
+   到不了 `_replace`。registry 上限是 32 列。
 
 需要 repo 擁有者裁決、程式目前一律 fail closed 的事項：
 
@@ -116,8 +128,15 @@ Job 內，`require_supported_host()` 會拒絕，所以 native 測試一項都�
    `ipc_auth_key`，registry 的欄位也是固定的，所以傳輸層目前只用 OS 驗證的 peer
    加上每次請求的 server nonce，沒有共享密鑰。這樣是否滿足計畫的 token 要求，
    需要擁有者確認；若要真正的共享密鑰，得先決定由誰簽發、存在哪一筆紀錄。
+4. helper 和 supervisor 的登記列由誰見證死亡。計畫的方向看起來是 supervisor 啟動
+   helper 並保留它的 creation handle，這一段還沒有程式。
+5. `register_infrastructure_locked` 的兩個提前拒絕會留下 POLICY entry nonce，之後每一次
+   `prepare` 都會得到 `policy_scope_busy`，沒有東西會清掉它。guardian 和 helper 的啟動
+   路徑都會經過這裡。移除函式上同樣形狀的問題已經修掉，這一個沒動：兩條啟動路徑在
+   同一個 scope 裡都先執行過 `initialize_registry_locked`，拒絕發生時帳本已經被碰過，
+   不能直接當成 clean rejection。
 
-整棵 adaptive 測試樹最後一次執行是 2026-09-21：78 個模組、1839 個測試、0 失敗、
+整棵 adaptive 測試樹最後一次執行是 2026-09-21：79 個模組、1911 個測試、0 失敗、
 0 錯誤、0 略過，經 `scripts/invoke-sentinel.ps1` 正常准入。傳輸層的未登記呼叫者
 檢查沒有紅燈證據，因為產生紅燈必須先拿掉一道安全檢查，該次執行被權限分類器拒絕，
 之後沒有繞過。這是 source 行為的證據，

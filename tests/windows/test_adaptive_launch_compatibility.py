@@ -32,6 +32,7 @@ if str(ROOT) not in sys.path:
 from tests.windows.adaptive_admission import (  # noqa: E402
     ContinuousAdmissionUnavailable, require_continuous_admission,
 )
+from sentinel.adaptive import launch_spec as launch_transport  # noqa: E402
 
 FIXTURE = ROOT / "tests" / "fixtures" / "adaptive_spawn_tree.py"
 CMD_LIMIT = 8191
@@ -39,7 +40,7 @@ CREATE_PROCESS_LIMIT = 32767
 
 
 def utf16_units(value: str) -> int:
-    return len(value.encode("utf-16-le")) // 2
+    return launch_transport.utf16_units(value)
 
 
 def encoded_spec(spec: dict) -> str:
@@ -49,12 +50,11 @@ def encoded_spec(spec: dict) -> str:
 def validate_launch_lengths(command: str, encoded: str, cmd_path: str, python: str, host: str) -> None:
     # cmd and CreateProcess have different limits. Successful Base64 transport
     # does not establish that cmd can execute the payload or its expansions.
-    cmd_line = '"' + cmd_path + '" /d /s /c "' + command + '"'
-    if "\0" in command or utf16_units(cmd_line) > CMD_LIMIT:
-        raise ValueError("cmd_payload_too_large_or_invalid")
-    host_line = subprocess.list2cmdline([python, host, "--launch-spec-b64", encoded])
-    if utf16_units(host_line) + 1 > CREATE_PROCESS_LIMIT:
-        raise ValueError("launch_payload_too_large")
+    launch_transport.build_cmd_command_line(command, cmd_path=cmd_path)
+    # The S2 envelope has fixture-only authorization fields. The common host
+    # transport validates its Base64/argv/length, not those fields or readiness.
+    launch_transport.prepare_encoded_host_command(encoded,
+        python_executable=python, host_path=host)
 
 
 def write_json(path: Path, value: object) -> None:
@@ -128,7 +128,7 @@ def _launch_host(payload: str) -> int:
                 raise RuntimeError("observer_handshake_timeout")
         # The raw synthetic command is passed intact to the established cmd
         # semantics; no split/rejoin, no post-spawn assignment, no retry.
-        command_line = '"' + cmd + '" /d /s /c "' + spec["command"] + '"'
+        command_line = launch_transport.build_cmd_command_line(spec["command"], cmd_path=cmd)
         try:
             process = native.launch_in_job(job, cmd, command_line, cwd=str(directory))
         except native.LaunchOutcomeUnknown as exc:
@@ -283,11 +283,12 @@ class LaunchLengthContracts(unittest.TestCase):
 
     def test_transport_and_cmd_limits_are_independent(self):
         cmd = r"C:\Windows\System32\cmd.exe"
+        python, host = r"C:\Python\python.exe", r"C:\Sentinel\host.py"
         with self.assertRaisesRegex(ValueError, "cmd_payload"):
-            validate_launch_lengths("x" * CMD_LIMIT, "QQ==", cmd, "python.exe", "host.py")
+            validate_launch_lengths("x" * CMD_LIMIT, "QQ==", cmd, python, host)
         with self.assertRaisesRegex(ValueError, "launch_payload_too_large"):
-            validate_launch_lengths("exit 0", "A" * CREATE_PROCESS_LIMIT, cmd, "python.exe", "host.py")
-        validate_launch_lengths("exit 0", "QQ==", cmd, "python.exe", "host.py")
+            validate_launch_lengths("exit 0", "A" * CREATE_PROCESS_LIMIT, cmd, python, host)
+        validate_launch_lengths("exit 0", "QQ==", cmd, python, host)
 
     def test_utf16_count_includes_surrogate_pairs(self):
         self.assertEqual(utf16_units("a\U0001f4be"), 3)

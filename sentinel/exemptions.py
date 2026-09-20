@@ -61,13 +61,8 @@ class Exemptions:
         row = dict(id=uuid.uuid4().hex, root_pid=int(pid), root_started=chain[0][1],
                    created_at=now, expires_at=now + minutes * 60,
                    reason=reason.strip()[:500], revoked_at=None)
-        conn = self._connect()
-        try:
-            with conn:
-                conn.execute("INSERT INTO exemptions VALUES (:id,:root_pid,:root_started,:created_at,:expires_at,:reason,:revoked_at)", row)
-        finally:
-            conn.close()
-        return row
+        from sentinel.adaptive.exemption_sync import grant_record
+        return grant_record(self, row, now=now)
 
     def rows(self, *, now=None, include_inactive=False):
         if not self.path.exists():
@@ -107,15 +102,8 @@ class Exemptions:
         return None
 
     def revoke(self, exemption_id, *, now=None):
-        if not self.path.exists():
-            return 0
-        conn = self._connect()
-        try:
-            with conn:
-                return conn.execute("UPDATE exemptions SET revoked_at=? WHERE id=? AND revoked_at IS NULL",
-                                    (time.time() if now is None else now, exemption_id)).rowcount
-        finally:
-            conn.close()
+        from sentinel.adaptive.exemption_sync import revoke_record
+        return revoke_record(self, exemption_id, now=time.time() if now is None else now)
 
     def resolve(self):
         """Return concrete identities for the collector; never just bare PIDs."""

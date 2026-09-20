@@ -128,3 +128,16 @@ Provider 優先評估已知有 CLI/API 入口者（如 Codex Cloud、Cursor Clou
 3. 本機常駐中控、受管 runner、公平調度與故障恢復。
 4. 一個雲端 provider 的真實端到端閉環，統一入口可追蹤與取消。
 5. 擴大第二雲端資源池、自動選址及 Local／Cloud 聯合調度。
+
+## 2026-09-20 補充研究：歷史學習、可靠續跑與 Jev
+
+以上章節保留 2026-09-05 的規劃文字；後續實作現況必須以分支、commit 與驗收證據核對，不能把本文件的舊日期或標題當成全專案進度。
+
+新增 [研究與後續實作入口](planning/resource-governance/README.md)，由 GPT-6 Astra Pro 協助整理：
+
+- [工具分類與對照](planning/resource-governance/LANDSCAPE-2026-09-20.md)：直接同題 governor、Agent 診斷、OS 程序控制、shell queue、container/cluster scheduler 與 sandbox；逐項來源、限制與可借鑑部分。
+- [學習與決策設計](planning/resource-governance/LEARNING-AND-DECISION-DESIGN.md)：不可覆寫的原始預測、實測誤差閉環、統計與小型 ML、持久化等待／續跑、可選 Jev 語意分類，以及驗收／回退。
+
+入口亦對照既有 [P3–P6 implementation plan](planning/adaptive-scheduler/IMPLEMENTATION-PLAN.md) 與 `6efa302` 的已提交進度。新建議另使用 R0–R6，不重編原階段，不把部分 P4 純函式或 portable tests 當作 native／A/B gate 通過。
+
+**本次僅補文件：未變更 runtime、正式 config、Scheduled Tasks、豁免、DB 或模型／雲端啟用狀態。研究建議不是立即實作或部署整份 backlog 的授權。**

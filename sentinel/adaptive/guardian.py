@@ -101,6 +101,27 @@ class GuardianLaunchOwner:
         with self._lock:
             return tuple(self._pending) + self.lifecycle.retained_execution_ids + tuple(self._failed_peers)
 
+    def restore_owned_caps(self):
+        """Restore the bounded adopted inventory without new admission/readiness.
+
+        Pending launch scopes have never received cap authority. Every adopted
+        entry gets one bounded attempt, so one bookkeeping failure cannot strand
+        a later cap. An aggregate error retains all unresolved outcomes.
+        """
+        with self._lock:
+            from .guardian_restore import RestoreBatchError
+            results, errors = [], []
+            for execution_id in self.lifecycle.retained_execution_ids:
+                try:
+                    results.append(self.lifecycle.restore_owned_cap(execution_id))
+                except BaseException as error:
+                    errors.append((execution_id, error))
+            if errors:
+                failure = RestoreBatchError(results, errors)
+                failure.guardian_restore_owner = self
+                raise failure
+            return tuple(results)
+
     @staticmethod
     def _deadline(deadline):
         if deadline.remaining_ms() <= 0:

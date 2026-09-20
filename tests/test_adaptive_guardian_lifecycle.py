@@ -21,6 +21,7 @@ from sentinel.adaptive.contracts import (
 from sentinel.adaptive.identity import IdentityUnavailable, VerifiedProcess
 from sentinel.adaptive.recovery_journal import RecoveryJournal
 from sentinel.adaptive.store import LifecycleError, LifecycleEvidence, LifecycleStore
+from sentinel.adaptive.windows import PolicyMutexLease
 from tests.fixtures.adaptive_evidence import fixture_evidence_provider
 from tests import test_adaptive_lifecycle as fixtures
 
@@ -130,6 +131,9 @@ class Job:
 
 class Mutex:
     def __init__(self, *args, **kwargs):
+        self.logon_id = args[0] if args else fixtures.WRAPPER.logon_id
+        self.instance_id = args[1] if len(args) > 1 else str(uuid.uuid4())
+        self.name = f"Local\\ResourceSentinel.Policy.{self.logon_id}.{self.instance_id}"
         self.acquired = self.closed = False
         self.abandoned = False
         self.release_error = None
@@ -142,7 +146,7 @@ class Mutex:
             raise AssertionError("unbounded fixture mutex wait")
         self.acquired = True
         try:
-            yield SimpleNamespace(abandoned=self.abandoned)
+            yield PolicyMutexLease(self.name, self.instance_id, self.logon_id, self.abandoned)
         finally:
             self.release()
 
@@ -417,9 +421,8 @@ class GuardianLifecycleTests(unittest.TestCase):
         case = self.adopt()
         self.root_exits(case)
         case.job.control = {"flags": 5, "rate_bp": 2500}
-        result = self.owner.reconcile(case.spec.execution_id, now=fixtures.NOW + 10)
-        self.assertTrue(result.restore_required)
-        self.assertFalse(result.terminal)
+        with self.assertRaisesRegex(LifecycleError, "external_control_conflict"):
+            self.owner.reconcile(case.spec.execution_id, now=fixtures.NOW + 10)
         self.assertEqual(case.job.control, {"flags": 5, "rate_bp": 2500})
         self.assert_custody(case)
 
@@ -428,9 +431,13 @@ class GuardianLifecycleTests(unittest.TestCase):
         self.root_exits(case)
         self.rewrite_manifest(case, manifest_seq=2,
             pending_intent=PendingIntent(str(uuid.uuid4()), DISABLED, CAP))
-        result = self.owner.reconcile(case.spec.execution_id, now=fixtures.NOW + 10)
-        self.assertTrue(result.restore_required)
-        self.assertFalse(result.terminal)
+        with self.assertRaisesRegex(LifecycleError, "guardian_restore_slot_unresolved"):
+            self.owner.reconcile(case.spec.execution_id, now=fixtures.NOW + 10)
+        self.assertEqual(case.job.control["flags"], 0)
+        self.assertEqual(self.row(case)["state"], "DRAINING")
+        record = self.journal.read(case.spec.execution_id, creation_nonce=case.record.creation_nonce)
+        self.assertIsNone(record.pending_intent)
+        self.assertEqual(record.last_applied, DISABLED)
         self.assert_custody(case)
 
     def test_native_query_failure_keeps_custody_and_full_allocation(self):
@@ -630,27 +637,97 @@ class GuardianLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(case.root._handle)
         self.assertIn(case.spec.execution_id, self.owner.retained_execution_ids)
 
-    def test_terminal_commit_then_policy_cleanup_failure_retains_handles_until_reconciled(self):
+    def test_terminal_commit_then_native_policy_cleanup_unknown_poison_retains_custody(self):
         case = self.adopt()
         self.root_exits(case)
         original = self.policy.hold
+        failure = OSError("fixture policy release acknowledgement lost")
         @contextmanager
         def lost_cleanup_ack(*args, **kwargs):
             with original(*args, **kwargs) as lease:
                 yield lease
-            raise OSError("fixture policy release acknowledgement lost")
-        with patch.object(self.policy, "hold", side_effect=lost_cleanup_ack):
-            with self.assertRaises(OSError):
-                self.owner.reconcile(case.spec.execution_id, now=fixtures.NOW + 10)
-        self.assertEqual(self.row(case)["state"], "FINISHED")
-        self.assertFalse(case.job.closed)
-        with self.assertRaises(LifecycleError):
+            raise failure
+        pinned = self.owner._restorer.policy_mutex
+        with patch.object(pinned, "acquire", wraps=pinned.acquire) as emergency_acquire:
+            with patch.object(self.policy, "hold", side_effect=lost_cleanup_ack):
+                with self.assertRaises(OSError) as caught:
+                    self.owner.reconcile(case.spec.execution_id, now=fixtures.NOW + 10)
+            self.assertIs(caught.exception, failure)
+            self.assertIs(self.owner._restorer.fence_error, failure)
+            self.assertIn("policy_scope_cleanup_failed", failure.__notes__)
+            row = self.row(case)
+            archive = dict(self.connection().execute(
+                "SELECT * FROM executions WHERE reservation_id=?", (case.spec.reservation.id,)).fetchone())
+            self.assertEqual(row["state"], "FINISHED")
+            self.assertIsNone(self.allocation(case))
+            with patch.object(self.policy, "hold", side_effect=AssertionError("must not reacquire POLICY")) as native_hold:
+                with patch.object(self.owner._entry(case.spec.execution_id).mutex, "acquire",
+                        side_effect=AssertionError("must not reacquire Job")) as job_acquire:
+                    with self.assertRaisesRegex(LifecycleError, "guardian_restore_fence_uncertain"):
+                        self.owner.reconcile(case.spec.execution_id, now=fixtures.NOW + 11)
+                job_acquire.assert_not_called()
+            native_hold.assert_not_called()
+            emergency_acquire.assert_not_called()
+        with self.assertRaisesRegex(LifecycleError, "guardian_custody_unsettled"):
             self.owner.close_terminal(case.spec.execution_id)
+        self.assertFalse(case.job.closed)
+        self.assertEqual(case.job.close_calls, 0)
         self.assertIsNotNone(case.root._handle)
-        result = self.owner.reconcile(case.spec.execution_id, now=fixtures.NOW + 11)
+        self.assertIsNotNone(case.wrapper._handle)
+        self.assertIn(case.spec.execution_id, self.owner.retained_execution_ids)
+        self.assertEqual(self.row(case), row)
+        self.assertEqual(dict(self.connection().execute(
+            "SELECT * FROM executions WHERE reservation_id=?", (case.spec.reservation.id,)).fetchone()), archive)
+
+    def test_terminal_commit_then_sql_nonce_clear_ack_loss_reconciles_after_native_release(self):
+        case = self.adopt()
+        self.root_exits(case)
+        policy = self.store._policy
+        original_clear = policy._clear
+        failure = sqlite3.OperationalError("fixture nonce clear commit acknowledgement lost")
+        cleared = []
+        def committed_clear_lost_ack(guard):
+            # The actual fixture provider has returned from ReleaseMutex before
+            # this SQL-only stage; no unknown native cleanup is being modeled.
+            self.assertFalse(self.policy.active)
+            self.assertIsNone(policy.current_guard())
+            original_clear(guard)
+            nonce = self.connection().execute("SELECT policy_entry_nonce FROM adaptive_runtime").fetchone()[0]
+            self.assertIsNone(nonce)
+            cleared.append(guard.nonce)
+            raise failure
+        with patch.object(policy, "_clear", side_effect=committed_clear_lost_ack):
+            with self.assertRaises(sqlite3.OperationalError) as caught:
+                self.owner.reconcile(case.spec.execution_id, now=fixtures.NOW + 10)
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(len(cleared), 1)
+        self.assertNotIn("policy_scope_cleanup_failed", getattr(failure, "__notes__", ()))
+        self.assertIsNone(self.owner._restorer.fence_error)
+        row = self.row(case)
+        archive = dict(self.connection().execute(
+            "SELECT * FROM executions WHERE reservation_id=?", (case.spec.reservation.id,)).fetchone())
+        self.assertEqual(row["state"], "FINISHED")
+        self.assertIsNone(self.allocation(case))
+        with self.assertRaisesRegex(LifecycleError, "guardian_custody_unsettled"):
+            self.owner.close_terminal(case.spec.execution_id)
+        self.assertFalse(case.job.closed)
+        self.assertIsNotNone(case.root._handle)
+        self.assertIsNotNone(case.wrapper._handle)
+        with patch.object(self.store, "finalize_if_empty", side_effect=AssertionError("must not archive again")) as finalize:
+            result = self.owner.reconcile(case.spec.execution_id, now=fixtures.NOW + 11)
+        finalize.assert_not_called()
         self.assertTrue(result.terminal)
+        self.assertEqual(self.row(case), row)
+        self.assertEqual(dict(self.connection().execute(
+            "SELECT * FROM executions WHERE reservation_id=?", (case.spec.reservation.id,)).fetchone()), archive)
+        self.assertEqual(self.connection().execute(
+            "SELECT count(*) FROM executions WHERE reservation_id=?", (case.spec.reservation.id,)).fetchone()[0], 1)
+        self.assertIsNone(self.owner._restorer.fence_error)
+        self.assertIsNone(self.connection().execute("SELECT policy_entry_nonce FROM adaptive_runtime").fetchone()[0])
         self.owner.close_terminal(case.spec.execution_id)
         self.assertTrue(case.job.closed)
+        self.assertIsNone(case.root._handle)
+        self.assertIsNone(case.wrapper._handle)
 
     def test_missing_ledger_is_not_recreated_by_policy_or_reconciliation(self):
         case = self.adopt()

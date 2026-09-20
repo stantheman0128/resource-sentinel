@@ -7,7 +7,12 @@
 與 [P2 admission-only 實作紀錄](P2-ADMISSION-ONLY.md)。
 以下「只做規劃」及 GPT Pro 提示是原規劃階段的歷史背景，不限制後續已授權的實作。
 
-最新已測實作另含 [guardian lifecycle 續租](P3-LIFECYCLE-RENEWAL.md)：
+最新已測實作包含 [guardian 持有中 Job 的還原流程](P3-GUARDIAN-RESTORE.md)：
+接上 compare-and-restore、DB 失效時的 retained native fence、lost-ACK 對帳及
+不確定持有權的隔離。最後 64 項受影響測試全數通過；cold-start 接管、獨立
+supervisor 與實機故障恢復仍未通過，完整 P3 及 P4–P6 尚未完成。
+
+另含 [guardian lifecycle 續租](P3-LIFECYCLE-RENEWAL.md)：
 保存原始固定租期、以 retained Job 證據續租、過期維持 HOLD，並封住 legacy routed
 heartbeat 對已納管工作的續租入口。這仍不代表完整 P3 gate 通過。
 

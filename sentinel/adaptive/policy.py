@@ -249,6 +249,12 @@ class PolicyCoordinator:
             self._held.guard = None
             try:
                 leave(scope, None, None, None)
+            except BaseException as primary:
+                # Distinguish native provider cleanup from the later SQLite
+                # nonce clear. A generic cleanup error is still uncertain
+                # ownership and must never authorize emergency reacquisition.
+                primary.add_note("policy_scope_cleanup_failed")
+                raise
             finally:
                 self._held.guard = None
             self._clear(guard)

@@ -183,7 +183,12 @@ database, marked as such at each site.
   `RECOVERY_HOLD` and keeps refusing new non-exempt admissions. Plan section 7.4
   does not say whose samples count once the Job is gone. That is a plan
   clarification for the repository owner, listed in `ACCEPTANCE-RESULTS.md`.
-  Nothing here relaxes the rule to get past it.
+  Nothing here relaxes the rule to get past it. Update, 2026-09-22: the owner
+  decided, and [BARRIER-CLEAR-FINISHED-JOB.md](BARRIER-CLEAR-FINISHED-JOB.md)
+  adds a second clear for a `FINISHED` execution. The orphan drain uses it.
+  `GuardianControl.clear_finished_admission_barrier` exists and has no
+  production caller, the same as `clear_admission_barrier`, so the first case
+  above still holds for a living guardian.
 - The default grant scope evaluator proves nothing. It answers `UNKNOWN` for
   every lease it is shown, so a proposal is refused as `exemption_scope_unknown`
   whenever at least one active exemption lease exists. With no active lease

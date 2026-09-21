@@ -7,6 +7,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from sentinel.adaptive.contracts import AllocationKind
+from sentinel.adaptive.control_slot import ControlSlotError, clear_finished_locked
 from sentinel.adaptive.store import ControlSlotRejected, LifecycleError, LifecycleEvidence, LifecycleStore
 from tests.fixtures.adaptive_evidence import fixture_evidence_provider
 from tests import test_adaptive_lifecycle as lifecycle
@@ -659,6 +660,118 @@ class ControlSlotTests(unittest.TestCase):
             self.assertEqual(done["state"], "FINISHED")
             self.assertEqual(self.runtime()["admission_barrier"], "RECOVERY_HOLD")
             self.assertEqual(self.slot()["slot_state"], "RESTORED")
+
+    # --- clarification C3: the finished Job's own barrier --------------------
+
+    @contextmanager
+    def finished_with_restored_slot(self):
+        """One real execution taken to FINISHED, its RESTORED slot still open."""
+        spec, row = self.running()
+        with self.policy_scope() as guard:
+            first = self.begin(spec, row)
+            self.release(spec, row, first["slot_id"])
+            done = self.store.finalize_if_empty(spec.execution_id, caller=WRAPPER,
+                                                expected_revision=row["state_revision"], now=NOW + 1)
+            self.assertEqual(done["state"], "FINISHED")
+            self.assertEqual(self.runtime()["admission_barrier"], "RECOVERY_HOLD")
+            yield spec, guard, first["slot_id"]
+
+    def clear_finished(self, spec, guard, slot_id, *, cleared_at=NOW + 2, row=None, runtime=None):
+        with self.store._transaction() as conn:
+            live = self.store._policy.revalidate(conn, guard)
+            values = dict(self.store._get(conn, spec.execution_id)) | (row or {})
+            return clear_finished_locked(conn, values, dict(live) | (runtime or {}), guard,
+                                         slot_id=slot_id, cleared_at=cleared_at)
+
+    def barrier_clears(self):
+        """The lazily created audit rows, or None while the table is absent."""
+        conn = self.connection()
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='adaptive_barrier_clears'").fetchone() is None:
+            return None
+        return [dict(item) for item in conn.execute("SELECT * FROM adaptive_barrier_clears")]
+
+    def assert_finished_clear_refused(self, spec, guard, slot_id, reason, **changes):
+        before = self.custody()
+        with self.assertRaises(ControlSlotError) as caught:
+            self.clear_finished(spec, guard, slot_id, **changes)
+        self.assertEqual(str(caught.exception), reason)
+        self.assertEqual(self.custody(), before)
+        self.assertEqual(self.runtime()["admission_barrier"], "RECOVERY_HOLD")
+        self.assertIsNone(self.barrier_clears())
+
+    def test_finished_execution_clears_the_barrier_and_records_one_audit_row(self):
+        with self.finished_with_restored_slot() as (spec, guard, slot_id):
+            slot = self.slot()
+            revision = self.runtime()["registry_revision"]
+            result = self.clear_finished(spec, guard, slot_id)
+            self.assertEqual(result["admission_barrier"], "NONE")
+            self.assertEqual(result["registry_revision"], revision + 1)
+            self.assertEqual(self.runtime()["admission_barrier"], "NONE")
+            # The RESTORED row stays as the durable boundary it always was.
+            self.assertEqual(self.slot(), slot)
+            self.assertEqual(self.barrier_clears(), [{
+                "registry_revision": revision + 1, "execution_id": spec.execution_id,
+                "slot_id": slot_id, "slot_revision": slot["slot_revision"],
+                "guardian_epoch": EPOCH, "reason": "finished_job",
+                "finished_at": NOW + 1, "cleared_at": NOW + 2}])
+
+    def test_a_second_clear_finds_no_held_barrier_and_writes_no_second_row(self):
+        with self.finished_with_restored_slot() as (spec, guard, slot_id):
+            self.clear_finished(spec, guard, slot_id)
+            recorded = self.barrier_clears()
+            with self.assertRaises(ControlSlotError) as caught:
+                self.clear_finished(spec, guard, slot_id)
+            self.assertEqual(str(caught.exception), "control_barrier_not_held")
+            self.assertEqual(self.barrier_clears(), recorded)
+            self.assertEqual(self.runtime()["admission_barrier"], "NONE")
+
+    def test_a_missing_slot_cannot_clear_a_finished_barrier(self):
+        with self.finished_with_restored_slot() as (spec, guard, slot_id):
+            self.connection().execute("DELETE FROM adaptive_control_slot")
+            self.assert_finished_clear_refused(spec, guard, slot_id, "control_slot_missing")
+
+    def test_another_slot_id_cannot_clear_a_finished_barrier(self):
+        with self.finished_with_restored_slot() as (spec, guard, slot_id):
+            self.assert_finished_clear_refused(spec, guard, str(uuid4()),
+                                               "control_slot_binding_mismatch")
+
+    def test_a_changed_row_binding_cannot_clear_a_finished_barrier(self):
+        with self.finished_with_restored_slot() as (spec, guard, slot_id):
+            self.assert_finished_clear_refused(spec, guard, slot_id, "control_slot_binding_mismatch",
+                                               row={"job_nonce": uuid4().hex})
+
+    def test_a_held_slot_cannot_clear_a_finished_barrier(self):
+        spec, row = self.running()
+        with self.policy_scope() as guard:
+            first = self.begin(spec, row)
+            self.connection().execute("UPDATE adaptive_runtime SET admission_barrier='RECOVERY_HOLD'")
+            self.assert_finished_clear_refused(spec, guard, first["slot_id"], "control_slot_unrestored")
+
+    def test_an_unfinished_or_cascaded_row_keeps_the_barrier(self):
+        with self.finished_with_restored_slot() as (spec, guard, slot_id):
+            for row in (dict(state="RUNNING"), dict(launch_sealed=0), dict(launch_in_flight=1),
+                        dict(finished_at=None), dict(finished_at=float("nan")),
+                        dict(parent_execution_id=str(uuid4())), dict(allocation_kind="parent")):
+                with self.subTest(row=tuple(row)):
+                    self.assert_finished_clear_refused(spec, guard, slot_id,
+                                                       "control_execution_unfinished", row=row)
+
+    def test_an_exhausted_or_changed_registry_revision_keeps_the_barrier(self):
+        with self.finished_with_restored_slot() as (spec, guard, slot_id):
+            self.assert_finished_clear_refused(spec, guard, slot_id, "control_slot_revision_exhausted",
+                                               runtime={"registry_revision": (1 << 63) - 1})
+            stale = self.runtime()["registry_revision"] - 1
+            self.assert_finished_clear_refused(spec, guard, slot_id, "control_slot_revision_conflict",
+                                               runtime={"registry_revision": stale})
+
+    def test_an_invalid_slot_id_or_clear_time_is_never_a_clear(self):
+        with self.finished_with_restored_slot() as (spec, guard, slot_id):
+            self.assert_finished_clear_refused(spec, guard, "not-a-uuid",
+                                               "invalid_control_slot_request")
+            for cleared_at in (None, -1.0, float("inf"), "now"):
+                with self.subTest(cleared_at=cleared_at):
+                    self.assert_finished_clear_refused(spec, guard, slot_id,
+                        "invalid_control_slot_request", cleared_at=cleared_at)
 
     def test_controlling_barrier_blocks_an_already_prepared_launch(self):
         victim, row, _ = self.prepared()

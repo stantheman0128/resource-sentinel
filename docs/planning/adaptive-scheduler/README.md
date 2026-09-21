@@ -66,8 +66,12 @@ P6 沒有任何 gate 通過，adaptive 維持 off。
 `PC/launcher2.c` 在 `launchEnvironment` 裡建立一個 Job，再把 python.exe 指派進去，
 所以經 `py` 啟動的行程一定在 Job 內，`read_host_capability()` 一定拒絕。擁有者在 app
 之外的 PowerShell 直接執行 `sys._base_executable` 指到的直譯器，同一個 preflight
-通過，回報 build 26340、12 個邏輯處理器、1 個 processor group。這是到目前為止唯一
-量到會通過的啟動路徑。[capability results](CAPABILITY-RESULTS.md) 在 2026-09-19 用真正
+通過，回報 build 26340、12 個邏輯處理器、1 個 processor group。擁有者接著在同一個
+主控台用同一個直譯器跑正式 probe `tests/windows/probe_adaptive_host.py`，結果是
+`in_any_job=false`、`validity=valid`、沒有錯誤、`active_host_candidate=true`、
+`capability_status=host_only_not_control_verified`。probe 輸出留在本機，不入庫。這個
+狀態只說明該主控台可以當 host，CPU 限速是否有效要由 S1 到 S3 量測，還沒做。這是到
+目前為止唯一量到會通過的啟動路徑。[capability results](CAPABILITY-RESULTS.md) 在 2026-09-19 用真正
 的直譯器路徑量過另外兩條：暫時的 Scheduled Task 與 Explorer shell 派發，子行程都回報
 `in_any_job=true`，那兩個結果與啟動器無關，仍然成立。下面各項寫到的拒絕，指的都是
 經 `py` 啟動的情況。
@@ -150,9 +154,12 @@ P6 沒有任何 gate 通過，adaptive 維持 off。
 仍然一律 fail closed：
 
 1. 計畫 7.4 沒說受控 Job 已經結束時，要用誰的五筆未限速樣本清除 barrier。
-   現況是 Job 先結束或由 orphan drain 結案時，barrier 會一直停在 `RECOVERY_HOLD`。
-   擁有者的答覆：Job 經現場查詢確認為空時視為可以清除，並留下稽核紀錄。這一項
-   還沒實作，canary 之前必須完成。
+   原本 Job 先結束或由 orphan drain 結案時，barrier 會一直停在 `RECOVERY_HOLD`。
+   擁有者的答覆：Job 經現場查詢確認為空時視為可以清除，並留下稽核紀錄。已實作，
+   契約與證據寫在 [barrier clear for a finished Job](BARRIER-CLEAR-FINISHED-JOB.md)。
+   orphan drain 在結案的同一輪清除，之後每一輪遇到已 `FINISHED` 的列會再試一次；
+   原本的五筆樣本路徑沒有改。只有可攜測試證據。guardian 端的對應方法沒有 production
+   caller。supervisor 在結案與清除之間結束的情況沒有人重試，併入第 4 項。
 2. `cancel` 與 `start_failed` 兩種狀態缺 guardian 證據，無法退場，細節在
    retained supervisor 文件的 remaining gates。擁有者的答覆：交給 Codex 提方案。
 3. 計畫 5.5 要求 caller 以 OS 可驗證身分和一次性 token 綁定。helper 沒有
@@ -171,7 +178,7 @@ P6 沒有任何 gate 通過，adaptive 維持 off。
    guardian host 與 helper host 都在 hold 內第一個呼叫它。原函式不變，帳本被碰過之後
    才發生的拒絕仍然保留 nonce，有測試固定這個行為。細節在 process hosts 文件。
 
-整棵 adaptive 測試樹最後一次執行是 2026-09-22：80 個模組、1945 個測試、0 失敗、
+整棵 adaptive 測試樹最後一次執行是 2026-09-22：80 個模組、1961 個測試、0 失敗、
 0 錯誤、0 略過，經 `scripts/invoke-sentinel.ps1` 正常准入。0 略過只對 agent session
 成立，在通過 preflight 的主控台上，斷言拒絕代碼的測試會改走 `skipTest`。同一天較早的
 一次執行有 1 個錯誤：`test_adaptive_guardian_launch` 出現 `coverage_read_timeout`，

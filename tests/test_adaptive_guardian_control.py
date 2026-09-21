@@ -756,6 +756,58 @@ class GuardianControlTests(unittest.TestCase):
         self.assertEqual(str(caught.exception), "control_slot_revision_conflict")
         self.assertEqual(self.runtime()["admission_barrier"], "RECOVERY_HOLD")
 
+    # --- clarification C3: a Job this guardian already finished ---------------
+
+    def finished_case(self):
+        case = self.restored_case()
+        fixture.GuardianLifecycleTests.root_exits(self, case)
+        result = self.owner.reconcile(case.spec.execution_id, now=fixture.fixtures.NOW + 10)
+        self.assertEqual(result.state, "FINISHED")
+        self.assertEqual(self.runtime()["admission_barrier"], "RECOVERY_HOLD")
+        return case
+
+    def barrier_clears(self):
+        with self.connection() as conn:
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE name='adaptive_barrier_clears'").fetchone() is None:
+                return None
+            return [dict(row) for row in conn.execute("SELECT * FROM adaptive_barrier_clears")]
+
+    def test_a_finished_job_clears_its_barrier_with_no_samples_and_no_job_operation(self):
+        case = self.finished_case()
+        sets = case.job.sets
+        revision = self.runtime()["registry_revision"]
+        result = self.control.clear_finished_admission_barrier(case.spec.execution_id)
+        self.assertEqual((result["admission_barrier"], result["registry_revision"]),
+                         ("NONE", revision + 1))
+        self.assertEqual(self.runtime()["admission_barrier"], "NONE")
+        self.assertEqual(self.slot()["slot_state"], "RESTORED")
+        self.assertEqual([(row["execution_id"], row["reason"]) for row in self.barrier_clears()],
+                         [(case.spec.execution_id, "finished_job")])
+        self.assertEqual(self.control._samples.get(case.spec.execution_id, []), [])
+        self.assertEqual(case.job.sets, sets)
+
+    def test_a_job_that_has_not_finished_cannot_use_the_finished_clear(self):
+        case = self.restored_case()
+        with self.assertRaises(LifecycleError) as caught:
+            self.control.clear_finished_admission_barrier(case.spec.execution_id)
+        self.assertEqual(str(caught.exception), "control_execution_unfinished")
+        self.assertEqual(self.runtime()["admission_barrier"], "RECOVERY_HOLD")
+        self.assertIsNone(self.barrier_clears())
+
+    def test_a_member_or_a_cap_read_after_the_finish_keeps_the_barrier(self):
+        case = self.finished_case()
+        case.job.members[:] = [4321]
+        with self.assertRaises(LifecycleError) as caught:
+            self.control.clear_finished_admission_barrier(case.spec.execution_id)
+        self.assertEqual(str(caught.exception), "finished_job_not_empty")
+        case.job.members.clear()
+        case.job.control = {"flags": 5, "rate_bp": 2500}
+        with self.assertRaises(LifecycleError) as caught:
+            self.control.clear_finished_admission_barrier(case.spec.execution_id)
+        self.assertEqual(str(caught.exception), "restore_unverified")
+        self.assertEqual(self.runtime()["admission_barrier"], "RECOVERY_HOLD")
+        self.assertIsNone(self.barrier_clears())
+
     def test_observe_uncapped_refuses_a_sample_taken_while_capped(self):
         case = self.start()
         self.apply_cap(case)

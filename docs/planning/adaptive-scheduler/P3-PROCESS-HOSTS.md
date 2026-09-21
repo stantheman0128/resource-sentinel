@@ -392,9 +392,16 @@ things put them in a Job:
 
 The repo owner ran the interpreter named by `sys._base_executable` from a
 PowerShell console outside the app. The same preflight passed there and reported
-build 26340, 12 logical processors and one processor group. So native tests can
-run on this machine from such a console. Nobody has run them yet, and an agent
-session cannot.
+build 26340, 12 logical processors and one processor group. The owner then ran
+the formal probe `tests/windows/probe_adaptive_host.py` from the same console
+with the same interpreter. It reported `in_any_job=false`, `validity=valid`, no
+errors, `active_host_candidate=true` and
+`capability_status=host_only_not_control_verified`, on Python 3.13.3 64-bit in
+session 1. The probe output stays on the machine and is not committed. That
+status means the console qualifies as a host. It says nothing about whether a
+CPU rate cap works, which is what S1 to S3 measure. So native tests can run on
+this machine from such a console. Nobody has run them yet, and an agent session
+cannot.
 
 That console is the only launch path measured to pass so far.
 [CAPABILITY-RESULTS.md](CAPABILITY-RESULTS.md) measured two others on 2026-09-19

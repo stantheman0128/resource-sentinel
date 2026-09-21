@@ -8,6 +8,7 @@ pure validation inside its existing short transaction.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 import re
 import sqlite3
 from uuid import UUID
@@ -39,6 +40,10 @@ _ACTION_FIELDS = (
     "reason", "win32_error",
 )
 _ACTION_STATES = ("INTENDED", "APPLIED", "RENEWED", "RESTORED", "UNVERIFIED", "FAILED", "CONFLICT")
+_BARRIER_CLEAR_FIELDS = (
+    "registry_revision", "execution_id", "slot_id", "slot_revision", "guardian_epoch",
+    "reason", "finished_at", "cleared_at",
+)
 
 
 def _integer(value, *, minimum=0):
@@ -125,6 +130,35 @@ def migrate_control_actions_schema(conn):
     columns = {row[1] for row in conn.execute("PRAGMA table_info(adaptive_actions)")}
     if columns != set(_ACTION_FIELDS):
         raise ControlSlotError("control_actions_schema_unsupported")
+
+
+def migrate_barrier_clears_schema(conn):
+    """Add the finished-Job barrier audit table inside the caller's transaction.
+
+    Clarification C3 of plan section 7.6's audit rule. One row per clear, keyed
+    by the registry revision the clear produced, so a replay at the same
+    revision cannot append a second record. Nothing here records capacity and
+    nothing reads this table to make a decision.
+    """
+    _transaction(conn)
+    found = conn.execute("SELECT type FROM sqlite_master WHERE name='adaptive_barrier_clears'").fetchone()
+    if found is not None and found[0] != "table":
+        raise ControlSlotError("control_barrier_clears_schema_unsupported")
+    conn.execute("""CREATE TABLE IF NOT EXISTS adaptive_barrier_clears (
+        registry_revision INTEGER PRIMARY KEY
+            CHECK(typeof(registry_revision)='integer' AND registry_revision>=1),
+        execution_id TEXT NOT NULL,
+        slot_id TEXT NOT NULL,
+        slot_revision INTEGER NOT NULL CHECK(typeof(slot_revision)='integer' AND slot_revision>=1),
+        guardian_epoch TEXT NOT NULL,
+        reason TEXT NOT NULL CHECK(reason='finished_job'),
+        finished_at REAL NOT NULL CHECK(typeof(finished_at)='real' AND finished_at>=0),
+        cleared_at REAL NOT NULL CHECK(typeof(cleared_at)='real' AND cleared_at>=0),
+        FOREIGN KEY(execution_id) REFERENCES managed_executions(execution_id)
+    )""")
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(adaptive_barrier_clears)")}
+    if columns != set(_BARRIER_CLEAR_FIELDS):
+        raise ControlSlotError("control_barrier_clears_schema_unsupported")
 
 
 @dataclass(frozen=True)
@@ -507,6 +541,66 @@ def clear_locked(conn, row, runtime, guard, *, samples, now_tick_100ns,
                       max_age_ms=sample_max_age_ms)
     if runtime["registry_revision"] >= _MAX_INT:
         raise ControlSlotError("control_slot_revision_exhausted")
+    if conn.execute("""UPDATE adaptive_runtime SET admission_barrier='NONE',registry_revision=registry_revision+1
+        WHERE singleton=1 AND registry_revision=? AND admission_barrier='RECOVERY_HOLD'""",
+        (runtime["registry_revision"],)).rowcount != 1:
+        raise ControlSlotError("control_slot_revision_conflict")
+    return _result(slot, dict(runtime) | {"admission_barrier": "NONE",
+        "registry_revision": runtime["registry_revision"] + 1}, duplicate=False)
+
+
+def _wall_clock(value):
+    """A stored second, not a tick: finite, not negative and never a bool."""
+    try:
+        return type(value) in (int, float) and math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
+
+
+def clear_finished_locked(conn, row, runtime, guard, *, slot_id, cleared_at):
+    """Clear RECOVERY_HOLD for a Job the lifecycle already finished (C3).
+
+    The second and last way to satisfy plan section 7.4. No new flag says the
+    Job ended. FINISHED is written only by finalize_if_empty, inside an evidence
+    scope that showed an empty sealed Job, a disabled readback and a settled
+    manifest, and the caller has already reconciled this row against that
+    terminal proof. The slot must still be RESTORED for this exact execution
+    and the barrier must still be held. There is no TTL, force flag or operator
+    bypass, and no Job operation happens here. ``clear_locked`` and its five
+    fresh uncapped samples are untouched.
+    """
+    _transaction(conn)
+    if not _uuid(slot_id) or not _wall_clock(cleared_at):
+        raise ControlSlotError("invalid_control_slot_request")
+    slot = query_locked(conn, runtime, guard)
+    if slot is None:
+        raise ControlSlotError("control_slot_missing")
+    binding = _binding(row, guard)
+    if slot["slot_id"] != slot_id or any(slot[key] != value for key, value in binding.items()):
+        raise ControlSlotError("control_slot_binding_mismatch")
+    if slot["slot_state"] != "RESTORED":
+        raise ControlSlotError("control_slot_unrestored")
+    if runtime["admission_barrier"] != "RECOVERY_HOLD":
+        raise ControlSlotError("control_barrier_not_held")
+    # A row that reached FINISHED through its parent's cascade is refused: the
+    # native proof at that commit was about the parent's Job, not this one.
+    if (row["state"] != "FINISHED" or row["launch_sealed"] != 1 or row["launch_in_flight"] != 0 or
+            row["allocation_kind"] not in {"direct", "routed"} or
+            row["parent_execution_id"] is not None or not _wall_clock(row["finished_at"])):
+        raise ControlSlotError("control_execution_unfinished")
+    if runtime["registry_revision"] >= _MAX_INT:
+        raise ControlSlotError("control_slot_revision_exhausted")
+    migrate_barrier_clears_schema(conn)
+    try:
+        conn.execute("INSERT INTO adaptive_barrier_clears(" + ",".join(_BARRIER_CLEAR_FIELDS) +
+                     ") VALUES(" + ",".join("?" for _ in _BARRIER_CLEAR_FIELDS) + ")",
+                     (runtime["registry_revision"] + 1, row["execution_id"], slot["slot_id"],
+                      slot["slot_revision"], slot["guardian_epoch"], "finished_job",
+                      float(row["finished_at"]), float(cleared_at)))
+    except sqlite3.IntegrityError:
+        raise ControlSlotError("control_barrier_clear_replayed") from None
+    except sqlite3.Error:
+        raise ControlSlotError("control_barrier_clears_unavailable") from None
     if conn.execute("""UPDATE adaptive_runtime SET admission_barrier='NONE',registry_revision=registry_revision+1
         WHERE singleton=1 AND registry_revision=? AND admission_barrier='RECOVERY_HOLD'""",
         (runtime["registry_revision"],)).rowcount != 1:

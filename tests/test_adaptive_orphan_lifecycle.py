@@ -137,6 +137,16 @@ class OrphanDrainTests(unittest.TestCase):
         return [row["outcome"] for row in self.connection().execute(
             "SELECT outcome FROM executions WHERE reservation_id=?", (case.spec.reservation.id,))]
 
+    def barrier_clears(self):
+        """The lazily created C3 audit rows, or None while the table is absent."""
+        conn = self.connection()
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name='adaptive_barrier_clears'").fetchone() is None:
+            return None
+        return [dict(row) for row in conn.execute("SELECT * FROM adaptive_barrier_clears")]
+
+    def entry_nonce(self):
+        return self.connection().execute("SELECT policy_entry_nonce FROM adaptive_runtime").fetchone()[0]
+
     def test_empty_job_releases_the_slot_and_finishes_under_the_three_fences(self):
         case = self.prepared()
         result = self.drain(case, now=NOW + 40)
@@ -145,7 +155,10 @@ class OrphanDrainTests(unittest.TestCase):
         self.assertEqual(self.row(case)["state"], "FINISHED")
         self.assertIsNone(self.allocation(case))
         self.assertEqual(self.archived(case), ["managed_finished"])
-        self.assertEqual((self.slot()["slot_state"], self.barrier()), ("RESTORED", "RECOVERY_HOLD"))
+        # Clarification C3: the finished Job's own barrier is cleared in the
+        # same pass, and the RESTORED slot stays as the durable boundary.
+        self.assertEqual((result.barrier_cleared, result.barrier_reason), (True, None))
+        self.assertEqual((self.slot()["slot_state"], self.barrier()), ("RESTORED", "NONE"))
         self.assertEqual([name for kind, name in self.events if kind == "enter"], self.fences(case))
         # No Set, no reopen and no second cap: the drain only reads the Job.
         self.assertEqual((case.job.sets, self.opened), (1, [case.record.job_name]))
@@ -190,14 +203,16 @@ class OrphanDrainTests(unittest.TestCase):
         result = self.drain(case, now=NOW + 40)
         self.assertEqual((result.state, result.active_processes, result.slot_released, result.finalized),
                          ("RUNNING", 1, False, False))
+        self.assertEqual((result.barrier_cleared, result.barrier_reason), (False, None))
         self.assertEqual(self.row(case)["state"], "RUNNING")
         self.assertEqual(self.allocation(case), allocation)
         self.assertEqual((self.slot()["slot_state"], self.barrier()), ("HELD", "CONTROLLING"))
         self.assertEqual(self.archived(case), [])
+        self.assertIsNone(self.barrier_clears())
         # The same production call finishes the scope once the member is gone.
         case.job.members.clear()
         self.assertTrue(self.drain(case, now=NOW + 50).finalized)
-        self.assertEqual((self.slot()["slot_state"], self.barrier()), ("RESTORED", "RECOVERY_HOLD"))
+        self.assertEqual((self.slot()["slot_state"], self.barrier()), ("RESTORED", "NONE"))
 
     def test_an_unrestored_or_unknown_scope_is_never_drained(self):
         case = self.case()
@@ -278,5 +293,84 @@ class OrphanDrainTests(unittest.TestCase):
         self.assertEqual((result.slot_released, result.finalized), (False, True))
         self.assertEqual(self.row(case)["state"], "FINISHED")
         self.assertIsNone(self.allocation(case))
-        # The barrier is another owner's decision and stays where it was.
+        # No slot names this execution, so this barrier belongs to someone
+        # else. Nothing is asked for and nothing is recorded.
         self.assertEqual((self.slot(), self.barrier()), (None, "RECOVERY_HOLD"))
+        self.assertEqual((result.barrier_cleared, result.barrier_reason), (False, None))
+        self.assertIsNone(self.barrier_clears())
+
+    # --- clarification C3: the finished Job's own barrier --------------------
+
+    def test_the_clear_records_one_audit_row_carrying_the_row_and_slot_fields(self):
+        case = self.prepared()
+        slot = self.slot()
+        result = self.drain(case, now=NOW + 40)
+        self.assertTrue(result.barrier_cleared)
+        rows = self.barrier_clears()
+        self.assertEqual(len(rows), 1)
+        record = rows[0]
+        self.assertEqual(record["registry_revision"],
+                         self.connection().execute(
+                             "SELECT registry_revision FROM adaptive_runtime").fetchone()[0])
+        self.assertEqual((record["execution_id"], record["reason"], record["finished_at"]),
+                         (case.spec.execution_id, "finished_job", NOW + 40))
+        self.assertEqual((record["slot_id"], record["guardian_epoch"]),
+                         (slot["slot_id"], case.record.guardian_epoch))
+        self.assertEqual(record["slot_revision"], self.slot()["slot_revision"])
+        # The clear stamps its own wall clock, never the ledger fixture clock.
+        self.assertIsInstance(record["cleared_at"], float)
+        # Nothing was actuated: the Job was read, never set or reopened.
+        self.assertEqual((case.job.sets, self.opened), (1, [case.record.job_name]))
+
+    def test_a_repeat_drain_after_the_clear_asks_for_nothing_and_adds_no_row(self):
+        case = self.prepared()
+        self.assertTrue(self.drain(case, now=NOW + 40).barrier_cleared)
+        before = self.barrier_clears()
+        result = self.drain(case, now=NOW + 50)
+        self.assertEqual((result.state, result.finalized), ("FINISHED", True))
+        self.assertEqual((result.barrier_cleared, result.barrier_reason), (False, None))
+        self.assertEqual(self.barrier_clears(), before)
+        self.assertEqual(self.barrier(), "NONE")
+
+    def test_an_unproven_terminal_row_keeps_the_barrier_and_clears_on_a_later_pass(self):
+        case = self.prepared()
+        refusal = LifecycleError("retained_terminal_unverified")
+        with patch.object(self.drain_store, "assert_retained_terminal", side_effect=refusal):
+            first = self.drain(case, now=NOW + 40)
+            self.assertEqual((first.finalized, first.barrier_cleared, first.barrier_reason),
+                             (True, False, "retained_terminal_unverified"))
+            self.assertEqual(self.barrier(), "RECOVERY_HOLD")
+            self.assertIsNone(self.barrier_clears())
+            # The early FINISHED branch refuses before the ledger is asked for
+            # anything, so the opportunistic pass leaves no entry nonce behind.
+            second = self.drain(case, now=NOW + 50)
+            self.assertEqual((second.finalized, second.barrier_cleared, second.barrier_reason),
+                             (True, False, "retained_terminal_unverified"))
+            self.assertIsNone(self.entry_nonce())
+        # The next prepare works and the same production call clears once the
+        # proof passes again.
+        third = self.drain(case, now=NOW + 60)
+        self.assertEqual((third.finalized, third.barrier_cleared, third.barrier_reason),
+                         (True, True, None))
+        self.assertEqual(self.barrier(), "NONE")
+        self.assertEqual(len(self.barrier_clears()), 1)
+        self.assertEqual(self.barrier_clears()[0]["finished_at"], NOW + 40)
+
+    def test_a_member_seen_after_the_terminal_row_keeps_the_barrier(self):
+        case = self.prepared()
+        refusal = LifecycleError("retained_terminal_unverified")
+        with patch.object(self.drain_store, "assert_retained_terminal", side_effect=refusal):
+            self.assertTrue(self.drain(case, now=NOW + 40).finalized)
+        # The ledger proof would pass now, but this pass reads a member in the
+        # Job, which contradicts the terminal row. The clear is never asked for.
+        case.job.members[:] = [4321]
+        result = self.drain(case, now=NOW + 50)
+        self.assertEqual((result.state, result.active_processes, result.finalized),
+                         ("FINISHED", 1, True))
+        self.assertEqual((result.barrier_cleared, result.barrier_reason),
+                         (False, "finished_job_not_empty"))
+        self.assertEqual(self.barrier(), "RECOVERY_HOLD")
+        self.assertIsNone(self.barrier_clears())
+        self.assertIsNone(self.entry_nonce())
+        case.job.members.clear()
+        self.assertTrue(self.drain(case, now=NOW + 60).barrier_cleared)

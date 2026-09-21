@@ -206,7 +206,8 @@ cap, because `finalize_if_empty` commits only on a native CPU disabled proof. A
 `HELD` slot, a malformed slot, or a `RESTORED` slot that names an unknown
 execution outside the live set is still refused, and the flow test asserts both
 refusals. After the drain the scope retires on the next tick and `close()`
-succeeds while the barrier stays `RECOVERY_HOLD`.
+succeeds. Since 2026-09-22 the same drain pass also clears the barrier that
+finished Job left, under [BARRIER-CLEAR-FINISHED-JOB.md](BARRIER-CLEAR-FINISHED-JOB.md).
 
 `tick()` takes an optional `now`, used only as the `finished_at` a drain
 records. The retirement proof compares `finished_at` with the archived
@@ -294,10 +295,11 @@ pass. Promotion remains stopped for this unresolved all-witness-loss contract.
   collector kill subtree. No task or global startup entry was installed.
 - Durable instance provenance for a new process with no captured POLICY binding,
   and an accepted exact-death contract when every native witness is gone.
-- Clearing the admission barrier for a Job that has already finished. The
-  guardian can clear `RECOVERY_HOLD` for a live Job with fresh uncapped samples;
-  see P3-GUARDIAN-CONTROL.md. A Job finished by the orphan drain produces no
-  samples, so its barrier stays, and plan 7.4 needs an owner decision first.
+- Retrying the finished Job barrier clear after this supervisor is gone. The
+  orphan drain clears the barrier for a Job it finished and offers the clear
+  again on later passes. If the supervisor process ends between the finalize
+  commit and the clear, a new supervisor has no custody of that Job and nothing
+  retries. This belongs with owner decision 4 in the README.
 - Separate durable recovery ownership transfer for a scope that must keep
   running, followed by lifecycle adoption, child accounting and original lease
   handling. The drain finishes a scope; it does not adopt one.

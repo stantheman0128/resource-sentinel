@@ -371,12 +371,14 @@ class P3FlowTests(unittest.TestCase):
         self.assertEqual(state.disables, ["recovery"])
         self.assertEqual(self.manifest(case), settled)
 
-    def test_h_orphan_drain_finishes_the_empty_job_and_leaves_the_barrier_held(self):
+    def test_h_orphan_drain_finishes_the_empty_job_and_clears_its_own_barrier(self):
         """H: the supervisor process completes the ledger after guardian death.
 
         The drain owner presents control_restore and finalize evidence built
         from custody it already holds. It never adopts the scope, so the
-        manifest creator stays immutable and the barrier stays RECOVERY_HOLD.
+        manifest creator stays immutable. Clarification C3 then lets the same
+        pass clear the RECOVERY_HOLD this finished Job left behind, using only
+        the FINISHED row and the settled manifest as evidence.
         """
         case = self.started_with_child()
         execution = case.snapshot.execution_id
@@ -407,22 +409,25 @@ class P3FlowTests(unittest.TestCase):
         with closing(sqlite3.connect(self.db)) as conn:
             self.assertEqual(conn.execute("""SELECT slot_state,admission_barrier
                 FROM adaptive_control_slot,adaptive_runtime""").fetchone(),
-                ("RESTORED", "RECOVERY_HOLD"))
+                ("RESTORED", "NONE"))
             self.assertEqual(conn.execute("SELECT count(*) FROM executions WHERE outcome='managed_finished'")
                              .fetchone()[0], 1)
+            self.assertEqual(conn.execute("""SELECT execution_id,reason FROM
+                adaptive_barrier_clears""").fetchall(), [(execution, "finished_job")])
         settled = self.manifest(case)
         self.assertEqual((settled.guardian_identity, settled.guardian_epoch), (GUARDIAN, EPOCH))
         self.assertEqual(self.kernel.jobs[case.job.name].disables, ["recovery"])
         self.assertEqual(supervisor.recovery.retained_execution_ids, ())
         # The RESTORED row is a boundary that owes no cap, so the inventory
-        # verifies again and the scope retires. The barrier is not this
-        # supervisor's to clear and stays held.
+        # verifies again and the scope retires. A later pass finds no held
+        # barrier, asks for nothing and writes no second audit row.
         tick = supervisor.tick()
         self.assertEqual((tick.inventory_verified, tick.known_executions), (True, ()))
         supervisor.close()
         with closing(sqlite3.connect(self.db)) as conn:
             self.assertEqual(conn.execute("SELECT admission_barrier FROM adaptive_runtime").fetchone()[0],
-                             "RECOVERY_HOLD")
+                             "NONE")
+            self.assertEqual(conn.execute("SELECT count(*) FROM adaptive_barrier_clears").fetchone()[0], 1)
 
     def drained_to_finished(self):
         case = self.started_with_child()

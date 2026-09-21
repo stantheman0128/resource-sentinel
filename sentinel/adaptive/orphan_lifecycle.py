@@ -27,6 +27,7 @@ import threading
 from uuid import uuid4
 
 from .contracts import CpuControl, CpuControlMode
+from .policy import PolicyError
 from .recovery_owner import RecoveryOwner
 from .store import LifecycleError, LifecycleEvidence
 
@@ -41,6 +42,10 @@ class DrainResult:
     active_processes: int
     slot_released: bool
     finalized: bool
+    # Clarification C3. False with no reason means the pass never asked: the
+    # slot, the barrier or the state said this is not ours to clear.
+    barrier_cleared: bool = False
+    barrier_reason: str | None = None
 
 
 class OrphanDrainOwner:
@@ -117,6 +122,39 @@ class OrphanDrainOwner:
                     guard.clean_rejection = True
                 raise
 
+    def _clear_barrier(self, record, row):
+        """Ask the store to clear a finished Job's barrier, or leave it held.
+
+        Clarification C3 of plan section 7.4. The read-only proof runs first, so
+        a refusal decided here exits the borrowed scope normally and leaves no
+        POLICY entry nonce behind for a pass that never wrote. Only the write
+        call below marks the ledger as touched, and a failure past that line
+        keeps the nonce like every other borrowed scope.
+        """
+        execution_id = row["execution_id"]
+        try:
+            slot = self.store.query_control_slot_locked()
+            guard = self.store._policy.assert_held()
+            with self.store._connection() as conn:
+                runtime = self.store._policy.revalidate(conn, guard)
+            if (slot is None or slot["execution_id"] != execution_id or
+                    slot["slot_state"] != "RESTORED" or
+                    runtime["admission_barrier"] != "RECOVERY_HOLD"):
+                # Another owner's slot, no slot at all, or a barrier this scope
+                # never placed. Nothing was asked and nothing is reported.
+                return False, None
+            self.store.assert_finished_barrier_clearable(execution_id,
+                caller=record.wrapper_identity, expected_revision=row["state_revision"],
+                manifest=record)
+        except (LifecycleError, PolicyError) as error:
+            return False, str(error)
+        self._ledger_touched = True
+        self.store.clear_recovery_hold_finished_locked(execution_id,
+            caller=record.wrapper_identity, expected_revision=row["state_revision"],
+            expected_registry_revision=runtime["registry_revision"],
+            slot_id=slot["slot_id"], manifest=record)
+        return True, None
+
     def drain(self, execution_id, *, creation_nonce, now=None):
         """One bounded pass: release the slot, then finish a natively empty Job.
 
@@ -136,8 +174,16 @@ class OrphanDrainOwner:
                 row = self.store.query(execution_id)
                 if row["state"] == "FINISHED":
                     # Committed by this or an earlier pass. Nothing is released
-                    # again; the caller may still settle its native custody.
-                    return DrainResult(execution_id, "FINISHED", count, False, True)
+                    # again; the caller may still settle its native custody. The
+                    # barrier an earlier pass left behind is still offered here,
+                    # so a clear that could not run then can run now. The owner's
+                    # rule asks for a Job this pass read as empty, so a member
+                    # seen now contradicts the terminal row and keeps the hold.
+                    if count != 0:
+                        return DrainResult(execution_id, "FINISHED", count, False, True,
+                                           False, "finished_job_not_empty")
+                    cleared, reason = self._clear_barrier(record, row)
+                    return DrainResult(execution_id, "FINISHED", count, False, True, cleared, reason)
                 if count != 0:
                     return DrainResult(execution_id, row["state"], count, False, False)
                 caller = record.wrapper_identity
@@ -159,7 +205,9 @@ class OrphanDrainOwner:
                         expected_revision=row["state_revision"], now=now)
                 finally:
                     self._scope_entry = self._scope_thread = None
-                return DrainResult(execution_id, row["state"], 0, released, row["state"] == "FINISHED")
+                finalized = row["state"] == "FINISHED"
+                cleared, reason = self._clear_barrier(record, row) if finalized else (False, None)
+                return DrainResult(execution_id, row["state"], 0, released, finalized, cleared, reason)
 
     @contextmanager
     def evidence_scope(self, operation, row, caller):

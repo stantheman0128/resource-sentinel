@@ -60,8 +60,9 @@ class SupervisionResult:
     unresolved_executions: tuple[str, ...]
     inventory_error: str | None
     # Drain outcomes for a dead guardian's Jobs. Slot release and finalization
-    # are separate facts: neither implies the other, and neither clears the
-    # admission barrier, which stays RECOVERY_HOLD for a later owner.
+    # are separate facts and neither implies the other. A drain that finishes a
+    # Job may also clear that Job's own RECOVERY_HOLD under clarification C3;
+    # the per execution outcome of that attempt stays on DrainResult.
     slot_released_executions: tuple[str, ...] = ()
     finalized_executions: tuple[str, ...] = ()
     drain_unresolved_executions: tuple[str, ...] = ()
@@ -76,10 +77,11 @@ class GuardianSupervisor:
 
     Restore results describe native disable plus journal settlement only. The
     separate drain pass may then release this execution's control slot and
-    finish a natively empty Job through the formal store operations. No result
-    asserts that normal mode can restart: the admission barrier stays
-    RECOVERY_HOLD, legacy exclusion is untouched, and a Job that still holds a
-    process keeps its allocation. All error owners are retained.
+    finish a natively empty Job through the formal store operations, and clear
+    the barrier that finished Job placed. No result asserts that normal mode can
+    restart: legacy exclusion is untouched, a barrier another scope holds stays
+    held, and a Job that still holds a process keeps its allocation. All error
+    owners are retained.
     """
 
     def __init__(self, store, recovery, *, journal=None):

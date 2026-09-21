@@ -127,6 +127,13 @@ fails closed and nothing was relaxed. The repository owner has to decide what
 evidence clears the barrier for a finished Job before any canary runs. See
 P3-GUARDIAN-CONTROL.md.
 
+Update, 2026-09-22. The owner decided, and the clear for a finished Job is
+implemented with portable test evidence only. The contract is in
+[BARRIER-CLEAR-FINISHED-JOB.md](BARRIER-CLEAR-FINISHED-JOB.md). The orphan drain
+calls it. No transport reaches the guardian side method yet, so a living
+guardian that finishes its own capped Job still leaves the barrier held. That
+part of the gap still blocks B.
+
 ## Sign off
 
 Sign off is blocked. It stays blocked until measured A1 and B records exist, the

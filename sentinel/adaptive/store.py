@@ -26,8 +26,8 @@ from sentinel.accounting import (
     validate_active_allocation,
 )
 from .contracts import (
-    AllocationKind, ContractViolation, ExecutionSpec, ProcessIdentity, RecoveryManifest,
-    ReservationRef, ResourceDemand, MAX_ENROLLED_JOBS,
+    AllocationKind, ContractViolation, CpuControl, CpuControlMode, ExecutionSpec, ProcessIdentity,
+    RecoveryManifest, ReservationRef, ResourceDemand, MAX_ENROLLED_JOBS,
 )
 from .capacity_schema import prepare_capacity_schema
 from .writers import migrate_writer_fence
@@ -38,6 +38,9 @@ _TABLES = {"direct": "reservations", "routed": "worker_reservations"}
 _STATES = ("NEW", "QUEUED", "RESERVED", "PREPARED", "LAUNCHING", "RUNNING",
            "DRAINING", "FINISHED", "CANCELLED_BEFORE_START", "START_FAILED",
            "START_UNKNOWN", "UNCERTAIN_HOLD")
+# The withdrawn state a settled recovery manifest carries, as the supervisor's
+# own retirement proof defines it.
+_DISABLED_CONTROL = CpuControl(CpuControlMode.DISABLED, None)
 
 
 class LifecycleError(RuntimeError):
@@ -2172,6 +2175,78 @@ class LifecycleStore:
                     result = clear_locked(conn, row, runtime, guard, samples=uncapped_samples,
                         now_tick_100ns=now_tick_100ns, required_samples=required_samples,
                         sample_max_age_ms=sample_max_age_ms)
+            return result
+        except (ControlSlotError, PolicyError) as error:
+            raise LifecycleError(str(error)) from error
+
+    def assert_finished_barrier_clearable(self, execution_id: str, *, caller: ProcessIdentity,
+                                          expected_revision: int, manifest) -> dict[str, Any]:
+        """Read-only half of the finished-Job barrier clear (clarification C3).
+
+        Public so an opportunistic caller can learn its refusal before the
+        ledger is asked to change anything, which keeps a POLICY entry nonce
+        from being left behind for work that cannot run. Nothing here writes,
+        and clear_recovery_hold_finished_locked calls this itself, so no caller
+        can reach the write half without it.
+        """
+        from .policy import PolicyError
+
+        try:
+            guard = self._policy.assert_held()
+            snapshot = self.query(execution_id)
+            self._require_revision(snapshot, expected_revision)
+            self._caller(snapshot, caller)
+            if guard.binding.logon_id != caller.logon_id:
+                raise LifecycleError("policy_logon_mismatch")
+            if (type(manifest) is not RecoveryManifest or manifest.original != _DISABLED_CONTROL or
+                    manifest.pending_intent is not None or
+                    manifest.last_applied not in (None, _DISABLED_CONTROL)):
+                raise LifecycleError("restore_unverified")
+            # The same reconciliation the supervisor inventory uses to retire a
+            # scope: a sealed top level row, no surviving allocation and exactly
+            # one matching managed_finished archive.
+            self.assert_retained_terminal(snapshot, manifest)
+            return snapshot
+        except PolicyError as error:
+            raise LifecycleError(str(error)) from error
+
+    def clear_recovery_hold_finished_locked(self, execution_id: str, *, caller: ProcessIdentity,
+                                            expected_revision: int, expected_registry_revision: int,
+                                            slot_id: str, manifest,
+                                            now: float | None = None) -> dict[str, Any]:
+        """Clear RECOVERY_HOLD for an execution the lifecycle already finished.
+
+        Clarification C3 of plan section 7.4, adopted by the repository owner on
+        2026-09-22. Every condition is evidence the lifecycle already produced:
+        the row is FINISHED, which only finalize_if_empty commits under a native
+        empty proof, the retained terminal reconciliation passes for that row and
+        its settled manifest, and the slot is RESTORED for this exact execution.
+        No evidence scope is opened, because the named Job may no longer exist
+        once it is finished. There is no TTL, force flag or operator bypass, no
+        Job operation and no manifest write; clear_recovery_hold_locked and its
+        five fresh uncapped samples are untouched.
+        """
+        from .control_slot import ControlSlotError, clear_finished_locked
+        from .policy import PolicyError
+
+        if type(expected_registry_revision) is not int or expected_registry_revision < 0:
+            raise ValueError("invalid_registry_revision")
+        now = time.time() if now is None else now
+        if not math.isfinite(now):
+            raise ValueError("invalid_time")
+        try:
+            guard = self._policy.assert_held()
+            self.assert_finished_barrier_clearable(execution_id, caller=caller,
+                expected_revision=expected_revision, manifest=manifest)
+            with self._transaction() as conn:
+                runtime = self._policy.revalidate(conn, guard)
+                if runtime["registry_revision"] != expected_registry_revision:
+                    raise LifecycleError("registry_revision_conflict")
+                row = self._get(conn, execution_id)
+                self._require_revision(row, expected_revision)
+                self._caller(row, caller)
+                result = clear_finished_locked(conn, row, runtime, guard,
+                    slot_id=slot_id, cleared_at=now)
             return result
         except (ControlSlotError, PolicyError) as error:
             raise LifecycleError(str(error)) from error

@@ -592,3 +592,38 @@ class GuardianControl:
                     now_tick_100ns=now,
                     required_samples=self.profile.admission_release_uncapped_samples,
                     sample_max_age_ms=self.profile.sample_max_age_ms)
+
+    def clear_finished_admission_barrier(self, execution_id, *, now=None):
+        """Plan 7.4 clarification C3, for a Job this guardian already finished.
+
+        The sibling above needs five fresh uncapped samples, which a Job with no
+        process can never produce. This path accepts instead the evidence the
+        lifecycle already committed: a FINISHED row and the settled journal
+        manifest that commit required. No production caller exists, exactly as
+        for ``clear_admission_barrier``; no transport carries helper frames or
+        this request to a guardian. Complete evidence or the barrier stays.
+        """
+        with self.owner._lock:
+            entry = self.lifecycle._entry(execution_id)
+            episode = self._episodes.get(execution_id)
+            if episode is None or not episode.restored:
+                raise LifecycleError("control_episode_unrestored")
+            with self.lifecycle._scope(entry):
+                runtime = self._runtime()
+                row = self.store.query(execution_id, existing_path=True)
+                if row["state"] != "FINISHED":
+                    raise LifecycleError("control_execution_unfinished")
+                # The owner's rule asks for a Job read as empty now, so the
+                # retained Job is queried again before the ledger is asked.
+                count, _ = self.lifecycle._members(entry)
+                if count != 0:
+                    raise LifecycleError("finished_job_not_empty")
+                if self.lifecycle._control(entry) != DISABLED:
+                    raise LifecycleError("restore_unverified")
+                # A finished row has no allocation left, so the manifest is
+                # reconciled against the terminal archive.
+                manifest = self.lifecycle._manifest(entry, row, terminal=True)
+                return self.store.clear_recovery_hold_finished_locked(execution_id,
+                    caller=entry.wrapper.identity, expected_revision=row["state_revision"],
+                    expected_registry_revision=runtime["registry_revision"],
+                    slot_id=episode.slot_id, manifest=manifest, now=now)

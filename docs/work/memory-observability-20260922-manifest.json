@@ -1,0 +1,50 @@
+{
+  "basis": "local live source captured before changes; not equivalent to Git HEAD",
+  "files": [
+    {
+      "path": "sentinel/changes.py",
+      "baseline_sha256": "4ff2e7c63c8cd0bcc0c68da0c72ed62cc49274b3e666b1bfbb42da07db82f24f",
+      "result_sha256": "102acf1b6b9ffc6123b8f25b9f8e5f6a7f1c8c9833bc9960fcc9fbf215a53f16"
+    },
+    {
+      "path": "sentinel/memory_ledger.py",
+      "baseline_sha256": null,
+      "result_sha256": "de5fa3510879b86a30d7ba25b71e5167f77c474b9f3785f4cc6832e2bb4ae34c"
+    },
+    {
+      "path": "scripts/collect.ps1",
+      "baseline_sha256": "418c7ec2c678f2eb8df124934a113201277980c468b6f19f75e29a6989d20660",
+      "result_sha256": "e8a3a821d5998aa6254762a02210635c7abfec274a77facd2d65b73849994caf"
+    },
+    {
+      "path": "scripts/memory-counters.ps1",
+      "baseline_sha256": null,
+      "result_sha256": "490f9e4c3a39ea5282188a24e861919e0e69080c30c4f8785a013384f734a359"
+    },
+    {
+      "path": "dashboard/dashboard.html",
+      "baseline_sha256": "417366281da86ec66088d85c07173cbcd8b2484a5880cfac217486beab69740f",
+      "result_sha256": "9e900839d0758f21bfacad3d51e458f3d881800709e2bbb1a48e10fcdae4a2b3"
+    },
+    {
+      "path": "tests/test_memory_ledger.py",
+      "baseline_sha256": null,
+      "result_sha256": "44f8e2d5bb3c979f863f584ea73d8326c09e8585fc9b3559173f202d7695f580"
+    },
+    {
+      "path": "tests/test_memory_counters.ps1",
+      "baseline_sha256": null,
+      "result_sha256": "54d5eee268bfe3ef1c384f718507cbef6e4d4d2f68fb18ad323af80fac2dde45"
+    },
+    {
+      "path": "tests/test_change_dashboard.cjs",
+      "baseline_sha256": "c80292ee63151c52af3ffc68ec819bfc64af5752a1eb6798a83d2fdf14ca3de5",
+      "result_sha256": "6c629fcb3ceb62787bb68ba317c537e910d3eda2e6b3f4044e7c002fc9a18e55"
+    },
+    {
+      "path": "docs/resource-changes.md",
+      "baseline_sha256": "e789ccea348bdb6fa2230dd2bd61b1b5c0441820890f656a92177d7f365e7dcb",
+      "result_sha256": "d04e4bd7f8e7f5141e8b50de60f5d0c217fe19cb698d0b59ccf88b706cf88417"
+    }
+  ]
+}

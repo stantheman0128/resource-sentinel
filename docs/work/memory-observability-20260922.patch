@@ -1,0 +1,771 @@
+diff --git a/sentinel/changes.py b/sentinel/changes.py
+--- a/sentinel/changes.py
++++ b/sentinel/changes.py
+@@ -16,6 +16,8 @@
+ from contextlib import contextmanager
+ from pathlib import Path
+ 
++from sentinel import memory_ledger
++
+ MIB = 1024 ** 2
+ 
+ 
+@@ -27,9 +29,10 @@
+ 
+ def process_changes(previous, current, *, threshold=128 * MIB):
+     """Creation identity prevents a reused PID from becoming a spurious delta."""
++    unreliable = memory_ledger.unreliable_pids(previous) | memory_ledger.unreliable_pids(current)
+     def index(rows):
+         return {(int(p["pid"]), str(p["created"])): p for p in rows
+-                if p.get("created") and int(p["pid"]) > 0}
++                if p.get("created") and int(p["pid"]) > 0 and p['pid'] not in unreliable}
+     before, after = index(previous), index(current)
+     changes = []
+     for key in before.keys() | after.keys():
+@@ -121,6 +124,7 @@
+                 CREATE INDEX IF NOT EXISTS files_identity ON files(root,generation,identity);
+                 CREATE INDEX IF NOT EXISTS events_time ON events(ts);
+             """)
++            memory_ledger.initialize(c)
+ 
+     @contextmanager
+     def db(self):
+@@ -161,14 +165,23 @@
+                 result["physical_used_delta"] = snapshot["physical_used"] - previous["physical_used"]
+                 commit = snapshot.get("commit_used")
+                 previous_commit = previous.get("commit_used")
+-                private_delta = sum(r["private_delta"] or 0 for r in changes)
++                private_missing = sum(r["private_delta"] is None for r in changes)
++                identity_incomplete = bool(memory_ledger.unreliable_pids(previous['processes']) |
++                                           memory_ledger.unreliable_pids(snapshot['processes']))
++                private_delta = (None if private_missing or identity_incomplete else
++                                 sum(r["private_delta"] or 0 for r in changes))
+                 result["process_private_delta"] = private_delta
+-                result["private_counter_missing"] = sum(r["private_delta"] is None for r in changes)
++                result["private_counter_missing"] = private_missing
++                result['identity_incomplete'] = identity_incomplete
+                 result["commit_delta"] = None if commit is None or previous_commit is None else commit - previous_commit
+                 # This is a non-reconciled counter difference, NOT measured kernel/cache growth.
+-                result["commit_unreconciled_delta"] = (None if result["commit_delta"] is None else
++                result["commit_unreconciled_delta"] = (None if result["commit_delta"] is None or private_delta is None else
+                                                        result["commit_delta"] - private_delta)
+-                significant = [r for r in changes if r["significant"]]
++                # Routine probe start/exit churn has a separate short ledger. Do
++                # not let it evict sustained-growth evidence from memory events.
++                significant = [r for r in changes if r["significant"] and
++                               (r['kind'] == 'changed' or
++                                max(abs(r['working_set_delta']), abs(r['private_delta'] or 0)) >= 512*MIB)]
+                 if significant:
+                     self.event(c, now, "process_memory", {"interval_sec": gap, "processes": significant[:12],
+                                                          "count": len(significant)})
+@@ -184,6 +197,7 @@
+                     if abs(disk["used_delta"]) >= self.limit("change_disk_mb", 256, 1, 1048576) * MIB:
+                         self.event(c, now, "disk_space", dict(disk, interval_sec=gap))
+             if previous is None or now > previous["time"]:
++                memory_ledger.record(c, snapshot, now=now, differ=process_changes)
+                 c.execute("INSERT OR REPLACE INTO meta VALUES('process_snapshot',?)",
+                           (json.dumps(dict(snapshot, time=now)),))
+                 c.execute("INSERT OR REPLACE INTO meta VALUES('process_summary',?)", (json.dumps(result),))
+@@ -367,7 +381,13 @@
+     def export(self, *, now, scan_state, rejected):
+         with self.db() as c:
+             c.execute("DELETE FROM events WHERE ts<?", (now - 7 * 86400,))
+-            c.execute("DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT 2000)")
++            # Independent quotas: frequent lifecycle observations cannot evict
++            # memory or file incidents. Age and count limits both apply.
++            for predicate, cap in (("kind='process_lifecycle'", 256),
++                                   ("kind='process_memory'", 2000),
++                                   ("kind NOT IN ('process_lifecycle','process_memory')", 2000)):
++                c.execute(f"DELETE FROM events WHERE {predicate} AND id NOT IN "
++                          f"(SELECT id FROM events WHERE {predicate} ORDER BY id DESC LIMIT ?)", (cap,))
+             process = c.execute("SELECT value FROM meta WHERE key='process_summary'").fetchone()
+             roots = []
+             for row in c.execute("SELECT * FROM roots ORDER BY path"):
+@@ -377,6 +397,9 @@
+             events = [dict(id=r["id"], ts=r["ts"], kind=r["kind"], **json.loads(r["payload"]))
+                       for r in c.execute("SELECT * FROM events ORDER BY id DESC LIMIT 40")]
+             payload = dict(generated_at=now, scan_state=scan_state, rejected_roots=rejected,
+-                           processes=json.loads(process[0]) if process else None, roots=roots, events=events)
++                           processes=json.loads(process[0]) if process else None, roots=roots, events=events,
++                           memory_ledger=memory_ledger.export(c, differ=process_changes),
++                           event_retention=[dict(kind=r[0], count=r[1], oldest_at=r[2]) for r in
++                                            c.execute('SELECT kind,COUNT(*),MIN(ts) FROM events GROUP BY kind')])
+         atomic_json(self.data_dir / "changes.json", payload)
+         return payload
+diff --git a/sentinel/memory_ledger.py b/sentinel/memory_ledger.py
+new file mode 100644
+--- /dev/null
++++ b/sentinel/memory_ledger.py
+@@ -0,0 +1,127 @@
++"""Bounded observation ledger; never changes admission or controls processes.
++
++Windows are endpoint net changes, not allocation traces. Shared working sets
++cannot be summed into machine physical use. Missing counters remain unknown.
++"""
++import json
++import math
++from collections import Counter
++
++FIELDS = ('physical_used', 'commit_used', 'commit_limit', 'pagefile_allocated',
++          'pool_paged', 'pool_nonpaged', 'pool_paged_resident', 'system_cache_resident')
++PROCESS_FIELDS = ('pid', 'created', 'name', 'agent_tree', 'working_set', 'private_bytes')
++MAX_PROCESSES = 4096
++MAX_SNAPSHOTS = 180
++MAX_INTERVALS = 20160
++
++
++def initialize(c):
++    c.executescript('''
++        CREATE TABLE IF NOT EXISTS memory_snapshots (ts REAL PRIMARY KEY, payload TEXT NOT NULL);
++        CREATE TABLE IF NOT EXISTS memory_intervals (ts REAL PRIMARY KEY, payload TEXT NOT NULL);
++    ''')
++
++
++def numeric(value):
++    return value if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0 else None
++
++
++def delta(old, new, key):
++    a, b = numeric(old.get(key)), numeric(new.get(key))
++    return None if a is None or b is None else b - a
++
++
++def unreliable_pids(rows):
++    counts = Counter(p.get('pid') for p in rows)
++    return {p.get('pid') for p in rows if not p.get('created') or counts[p.get('pid')] > 1}
++
++
++def pack(snapshot):
++    processes = snapshot.get('processes', [])
++    unreliable = unreliable_pids(processes)
++    rows = [{k: p.get(k) for k in PROCESS_FIELDS} for p in processes[:MAX_PROCESSES]
++            if p.get('pid') not in unreliable and isinstance(p.get('pid'), int) and p['pid'] > 0]
++    for row in rows:
++        row['private_bytes'] = numeric(row.get('private_bytes'))
++    current = {k: numeric(snapshot.get(k)) for k in FIELDS}
++    current.update(process_count=len(processes),
++                   identity_missing=len(processes[:MAX_PROCESSES]) - len(rows),
++                   truncated=len(processes) > MAX_PROCESSES,
++                   private_counter_missing=sum(p['private_bytes'] is None for p in rows),
++                   process_private_known_total=sum(p['private_bytes'] or 0 for p in rows))
++    return {'current': current, 'processes': rows,
++            'unknown_identity_pids': [p for p in unreliable if isinstance(p, int)]}
++
++
++def comparison(old, new, differ):
++    result = {k + '_delta': delta(old['current'], new['current'], k) for k in FIELDS}
++    unknown = set(old.get('unknown_identity_pids', [])) | set(new.get('unknown_identity_pids', []))
++    changes = differ([p for p in old['processes'] if p['pid'] not in unknown],
++                     [p for p in new['processes'] if p['pid'] not in unknown])
++    if old['current']['truncated'] or new['current']['truncated']:
++        # Crossing a storage boundary is not a native process start/exit.
++        changes = [p for p in changes if p['kind'] == 'changed']
++    missing = sum(p['private_delta'] is None for p in changes)
++    identity_gap = any(s['current']['identity_missing'] or s['current']['truncated'] for s in (old, new))
++    known = sum(p['private_delta'] or 0 for p in changes)
++    private = None if missing or identity_gap else known
++    commit = result['commit_used_delta']
++    result.update(process_private_delta=private, process_private_known_delta=known,
++                  private_counter_missing=missing, identity_incomplete=identity_gap,
++                  commit_unreconciled_delta=None if commit is None or private is None else commit-private,
++                  changes=[r for r in changes if r['private_delta'] or r['working_set_delta']][:20])
++    return result
++
++
++def record(c, snapshot, *, now, differ):
++    """Caller owns transaction. Duplicate/future comparisons never overwrite evidence."""
++    previous = c.execute('SELECT ts,payload FROM memory_snapshots ORDER BY ts DESC LIMIT 1').fetchone()
++    if previous and now <= previous[0]:
++        return
++    current = pack(snapshot)
++    interval = dict(comparable=False, reason='baseline', interval_sec=None)
++    if previous:
++        gap = now - previous[0]
++        interval.update(interval_sec=gap, comparable=0 < gap <= 90,
++                        reason='ok' if gap <= 90 else 'sample_gap')
++        if interval['comparable']:
++            interval.update(comparison(json.loads(previous[1]), current, differ))
++            interval.pop('changes')  # detailed endpoints have their own bounded store
++    c.execute('INSERT INTO memory_snapshots VALUES (?,?)', (now, json.dumps(current)))
++    c.execute('INSERT INTO memory_intervals VALUES (?,?)', (now, json.dumps(interval)))
++    c.execute('DELETE FROM memory_snapshots WHERE ts<?', (now-3900,))
++    c.execute('DELETE FROM memory_snapshots WHERE ts NOT IN (SELECT ts FROM memory_snapshots ORDER BY ts DESC LIMIT ?)', (MAX_SNAPSHOTS,))
++    c.execute('DELETE FROM memory_intervals WHERE ts<?', (now-7*86400,))
++    c.execute('DELETE FROM memory_intervals WHERE ts NOT IN (SELECT ts FROM memory_intervals ORDER BY ts DESC LIMIT ?)', (MAX_INTERVALS,))
++
++
++def export(c, *, differ):
++    latest = c.execute('SELECT ts,payload FROM memory_snapshots ORDER BY ts DESC LIMIT 1').fetchone()
++    if not latest:
++        return None
++    now, packed = latest[0], json.loads(latest[1])
++    last_interval = c.execute('SELECT payload FROM memory_intervals WHERE ts=?', (now,)).fetchone()
++    windows = []
++    for seconds in (60, 300, 1800):
++        window = dict(seconds=seconds, comparable=False, reason='baseline_unavailable', to=now)
++        base = c.execute('SELECT ts,payload FROM memory_snapshots WHERE ts<=? ORDER BY ts DESC LIMIT 1', (now-seconds,)).fetchone()
++        if base and now-seconds-base[0] <= 45:
++            intervals = [json.loads(r[0]) for r in c.execute('SELECT payload FROM memory_intervals WHERE ts>? AND ts<=? ORDER BY ts', (base[0], now))]
++            window.update({'from': base[0], 'interval_sec': now-base[0]})
++            if not intervals or any(not i['comparable'] for i in intervals):
++                window['reason'] = 'sample_gap'
++            else:
++                window.update(comparison(json.loads(base[1]), packed, differ))
++                # Missing intermediate counters invalidate complete attribution, even
++                # if endpoints recovered; observed endpoint deltas remain available.
++                incomplete = any(i.get('identity_incomplete') or i.get('private_counter_missing') for i in intervals)
++                if incomplete:
++                    window['process_private_delta'] = None
++                    window['commit_unreconciled_delta'] = None
++                window.update(comparable=True, reason='partial_counters' if incomplete or window['private_counter_missing'] or window['identity_incomplete'] else 'ok')
++        windows.append(window)
++    retained = c.execute('SELECT COUNT(*),MIN(ts) FROM memory_intervals').fetchone()
++    return dict(sampled_at=now, current=packed['current'],
++                interval=json.loads(last_interval[0]) if last_interval else None, windows=windows,
++                retention=dict(interval_count=retained[0], oldest_interval_at=retained[1],
++                               snapshot_count=c.execute('SELECT COUNT(*) FROM memory_snapshots').fetchone()[0]))
+diff --git a/scripts/collect.ps1 b/scripts/collect.ps1
+--- a/scripts/collect.ps1
++++ b/scripts/collect.ps1
+@@ -294,6 +294,13 @@
+ $pagefileUsedGb = if ($pagefiles.Count -gt 0) {
+     [math]::Round((($pagefiles.CurrentUsage | Measure-Object -Sum).Sum) / 1024, 2)
+ } else { $null }
++$memoryPools = @{}
++if ($config.change_tracking_enabled) {
++    try {
++        . (Join-Path $PSScriptRoot 'memory-counters.ps1')
++        $memoryPools = Invoke-SentinelMemoryPools
++    } catch { } # Diagnostics cannot replace or invalidate admission measurements.
++}
+ $memory = [ordered]@{
+     commit_used_gib = $commitUsedGb; commit_limit_gib = $commitLimitGb
+     commit_used_pct = $commitUsedPct; pagefile_used_gib = $pagefileUsedGb
+@@ -858,10 +865,10 @@
+         . (Join-Path $PSScriptRoot 'change-tracker.ps1')
+         $changeDisks = @{}
+         foreach ($d in $disks) { $changeDisks[$d.drive] = $d.free_bytes }
+-        $changeProcesses = @($procs | Where-Object { $_.ProcessId -gt 0 -and $null -ne $_.CreationDate } | ForEach-Object {
++        $changeProcesses = @($procs | Where-Object { $_.ProcessId -gt 0 } | ForEach-Object {
+             $label = $null
+             if ($treeOf.ContainsKey($_.ProcessId)) { $label = $treeOf[$_.ProcessId] }
+-            [ordered]@{ pid = $_.ProcessId; created = ([datetime]$_.CreationDate).ToUniversalTime().ToString('o');
++            [ordered]@{ pid = $_.ProcessId; created = $(if ($null -ne $_.CreationDate) { ([datetime]$_.CreationDate).ToUniversalTime().ToString('o') } else { $null });
+                 name = $_.Name; working_set = [long]$_.WorkingSetSize;
+                 private_bytes = $(if ($null -eq $_.PrivatePageCount) { $null } else { [long]$_.PrivatePageCount });
+                 agent_tree = $label }
+@@ -869,7 +876,12 @@
+         $changeInput = [ordered]@{
+             sampled_at = $nowStr; time = ([DateTimeOffset]$now).ToUnixTimeSeconds(); light = $light;
+             physical_used = ([long]$os.TotalVisibleMemorySize - [long]$os.FreePhysicalMemory) * 1024;
+-            commit_used = $commitBytes; disks = $changeDisks; processes = $changeProcesses
++            commit_used = $commitBytes; commit_limit = $commitLimitBytes;
++            pagefile_allocated = $(if ($pagefiles.Count -gt 0) { [long](($pagefiles.AllocatedBaseSize | Measure-Object -Sum).Sum) * 1MB } else { $null });
++            pool_paged = $memoryPools.pool_paged; pool_nonpaged = $memoryPools.pool_nonpaged;
++            pool_paged_resident = $memoryPools.pool_paged_resident;
++            system_cache_resident = $memoryPools.system_cache_resident;
++            disks = $changeDisks; processes = $changeProcesses
+         }
+         $changeInputPath = Join-Path $dataDir 'change-input.json'
+         $changeInput | ConvertTo-Json -Depth 5 -Compress | Set-Content -LiteralPath "$changeInputPath.tmp" -Encoding utf8
+diff --git a/scripts/memory-counters.ps1 b/scripts/memory-counters.ps1
+new file mode 100644
+--- /dev/null
++++ b/scripts/memory-counters.ps1
+@@ -0,0 +1,42 @@
++# Optional observation only. Failure never changes admission counter semantics.
++function Invoke-SentinelMemoryPools {
++    param([string]$ProbeScript = (Join-Path $PSScriptRoot 'memory-counters.ps1'), [int]$TimeoutMs = 2500)
++    try {
++        . (Join-Path $PSScriptRoot 'bounded-query.ps1')
++        $exe = (Get-Command powershell.exe -ErrorAction Stop).Source
++        $arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + $ProbeScript + '"'
++        return (Invoke-BoundedQuery $exe $arguments $TimeoutMs) | ConvertFrom-Json
++    } catch {
++        return @{ pool_paged=$null; pool_nonpaged=$null; pool_paged_resident=$null; system_cache_resident=$null }
++    }
++}
++
++function Get-SentinelMemoryPools {
++    param([scriptblock]$ReadCounters = { param($paths) Get-Counter -Counter $paths -ErrorAction SilentlyContinue })
++    $paths = [ordered]@{
++        pool_paged = '\Memory\Pool Paged Bytes'
++        pool_nonpaged = '\Memory\Pool Nonpaged Bytes'
++        pool_paged_resident = '\Memory\Pool Paged Resident Bytes'
++        system_cache_resident = '\Memory\System Cache Resident Bytes'
++    }
++    $result = [ordered]@{}
++    foreach ($key in $paths.Keys) { $result[$key] = $null }
++    try {
++        $sample = & $ReadCounters @($paths.Values)
++        foreach ($counter in $sample.CounterSamples) {
++            if ($null -eq $counter.CookedValue -or $counter.Status -ne 0) { continue }
++            $value = [double]$counter.CookedValue
++            if ([double]::IsNaN($value) -or [double]::IsInfinity($value) -or $value -lt 0) { continue }
++            foreach ($key in $paths.Keys) {
++                if ($counter.Path.EndsWith($paths[$key], [StringComparison]::OrdinalIgnoreCase)) {
++                    $result[$key] = [long]$value
++                }
++            }
++        }
++    } catch { } # Unsupported/localized counters remain unknown, never zero.
++    return $result
++}
++
++if ($MyInvocation.InvocationName -ne '.') {
++    Get-SentinelMemoryPools | ConvertTo-Json -Compress
++}
+diff --git a/dashboard/dashboard.html b/dashboard/dashboard.html
+--- a/dashboard/dashboard.html
++++ b/dashboard/dashboard.html
+@@ -129,6 +129,7 @@
+   <h2 id="overview-title">正在讀取電腦狀況</h2>
+   <p id="overview-advice">資料會在採集完成後顯示。</p>
+   <div id="resource-pressure" class="pressure-strip"></div>
++  <details data-panel="pressure-recovery"><summary>燈號為什麼尚未恢復？</summary><div id="pressure-recovery" class="section-note"></div></details>
+ </section>
+ <div class="grid primary" id="primary-tiles"></div>
+ <section aria-labelledby="trend-title">
+@@ -165,9 +166,10 @@
+ </section>
+ <details class="panel" data-panel="investigate">
+   <summary>查看變動細節 <small>程序、檔案與歷史紀錄</small></summary>
++  <section><h2>全機記憶體帳本</h2><p class="section-note">目前占用與期間增長分開看。私人記憶體配置（Private bytes）不等於實體 RAM；工作集可能含共用頁，不可直接相加解釋全機 RAM。</p><div id="memory-ledger" class="table-scroll"></div></section>
+   <section><h2>程序記憶體增減</h2><div class="table-scroll" id="changes"></div></section>
+   <section><h2>目錄與檔案增減</h2><div class="table-scroll" id="file-changes"></div></section>
+-  <section><h2>歷史變動紀錄</h2><div class="table-scroll" id="change-events"></div></section>
++  <section><h2>歷史變動紀錄</h2><div id="event-retention" class="table-scroll"></div><div class="table-scroll" id="change-events"></div></section>
+ </details>
+ <details class="panel" data-panel="usage">
+   <summary>查看完整用量 <small>應用程式與子程序清單</small></summary>
+@@ -302,6 +304,8 @@
+ document.getElementById('overview-advice').textContent = overview[1];
+ document.getElementById('resource-pressure').innerHTML = policy?.mode !== 'resource-v2' ? '' : Object.entries(policy.resources || {}).map(([key,r]) =>
+   `<span class="pressure-${r.rank == null ? 'unknown' : Number(r.rank)}" title="${esc(r.value == null ? '尚無計數' : Number(r.value).toFixed(1) + ' ' + r.unit)}">${esc(resourceNames[key] || key)} · ${esc(r.rank == null ? '未知' : policyLabels[r.rank])}</span>`).join('');
++const rankLabel = rank => rank == null ? '未知' : policyLabels[rank] || '未知';
++document.getElementById('pressure-recovery').innerHTML = `<p>${!statusFresh ? '以下為最後觀測，無法代表目前狀態。' : ''}舊總燈號：${esc(S?.light || '未知')}。舊總燈號與 resource-v2 分項各自判定、各自累計恢復；兩者可能暫時不同。燈號不能代替任務的正式准入計算。</p>` + (policy?.mode === 'resource-v2' ? '<table><tr><th>分項</th><th>維持狀態</th><th>本輪原始狀態</th><th>連續恢復樣本</th></tr>' + Object.entries(policy.resources || {}).map(([key,r]) => `<tr><td>${esc(resourceNames[key] || key)}</td><td>${esc(rankLabel(r.rank))}</td><td>${esc(rankLabel(r.raw_rank))}</td><td>${esc(r.recovery_streak ?? '未知')}</td></tr>`).join('') + '</table><p>恢復樣本數是採集器發布的觀測值；未發布的解除條件與所需時間不在此推算。</p>' : '<p>尚無 resource-v2 的分項恢復資料。</p>');
+ const disk = arr(S?.disks).find(d => d.drive === 'C:') || arr(S?.disks).find(d => !d.is_virtual);
+ const mainTiles = [
+   ['處理器', S?.cpu_pct == null ? '未知' : `${S.cpu_pct}%`, `CPU 即時 · 准入 5 分鐘均 ${S?.cpu_5min_avg ?? '未知'}%`],
+@@ -372,6 +376,42 @@
+ document.getElementById('app-context').textContent = appView === 'current' ? '目前工作集最多的三個 AI 應用程式；工作集可含共用頁。' : `比較 ${when(growth.baseline_at)} → ${when(growth.sampled_at)}（${growth.interval_sec ?? '未知'} 秒）· ${growth.scope || '觀測範圍未確認'}。工作集增長不等於記憶體洩漏。${!obsFresh ? ' 資料延遲。' : ''}`;
+ document.getElementById('app-brief').innerHTML = appView === 'current' ? (topApps.length ? '<ul class="brief-list">' + topApps.map(g => `<li><div><a id="app-current-${esc(encodeURIComponent(g.app))}" href="#agents" data-app-link="usage">${esc(appName(g.app))}</a><small>CPU ${esc(g.total_cpu_pct)}% · 包含它啟動的子程序</small></div><span class="amount">${bytes(g.total_ram_mb == null ? null : g.total_ram_mb * 1048576)}</span></li>`).join('') + '</ul>' : '<p class="empty">尚未偵測到 AI 應用程式用量。</p>') : growthRows.length && obsFresh ? '<ul class="brief-list">'+growthRows.map(g => `<li><div><a id="app-growth-${esc(encodeURIComponent(g.name))}" href="#agents" data-app-link="usage">${esc(appName(g.name))}</a><small>工作集 ${bytes(g.working_set_mb == null ? null : g.working_set_mb * 1048576)} · Private bytes ${g.private_mb == null ? '未知' : bytes(g.private_mb * 1048576)}，增減 ${g.private_delta_mb == null ? '不可比較' : deltaBytes(g.private_delta_mb * 1048576)}</small><small>${esc(g.coverage || g.state || '')}</small></div><span class="amount">${deltaBytes(g.working_set_delta_mb * 1048576)}</span></li>`).join('')+'</ul>' : `<p class="empty">${growth.state === 'building_history' ? '正在建立成長比較歷史。' : !obsFresh ? '成長資料延遲，暫不提供目前排行。' : '尚無可比較的正成長；可能沒有增加，或程序身分／採樣涵蓋不足。'}</p>`;
+ 
++const ledger = C?.memory_ledger;
++const observedFlag = value => value === true ? '是' : value === false ? '否' : '未知';
++const memoryReason = reason => ({baseline_unavailable:'尚無足夠的比較基準',baseline:'首次採樣，正在建立基準',sample_gap:'採樣中斷，無法連續比較',partial_counters:'計數或程序身分涵蓋不完整',ok:'採樣區間連續'}[reason] || reason || '未發布涵蓋說明');
++const identityCoverage = snapshot => `私人計數缺失 ${esc(snapshot.private_counter_missing ?? '未知')}；身分涵蓋不足 ${observedFlag(snapshot.identity_incomplete)}`;
++const retentionKinds = {process_memory:'顯著記憶體變動',process_lifecycle:'程序啟動／退出',file_changes:'檔案變動',disk_space:'磁碟空間變動'};
++document.getElementById('event-retention').innerHTML = arr(C?.event_retention).length ? '<p class="section-note">目前保存的事件依類型分開統計；顯著記憶體事件與頻繁的程序啟停使用不同保存名額。各類仍受保存期限及數量上限約束；下方只列最近發布的事件，不代表完整保存範圍。</p><table><tr><th>事件類型</th><th class="num">現存筆數</th><th>最早現存事件</th></tr>' + arr(C.event_retention).map(r => `<tr><td>${esc(retentionKinds[r.kind] || r.kind || '未知類型')}</td><td class="num">${esc(r.count ?? '未知')}</td><td>${esc(when(r.oldest_at))}</td></tr>`).join('') + '</table>' : '<p class="empty">尚未發布各類事件的保存範圍。</p>';
++const memoryFields = [
++  ['physical_used','實體 RAM 已用'], ['commit_used','Commit 已用'], ['commit_limit','Commit 上限'],
++  ['pagefile_allocated','分頁檔已配置空間'], ['pool_paged','核心 Paged pool（配置）'],
++  ['pool_nonpaged','核心 Nonpaged pool'], ['pool_paged_resident','核心 Paged pool（常駐 RAM）'],
++  ['system_cache_resident','系統快取（常駐 RAM）'], ['process_private_known_total','可觀察程序的私人記憶體合計'],
++];
++const memoryDeltaRows = snapshot => [
++  ['實體 RAM 已用增減', snapshot.physical_used_delta], ['Commit 已用增減', snapshot.commit_used_delta],
++  ['Commit 上限增減', snapshot.commit_limit_delta], ['程序私人記憶體淨增減', snapshot.process_private_delta],
++  ['Commit 未對齊差額', snapshot.commit_unreconciled_delta],
++].map(([label,value]) => `<tr><td>${label}</td><td class="num">${deltaBytes(value)}</td></tr>`).join('');
++const memoryChanges = rows => {
++  const ranked = arr(rows).slice().sort((a,b) => Math.abs(b.private_delta ?? b.working_set_delta ?? 0)-Math.abs(a.private_delta ?? a.working_set_delta ?? 0)).slice(0,10);
++  return ranked.length ? '<table><tr><th>程序精確識別／歸屬</th><th>事件</th><th class="num">私人配置淨增減</th><th class="num">工作集淨增減</th></tr>' + ranked.map(r => `<tr><td>${esc(r.name || '未知程序')} · PID ${esc(r.pid ?? '未知')}<br><span class="stamp">建立時間 ${esc(r.created ?? '未知')}<br>${r.agent_tree ? `程序樹 ${esc(r.agent_tree)} · 可能由多個 session 共用` : '程序樹歸屬未知'} · session 未驗證</span></td><td>${esc(procKind(r.kind) || '未知')}</td><td class="num">${deltaBytes(r.private_delta)}</td><td class="num">${deltaBytes(r.working_set_delta)}</td></tr>`).join('') + '</table>' : '<p class="empty">此期間沒有可顯示的程序淨變動；不代表所有配置都已歸因。</p>';
++};
++if (!ledger) {
++  document.getElementById('memory-ledger').innerHTML = '<p class="empty">尚未發布全機記憶體帳本；原有程序變動仍列在下方。缺少資料不代表用量為零。</p>';
++} else {
++  const current = ledger.current || {}, interval = ledger.interval || {}, retention = ledger.retention || {};
++  const ledgerAge = Date.now()/1000 - ledger.sampled_at;
++  const ledgerFresh = changeFresh && Number.isFinite(ledgerAge) && ledgerAge >= -30 && ledgerAge <= 300;
++  let memoryHtml = `<p class="${ledgerFresh ? 'stamp' : 'warn'}">採樣 ${esc(when(ledger.sampled_at))}${ledgerFresh ? '' : ' · 最後成功資料，不能代表目前用量'}</p><h3>這次採樣的占用</h3><table><tr><th>指標</th><th class="num">觀測量</th></tr>` + memoryFields.map(([key,label]) => `<tr><td>${label}</td><td class="num">${bytes(current[key])}</td></tr>`).join('') + '</table>';
++  memoryHtml += `<p class="stamp">觀測 ${esc(current.process_count ?? '未知')} 個程序；其中 ${esc(current.private_counter_missing ?? '未知')} 個私人計數缺失。身分缺失或重複 ${esc(current.identity_missing ?? '未知')} 筆；清單截斷 ${observedFlag(current.truncated)}。私人計數缺失為零，也不代表程序身分或清單完整。以上指標可能互相包含，不能加總成全機用量。</p><h3>最近一輪的變化</h3>`;
++  memoryHtml += interval.comparable === true ? `<p>比較 ${esc(interval.interval_sec ?? '未知')} 秒；${identityCoverage(interval)}。</p><table><tr><th>指標</th><th class="num">增減</th></tr>${memoryDeltaRows(interval)}<tr><td>分頁檔已配置空間增減</td><td class="num">${deltaBytes(interval.pagefile_allocated_delta)}</td></tr><tr><td>核心 Paged pool 增減</td><td class="num">${deltaBytes(interval.pool_paged_delta)}</td></tr><tr><td>核心 Nonpaged pool 增減</td><td class="num">${deltaBytes(interval.pool_nonpaged_delta)}</td></tr></table>` : `<p class="warn">本輪無法比較：${esc(memoryReason(interval.reason))}；不推算增減。</p>`;
++  memoryHtml += '<p class="section-note">Commit 上限增加是額度變大，並非工作釋放記憶體。未對齊差額 = Commit 已用增減 − 可觀察程序私人配置增減；差額可能含系統配置、缺失計數與採樣差異，尚未確認原因。</p><h3>累積增減</h3>';
++  memoryHtml += arr(ledger.windows).length ? arr(ledger.windows).map(w => `<details data-panel="memory-window-${esc(w.seconds)}"><summary>近 ${esc(Number(w.seconds)/60)} 分鐘 · ${w.comparable === true ? '可比較' : '無法比較'}</summary><p class="stamp">涵蓋 ${esc(when(w.from))} → ${esc(when(w.to))}（${esc(w.interval_sec ?? '未知')} 秒）· ${esc(memoryReason(w.reason))} · ${identityCoverage(w)}</p>${w.comparable === true ? `<table><tr><th>指標</th><th class="num">淨增減</th></tr>${memoryDeltaRows(w)}</table><p class="stamp">按私人配置淨變化的絕對值排序，缺少私人計數時使用工作集；最多列十個精確程序身分。淨值不代表期間峰值。</p>${memoryChanges(w.changes)}` : '<p class="warn">基準或涵蓋不足；不以缺口前後的程序差異推算增減。</p>'}</details>`).join('') : '<p class="empty">尚無累積區間資料。</p>';
++  memoryHtml += `<p class="footnote">現存 ${esc(retention.interval_count ?? '未知')} 個區間、${esc(retention.snapshot_count ?? '未知')} 個快照；最早區間 ${esc(when(retention.oldest_interval_at))}。保存範圍之前的起因無法由本帳本還原。</p>`;
++  document.getElementById('memory-ledger').innerHTML = memoryHtml;
++}
++
+ if (!C) {
+   for (const id of ['changes', 'file-changes', 'change-events']) {
+     document.getElementById(id).textContent = '變動帳本尚未建立，或追蹤已停用。';
+@@ -384,7 +424,7 @@
+     ? `<p>比較 ${esc(p.interval_sec)} 秒：啟動 ${esc(p.started)}、退出 ${esc(p.exited)} 個程序。全機實體 RAM ${deltaBytes(p.physical_used_delta)}；Commit ${deltaBytes(p.commit_delta)}。</p>`
+     : '<p class="empty">正在建立基準，或採集間隔中斷超過 5 分鐘；本輪不推算增減。</p>';
+   if (p.comparable) {
+-    h += `<p class="stamp">私人記憶體合計變化 ${deltaBytes(p.process_private_delta)}；Commit 未對齊差額 ${deltaBytes(p.commit_unreconciled_delta)}（含系統／未取得計數等，不能當成已確認的系統增長）。${esc(p.private_counter_missing || 0)} 個程序未取得私人記憶體計數。工作集可含共用頁，不可直接相加解釋全機 RAM。</p>`;
++    h += `<p class="stamp">私人記憶體合計變化 ${deltaBytes(p.process_private_delta)}；Commit 未對齊差額 ${deltaBytes(p.commit_unreconciled_delta)}（含系統／未取得計數等，不能當成已確認的系統增長）。${identityCoverage(p)}。工作集可含共用頁，不可直接相加解釋全機 RAM。</p>`;
+   }
+   const changes = arr(p.changes);
+   h += !changes.length ? '<p class="empty">本輪沒有可顯示的程序變動。</p>' :
+diff --git a/tests/test_memory_ledger.py b/tests/test_memory_ledger.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_memory_ledger.py
+@@ -0,0 +1,183 @@
++import json
++import tempfile
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++from sentinel.changes import ChangeTracker, MIB, process_changes
++from sentinel import memory_ledger
++
++
++class MemoryLedgerTests(unittest.TestCase):
++    def setUp(self):
++        self.temp = tempfile.TemporaryDirectory()
++        self.addCleanup(self.temp.cleanup)
++        self.tracker = ChangeTracker(Path(self.temp.name))
++
++    def record(self, ts, private=100, created='first', **system):
++        processes = system.pop('processes', [dict(pid=10, created=created, name='app',
++                                                working_set=200, private_bytes=private, agent_tree=None)])
++        snapshot = dict(sampled_at=str(ts), physical_used=1000, commit_used=2000,
++                        commit_limit=4000, processes=processes, disks={})
++        snapshot.update(system)
++        self.tracker.record_processes(snapshot, now=ts)
++        return self.tracker.export(now=ts, scan_state='paused_load', rejected=[])['memory_ledger']
++
++    def test_limit_growth_is_not_usage_release(self):
++        self.record(1000, pagefile_allocated=1000)
++        result = self.record(1030, commit_limit=5000, pagefile_allocated=2000)
++        interval = result['interval']
++        self.assertEqual(interval['commit_used_delta'], 0)
++        self.assertEqual(interval['commit_limit_delta'], 1000)
++        self.assertEqual(interval['pagefile_allocated_delta'], 1000)
++        self.assertEqual(interval['commit_unreconciled_delta'], 0)
++
++    def test_small_growth_accumulates_across_complete_window(self):
++        for ts in range(1000, 1301, 30):
++            result = self.record(ts, private=100+ts-1000, commit_used=2000+2*(ts-1000))
++        window = result['windows'][1]
++        self.assertTrue(window['comparable'])
++        self.assertEqual(window['process_private_delta'], 300)
++        self.assertEqual(window['commit_unreconciled_delta'], 300)
++        self.assertEqual(window['changes'][0]['private_delta'], 300)
++        self.assertEqual(window['changes'][0]['created'], 'first')
++
++    def test_missing_baseline_never_fabricates_thirty_minutes(self):
++        result = self.record(1000)
++        self.assertFalse(result['interval']['comparable'])
++        self.assertTrue(all(not w['comparable'] for w in result['windows']))
++
++    def test_gap_invalidates_window_even_when_endpoints_exist(self):
++        self.record(1000)
++        self.record(1210)
++        self.record(1240)
++        self.record(1270)
++        result = self.record(1300)
++        self.assertTrue(result['windows'][0]['comparable'])
++        self.assertFalse(result['windows'][1]['comparable'])
++        self.assertEqual(result['windows'][1]['reason'], 'sample_gap')
++
++    def test_missing_counter_is_not_zero_or_reconciled(self):
++        self.record(1000)
++        result = self.record(1030, private=None, commit_used=2200)
++        self.assertIsNone(result['interval']['process_private_delta'])
++        self.assertIsNone(result['interval']['commit_unreconciled_delta'])
++        self.assertEqual(result['interval']['private_counter_missing'], 1)
++        self.assertIsNone(result['current']['pool_nonpaged'])
++
++    def test_missing_intermediate_counter_is_disclosed_after_recovery(self):
++        self.record(1000)
++        self.record(1030, private=None)
++        window = self.record(1060, private=200)['windows'][0]
++        self.assertTrue(window['comparable'])
++        self.assertEqual(window['reason'], 'partial_counters')
++        self.assertIsNone(window['commit_unreconciled_delta'])
++
++    def test_unknown_identity_prevents_complete_private_sum(self):
++        self.record(1000)
++        result = self.record(1030, created=None)
++        self.assertTrue(result['interval']['identity_incomplete'])
++        self.assertIsNone(result['interval']['process_private_delta'])
++        with self.tracker.db() as c:
++            legacy = json.loads(c.execute("SELECT value FROM meta WHERE key='process_summary'").fetchone()[0])
++        self.assertEqual(legacy['exited'], 0)
++        self.assertEqual(legacy['changes'], [])
++        self.assertIsNone(legacy['commit_unreconciled_delta'])
++
++    def test_missing_private_counter_is_unknown_in_both_datasets(self):
++        self.record(1000)
++        self.record(1030, private=None)
++        with self.tracker.db() as c:
++            legacy = json.loads(c.execute("SELECT value FROM meta WHERE key='process_summary'").fetchone()[0])
++        self.assertIsNone(legacy['process_private_delta'])
++        self.assertIsNone(legacy['commit_unreconciled_delta'])
++
++    def test_duplicate_pid_is_partial_and_independent_of_row_order(self):
++        self.record(1000)
++        for first, second in ((100, 200), (200, 100), (100, 100)):
++            with self.subTest(first=first, second=second):
++                rows = [dict(pid=10, created='a', name='app', working_set=100, private_bytes=p) for p in (first, second)]
++                packed = memory_ledger.pack(dict(processes=rows))
++                self.assertEqual(packed['current']['identity_missing'], 2)
++                self.assertEqual(packed['current']['process_private_known_total'], 0)
++                result = memory_ledger.comparison(memory_ledger.pack(dict(processes=[rows[0]])), packed,
++                                                 process_changes)
++                self.assertEqual(result['changes'], [])
++                self.assertIsNone(result['process_private_delta'])
++
++    def test_pid_reuse_keeps_two_creation_identities(self):
++        self.record(1000, private=1000)
++        self.record(1030, private=50, created='second')
++        result = self.record(1060, private=60, created='second')
++        window = result['windows'][0]
++        self.assertEqual(window['process_private_delta'], -940)
++        self.assertEqual({r['kind'] for r in window['changes']}, {'started', 'exited'})
++        self.assertEqual({r['created'] for r in window['changes']}, {'first', 'second'})
++
++    def test_duplicate_and_out_of_order_do_not_replace_history(self):
++        self.record(1000, private=100)
++        self.record(1030, private=200)
++        self.record(1030, private=999)
++        result = self.record(1020, private=888)
++        self.assertEqual(result['sampled_at'], 1030)
++        self.assertEqual(result['current']['process_private_known_total'], 200)
++        self.assertEqual(result['retention']['interval_count'], 2)
++
++    def test_lifecycle_churn_cannot_evict_memory_incidents(self):
++        with self.tracker.db() as c:
++            self.tracker.event(c, 1000, 'process_memory', {'processes': []})
++            for n in range(2200):
++                self.tracker.event(c, 1001+n, 'process_lifecycle', {})
++        self.tracker.export(now=4000, scan_state='paused_load', rejected=[])
++        with self.tracker.db() as c:
++            counts = dict(c.execute('SELECT kind,COUNT(*) FROM events GROUP BY kind'))
++        self.assertEqual(counts['process_memory'], 1)
++        self.assertEqual(counts['process_lifecycle'], 256)
++
++    def test_routine_probe_churn_stays_out_of_memory_incident_bucket(self):
++        self.record(1000, processes=[])
++        self.record(1030, private=140*MIB)
++        with self.tracker.db() as c:
++            self.assertEqual(c.execute("SELECT COUNT(*) FROM events WHERE kind='process_memory'").fetchone()[0], 0)
++        self.record(1060, private=300*MIB)
++        with self.tracker.db() as c:
++            self.assertEqual(c.execute("SELECT COUNT(*) FROM events WHERE kind='process_memory'").fetchone()[0], 1)
++
++    def test_all_tables_remain_bounded_and_age_pruned(self):
++        with patch.object(memory_ledger, 'MAX_SNAPSHOTS', 3), patch.object(memory_ledger, 'MAX_INTERVALS', 5):
++            for ts in range(1000, 1301, 30):
++                result = self.record(ts)
++            self.assertEqual(result['retention']['snapshot_count'], 3)
++            self.assertEqual(result['retention']['interval_count'], 5)
++        result = self.record(1_000_000)
++        self.assertEqual(result['retention']['snapshot_count'], 1)
++        self.assertEqual(result['retention']['interval_count'], 1)
++
++    def test_process_limit_marks_partial_not_false_total(self):
++        with patch.object(memory_ledger, 'MAX_PROCESSES', 1):
++            self.record(1000)
++            result = self.record(1030, processes=[dict(pid=i, created='a', name='app',
++                                 working_set=100, private_bytes=200) for i in (10, 20)])
++        self.assertTrue(result['current']['truncated'])
++        self.assertIsNone(result['interval']['process_private_delta'])
++
++    def test_storage_boundary_does_not_fabricate_lifecycle(self):
++        rows = [dict(pid=i, created='a', name='app', working_set=100, private_bytes=200) for i in (10, 20)]
++        with patch.object(memory_ledger, 'MAX_PROCESSES', 1):
++            old = memory_ledger.pack(dict(processes=rows))
++            new = memory_ledger.pack(dict(processes=rows[::-1]))
++        result = memory_ledger.comparison(old, new, process_changes)
++        self.assertEqual(result['changes'], [])
++        self.assertIsNone(result['process_private_delta'])
++
++    def test_snapshot_storage_does_not_persist_commands_or_secrets(self):
++        self.record(1000, processes=[dict(pid=10, created='a', name='app', working_set=1,
++                                        private_bytes=1, commandline='SECRET', env='SECRET')])
++        with self.tracker.db() as c:
++            stored = c.execute('SELECT payload FROM memory_snapshots').fetchone()[0]
++        self.assertNotIn('SECRET', stored)
++        json.loads(stored)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tests/test_memory_counters.ps1 b/tests/test_memory_counters.ps1
+new file mode 100644
+--- /dev/null
++++ b/tests/test_memory_counters.ps1
+@@ -0,0 +1,51 @@
++$ErrorActionPreference = 'Stop'
++. (Join-Path (Split-Path $PSScriptRoot -Parent) 'scripts/memory-counters.ps1')
++function Assert($value, $message) { if (-not $value) { throw $message } }
++$result = Get-SentinelMemoryPools -ReadCounters {
++    param($paths)
++    Assert ($paths.Count -eq 4) 'A single batch must request all four optional counters'
++    @{ CounterSamples = @(
++        @{ Path='\\HOST\memory\pool paged bytes'; Status=0; CookedValue=123 },
++        @{ Path='\\HOST\memory\pool nonpaged bytes'; Status=1; CookedValue=999 },
++        @{ Path='\\HOST\memory\pool paged resident bytes'; Status=0; CookedValue=[double]::NaN },
++        @{ Path='\\HOST\memory\system cache resident bytes'; Status=0; CookedValue=0 }
++    ) }
++}
++Assert ($result.pool_paged -eq 123) 'Case insensitive counter suffix must match'
++Assert ($null -eq $result.pool_nonpaged) 'Invalid counter status must remain unknown'
++Assert ($null -eq $result.pool_paged_resident) 'NaN must remain unknown'
++Assert ($result.system_cache_resident -eq 0) 'Measured zero must remain zero'
++$missing = Get-SentinelMemoryPools -ReadCounters { throw 'unsupported' }
++Assert (@($missing.Values | Where-Object { $null -ne $_ }).Count -eq 0) 'Failure must not fabricate measurements'
++Write-Output 'Memory counters: valid, zero, missing, unsupported, nonfinite and failed-status cases passed.'
++
++$testRoot = Join-Path ([IO.Path]::GetTempPath()) ('sentinel-pools-test-' + [guid]::NewGuid().ToString('N'))
++$null = New-Item -ItemType Directory -Path $testRoot
++try {
++    $probe = Join-Path $testRoot 'hung.ps1'
++    @'
++$PID | Set-Content -LiteralPath (Join-Path $PSScriptRoot 'pid.txt')
++Start-Sleep -Seconds 30
++'@ | Set-Content -LiteralPath $probe -Encoding UTF8
++    $watch = [Diagnostics.Stopwatch]::StartNew()
++    $unknown = Invoke-SentinelMemoryPools -ProbeScript $probe -TimeoutMs 1000
++    $watch.Stop()
++    # This marker stands for the caller's next publication step after return.
++    'continued' | Set-Content -LiteralPath (Join-Path $testRoot 'publication.txt')
++    Assert ($watch.Elapsed.TotalSeconds -lt 5) 'Hung optional provider must not stall caller'
++    Assert ($null -eq $unknown.pool_paged) 'Timeout must return unknown, not old or zero data'
++    Assert (Test-Path -LiteralPath (Join-Path $testRoot 'publication.txt')) 'Caller must continue after timeout'
++    $probeId = [int](Get-Content -LiteralPath (Join-Path $testRoot 'pid.txt'))
++    $exited = $false
++    for ($n=0; $n -lt 10; $n++) {
++        if (-not (Get-Process -Id $probeId -ErrorAction SilentlyContinue)) { $exited=$true; break }
++        Start-Sleep -Milliseconds 50
++    }
++    Assert $exited 'Only the test probe must terminate after its deadline'
++    Write-Output 'Memory counter timeout: bounded return, unknown fields, continuation and test-probe cleanup passed.'
++} finally {
++    $resolved = [IO.Path]::GetFullPath($testRoot)
++    $parent = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\') + '\'
++    if (-not $resolved.StartsWith($parent, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe test cleanup path' }
++    Remove-Item -LiteralPath $resolved -Recurse -Force
++}
+diff --git a/tests/test_change_dashboard.cjs b/tests/test_change_dashboard.cjs
+--- a/tests/test_change_dashboard.cjs
++++ b/tests/test_change_dashboard.cjs
+@@ -109,6 +109,73 @@
+ assert.equal(pressurePage.elements.light.textContent,'受限');
+ assert.match(pressurePage.elements['overview-title'].textContent,/記憶體配置/);
+ assert.match(pressurePage.elements['resource-pressure'].innerHTML,/CPU · 正常/);
++assert.match(pressurePage.elements['pressure-recovery'].innerHTML,/舊總燈號：RED/);
++assert.match(pressurePage.elements['pressure-recovery'].innerHTML,/各自累計恢復/);
++assert.match(pressurePage.elements['pressure-recovery'].innerHTML,/<td>未知<\/td>/,'Missing recovery counters remain unknown');
++const recovering = render(data, {...status, resource_policy:{mode:'resource-v2',resources:{commit:{rank:3,raw_rank:1,recovery_streak:2}}}});
++assert.match(recovering.elements['pressure-recovery'].innerHTML,/<td>受限<\/td><td>注意<\/td><td>2<\/td>/,'Maintained vs raw rank and actual recovery samples are separate');
++assert.match(render(data).elements['memory-ledger'].innerHTML,/尚未發布全機記憶體帳本/,'Older data publications remain renderable');
++assert.match(render(null).elements['memory-ledger'].innerHTML,/不代表用量為零/);
++const GiB = 1073741824;
++const memoryLedger = {
++  sampled_at:now,
++  current:{physical_used:45*GiB,commit_used:69*GiB,commit_limit:81*GiB,pagefile_allocated:null,pool_paged:7*GiB,pool_nonpaged:3*GiB,process_private_known_total:52*GiB,private_counter_missing:2,process_count:250},
++  interval:{comparable:true,interval_sec:30,physical_used_delta:GiB,commit_used_delta:0,commit_limit_delta:7*GiB,pagefile_allocated_delta:null,process_private_delta:null,commit_unreconciled_delta:null,private_counter_missing:2},
++  windows:[
++    {seconds:60,comparable:true,reason:'covered',from:now-60,to:now,interval_sec:60,commit_used_delta:GiB,commit_limit_delta:7*GiB,process_private_delta:2*GiB,commit_unreconciled_delta:-GiB,private_counter_missing:2,changes:[{pid:42,created:'2026-09-22T01:02:03.123Z',name:unsafe,agent_tree:unsafe,kind:'changed',private_delta:2*GiB,working_set_delta:null}]},
++    {seconds:300,comparable:false,reason:unsafe,from:now-180,to:now,interval_sec:180,commit_used_delta:99*GiB,changes:[{name:'must-not-render-in-gap',private_delta:99*GiB}]},
++    {seconds:1800,comparable:false,reason:'insufficient_history'}
++  ],
++  retention:{interval_count:3,snapshot_count:4,oldest_interval_at:now-90}
++};
++const ledgerHtml = render({...data,memory_ledger:memoryLedger}).elements['memory-ledger'].innerHTML;
++assert.match(ledgerHtml,/<td>Commit 已用增減<\/td><td class="num">0 MiB<\/td>/,'Stable usage must not become a release when the limit grows');
++assert.match(ledgerHtml,/<td>Commit 上限增減<\/td><td class="num">\+7 GiB<\/td>/);
++assert.match(ledgerHtml,/額度變大，並非工作釋放記憶體/);
++assert.match(ledgerHtml,/<td>分頁檔已配置空間<\/td><td class="num">未知<\/td>/);
++assert.match(ledgerHtml,/<td>系統快取（常駐 RAM）<\/td><td class="num">未知<\/td>/);
++assert.match(ledgerHtml,/<td>Commit 未對齊差額<\/td><td class="num">未知<\/td>/,'Unknown reconciliation must not become zero');
++assert.match(ledgerHtml,/PID 42/);
++assert.match(ledgerHtml,/建立時間 2026-09-22T01:02:03.123Z/,'PID identity includes the exact creation value');
++assert.match(ledgerHtml,/可能由多個 session 共用/);
++assert.match(ledgerHtml,/session 未驗證/,'An agent tree is not a verified session name');
++assert.match(ledgerHtml,/近 5 分鐘 · 無法比較/);
++assert.match(ledgerHtml,/近 30 分鐘 · 無法比較/);
++assert.match(ledgerHtml,/180 秒/,'Actual shorter coverage is visible');
++assert.ok(!ledgerHtml.includes('must-not-render-in-gap'),'Incomparable window must not render process growth');
++assert.ok(!ledgerHtml.includes('99 GiB'),'Incomparable window must not render speculative totals');
++assert.ok(!ledgerHtml.includes('<img'));
++assert.ok(ledgerHtml.includes('&lt;img'));
++assert.ok(!ledgerHtml.includes('onerror="'));
++assert.match(render({...data,memory_ledger:{sampled_at:now,current:{},interval:{comparable:false},windows:[]}}).elements['memory-ledger'].innerHTML,/私人計數缺失/);
++assert.match(render({...data,memory_ledger:{...memoryLedger,sampled_at:now-600}}).elements['memory-ledger'].innerHTML,/最後成功資料/,'Ledger freshness is checked independently');
++const incompleteLedger = render({...data,memory_ledger:{...memoryLedger,
++  current:{...memoryLedger.current,private_counter_missing:0,identity_missing:3,truncated:true},
++  interval:{...memoryLedger.interval,private_counter_missing:0,identity_incomplete:true},
++  windows:[{...memoryLedger.windows[0],reason:'partial_counters',identity_incomplete:true,private_counter_missing:0}]
++}}).elements['memory-ledger'].innerHTML;
++assert.match(incompleteLedger,/身分缺失或重複 3 筆；清單截斷 是/);
++assert.match(incompleteLedger,/私人計數缺失 0；身分涵蓋不足 是/,'Zero private-counter gaps must not conceal identity gaps');
++assert.match(incompleteLedger,/計數或程序身分涵蓋不完整/);
++assert.match(incompleteLedger,/不代表程序身分或清單完整/);
++for (const [reason,label] of [['baseline_unavailable','尚無足夠的比較基準'],['sample_gap','採樣中斷，無法連續比較'],['ok','採樣區間連續']]) {
++  assert.ok(render({...data,memory_ledger:{...memoryLedger,windows:[{seconds:60,comparable:false,reason}]}}).elements['memory-ledger'].innerHTML.includes(label));
++}
++assert.match(render(data).elements['event-retention'].innerHTML,/尚未發布/);
++const retainedEvents = render({...data,event_retention:[
++  {kind:'process_memory',count:100,oldest_at:now-86400},
++  {kind:'process_lifecycle',count:256,oldest_at:now-3600},
++  {kind:unsafe,count:null,oldest_at:null}
++]}).elements['event-retention'].innerHTML;
++assert.match(retainedEvents,/<td>顯著記憶體變動<\/td><td class="num">100<\/td>/);
++assert.match(retainedEvents,/<td>程序啟動／退出<\/td><td class="num">256<\/td>/);
++assert.match(retainedEvents,/不同保存名額/);
++assert.match(retainedEvents,/最早現存事件/);
++assert.ok(retainedEvents.includes(new Date((now-86400)*1000).toLocaleString('zh-TW',{hour12:false})));
++assert.ok(!retainedEvents.includes('<img'));
++assert.ok(retainedEvents.includes('&lt;img'));
++assert.match(retainedEvents,/<td class="num">未知<\/td>/);
++assert.match(html,/Private bytes）不等於實體 RAM/);
+ assert.ok(!html.match(/<details class="panel"[^>]*\bopen\b/), 'Technical panels must start collapsed');
+ assert.match(html, /name="viewport"/);
+ assert.ok(html.indexOf('id="chart-cpu"') < html.indexOf('<details class="panel"'), 'Charts must be visible before investigation panels');
+diff --git a/docs/resource-changes.md b/docs/resource-changes.md
+--- a/docs/resource-changes.md
++++ b/docs/resource-changes.md
+@@ -67,10 +67,44 @@
+ 主採集器繼續發布狀態。300 毫秒是檔案列舉預算，彙總、SQLite 交易和啟動成本另計。
+ 
+ `changes.sqlite3` 保存前一次程序快照、各目錄最近完成與進行中的盤點，以及最多
+-7 天／2000 筆事件。`changes.json` 匯出前 40 筆事件、前 20 筆程序變動、各目錄
++7 天內的事件；數量另分為程序啟停 256 筆、記憶體事件 2000 筆、其他事件合計 2000 筆。
++程序啟停不再消耗記憶體事件名額；啟停的記憶體事件至少需 512 MiB，既有程序的
++變化仍依 `change_memory_mb` 判斷。這些都是上限，不保證保存完整七天。
++`changes.json` 匯出前 40 筆事件、前 20 筆程序變動、各目錄
+ 前 20 筆達門檻的檔案變化；原子替換避免半份 JSON。`change-input.json` 是本輪輸入。
+ 這些檔案都位於 `%USERPROFILE%\.resource-sentinel`。移除監看目錄會刪除該目錄盤點，
+ 其舊事件仍依保留期限清理。SQLite 會重用空頁，不保證檔案立即縮小。
++
++## 記憶體區間帳本（待獨立啟用）
++
++`memory_intervals` 獨立保存每輪實體 RAM、Commit 已用／上限、分頁檔配置空間、
++核心 paged/nonpaged pool 的增減，以及程序私人配置增減與未對齊差額。
++保存最多七天／20,160 輪，與程序啟停事件的名額分離。Windows 的額外核心計數器
++由無視窗探測子程序取得，主程序最多等待 2.5 秒（另有最多 0.5 秒輸出讀取邊界）；
++逾時僅終止自己的探測程序，欄位維持未知，不影響原有准入計數及規則。
++探測不啟動使用者工作、不追蹤配置呼叫、不執行清理或限制。
++
++`memory_snapshots` 保存最多 65 分鐘／180 輪端點快照，每輪最多 4096 個程序。
++每個程序只保存名稱、PID、建立時間、樹標籤及記憶體計数，不保存命令列／env。
++儀表板以實際端點比較近 1／5／30 分鐘淨增減，涵蓋期間與未歸因值一起顯示。
++基準允許比指定期間多最多 45 秒；任一採樣間隔超過 90 秒即不推算跨缺口差異。
++保存名額不足或尚未累積足夠時間時不補造窗口。
++
++每輪低於事件門檻的小幅增長仍能反映在端點淨增減中，但期間內啟動又退出的
++程序、期間尖峰、兩輪之間的短暫配置無法由端點還原。窗口最多列 20 個大幅變動，
++儀表板再列其中前 10 個；全體私人配置淨值在截斷顯示前計算。
++精確身分未知、重複 PID、私人計數缺失或程序數截斷時，不宣稱完整歸因；
++未取得的私人配置增減及未對齊差額顯示未知。程序 PID 還存在但建立時間讀不到時，
++不把它當作退出並釋放記憶體。缺失身分的已知 PID 會抑制該 PID 的生命週期推算。
++
++Commit 上限增大與 Commit 已用減少分開呈現。核心池與快取計數可能和其他項目
++互相包含，不能任意相加成全機 RAM；各計數也不是同一瞬間的原子快照。
++程序樹名稱不等於已驗證的 session 名稱，共享 UI 的配置不分攤給個別 session。
++總覽另外列出 legacy 總燈號與 v2 分項的原始／維持狀態及已發布的恢復樣本數。
++
++測試新增 `python -m unittest discover -s tests -p test_memory_ledger.py -v` 及
++`powershell -NoProfile -ExecutionPolicy Bypass -File tests/test_memory_counters.ps1`；
++同樣須透過正常 Sentinel wrapper 准入，測試資料使用暫存目錄。
+ 
+ 驗證命令（請依全機規範透過 `invoke-sentinel.ps1` 執行）：
+ 

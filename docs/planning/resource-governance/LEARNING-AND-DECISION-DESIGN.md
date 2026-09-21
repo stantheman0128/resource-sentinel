@@ -1,6 +1,7 @@
 # 歷史學習、可靠續跑與 Jev：後續設計提案
 
 日期：2026-09-20（Asia/Taipei）  
+整合補充：2026-09-21（Asia/Taipei）；見 [§10：P3–P6 與 R0–R6 接入契約](#10-p3p6-與-r0r6-接入契約2026-09-21-補充)。  
 由 GPT-6 Astra Pro 協助整理。  
 **狀態：未實作的增量設計，不授權啟用 CPU cap、付費 API、資料外送或雲端 execution。**
 
@@ -172,12 +173,14 @@ Jev adapter 只回傳 advisory record：`question_schema_version`、`model_id`�
 
 ## 8. 實驗、發布與回退
 
+預測比較組統一使用 `PRED-B0`–`PRED-B3`。原 adaptive plan 的 `S1`–`S3` 仍專指 Windows capability gates；本表不再重用那些編號。
+
 | 對照版本 | 預測／决策內容 | 目的 |
 |---|---|---|
-| S0 | 既有 bootstrap 類別 | 最低成本基線 |
-| S1 | 相似工作統計＋誤差校準 | 確認歷史是否真的有用 |
-| S2 | S1 可 fallback 的 tabular ML | 確認額外特徵／模型帶來增量 |
-| S3 | 相同 S2 加 Jev 語意特徵或受限軟排序 | 單獨量出 Jev 的增量，不把前面所有收益算給它 |
+| PRED-B0 | 既有 bootstrap 類別 | 最低成本基線 |
+| PRED-B1 | 相似工作統計＋誤差校準 | 確認歷史是否真的有用 |
+| PRED-B2 | PRED-B1 可 fallback 的 tabular ML | 確認額外特徵／模型帶來增量 |
+| PRED-B3 | 相同 PRED-B2 加 Jev 語意特徵或受限軟排序 | 單獨量出 Jev 的增量，不把前面所有收益算給它 |
 
 先離線／shadow，記錄每次 forecast、原模型／資料 cutoff 與實際 outcome。時間順序評估低估頻率、低估尾部幅度、分位數 empirical coverage、保留過量、未知工作比例；避免只報平均誤差。真實 rollout 再量 queue wait、makespan、foreground latency、人工介入與失敗。模型較準但 scheduling 更差，仍不算成功。
 
@@ -200,3 +203,64 @@ Jev 額外測 end-to-end p50/p95/p99、cache hit/miss、cold request、輸入長
 - J3：[Vercel：classify, route, score with Jev and AI SDK](https://vercel.com/kb/guide/typesafe-jev-and-ai-sdk)，型別化決策與程式分支，型別正確不等於語意正確。
 - J4：[TypeSafe：Autoresearch feature discovery](https://docs.typesafe.ai/cookbooks/autoresearch_feature_discovery)，文字→語意特徵→CatBoost 範例；不是資源預測 benchmark。
 - [TypeSafe Python SDK](https://docs.typesafe.ai/sdk/python) 與 [confidence](https://docs.typesafe.ai/confidence) 為未來實驗查核入口；此文件不 pin 尚未在 Sentinel 驗證的套件版本。
+
+## 10. P3–P6 與 R0–R6 接入契約（2026-09-21 補充）
+
+本節把後續相容性核對正式入庫。結論：**不推倒原 P3–P6；R0–R6 是另外的增量，不能當成完成 P3–P6 時順手全部實作的清單。**本節只澄清範圍、接點與驗收，沒有修改原計畫的安全政策，也不代表相關功能已實作或啟用。
+
+### 10.1 歷史快照與最新進度分開
+
+研究入口的 `6efa302` 進度描述是 2026-09-20 固定快照，不是持續更新的 live status。本次補充先核對實作分支 `b64ce6e75102868cf306b5323dac7de9dc64748a`，它比研究 commit `55f5002` 多 20 個提交，包含 P3/P4 元件與 A/B 工具／文件的新工作；不得沿用舊快照斷言目前仍然只有未接線的純決策函式。
+
+這也不表示新階段已通過：本次讀到的 [ACCEPTANCE-RESULTS.md](../adaptive-scheduler/ACCEPTANCE-RESULTS.md) 明示 A/B 為 `NOT_MEASURED`，尚無 measured run records。元件、harness、模板與效果驗收要分開判斷；本輪沒有重新執行其測試或對最新 runtime 做完整審查。
+
+後續實作者先讀 [adaptive-scheduler README](../adaptive-scheduler/README.md)、[IMPLEMENTATION-PLAN](../adaptive-scheduler/IMPLEMENTATION-PLAN.md)、最新 evidence 與 [AB-THRESHOLD-CLARIFICATION](../adaptive-scheduler/AB-THRESHOLD-CLARIFICATION.md)，再對齊實際 HEAD 與未提交修改。不能 checkout 舊研究基準覆蓋後來實作。原計畫約束與本節衝突時，先停下受影響的啟用／政策變更，留下明確決策，不自行放寬。
+
+### 10.2 範圍與唯一權威
+
+| 新增項目 | 與原計畫的接點 | 接入要求 |
+|---|---|---|
+| R0 歷史／預測記錄 | P2 execution/accounting 與 P4 telemetry | 重用身分、單位、coverage 與採樣；不得新增第二套容量帳本或高頻全機掃描；新增寫入與監測成本納入 overhead |
+| R1 等待／續跑 | 既有 orchestrator、Coordinator、runner 及 P3 lifecycle | 不另造可繞過准入的 launcher；單一 execution owner；長等待、重啟、通知與取消均不得導致重複執行 |
+| R2/R3 預測 | 工作需求建立之前的 advisory 階段 | 初始 estimate 可改善新需求；既有 request／allocation 與 active floor 不由 predictor 任意改寫 |
+| R4 前景／公平 | queue policy 與受管 CPU 控制 | 另外驗證，不自行擴大受控範圍、同時 cap 數或修改有效豁免；不能把模型分數當公平性保證 |
+| R5 Jev | 非必要、低頻率的語意特徵／軟建議 | 不取代 P4 fast-loop policy，不接 reservation、PID、lease、restore authority；停用／失聯不妨礙核心恢復 |
+| R6 遠端 worker | 後續獨立 adapter | 不混入原本機 CPU MVP；另驗證 submit/status/cancel/result、資料授權與結果未知時的 reconciliation |
+
+原計畫 §10.2 禁止順手重寫 orchestrator、workspace、cloud adapters、公平系統及 GPU 治理。R1 等增量可能需要明確的小範圍修改，但應先列出檔案、契約、測試與回退，另作增量交付，不把「研究裡寫過」視為不受限的實作／部署授權。
+
+### 10.3 啟動 barrier 不因有新排程器而失效
+
+原計畫 §7.4 的保守 MVP 是：有 active CPU cap 時，阻擋新的非豁免 launch，已 RESERVED 但未啟動的工作亦須遵守；解除限制後要等指定的新鮮量測與計帳證據，不能只改顯示狀態就開放。
+
+因此 R1 不得收到喚醒事件便跳過 barrier；R2/R3 也不能因预测較小或實測 CPU 因 cap 降低，就放入更多工作。通知只是一個重新檢查機會，不是容量授權；啟動前仍走同一權威路徑。
+
+這個 MVP 尚不是「降速 A，同時自由把 B 放進來」。要支援邊限速邊准入，必須另立明確政策變更，驗證需求計帳、前景效果、競爭與恢復；不能把它包裝成 P4 微調。
+
+本次基準的 A/B 驗收文件另外記錄：當被控 Job 已結束，如何取得解除 `RECOVERY_HOLD` 所需的證據仍有待政策釐清。這是一個文件所列的阻塞項，不是本輪已修正的功能。後續 R1 不可用排隊很久、通知已送達、TTL 到期或模型判斷代替所需證據；先對齊最新原生控制文件，明文解決其證據契約。
+
+### 10.4 預測可以修正未來，不能偷改當前承諾
+
+原計畫 §7 保留不可變的 `requested` 與執行中的 `demand_floor`。新工作的預測應在其需求建立／准入前生成，保留原始預測、顯式需求、政策版本與最終核准值；使用者明確需求不由模型悄悄覆寫。
+
+工作進入既有生命週期後，新的 forecast revision 仍只是觀測／建議。不能因目前用量低、模型更新或 CPU cap 生效而下調 active floor 或重寫已綁定 allocation。實際低估的保守更新仍由既有帳本契約處理；事後學到較小需求可以用在後續 execution。未啟動請求要調整時，也須定義明確的更新／取消重建與去重流程，不直接修改雜湊或 binding。
+
+不得以 `measured + 全額預測` 建立重複計帳，也不得把縮小預測視為真實釋放 RAM。模型估計不取代新鮮 telemetry、身份與 native evidence。
+
+### 10.5 續跑與安全前提
+
+R1 可以先做離線設計、持久化 metadata、結果交付測試，或經核可、使用既有 admission-only 路徑的小範圍 adapter；**不需要先啟用 CPU cap，不等於可以跳過必要的 execution identity、一次性 claim、permission 與故障核對。**
+
+命令已完成但通知失敗：重送保存好的結果；命令是否已啟動不明：先 reconcile，不盲目重跑；主程序退出但子程序仍活著：按原生命周期保留資源；provider deferred tool 與 Sentinel runner 不得各執行一次。收到舊 resume 事件，也要核對 session 世代、取消與使用者後續操作。
+
+新的 continuation service 不是第二個 native actuator，不取得自己的一套 cap／restore 權限。有效豁免繼續遵守原約定並計帳；遊戲模式、ML 或 Jev 均不得默默撤銷。無法同時滿足前景需求與背景進度時要揭露等待原因，不自動犧牲真實工作來兌現承諾。
+
+### 10.6 驗收、命名與回退
+
+保留原 P6 的 A0/A1/B，用相同基準隔離 observer 與 CPU 控制效果。預測比較另用本文件 §8 的 `PRED-B0`–`PRED-B3`；原 Windows `S1`–`S3` gate 與 P phase 不重編。舊研究文件的預測 S0–S3 標籤由這組 PRED 名稱取代，不能引用「S1 通過」混指統計預測。
+
+增加 recorder、trainer、continuation runtime、queue policy 或 Jev 後，需重新量測整體 overhead 與受影響的體驗／安全結果；不能繼承先前 P6 分數，亦不能在一次測試同時改多種政策卻把收益歸給單一元件。不得在原 gates 下重命名新功能、重用舊測試結果，宣稱自動完成。
+
+建议順序：保留 P3–P6 的 native 驗證路徑；可並行 R0 觀測契約、離線統計與 R1 小範圍設計；先 shadow 驗證預測，再逐項允許其影響新准入；公平／前景、Jev 與遠端另作增量。不因研究文件入庫而啟用全部項目。
+
+每個增量交付前列出：讀取基準與 dirty files、要改哪些契約、依賴哪些已實測 gates、未覆蓋入口、新增 overhead、與舊模式並存方式、取消／lost ACK、回退後 live allocations 和待交付結果的處理。原 native rollback 仍需 Query-confirmed restore；關閉 predictor 不回滾資料庫，不抹去既有授權與執行狀態。

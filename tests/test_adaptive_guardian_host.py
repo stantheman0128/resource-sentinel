@@ -11,6 +11,7 @@ interpreter.
 """
 import json
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -19,17 +20,45 @@ import unittest
 from unittest.mock import patch
 
 from sentinel.adaptive import guardian_host as module
+from sentinel.adaptive.contracts import IdentityStatus, ProcessIdentity
 from sentinel.adaptive.guardian_host import (
     EXIT_OK, EXIT_REFUSED, GuardianHost, GuardianHostRefused,
 )
 from sentinel.adaptive.host_authority import HostCapabilityUnsupported
+from sentinel.adaptive.identity import IdentityUnavailable, VerifiedProcess
 from sentinel.adaptive.ipc import IpcError
 from sentinel.adaptive.pipe_windows import NativePipeError
+from sentinel.adaptive.store import LifecycleStore
+from tests.fixtures.adaptive_evidence import FixturePolicyProvider
 from tests.test_adaptive_host_authority import SYNTHETIC, live_capability_refusal
 
 
 EPOCH = "guardian-fixture-epoch"
 REPO_ROOT = Path(module.__file__).resolve().parents[2]
+LOGON = "S-1-5-5-1-2"
+GUARDIAN = ProcessIdentity(6001, 134343072000000005, LOGON)
+
+
+class ProcessBackend:
+    """A real VerifiedProcess retains these explicit synthetic handle entries."""
+
+    def __init__(self):
+        self.entries, self.next_handle = {}, 9000
+
+    def process(self, identity):
+        handle = self.next_handle
+        self.next_handle += 1
+        self.entries[handle] = SimpleNamespace(state=IdentityStatus.ALIVE, closed=False)
+        return VerifiedProcess(self, handle, identity)
+
+    def wait(self, handle):
+        entry = self.entries[handle]
+        if entry.closed:
+            raise IdentityUnavailable("fixture_closed_handle")
+        return entry.state
+
+    def close(self, handle):
+        self.entries[handle].closed = True
 
 
 class Service:
@@ -336,6 +365,79 @@ class GuardianHostTests(unittest.TestCase):
         record = host.serve_until_stopped()
         self.assertEqual(record["reason"], "interrupted")
         self.assertEqual(record["iterations"], 2)
+
+
+class GuardianRegistrationTests(unittest.TestCase):
+    """The registration step alone against a real isolated ledger.
+
+    The policy coordinator and the legacy writer are the production modules.
+    The policy provider is the in-process fixture and the retained guardian is
+    a real VerifiedProcess over a synthetic handle backend, as in the helper
+    host registration tests. Nothing native is held here.
+    """
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+        self.db = self.directory / "sentinel.db"
+        self.policy = FixturePolicyProvider(LOGON)
+        self.store = LifecycleStore(self.db, policy_provider=self.policy)
+        self.backend = ProcessBackend()
+
+    def build(self, process=None):
+        host = GuardianHost(data_dir=self.directory, journal_dir=self.directory / "recovery",
+                            guardian_epoch=EPOCH)
+        host.store = self.store
+        host.guardian = self.backend.process(GUARDIAN) if process is None else process
+        return host
+
+    def connection(self):
+        conn = sqlite3.connect(self.db, isolation_level=None)
+        self.addCleanup(conn.close)
+        return conn
+
+    def entry_nonce(self):
+        return self.connection().execute(
+            "SELECT policy_entry_nonce FROM adaptive_runtime WHERE singleton=1").fetchone()[0]
+
+    def rows(self):
+        return [tuple(row) for row in self.connection().execute(
+            "SELECT role,pid FROM adaptive_infrastructure ORDER BY role,pid")]
+
+    def test_the_candidate_is_verified_before_the_registry_is_touched(self):
+        # Order is the whole point: only a scope that has not read or written
+        # the ledger can call the identity refusal a clean rejection.
+        from sentinel.adaptive import legacy_writer
+
+        calls = []
+
+        def record(name, original):
+            def recorded(*args, **kwargs):
+                calls.append(name)
+                return original(*args, **kwargs)
+            return recorded
+
+        with patch.object(legacy_writer, "verify_infrastructure_candidate_locked",
+                          record("verify", legacy_writer.verify_infrastructure_candidate_locked)), \
+                patch.object(legacy_writer, "initialize_registry_locked",
+                             record("initialize", legacy_writer.initialize_registry_locked)):
+            host = self.build()
+            host._register()
+        self.assertEqual(calls, ["verify", "initialize"])
+        self.assertTrue(host.registered)
+        self.assertEqual(self.rows(), [("guardian", 6001)])
+
+    def test_an_unverifiable_candidate_refuses_and_releases_policy(self):
+        host = self.build(SimpleNamespace(identity=GUARDIAN))
+        with self.assertRaises(GuardianHostRefused) as caught:
+            host._register()
+        self.assertEqual(caught.exception.reason, "guardian_host_registry_unavailable")
+        self.assertFalse(host.registered)
+        self.assertIsNone(self.entry_nonce())
+        # The scope is free, so the next owner can take it and write.
+        self.build()._register()
+        self.assertEqual(self.rows(), [("guardian", 6001)])
 
 
 class GuardianHostSubprocessTests(unittest.TestCase):

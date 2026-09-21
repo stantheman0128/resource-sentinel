@@ -89,6 +89,34 @@ def initialize_registry_locked(store):
         _infra_schema(conn)
 
 
+def verify_infrastructure_candidate_locked(store, role, process):
+    """Decide the two registration identity refusals while the scope is ledger-free.
+
+    This must be the FIRST call inside the POLICY scope, before
+    initialize_registry_locked or any other ledger access. Neither assert_held
+    nor observe reads or writes the ledger, so a refusal raised here is a clean
+    rejection and POLICY may release its durable entry nonce. A caller that has
+    already touched the ledger in this scope must not call it, because the
+    rejection would no longer be true and the nonce must then be retained.
+
+    The codes are the ones register_infrastructure_locked raises, and that
+    function keeps both checks. This call is the one that can release POLICY,
+    not a replacement for the checks at the write itself. It opens no
+    transaction, reads and writes nothing, and on success returns None and sets
+    no flag.
+    """
+    guard = store._policy.assert_held()
+    if role not in {"guardian", "helper", "supervisor"} or not isinstance(process, VerifiedProcess):
+        guard.clean_rejection = True
+        raise LegacyMutationError("legacy_infrastructure_identity_required")
+    observed = process.observe()
+    identity = process.identity
+    if (observed.status is not IdentityStatus.ALIVE or observed.identity != identity or
+            identity.logon_id != guard.binding.logon_id):
+        guard.clean_rejection = True
+        raise LegacyMutationError("legacy_infrastructure_identity_unverified")
+
+
 def register_infrastructure_locked(store, role, process):
     """Register a retained, live VerifiedProcess before publishing infrastructure.
 

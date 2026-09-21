@@ -183,13 +183,23 @@ class GuardianHost:
         It writes to whatever sentinel.db --data-dir names. Pointing this host
         at the daily data directory therefore writes the registry table into
         the daily ledger.
+
+        The candidate is verified first, while the scope has not touched the
+        ledger, so a refused identity is a clean rejection and POLICY releases
+        its durable entry nonce. After initialize_registry_locked the same
+        refusal would keep the nonce and every later prepare on this data
+        directory would answer policy_scope_busy.
         """
-        from .legacy_writer import initialize_registry_locked, register_infrastructure_locked
+        from .legacy_writer import (
+            initialize_registry_locked, register_infrastructure_locked,
+            verify_infrastructure_candidate_locked,
+        )
 
         policy = self.store._policy
         try:
             guard = policy.prepare(policy.current_logon())
             with policy.hold(guard):
+                verify_infrastructure_candidate_locked(self.store, "guardian", self.guardian)
                 initialize_registry_locked(self.store)
                 register_infrastructure_locked(self.store, "guardian", self.guardian)
         except Exception as error:

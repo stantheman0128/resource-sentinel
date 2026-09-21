@@ -659,6 +659,72 @@ class LegacyWriterTests(unittest.TestCase):
         with self.assertRaisesRegex(PolicyError, "policy_scope_busy"):
             self.store._policy.prepare(WRAPPER.logon_id)
 
+    def test_infrastructure_candidate_wrong_role_or_object_releases_policy(self):
+        """The registration counterpart of the removal refusal above.
+
+        Both production hosts call this first, before the registry exists, so a
+        refused candidate must leave the scope free. A retained nonce would
+        answer every later prepare on this data directory with
+        policy_scope_busy, the next guardian registration included.
+        """
+        alive, _ = self.verified_process(self.identity())
+        for label, role, candidate in (("role", "collector", alive),
+                                       ("object", "guardian", SimpleNamespace(identity=self.identity()))):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(writer.LegacyMutationError,
+                                            "legacy_infrastructure_identity_required"):
+                    with self.held():
+                        writer.verify_infrastructure_candidate_locked(self.store, role, candidate)
+                self.assertIsNone(self.runtime()["policy_entry_nonce"])
+                self.assertFalse(self.policy.active)
+        with self.held():
+            self.assertTrue(writer.register_infrastructure_locked(self.store, "guardian", alive))
+
+    def test_infrastructure_candidate_unverified_identity_releases_policy(self):
+        dead, _ = self.verified_process(self.identity(502), IdentityStatus.DEAD)
+        unknown, _ = self.verified_process(self.identity(503), IdentityStatus.UNKNOWN)
+        foreign, _ = self.verified_process(ProcessIdentity(504, 134342315823996151, "S-1-5-5-7-7"))
+        alive, _ = self.verified_process(self.identity())
+        for label, candidate in (("dead", dead), ("unknown", unknown), ("foreign_logon", foreign)):
+            with self.subTest(label=label):
+                with self.assertRaisesRegex(writer.LegacyMutationError,
+                                            "legacy_infrastructure_identity_unverified"):
+                    with self.held():
+                        writer.verify_infrastructure_candidate_locked(self.store, "helper", candidate)
+                self.assertIsNone(self.runtime()["policy_entry_nonce"])
+                self.assertFalse(self.policy.active)
+        with self.held():
+            self.assertTrue(writer.register_infrastructure_locked(self.store, "guardian", alive))
+
+    def test_verified_candidate_sets_no_flag_and_the_same_scope_still_registers(self):
+        alive, _ = self.verified_process(self.identity())
+        with self.held() as guard:
+            self.assertIsNone(writer.verify_infrastructure_candidate_locked(self.store, "guardian", alive))
+            self.assertFalse(guard.clean_rejection)
+            writer.initialize_registry_locked(self.store)
+            self.assertTrue(writer.register_infrastructure_locked(self.store, "guardian", alive))
+            self.assertFalse(guard.clean_rejection)
+        self.assertIsNone(self.runtime()["policy_entry_nonce"])
+        self.assertEqual([tuple(row) for row in self.connection().execute(
+            "SELECT role,pid FROM adaptive_infrastructure")], [("guardian", 501)])
+
+    def test_registration_refusal_after_the_ledger_was_touched_still_retains_policy(self):
+        """The conservative behaviour of register_infrastructure_locked is unchanged.
+
+        By the time the registry has been initialized the scope has written the
+        ledger, so its own refusals cannot claim a clean rejection and the nonce
+        must stay. The verifier above exists so hosts never reach this state.
+        """
+        with self.assertRaisesRegex(writer.LegacyMutationError,
+                                    "legacy_infrastructure_identity_required"):
+            with self.held():
+                writer.initialize_registry_locked(self.store)
+                writer.register_infrastructure_locked(self.store, "guardian",
+                                                      SimpleNamespace(identity=self.identity()))
+        self.assertIsNotNone(self.runtime()["policy_entry_nonce"])
+        with self.assertRaisesRegex(PolicyError, "policy_scope_busy"):
+            self.store._policy.prepare(WRAPPER.logon_id)
+
     def test_candidate_json_requires_decimal_filetime_without_float_rounding(self):
         value = dict(pid=501, created_filetime_100ns="134342315823996150",
                      priority_action="demote", restore_priority="Normal", io_priority=1, trim=True)

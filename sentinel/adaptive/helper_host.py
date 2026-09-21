@@ -388,13 +388,22 @@ class HelperHost:
         prepare answers a leftover nonce with policy_scope_busy for every later
         caller, the guardian included. A stale helper row is the expected state
         on a restart, so that refusal must not cost the ledger its POLICY entry.
+
+        The identity refusals have the same problem and the opposite fix: they
+        are decided inside the scope, so they run first, while nothing has read
+        or written the ledger. Only then are they clean rejections that let
+        POLICY release its entry nonce.
         """
-        from .legacy_writer import initialize_registry_locked, register_infrastructure_locked
+        from .legacy_writer import (
+            initialize_registry_locked, register_infrastructure_locked,
+            verify_infrastructure_candidate_locked,
+        )
 
         policy = self.store._policy
         try:
             guard = policy.prepare(policy.current_logon())
             with policy.hold(guard):
+                verify_infrastructure_candidate_locked(self.store, "helper", self.process)
                 initialize_registry_locked(self.store)
                 occupied = self._other_helpers(guard)
                 if not occupied:

@@ -349,6 +349,41 @@ class RegistrationTests(LedgerCase):
         self.assertEqual([tuple(row) for row in self.helper_rows()],
                          [("guardian", 7003), ("helper", 7002)])
 
+    def test_the_candidate_is_verified_before_the_registry_is_touched(self):
+        # Order is the whole point: only a scope that has not read or written
+        # the ledger can call the identity refusal a clean rejection.
+        from sentinel.adaptive import legacy_writer
+
+        calls = []
+
+        def record(name, original):
+            def recorded(*args, **kwargs):
+                calls.append(name)
+                return original(*args, **kwargs)
+            return recorded
+
+        with patch.object(legacy_writer, "verify_infrastructure_candidate_locked",
+                          record("verify", legacy_writer.verify_infrastructure_candidate_locked)), \
+                patch.object(legacy_writer, "initialize_registry_locked",
+                             record("initialize", legacy_writer.initialize_registry_locked)):
+            host = self.build()
+            host._register()
+        self.assertEqual(calls, ["verify", "initialize"])
+        self.assertEqual([tuple(row) for row in self.helper_rows()], [("helper", 7001)])
+
+    def test_an_unverifiable_candidate_refuses_and_releases_policy(self):
+        host = self.build()
+        host.process = SimpleNamespace(identity=HELPER)
+        with self.assertRaises(HelperHostRefused) as caught:
+            host._register()
+        self.assertEqual(caught.exception.reason, "helper_host_registry_unavailable")
+        self.assertFalse(host.registered)
+        self.assertIsNone(self.connection().execute(
+            "SELECT policy_entry_nonce FROM adaptive_runtime WHERE singleton=1").fetchone()[0])
+        # The scope is free, so the next owner can take it and write.
+        self.register("guardian", self.processes.process(STRANGER))
+        self.assertEqual([tuple(row) for row in self.helper_rows()], [("guardian", 7002)])
+
     def test_a_guardian_row_does_not_block_a_helper(self):
         self.register("guardian", self.processes.process(STRANGER))
         host = self.build()

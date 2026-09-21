@@ -62,18 +62,23 @@ production supervisor、完整 loaded-writer 交接及 native gate 尚未通過�
 Job、程序與 mutex 都是測試內標明的 synthetic backend。native 測試一項都沒跑，P3 到
 P6 沒有任何 gate 通過，adaptive 維持 off。
 
-2026-09-22 更正：先前每一次 `host_foreign_parent_job` 都來自 `py` 啟動器。CPython 的
+2026-09-22 更正：這一輪每一次 `host_foreign_parent_job` 都經過 `py` 啟動器。CPython 的
 `PC/launcher2.c` 在 `launchEnvironment` 裡建立一個 Job，再把 python.exe 指派進去，
 所以經 `py` 啟動的行程一定在 Job 內，`read_host_capability()` 一定拒絕。擁有者在 app
 之外的 PowerShell 直接執行 `sys._base_executable` 指到的直譯器，同一個 preflight
-通過，回報 build 26340、12 個邏輯處理器、1 個 processor group。這台機器因此不是
-環境限制。下面各項寫到的拒絕，指的都是經 `py` 啟動的情況。
+通過，回報 build 26340、12 個邏輯處理器、1 個 processor group。這是到目前為止唯一
+量到會通過的啟動路徑。[capability results](CAPABILITY-RESULTS.md) 在 2026-09-19 用真正
+的直譯器路徑量過另外兩條：暫時的 Scheduled Task 與 Explorer shell 派發，子行程都回報
+`in_any_job=true`，那兩個結果與啟動器無關，仍然成立。下面各項寫到的拒絕，指的都是
+經 `py` 啟動的情況。
 
 同一天在 Claude 的 agent session 裡，經 `scripts/invoke-sentinel.ps1` 直接執行
 `C:\Python313\python.exe`，沒有經過 `py`，preflight 仍然回 `host_foreign_parent_job`。
 `scripts/` 底下沒有任何建立 Job 的程式，所以那一層 Job 來自 agent 的執行環境，是哪個
 行程建立的沒有查。結論是 agent 自己跑不了 native 測試，要由擁有者在 app 之外的
-主控台用真正的直譯器執行。native 測試到現在還沒有人跑過。
+主控台用真正的直譯器執行。native 測試到現在還沒有人跑過。另一個後果：
+`scripts/adaptive-supervisor.ps1` 從 Scheduled Task 啟動時，依 09-19 的量測會被拒絕，
+目前只有互動式主控台這條路徑可用，常駐啟動方式因此還沒有答案。
 
 已入庫的程式與對應文件：
 

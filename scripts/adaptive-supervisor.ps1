@@ -7,7 +7,9 @@
 # This script registers no Scheduled Task and changes no configuration. Run it
 # from its own task or console, never from the collector task: the collector
 # runner may end its whole subtree, and a guardian inside that subtree would
-# break the rule that managed work is never killed.
+# break the rule that managed work is never killed. On the development machine a
+# Scheduled Task child was measured inside a Job (CAPABILITY-RESULTS.md,
+# 2026-09-19), so the host refuses there and only a plain console passes.
 #
 # It has no stop path for a child. It does not call taskkill, Stop-Process or
 # any tree kill. Ctrl+C ends the supervisor host only. The guardian and the

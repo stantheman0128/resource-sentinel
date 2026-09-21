@@ -377,8 +377,8 @@ preflight refuses rather than approximating one. Each host module has a
 subprocess smoke test that starts it against an isolated temporary data
 directory and asserts exactly that typed refusal, and that stdout stays empty.
 
-Correction, 2026-09-22. The machine is not the cause. Two separate things put
-those processes in a Job:
+Correction, 2026-09-22. For the host processes of this slice, two separate
+things put them in a Job:
 
 1. The `py` launcher. `launchEnvironment` in CPython's `PC/launcher2.c` calls
    `CreateJobObject`, sets `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and
@@ -395,6 +395,14 @@ PowerShell console outside the app. The same preflight passed there and reported
 build 26340, 12 logical processors and one processor group. So native tests can
 run on this machine from such a console. Nobody has run them yet, and an agent
 session cannot.
+
+That console is the only launch path measured to pass so far.
+[CAPABILITY-RESULTS.md](CAPABILITY-RESULTS.md) measured two others on 2026-09-19
+with the real interpreter path: a temporary Scheduled Task and an Explorer shell
+dispatch. Both children reported `in_any_job=true`. The launcher does not
+explain those results and they still stand. A supervisor started from a
+Scheduled Task would therefore refuse on this machine, and how the supervisor is
+kept running outside an interactive console has no answer yet.
 
 `scripts/adaptive-supervisor.ps1` used to start the host with `& py`, which would
 have refused on every machine. It now asks the launcher only for the interpreter

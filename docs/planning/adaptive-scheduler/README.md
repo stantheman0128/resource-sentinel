@@ -59,9 +59,21 @@ production supervisor、完整 loaded-writer 交接及 native gate 尚未通過�
 ## 2026-09-20 接手紀錄：交還 Codex 前的現況
 
 這一輪由 Claude 接手既有實作，沒有重寫架構。以下每一項都只有可攜測試證據，
-Job、程序與 mutex 都是測試內標明的 synthetic backend。這台開發機的程序位於外層
-Job 內，`require_supported_host()` 會拒絕，所以 native 測試一項都沒跑，P3 到 P6
-沒有任何 gate 通過，adaptive 維持 off。
+Job、程序與 mutex 都是測試內標明的 synthetic backend。native 測試一項都沒跑，P3 到
+P6 沒有任何 gate 通過，adaptive 維持 off。
+
+2026-09-22 更正：先前每一次 `host_foreign_parent_job` 都來自 `py` 啟動器。CPython 的
+`PC/launcher2.c` 在 `launchEnvironment` 裡建立一個 Job，再把 python.exe 指派進去，
+所以經 `py` 啟動的行程一定在 Job 內，`read_host_capability()` 一定拒絕。擁有者在 app
+之外的 PowerShell 直接執行 `sys._base_executable` 指到的直譯器，同一個 preflight
+通過，回報 build 26340、12 個邏輯處理器、1 個 processor group。這台機器因此不是
+環境限制。下面各項寫到的拒絕，指的都是經 `py` 啟動的情況。
+
+同一天在 Claude 的 agent session 裡，經 `scripts/invoke-sentinel.ps1` 直接執行
+`C:\Python313\python.exe`，沒有經過 `py`，preflight 仍然回 `host_foreign_parent_job`。
+`scripts/` 底下沒有任何建立 Job 的程式，所以那一層 Job 來自 agent 的執行環境，是哪個
+行程建立的沒有查。結論是 agent 自己跑不了 native 測試，要由擁有者在 app 之外的
+主控台用真正的直譯器執行。native 測試到現在還沒有人跑過。
 
 已入庫的程式與對應文件：
 
@@ -106,7 +118,8 @@ Job 內，`require_supported_host()` 會拒絕，所以 native 測試一項都�
    的登記列，移除沒有失敗、預算也允許時才啟動替代者。沒給這個選項時 supervisor 的
    行為和所有紀錄都不變。`scripts/adaptive-supervisor.ps1` 是計畫 P3 表列的入口，
    只在前景執行 supervisor host 並傳回它的 exit code，不註冊 Scheduled Task，兩個
-   目錄都必填、沒有預設值，裡面沒有任何停止子行程的路徑。
+   目錄都必填、沒有預設值，裡面沒有任何停止子行程的路徑。它只向 `py` 問直譯器的
+   路徑，再直接啟動那個檔案，因為經 `py` 啟動的行程一定在 Job 內。
 
 已知缺口，都還沒有程式：
 
@@ -128,29 +141,37 @@ Job 內，`require_supported_host()` 會拒絕，所以 native 測試一項都�
    另一項任務尚未提交的修改，這一輪無法乾淨分離，所以沒有動它。缺口 4 的釋放路徑
    會動到 `sentinel/coordinator.py`，原因相同。
 
-需要 repo 擁有者裁決、程式目前一律 fail closed 的事項：
+需要 repo 擁有者裁決的事項，以及擁有者在 2026-09-22 的答覆。還沒實作的部分，程式
+仍然一律 fail closed：
 
 1. 計畫 7.4 沒說受控 Job 已經結束時，要用誰的五筆未限速樣本清除 barrier。
    現況是 Job 先結束或由 orphan drain 結案時，barrier 會一直停在 `RECOVERY_HOLD`。
-   這一點在 canary 之前必須決定。
+   擁有者的答覆：Job 經現場查詢確認為空時視為可以清除，並留下稽核紀錄。這一項
+   還沒實作，canary 之前必須完成。
 2. `cancel` 與 `start_failed` 兩種狀態缺 guardian 證據，無法退場，細節在
-   retained supervisor 文件的 remaining gates。
+   retained supervisor 文件的 remaining gates。擁有者的答覆：交給 Codex 提方案。
 3. 計畫 5.5 要求 caller 以 OS 可驗證身分和一次性 token 綁定。helper 沒有
-   `ipc_auth_key`，registry 的欄位也是固定的，所以傳輸層目前只用 OS 驗證的 peer
-   加上每次請求的 server nonce，沒有共享密鑰。這樣是否滿足計畫的 token 要求，
-   需要擁有者確認；若要真正的共享密鑰，得先決定由誰簽發、存在哪一筆紀錄。
+   `ipc_auth_key`，registry 的欄位也是固定的，所以傳輸層只用 OS 驗證的 peer
+   加上每次請求的 server nonce，沒有共享密鑰。擁有者的答覆：接受現況。
 4. supervisor 自己由誰見證。supervisor 不登記自己，也沒有任何行程持有它的 witness，
-   它結束之後留下的 guardian 列和 helper 列就沒有人能移除。另外，helper 的列移除失敗
-   之後，supervisor host 不會重試移除，也不會再啟動 helper，之後每一輪只回報 absent；
-   這是比照 guardian 路徑的保守做法，要不要改成每輪重試由擁有者決定。
-5. `register_infrastructure_locked` 的兩個提前拒絕會留下 POLICY entry nonce，之後每一次
-   `prepare` 都會得到 `policy_scope_busy`，沒有東西會清掉它。guardian 和 helper 的啟動
-   路徑都會經過這裡。移除函式上同樣形狀的問題已經修掉，這一個沒動：兩條啟動路徑在
-   同一個 scope 裡都先執行過 `initialize_registry_locked`，拒絕發生時帳本已經被碰過，
-   不能直接當成 clean rejection。
+   它結束之後留下的 guardian 列和 helper 列就沒有人能移除。擁有者問到是否需要
+   failsafe。需要兩層：由外部機制把 supervisor 重新啟動，以及新的 supervisor 如何
+   對待它沒有 handle 的舊 guardian。第一層屬於部署，這一輪沒有碰；第二層是計畫層級
+   的設計，連同第 2 項交給 Codex 與計畫作者，canary 之前定案。另外，helper 的列
+   移除失敗之後，supervisor host 不會重試移除，也不會再啟動 helper，之後每一輪只回報
+   absent；要不要改成每輪重試還沒有答覆。
+5. `register_infrastructure_locked` 的兩個提前拒絕原本會留下 POLICY entry nonce，之後
+   每一次 `prepare` 都會得到 `policy_scope_busy`。擁有者授權修正，已完成：
+   `verify_infrastructure_candidate_locked` 在 scope 還沒碰帳本時先做同樣兩個檢查，
+   guardian host 與 helper host 都在 hold 內第一個呼叫它。原函式不變，帳本被碰過之後
+   才發生的拒絕仍然保留 nonce，有測試固定這個行為。細節在 process hosts 文件。
 
-整棵 adaptive 測試樹最後一次執行是 2026-09-21：80 個模組、1936 個測試、0 失敗、
-0 錯誤、0 略過，經 `scripts/invoke-sentinel.ps1` 正常准入。傳輸層的未登記呼叫者
+整棵 adaptive 測試樹最後一次執行是 2026-09-22：80 個模組、1945 個測試、0 失敗、
+0 錯誤、0 略過，經 `scripts/invoke-sentinel.ps1` 正常准入。0 略過只對 agent session
+成立，在通過 preflight 的主控台上，斷言拒絕代碼的測試會改走 `skipTest`。同一天較早的
+一次執行有 1 個錯誤：`test_adaptive_guardian_launch` 出現 `coverage_read_timeout`，
+來源是 `_coverage_read_transaction` 的 0.25 秒真實時間上限，當時主機負載偏高；該模組
+單獨重跑 22 個測試全過。這個上限沒有改，列為 follow-up。傳輸層的未登記呼叫者
 檢查沒有紅燈證據，因為產生紅燈必須先拿掉一道安全檢查，該次執行被權限分類器拒絕，
 之後沒有繞過。這是 source 行為的證據，
 不是任何 native gate 的通過聲明。

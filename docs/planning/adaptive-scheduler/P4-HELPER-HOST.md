@@ -164,9 +164,12 @@ next `POLICY` entry with nothing to clear it. The host now counts the other rows
 inside the hold, skips the insert, lets the scope exit, and then refuses. A test
 asserts that the nonce is gone and that a guardian can register afterwards.
 
-Failures inside `initialize_registry_locked` or `register_infrastructure_locked`
-still leave the nonce. That is the same shape recorded for the guardian start
-path in `P3-PROCESS-HOSTS.md`, and it is not changed here.
+The two identity refusals are now decided first, by
+`verify_infrastructure_candidate_locked`, while the scope has not touched the
+ledger, so they release the nonce. `P3-PROCESS-HOSTS.md` records the reasoning.
+Any other failure inside `initialize_registry_locked` or
+`register_infrastructure_locked` still leaves the nonce, because the ledger
+outcome is then not known.
 
 The consequence is a restart gap, and it is not fixed here. There is no live
 deregistration function in this repository. A row can only be removed by
@@ -229,7 +232,9 @@ Nothing starts this process in production. The supervisor host can start and
 witness one helper when it is given `--helper-profile`, as described above, but
 that option is off by default and nothing selects it.
 `scripts/adaptive-supervisor.ps1` is a thin entry point that runs the supervisor
-host in the foreground and passes `-HelperProfile` through. It registers no
+host in the foreground and passes `-HelperProfile` through. It starts the
+interpreter file directly and uses the `py` launcher only to find that file,
+because the launcher puts what it starts inside a Job. It registers no
 scheduled task, has no default data directory and nothing calls it. No scheduled
 task, hook or existing script was changed.
 
@@ -247,9 +252,11 @@ ledger it names. Nothing in this slice was run against the daily data directory.
 
 ## What is unverified
 
-Nothing native ran on this machine. The host capability preflight refuses here
-with `host_foreign_parent_job`, because this development host runs its processes
-inside a parent Job. Every claim above that involves a real Job handle, a real
+Nothing native ran on this machine. The host capability preflight refused with
+`host_foreign_parent_job` in every run so far. The `py` launcher and the agent
+session each put the process inside a Job, and the machine itself passes the
+preflight from a plain console, as the process hosts document records under
+"What this machine answers". Every claim above that involves a real Job handle, a real
 accounting query, a real interrupt time tick or a real registry on a live system
 is therefore unverified by execution. The tests are portable evidence about the
 host's wiring, its refusals and its arithmetic.

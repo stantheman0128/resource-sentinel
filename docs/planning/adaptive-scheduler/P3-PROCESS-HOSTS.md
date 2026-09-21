@@ -190,9 +190,17 @@ of that data directory with `policy_scope_busy`, the replacement guardian's own
 registration included, and nothing self heals it. That is deliberate: an
 unknown write outcome is not something a later owner may clear for itself.
 
-`register_infrastructure_locked` has the same shape and still leaves its
-pre-transaction refusals holding the entry. It was out of scope here and is a
-follow-up.
+`register_infrastructure_locked` has the same shape, with one difference: both
+start paths run `initialize_registry_locked` earlier in the same scope, so by
+the time its identity refusals fire the scope has already opened a ledger
+transaction and the refusal is not a clean rejection. The owner authorized a fix
+on 2026-09-22. `verify_infrastructure_candidate_locked` in
+`sentinel/adaptive/legacy_writer.py` decides the same two refusals with the same
+codes, sets the flag before raising, and touches no ledger. The guardian host
+and the helper host call it first inside the hold, before
+`initialize_registry_locked`. `register_infrastructure_locked` is unchanged and
+keeps both checks. If one of them ever fires after the ledger was touched, the
+entry nonce is still retained, and a test pins that.
 
 A guardian that exits cleanly reaches this same path. `main` at
 `guardian_host.py:384` returns after a bounded `--iterations` run or after an
@@ -362,12 +370,41 @@ No native P3, P4 or P5 gate is claimed.
 
 ## What this machine answers
 
-Every host process refuses on this development machine, with
-`host_foreign_parent_job` from `read_host_capability`. The process sits inside a
-Job it does not own, so it cannot be given an independent CPU rate denominator,
-and the preflight refuses rather than approximating one. Each host module has a
+Every host process started so far on this development machine refused with
+`host_foreign_parent_job` from `read_host_capability`. A process inside a Job it
+does not own cannot be given an independent CPU rate denominator, and the
+preflight refuses rather than approximating one. Each host module has a
 subprocess smoke test that starts it against an isolated temporary data
 directory and asserts exactly that typed refusal, and that stdout stays empty.
+
+Correction, 2026-09-22. The machine is not the cause. Two separate things put
+those processes in a Job:
+
+1. The `py` launcher. `launchEnvironment` in CPython's `PC/launcher2.c` calls
+   `CreateJobObject`, sets `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` and
+   `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`, and assigns the python.exe it starts
+   to that Job. The source was read on the 3.13 branch. Every probe and test
+   before this date was started through `py`.
+2. The agent session. Inside Claude's session, `C:\Python313\python.exe` started
+   through `scripts/invoke-sentinel.ps1` with no launcher involved still gets
+   `host_foreign_parent_job`. Nothing under `scripts/` creates a Job. Which
+   process in the agent's environment does was not investigated.
+
+The repo owner ran the interpreter named by `sys._base_executable` from a
+PowerShell console outside the app. The same preflight passed there and reported
+build 26340, 12 logical processors and one processor group. So native tests can
+run on this machine from such a console. Nobody has run them yet, and an agent
+session cannot.
+
+`scripts/adaptive-supervisor.ps1` used to start the host with `& py`, which would
+have refused on every machine. It now asks the launcher only for the interpreter
+path, or takes `-Python`, and starts that file directly. An unresolved path
+refuses with `adaptive_supervisor_python_unresolved` and exit code 3. The host
+starts its children with `sys.executable`, so they are started the same way.
+
+On a console that passes the preflight, the tests that assert the typed refusal
+call `skipTest`, so the zero skipped count reported from the agent session will
+not carry over to that console.
 
 ## Follow-ups, not done here
 

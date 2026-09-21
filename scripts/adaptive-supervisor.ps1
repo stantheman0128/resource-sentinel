@@ -22,7 +22,8 @@ param(
     [string]$HelperProfile = '',
     [int]$MaxGuardians = 1,
     [int]$MaxHelpers = 1,
-    [int]$Iterations = 0
+    [int]$Iterations = 0,
+    [string]$Python = ''
 )
 $ErrorActionPreference = 'Stop'
 
@@ -32,6 +33,23 @@ foreach ($directory in @($DataDir, $JournalDir)) {
         [Console]::Error.WriteLine('adaptive_supervisor_directory_missing')
         exit 3
     }
+}
+
+# The py launcher creates a Job of its own and assigns python.exe to it, and the
+# supervisor host refuses to start inside a Job. So the launcher is only asked
+# where the interpreter is, and the host is started from that path directly.
+if (-not $Python) {
+    try {
+        $Python = [string](& py -c 'import sys; print(sys._base_executable or sys.executable)' |
+                           Select-Object -First 1)
+    } catch {
+        $Python = ''
+    }
+}
+$Python = $Python.Trim()
+if (-not $Python -or -not (Test-Path -LiteralPath $Python -PathType Leaf)) {
+    [Console]::Error.WriteLine('adaptive_supervisor_python_unresolved')
+    exit 3
 }
 
 $argsList = @(
@@ -52,7 +70,7 @@ if ($HelperProfile) {
 
 Push-Location -LiteralPath $repoRoot
 try {
-    & py @argsList
+    & $Python @argsList
     $code = $LASTEXITCODE
 } finally {
     Pop-Location

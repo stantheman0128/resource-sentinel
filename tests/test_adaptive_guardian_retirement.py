@@ -15,7 +15,9 @@ from sentinel.adaptive.contracts import (
 )
 from sentinel.adaptive.launch_transport import CancelBeforeStartRequest, StartFailedRequest
 from sentinel.adaptive import native_job
+from sentinel.adaptive.prelaunch_receipt import PrelaunchReceiptOperation
 from sentinel.adaptive.store import LifecycleError
+from sentinel.adaptive.supervisor_reconcile import ReconcileResult
 from sentinel.adaptive.windows import NativePolicyMutexError
 from tests import test_adaptive_guardian_launch as fixture
 from tests import test_adaptive_native_job as native_fixture
@@ -286,6 +288,67 @@ class GuardianRetirementTests(unittest.TestCase):
         self.assertIn(case.snapshot.execution_id, self.owner.retained_execution_ids)
         self.assertTrue(self.owner.retire_completed_pending()[0]["terminal"])
         self.assertEqual(self.owner.retained_execution_ids, ())
+
+    def test_receipt_capture_failure_never_starts_native_cleanup(self):
+        case = self.admitted()
+        self.prepare(case)
+        self.retire(case)
+        entry = self.owner._pending[case.snapshot.execution_id]
+        with patch("sentinel.adaptive.prelaunch_receipt.PrelaunchReceiptOperation",
+                   side_effect=LifecycleError("fixture_receipt_capture_failed")), \
+                patch.object(entry.job, "close", wraps=entry.job.close) as job_close, \
+                patch.object(entry.wrapper, "close", wraps=entry.wrapper.close) as wrapper_close, \
+                patch.object(entry.mutex, "close", wraps=entry.mutex.close) as mutex_close:
+            result, = self.owner.retire_completed_pending()
+        self.assertFalse(result["terminal"])
+        self.assertEqual(result["reason"], "guardian_retirement_cleanup_unverified")
+        self.assertFalse(entry.retirement_cleanup_started)
+        self.assertIsNone(entry.retirement_receipt_operation)
+        self.assertEqual(entry.closed_handles, set())
+        for close in (job_close, wrapper_close, mutex_close):
+            close.assert_not_called()
+        self.assertIs(self.owner._pending[case.snapshot.execution_id], entry)
+        self.assertTrue(self.owner.retire_completed_pending()[0]["terminal"])
+
+    def test_clean_scope_captures_once_and_pending_publication_retains_closed_owners(self):
+        case = self.admitted()
+        self.prepare(case)
+        self.retire(case)
+        entry = self.owner._pending[case.snapshot.execution_id]
+        captured = []
+
+        def capture(owner, original_entry, row, manifest, binding):
+            self.assertIs(owner, self.owner)
+            self.assertIs(original_entry, entry)
+            self.assertIsNone(owner.lifecycle._scope_entry)
+            self.assertIsNone(self.store._policy.current_guard())
+            self.assertFalse(entry.mutex.acquired)
+            self.assertEqual(entry.closed_handles, set())
+            operation = PrelaunchReceiptOperation(owner, entry, row, manifest, binding)
+            captured.append(operation)
+            return operation
+
+        with patch("sentinel.adaptive.prelaunch_receipt.PrelaunchReceiptOperation", side_effect=capture) as factory, \
+                patch.object(entry.job, "close", wraps=entry.job.close) as job_close, \
+                patch.object(entry.wrapper, "close", wraps=entry.wrapper.close) as wrapper_close, \
+                patch.object(entry.mutex, "close", wraps=entry.mutex.close) as mutex_close:
+            with patch.object(PrelaunchReceiptOperation, "tick",
+                    return_value=ReconcileResult(False, True, False, "fixture_publication_pending")):
+                first, = self.owner.retire_completed_pending()
+            self.assertFalse(first["terminal"])
+            self.assertEqual(first["reason"], "fixture_publication_pending")
+            self.assertEqual(entry.closed_handles, {"job", "wrapper", "mutex"})
+            self.assertIs(entry.retirement_receipt_operation, captured[0])
+            self.assertIs(self.owner._pending[case.snapshot.execution_id], entry)
+            with patch.object(entry.mutex, "acquire", side_effect=AssertionError("closed mutex reacquired")), \
+                    patch.object(entry.job, "accounting", side_effect=AssertionError("closed Job queried")):
+                final, = self.owner.retire_completed_pending()
+            self.assertTrue(final["terminal"], final)
+            factory.assert_called_once()
+            for close in (job_close, wrapper_close, mutex_close):
+                close.assert_called_once()
+        self.assertEqual(self.owner.retained_execution_ids, ())
+        self.assertEqual(self.archive_count(case), 1)
 
     def test_native_job_known_close_failure_retries_without_querying_closed_custody(self):
         case, kernel = self.prepared_native_job()

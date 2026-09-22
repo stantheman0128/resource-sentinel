@@ -52,6 +52,7 @@ class _PendingExecution:
         self.closed_handles = set()
         self.retirement_cleanup_started = False
         self.retirement_mutex_close_unknown = False
+        self.retirement_receipt_operation = None
 
     def assert_held(self):
         self.owner.lifecycle.store._policy.assert_held()
@@ -627,18 +628,20 @@ class GuardianLaunchOwner:
                                         entry.query_cpu_control() != _DISABLED or
                                         entry.job.accounting().total_processes != 0):
                                     raise LifecycleError("guardian_retirement_changed")
-                        # Publish after successful fence exit, before any close.
+                            binding = self.store._policy.current_guard().binding
+                        # Capture the original proof and owners only after a
+                        # clean fence exit, before any native owner can close.
+                        from .prelaunch_receipt import PrelaunchReceiptOperation
+                        entry.retirement_receipt_operation = PrelaunchReceiptOperation(
+                            self, entry, row, record, binding)
                         entry.retirement_cleanup_started = True
-                    else:
-                        # NativeJob becomes non-queryable as soon as close starts;
-                        # a possibly closed mutex must never be acquired again.
-                        # The immutable terminal receipt is now the authority to
-                        # retry only the exact native owners' cleanup contracts.
-                        self.lifecycle._validate_guardian()
-                        record = self._read_record(entry)
-                        if record != entry.record:
-                            raise LifecycleError("guardian_retirement_manifest_changed")
-                        self.store.assert_retained_terminal(row, record)
+                    receipt = entry.retirement_receipt_operation
+                    if receipt is None:
+                        raise LifecycleError("guardian_retirement_custody_unverified")
+                    # NativeJob becomes non-queryable as soon as close starts;
+                    # a possibly closed mutex must never be acquired again.
+                    # Verify only the captured owners and immutable proof here.
+                    receipt.verify(entry)
                     for name in ("job", "wrapper", "mutex"):
                         owner = getattr(entry, name)
                         if owner is not None and name not in entry.closed_handles:
@@ -660,6 +663,14 @@ class GuardianLaunchOwner:
                                 # CloseHandle outcomes internally before the call.
                                 owner.close()
                             entry.closed_handles.add(name)
+                    # Positive native closes are not a durable custody receipt.
+                    # Keep this entry and its original POLICY operation until
+                    # publication, its acknowledgement and cleanup all settle.
+                    published = receipt.tick(entry)
+                    if not published.complete:
+                        results.append({"execution_id": execution_id, "terminal": False,
+                            "reason": published.reason or "guardian_retirement_receipt_pending"})
+                        continue
                     del self._pending[execution_id]
                     results.append({"execution_id": execution_id, "state": row["state"], "terminal": True})
                 except Exception as error:

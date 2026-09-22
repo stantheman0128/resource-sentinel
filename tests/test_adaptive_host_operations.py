@@ -1,6 +1,8 @@
 """Real isolated SQLite/journal, explicitly synthetic retained Windows owners."""
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import replace
+import sqlite3
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from uuid import uuid4
@@ -12,6 +14,7 @@ from sentinel.adaptive.operator_messages import OperatorRequest, OperatorOperati
 from sentinel.adaptive.store import LifecycleError
 from tests.test_adaptive_guardian_control import GuardianControlTests as Fixture
 from tests import test_adaptive_guardian_lifecycle as lifecycle_fixture
+from tests import test_adaptive_guardian_retirement as retirement_fixture
 
 
 class HostOperationsTests(unittest.TestCase):
@@ -433,3 +436,145 @@ class HostOperationsTests(unittest.TestCase):
         changed = original[:-1] + ("A" if original[-1] != "A" else "B")
         with self.assertRaises(LifecycleError):
             ops(self.request(Op.AUDIT, cursor=changed), caller_identity=self.guardian.identity)
+
+
+class PrelaunchHostOperationsTests(unittest.TestCase):
+    """Historical C2 inventory uses actual retirement and original-owner close."""
+
+    setUp = retirement_fixture.GuardianRetirementTests.setUp
+    tearDown = retirement_fixture.GuardianRetirementTests.tearDown
+    native_probe = retirement_fixture.GuardianRetirementTests.native_probe
+    make_mutex = retirement_fixture.GuardianRetirementTests.make_mutex
+    make_job = retirement_fixture.GuardianRetirementTests.make_job
+    admitted = retirement_fixture.GuardianRetirementTests.admitted
+    row = retirement_fixture.GuardianRetirementTests.row
+    allocation = retirement_fixture.GuardianRetirementTests.allocation
+    prepare = retirement_fixture.GuardianRetirementTests.prepare
+    claim_request = retirement_fixture.GuardianRetirementTests.claim_request
+    claim = retirement_fixture.GuardianRetirementTests.claim
+    request = retirement_fixture.GuardianRetirementTests.request
+    retire = retirement_fixture.GuardianRetirementTests.retire
+
+    @contextmanager
+    def connection(self):
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.row_factory = sqlite3.Row
+            with conn:
+                yield conn
+
+    def sql(self, statement, arguments=()):
+        with self.connection() as conn:
+            return [dict(row) for row in conn.execute(statement, arguments).fetchall()]
+
+    def durable_snapshot(self):
+        with self.connection() as conn:
+            return tuple(conn.iterdump())
+
+    def ops(self):
+        runtime = self.sql("SELECT * FROM adaptive_runtime WHERE singleton=1")[0]
+        return GuardianHostOperations(self.owner, SimpleNamespace(clock=lambda: 0),
+            instance_id=str(uuid4()), policy_instance_id=runtime["policy_instance_id"])
+
+    def terminal_case(self, *, never_created=False):
+        case = self.admitted()
+        if never_created:
+            with patch.object(self.owner, "_initial_record", side_effect=LifecycleError("fixture_prepare_cut")):
+                with self.assertRaisesRegex(LifecycleError, "fixture_prepare_cut"):
+                    self.prepare(case)
+        else:
+            self.prepare(case)
+            self.claim(case)
+        result = self.retire(case, failure=not never_created)
+        self.assertEqual(result.state, "CANCELLED_BEFORE_START" if never_created else "START_FAILED")
+        case.entry = self.owner._pending[case.snapshot.execution_id]
+        case.wrapper_handle = case.entry.wrapper._handle
+        self.assertIsNone(case.entry.root)
+        self.assertIsNone(self.allocation(case))
+        return case
+
+    def close_pending(self, case):
+        results = self.owner.retire_completed_pending()
+        result = next(item for item in results if item["execution_id"] == case.snapshot.execution_id)
+        self.assertTrue(result["terminal"], result)
+        self.assertNotIn(case.snapshot.execution_id, self.owner.retained_execution_ids)
+        self.assertTrue(self.processes.handles[case.wrapper_handle].closed)
+        self.assertTrue(case.entry.mutex.closed)
+        if case.job is not None:
+            self.assertTrue(case.job.closed)
+        receipts = self.sql("SELECT * FROM adaptive_prelaunch_custody_receipts WHERE execution_id=?",
+                            (case.snapshot.execution_id,))
+        self.assertEqual(len(receipts), 1)
+
+    def assert_readonly_inventory(self, ops, case, *, retired):
+        runtime = self.sql("SELECT * FROM adaptive_runtime WHERE singleton=1")[0]
+        request = OperatorRequest(request_id=str(uuid4()), operation=Op.AUDIT,
+            instance_id=ops.instance_id, policy_instance_id=ops.policy_instance_id,
+            guardian_epoch=ops.epoch, expected_registry_revision=runtime["registry_revision"])
+        before = self.durable_snapshot()
+        with patch.object(self.store._policy, "prepare", side_effect=AssertionError("audit must be readonly")), \
+                patch.object(self.owner, "retire_completed_pending", side_effect=AssertionError("audit cannot close custody")), \
+                patch.object(self.owner, "_job_factory", side_effect=AssertionError("audit cannot recreate Job")):
+            item = ops._item(self.row(case))
+            reply = ops(request, caller_identity=self.guardian.identity)
+        self.assertEqual(self.durable_snapshot(), before)
+        self.assertEqual(item.provenance, "retired" if retired else "unknown")
+        self.assertIs(item.cleanup_complete, True if retired else None)
+        self.assertIs(item.bookkeeping_settled, True if retired else None)
+        self.assertEqual(reply.outcome, OperatorOutcome.COMPLETE if retired else OperatorOutcome.UNVERIFIED)
+        self.assertEqual(reply.items, (item,))
+        self.assertTrue(reply.inventory_complete)
+        self.assertEqual(reply.remaining_executions, 0)
+        self.assertEqual(reply.cleanup_settled, retired)
+        self.assertEqual(reply.native_disabled, retired)
+        return reply
+
+    def assert_retired_only_after_original_close(self, *, never_created):
+        case = self.terminal_case(never_created=never_created)
+        ops = self.ops()
+        self.assertIn(case.snapshot.execution_id, self.owner.retained_execution_ids)
+        self.assertFalse(self.processes.handles[case.wrapper_handle].closed)
+        self.assertFalse(case.entry.mutex.closed)
+        before = self.assert_readonly_inventory(ops, case, retired=False)
+        self.assertEqual(before.remaining_custody, 1)
+
+        self.close_pending(case)
+
+        after = self.assert_readonly_inventory(ops, case, retired=True)
+        self.assertEqual(after.remaining_custody, 0)
+        self.assertEqual(case.launches, 0)
+        if never_created:
+            self.assertEqual(self.jobs, [])
+        else:
+            self.assertEqual(case.job.total_processes, 0)
+
+    def test_never_created_cancel_is_retired_only_after_original_custody_closes(self):
+        self.assert_retired_only_after_original_close(never_created=True)
+
+    def test_never_associated_start_failed_is_retired_only_after_original_custody_closes(self):
+        self.assert_retired_only_after_original_close(never_created=False)
+
+    def assert_corrupt_history_unknown(self, statement):
+        case = self.terminal_case()
+        self.close_pending(case)
+        ops = self.ops()
+        self.assert_readonly_inventory(ops, case, retired=True)
+        self.sql(statement, (case.snapshot.execution_id,))
+        reply = self.assert_readonly_inventory(ops, case, retired=False)
+        self.assertEqual(reply.remaining_custody, 0)
+        self.assertNotIn(case.snapshot.execution_id, self.owner.retained_execution_ids)
+
+    def test_missing_postclose_receipt_does_not_reuse_existing_c2_retirement_proof(self):
+        self.assert_corrupt_history_unknown(
+            "DELETE FROM adaptive_prelaunch_custody_receipts WHERE execution_id=?")
+
+    def test_tampered_postclose_receipt_cannot_certify_historical_cleanup(self):
+        self.assert_corrupt_history_unknown(
+            "UPDATE adaptive_prelaunch_custody_receipts SET receipt_hash='tampered' WHERE execution_id=?")
+
+    def test_postclose_receipt_requires_existing_c2_retirement_proof(self):
+        self.assert_corrupt_history_unknown(
+            "DELETE FROM adaptive_prelaunch_retirements WHERE execution_id=?")
+
+    def test_postclose_receipt_rejects_changed_c2_lifetime_proof(self):
+        self.assert_corrupt_history_unknown(
+            "UPDATE adaptive_prelaunch_retirements SET total_process_count=1 WHERE execution_id=?")

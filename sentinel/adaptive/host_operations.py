@@ -63,8 +63,8 @@ class GuardianHostOperations:
         self._hold_quarantined = False
         self._hold_cleared_revision = None
         if self._terminal_proof is None:
-            from .terminal_receipt import assert_terminal_custody_receipt
-            self._terminal_proof = assert_terminal_custody_receipt
+            from .prelaunch_receipt import assert_closed_custody_receipt
+            self._terminal_proof = assert_closed_custody_receipt
 
     def _assert_owner(self, request):
         if (request.instance_id != self.instance_id or

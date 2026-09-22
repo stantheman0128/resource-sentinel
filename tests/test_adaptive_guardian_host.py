@@ -408,6 +408,43 @@ class GuardianRegistrationTests(unittest.TestCase):
         return [tuple(row) for row in self.connection().execute(
             "SELECT role,pid FROM adaptive_infrastructure ORDER BY role,pid")]
 
+    def registry_rows(self):
+        return [tuple(row) for row in self.connection().execute(
+            "SELECT role,pid,created_filetime_100ns,logon_id,schema_version "
+            "FROM adaptive_infrastructure ORDER BY role,pid,created_filetime_100ns,logon_id")]
+
+    def seed_registry(self, *identities, epoch=""):
+        from sentinel.adaptive.legacy_writer import initialize_registry_locked
+
+        policy = self.store._policy
+        with policy.hold(policy.prepare(LOGON)):
+            initialize_registry_locked(self.store)
+        # Fixture-only historical rows exercise the real bounded SELECT, including
+        # states an older host could have published before singleton enforcement.
+        conn = self.connection()
+        conn.executemany(
+            "INSERT INTO adaptive_infrastructure "
+            "(role,pid,created_filetime_100ns,logon_id,schema_version) VALUES('guardian',?,?,?,1)",
+            [(identity.pid, str(identity.created_filetime_100ns), identity.logon_id)
+             for identity in identities])
+        conn.execute("UPDATE adaptive_runtime SET guardian_epoch=? WHERE singleton=1", (epoch,))
+
+    def assert_registration_refused_without_registry_change(self, host, reason):
+        before = self.registry_rows()
+        with self.assertRaises(GuardianHostRefused) as caught:
+            host._register()
+        self.assertEqual(caught.exception.reason, reason)
+        self.assertFalse(host.registered)
+        self.assertEqual(self.registry_rows(), before)
+        self.assertIsNone(self.entry_nonce())
+        self.assertFalse(self.policy.active)
+        # A clean refusal must permit the next POLICY entry, not just make the
+        # fixture mutex look free while leaving its durable nonce behind.
+        policy = self.store._policy
+        with policy.hold(policy.prepare(LOGON)):
+            policy.assert_held()
+        self.assertIsNone(self.entry_nonce())
+
     def test_the_candidate_is_verified_before_the_registry_is_touched(self):
         # Order is the whole point: only a scope that has not read or written
         # the ledger can call the identity refusal a clean rejection.
@@ -430,6 +467,71 @@ class GuardianRegistrationTests(unittest.TestCase):
         self.assertEqual(calls, ["verify", "initialize"])
         self.assertTrue(host.registered)
         self.assertEqual(self.rows(), [("guardian", 6001)])
+
+    def test_empty_registry_registers_exact_identity_and_clears_policy_nonce(self):
+        self.seed_registry()
+        host = self.build()
+        host._register()
+        self.assertTrue(host.registered)
+        self.assertEqual(self.registry_rows(), [
+            ("guardian", GUARDIAN.pid, str(GUARDIAN.created_filetime_100ns), LOGON, 1)])
+        self.assertIsNone(self.entry_nonce())
+
+    def test_exact_existing_identity_and_epoch_are_idempotent(self):
+        self.seed_registry(GUARDIAN, epoch=EPOCH)
+        before = self.registry_rows()
+        conn = self.connection()
+        revision = conn.execute(
+            "SELECT registry_revision FROM adaptive_runtime WHERE singleton=1").fetchone()[0]
+        for _ in range(2):
+            host = self.build()
+            host._register()
+            self.assertTrue(host.registered)
+            self.assertEqual(self.registry_rows(), before)
+            self.assertEqual(conn.execute(
+                "SELECT registry_revision FROM adaptive_runtime WHERE singleton=1").fetchone()[0], revision)
+            self.assertIsNone(self.entry_nonce())
+
+    def test_second_guardian_cannot_add_a_registry_row(self):
+        first = ProcessIdentity(GUARDIAN.pid + 1, GUARDIAN.created_filetime_100ns + 1, LOGON)
+        self.build(self.backend.process(first))._register()
+        self.assert_registration_refused_without_registry_change(
+            self.build(), "guardian_host_registry_occupied")
+
+    def test_same_pid_with_different_creation_identity_is_occupied(self):
+        self.seed_registry(ProcessIdentity(GUARDIAN.pid, GUARDIAN.created_filetime_100ns + 1, LOGON))
+        self.assert_registration_refused_without_registry_change(
+            self.build(), "guardian_host_registry_occupied")
+
+    def test_foreign_logon_registry_identity_is_occupied_even_when_pid_and_birth_match(self):
+        self.seed_registry(ProcessIdentity(GUARDIAN.pid, GUARDIAN.created_filetime_100ns, "S-1-5-5-3-4"))
+        self.assert_registration_refused_without_registry_change(
+            self.build(), "guardian_host_registry_occupied")
+
+    def test_foreign_logon_candidate_cannot_publish(self):
+        self.seed_registry()
+        foreign = ProcessIdentity(GUARDIAN.pid, GUARDIAN.created_filetime_100ns, "S-1-5-5-3-4")
+        self.assert_registration_refused_without_registry_change(
+            self.build(self.backend.process(foreign)), "guardian_host_registry_unavailable")
+
+    def test_two_existing_guardians_refuse_even_when_one_is_exact_self(self):
+        self.seed_registry(GUARDIAN, ProcessIdentity(
+            GUARDIAN.pid + 1, GUARDIAN.created_filetime_100ns + 1, LOGON))
+        self.assert_registration_refused_without_registry_change(
+            self.build(), "guardian_host_registry_occupied")
+
+    def test_foreign_runtime_epoch_refuses_without_adding_guardian_or_sticking_nonce(self):
+        self.seed_registry(epoch="prior-guardian-epoch")
+        self.assert_registration_refused_without_registry_change(
+            self.build(), "guardian_host_epoch_occupied")
+        self.assertEqual(self.connection().execute(
+            "SELECT guardian_epoch FROM adaptive_runtime WHERE singleton=1").fetchone()[0],
+            "prior-guardian-epoch")
+
+    def test_exact_existing_identity_does_not_authorize_a_different_epoch(self):
+        self.seed_registry(GUARDIAN, epoch="prior-guardian-epoch")
+        self.assert_registration_refused_without_registry_change(
+            self.build(), "guardian_host_epoch_occupied")
 
     def test_an_unverifiable_candidate_refuses_and_releases_policy(self):
         host = self.build(SimpleNamespace(identity=GUARDIAN))

@@ -196,14 +196,29 @@ class GuardianHost:
         )
 
         policy = self.store._policy
+        refusal = None
         try:
             guard = policy.prepare(policy.current_logon())
             with policy.hold(guard):
                 verify_infrastructure_candidate_locked(self.store, "guardian", self.guardian)
                 initialize_registry_locked(self.store)
-                register_infrastructure_locked(self.store, "guardian", self.guardian)
+                # Enforce singleton publication inside POLICY too: an older
+                # supervisor may not participate in the new lifetime mutex.
+                with self.store._connection() as conn:
+                    runtime = policy.revalidate(conn, guard)
+                    candidates = conn.execute("SELECT pid,created_filetime_100ns,logon_id FROM adaptive_infrastructure WHERE role='guardian' LIMIT 2").fetchall()
+                expected = (self.guardian.identity.pid,
+                    str(self.guardian.identity.created_filetime_100ns), self.guardian.identity.logon_id)
+                if (len(candidates) > 1 or any(tuple(row) != expected for row in candidates)):
+                    refusal = "guardian_host_registry_occupied"
+                elif runtime["guardian_epoch"] not in {"", self.guardian_epoch}:
+                    refusal = "guardian_host_epoch_occupied"
+                else:
+                    register_infrastructure_locked(self.store, "guardian", self.guardian)
         except Exception as error:
             raise GuardianHostRefused("guardian_host_registry_unavailable", _reason(error)) from None
+        if refusal is not None:
+            raise GuardianHostRefused(refusal)
         self.registered = True
 
     def _endpoints(self):

@@ -13,10 +13,19 @@ receipt、supervisor 核對與 host 每輪 cleanup。完整 adaptive 回歸 82 �
 （24.642 秒）。這兩次均為 0 failures／errors／skips；完整回歸的 2,007 不包含
 最後新增的六個測試。Native acceptance 仍未驗證。
 
+裁決 ④ 的 [supervisor failsafe 契約](P3-SUPERVISOR-FAILSAFE.md)於 `2873a3f`
+先提交。C4 source 現已完成：lifetime instance fence、沒有舊 handle 時的明確 HOLD、
+原 creation witness 的 early-death recovery、每輪同 guard 的 registry/barrier retry、
+完整歷史證據後的 epoch rollover。獨立 review 找到並修正建立後 POLICY exit 遺失
+custody、SQL 暫時故障丟失 guard、interrupt 隱藏 pending operation，以及後續 attach
+繞過未清理 operation 的問題。最後完整 adaptive 回歸 **2,127 tests 全過，236.798 秒，
+0 failures／errors／skips**；其前 120 個針對性 tests 亦全過（20.556 秒）。
+這是 source 與隔離 fixture 的驗證，不是 native P3–P6 通過。
+
 | 目標項目 | 已驗證狀態／剩餘工作 |
 | --- | --- |
 | 1. 裁決 ② | 契約與 source 完成；完整 2,007 tests，最後 cleanup 修正後 102 tests 通過。 |
-| 2. 裁決 ④ | 下一項：cold-start failsafe、保留 creation witness 的早期死亡接管、每輪 registry cleanup retry、barrier retry 與安全 epoch rollover。 |
+| 2. 裁決 ④ | 契約與 source 完成；最後完整 adaptive 2,127 tests 通過。沒有舊 witness 的 cold adoption 仍不支援；native recovery 未驗證。 |
 | 3. helper sender | 尚缺 sender、ACK 驅動、uncapped frame／restore 傳輸與 capability 證據接線。 |
 | 4. release／CLI | 已有 explicit named retirement API；wrapper host 自動失敗收尾、Coordinator 路徑、discovery／停止協定與 operational CLI 未完成。 |
 | 5. 全程容量覆蓋 | 尚缺能證明所有 live consumers 使用相同 lifetime accounting 的 provider；原日常 grace 前提仍不滿足，不能以測試 DB 假裝解鎖。 |
@@ -31,6 +40,7 @@ P3–P6 都尚未通過。日常 config／Scheduled Task／啟動入口未修改
 ```text
 C:\Python313\python.exe -m unittest discover -s tests -p test_adaptive*.py -q
 C:\Python313\python.exe -m unittest tests.test_adaptive_launcher tests.test_adaptive_guardian_retirement tests.test_adaptive_prelaunch_retirement_store tests.test_adaptive_p3_flow tests.test_adaptive_wrapper_host -q
+C:\Python313\python.exe -m unittest tests.test_adaptive_supervisor_startup tests.test_adaptive_supervisor_reconcile tests.test_adaptive_supervisor_epoch tests.test_adaptive_early_guardian_death tests.test_adaptive_guardian_host -q
 ```
 
 第一次完整測試的七個錯誤來自 P3 flow 合成 fixture 缺少新要求的 lifetime process
@@ -38,6 +48,14 @@ counter；修正 fixture 後全過，未放寬 production 證據。更早的 tar
 見 C2 文件。測試仍依賴接手前 dirty tree 的 exemption／observability 整合內容；
 那些檔案未納入本次窄提交，這不是乾淨 clone 已重跑的聲明。沒有新建或限速真實
 test Job，沒有修改日常 runtime 或啟用 adaptive。
+
+C4 先前 targeted runs 的故障記錄：48 tests 有 2 failures（epoch observation 錯誤
+未轉穩定拒絕碼、fixture manifest 未有效封裝）；111 tests 有 10 errors（fixture
+SQLite connection 未關閉導致 Windows temp cleanup 拒絕）；181 tests 有 1 failure
+（epoch-reuse 測試從錯誤 seam 注入）。分別修正 source 錯誤回報及 fixture，再新增
+review 找到的恢復案例，最後完整 2,127 全過。沒有刪除 assertion、降低 gate 或以
+skip 取代實測。C4 的保守偏差：cold startup 連有效 terminal history 也 HOLD；
+保留 witness 的 rollover 才分頁驗證歷史。詳見 C4 契約的 implementation checkpoint。
 
 目前交接入口是 [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md)、
 [P0 對齊結果](BASELINE-RECONCILIATION.md)、[Windows capability 證據](CAPABILITY-RESULTS.md)
@@ -177,10 +195,10 @@ P6 沒有任何 gate 通過，adaptive 維持 off。
    手動傳入 pid、creation FILETIME、instance id 與 epoch。
 3. 除了行程收到 interrupt 之外沒有正式的停止訊號。
 4. wrapper 被拒絕之後，已綁定的 reservation 沒有釋放路徑，細節在 process hosts 文件。
-5. guardian 在 supervisor 第一次 attach 成功之前死亡時無法被接管，因為
-   `RecoveryOwner.capture` 要求 guardian 為 ALIVE。
-6. guardian 在 supervisor attach 成功之前就結束時，它的登記列不會被移除，因為那條路徑
-   到不了 `_replace`。registry 上限是 32 列。
+5. C4 已補上同一 supervisor 持有原 creation witness 時的 early-death capture；
+   一般 `RecoveryOwner.capture` 仍要求 ALIVE。沒有舊 handle 的冷啟動仍 HOLD。
+6. C4 的 early-death 路徑經正向證據、cleanup 與 registry retirement 後才允許
+   replacement；helper 列刪除失敗亦每輪重試。registry 上限仍是 32 列。
 7. 計畫 P3 與 P4 表列在 `scripts/sentinelctl.py` 的 `run-managed`、`adaptive-status`、
    `adaptive-recover` 與 mode、drain、audit 命令都還沒寫，目前只有唯讀的
    `adaptive-query`。這個檔案在工作目錄裡帶著
@@ -196,7 +214,8 @@ P6 沒有任何 gate 通過，adaptive 維持 off。
    契約與證據寫在 [barrier clear for a finished Job](BARRIER-CLEAR-FINISHED-JOB.md)。
    orphan drain 在結案的同一輪清除，之後每一輪遇到已 `FINISHED` 的列會再試一次；
    原本的五筆樣本路徑沒有改。只有可攜測試證據。guardian 端的對應方法沒有 production
-   caller。supervisor 在結案與清除之間結束的情況沒有人重試，併入第 4 項。
+   caller，列為項目 3 接線。C4 的新 supervisor startup/tick 已接上 durable
+   finished-barrier janitor；其可驗證證據與限制見 [C4](P3-SUPERVISOR-FAILSAFE.md)。
 2. `cancel` 與 `start_failed` 的 guardian 證據採
    [C2 正向退場契約](P3-PRELAUNCH-RETIREMENT.md)：共享啟動鎖、原始 retained Job
    的 lifetime 零程序證據、原子 receipt／archive。Source 已實作，targeted tests
@@ -204,13 +223,13 @@ P6 沒有任何 gate 通過，adaptive 維持 off。
 3. 計畫 5.5 要求 caller 以 OS 可驗證身分和一次性 token 綁定。helper 沒有
    `ipc_auth_key`，registry 的欄位也是固定的，所以傳輸層只用 OS 驗證的 peer
    加上每次請求的 server nonce，沒有共享密鑰。擁有者的答覆：接受現況。
-4. supervisor 自己由誰見證。supervisor 不登記自己，也沒有任何行程持有它的 witness，
-   它結束之後留下的 guardian 列和 helper 列就沒有人能移除。擁有者問到是否需要
-   failsafe。需要兩層：由外部機制把 supervisor 重新啟動，以及新的 supervisor 如何
-   對待它沒有 handle 的舊 guardian。第一層屬於部署，這一輪沒有碰；第二層是計畫層級
-   的設計，連同第 2 項交給 Codex 與計畫作者，canary 之前定案。另外，helper 的列
-   移除失敗之後，supervisor host 不會重試移除，也不會再啟動 helper，之後每一輪只回報
-   absent；要不要改成每輪重試還沒有答覆。
+4. supervisor failsafe 已採 [C4](P3-SUPERVISOR-FAILSAFE.md)：外部重啟服務仍屬部署，
+   本次未安裝。新 supervisor 沒有舊 witness 時回報 `COLD_RECOVERY_HOLD`，不推測
+   DEAD、不 restore、不建立競爭 guardian。保留原 witness 的 supervisor 能處理
+   早期死亡，並每輪重試 helper/guardian 列移除及 C3 barrier 清理；預算耗盡也不丟
+   清理義務。冷啟動目前更保守：連有效 terminal history 也拒絕；retained rollover
+   則完整分頁驗證歷史後原子切換 epoch。未知 native cleanup 隔離、暫時 SQL 故障
+   保留相同 guard 重試。Source 已完成；實測狀態以本頁最上方 checkpoint 為準。
 5. `register_infrastructure_locked` 的兩個提前拒絕原本會留下 POLICY entry nonce，之後
    每一次 `prepare` 都會得到 `policy_scope_busy`。擁有者授權修正，已完成：
    `verify_infrastructure_candidate_locked` 在 scope 還沒碰帳本時先做同樣兩個檢查，

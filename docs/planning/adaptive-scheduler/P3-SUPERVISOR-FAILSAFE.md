@@ -242,3 +242,76 @@ commands, environment, failures/errors/skips and native capability refusals.
 Portable success is not evidence of native S1-S3, guardian-loss timing, P4
 overhead, P5 fault recovery or P6 A/B performance. No test may crash, stop,
 limit or trim a user's working process.
+
+## Implementation checkpoint: 2026-09-22
+
+The original C4 contract was committed and pushed as `2873a3f`, before its
+implementation. The behavior below describes the current source; executed
+commands, counts, failures and integration status remain in the
+[current README checkpoint](README.md#2026-09-22-codex-實作-checkpoint目前狀態).
+The final C4 regression ran 2,127 adaptive tests across 86 modules in 236.798
+seconds, with zero failures, errors or skips. The targeted 120-test retry run
+also passed in 20.556 seconds. Commands, earlier failures and the protected dirty
+baseline dependency are recorded in README. Nothing in this section asserts a
+native gate or completed deployment.
+
+`SupervisorHost.start()` now retains `SupervisorStartup`, acquires the lifetime
+instance fence, invokes `FinishedBarrierJanitor`, and checks fresh state before
+creating infrastructure. The final startup check and publication of the child
+remain under POLICY without spanning CreateProcess with a SQLite transaction.
+The child is retained before POLICY cleanup, so a lost acknowledgement cannot
+cause a second Create. The host preserves exact pending POLICY operations and
+quarantines unknown Create or native cleanup outcomes. Cold refusals emit
+`COLD_RECOVERY_HOLD` with a concrete reason, create no replacement, and keep the
+safe barrier reconciliation available when its prerequisites can be verified.
+
+**Conservative implementation deviation:** cold startup rejects all historical
+rows in its inspected managed-execution, control, launch and retirement tables,
+including valid terminal rows and prior barrier-clear audit rows. It also
+rejects existing infrastructure, an old guardian binding, published managed
+allocations, and recovery journal files. It uses complete empty-state probes
+rather than paging history to authorize a fresh supervisor. Consequently, a
+previously used but completely settled ledger is still not fresh-startable by
+this path. No automatic deletion, alternate data directory or bypass is offered
+as recovery for old obligations. Cold adoption and authenticated host
+publication remain explicit operational item 4 limitations.
+
+That startup restriction is separate from **retained rollover**:
+`SettledEpochRollover` pages every named historical scope, including earlier
+epochs, at most 16 per tick under a stable registry revision. It validates
+terminal archives, settled manifests and C2 receipts where applicable, rechecks
+the dead witness and current obligations, and atomically writes the runtime
+epoch transition plus `adaptive_epoch_rollovers` audit. A changed revision
+invalidates the scan. The host keeps one replacement epoch and attempt through
+retries instead of reminting after an uncertain outcome. Historical creator
+identity and manifests remain unchanged.
+
+For early child death, `_start_guardian()` mints `RetainedGuardianCreation`
+directly from the actual creation handle. `_retry_attach()` uses
+`GuardianSupervisor.attach_created()` and `RecoveryOwner.capture_created()`
+only for that same-process, exact retained DEAD witness. Ordinary capture still
+requires ALIVE. A child that died before any scope/launch/control obligation is
+registered has a separate complete POLICY-fenced no-Job check. Registered
+scopes with missing evidence do not take that shortcut.
+
+Helper and guardian row removals now retain
+`PendingInfrastructureRetirement` objects. Every applicable host tick retries
+the exact operation before considering replacement budgets. Known retryable
+failures reuse the original guard; changed ownership, unreturned guard or
+uncertain native cleanup stays pending/quarantined. A failed helper deletion
+keeps its witness and does not become permanent `absent`. Shutdown refuses to
+discard pending registry, startup, rollover or barrier operations. Retired
+child handle cleanup records completed closes and unknown outcomes separately.
+
+`FinishedBarrierJanitor` is called at startup and on each host tick. It invokes
+the existing C3 ledger operation and reconciles its audit after a lost ACK,
+without opening a Job or setting a control. The host defers it when retained
+native custody or an integrity error could contradict the durable evidence.
+Thus the former finalize-then-supervisor-exit barrier retry gap has a production
+caller; actual verification is reported in README, not inferred from wiring.
+
+No daily config, formal Scheduled Task, global startup entry, exemption limit or
+resource threshold was changed for this source checkpoint. Adaptive remains
+off. Native timing, independent service startup, S1-S3, P4 overhead, P5 fault
+recovery and P6 comparable A/B measurements remain unverified unless README
+later records the corresponding actual evidence.

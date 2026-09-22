@@ -263,6 +263,12 @@ existing cases pin this behavior:
 `test_alive_and_unknown_guardian_do_not_open_or_control_job`. The background
 that led to the decision follows.
 
+The 2026-09-22 [C4 contract and source checkpoint](P3-SUPERVISOR-FAILSAFE.md)
+also supports a child already DEAD before the first attach, but only when this
+same supervisor retained that child's verified CreateProcess witness. It does
+not replace ordinary ALIVE capture or permit a fresh host to infer old death.
+Fresh cold adoption remains explicitly unsupported.
+
 Formal plan §3.2 requires the old guardian's held process handle to be signaled.
 §8.3 also describes a fresh Scheduled Task recovery after helper, guardian and
 wrapper have all disappeared. These requirements are not automatically
@@ -291,13 +297,18 @@ pass. Promotion remains stopped for this unresolved all-witness-loss contract.
 
 - Actual independent service host/startup and supervisor scheduling, outside the
   collector kill subtree. No task or global startup entry was installed.
-- Durable instance provenance for a new process with no captured POLICY binding,
-  and an accepted exact-death contract when every native witness is gone.
-- Retrying the finished Job barrier clear after this supervisor is gone. The
-  orphan drain clears the barrier for a Job it finished and offers the clear
-  again on later passes. If the supervisor process ends between the finalize
-  commit and the clear, a new supervisor has no custody of that Job and nothing
-  retries. This belongs with owner decision 4 in the README.
+- Authenticated host publication and supported cold adoption remain operational
+  item 4 limitations. C4's fresh host keeps `COLD_RECOVERY_HOLD` for old
+  infrastructure, bindings and even terminal history; a new instance mutex
+  does not prove compatibility of older supervisors. The accepted all-witness
+  loss rule continues to forbid inferred death or automatic restoration.
+- The former finished-Job barrier retry source gap is addressed by C4's
+  `FinishedBarrierJanitor`, called from supervisor startup and every tick.
+  It uses C3's exact durable finalization/archive/manifest and atomic audit,
+  requires no vanished Job handle, and defers to contradictory retained native
+  custody. Its implementation is described in
+  [P3-SUPERVISOR-FAILSAFE.md](P3-SUPERVISOR-FAILSAFE.md#implementation-checkpoint-2026-09-22);
+  executed evidence and remaining gaps belong to the [current README](README.md).
 - Separate durable recovery ownership transfer for a scope that must keep
   running, followed by lifecycle adoption, child accounting and original lease
   handling. The drain finishes a scope; it does not adopt one.
@@ -310,3 +321,17 @@ pass. Promotion remains stopped for this unresolved all-witness-loss contract.
 All native-control and release gates remain unpassed. The daily runtime stays
 unchanged and adaptive stays off; portable integration is evidence of source
 behavior only.
+
+## C4 source handoff
+
+Contract commit `2873a3f` preceded the C4 source changes. The current host now
+wires startup exclusion, retained creation-witness early-death capture,
+independent guardian/helper registry cleanup retries, finished-barrier retry
+and settled epoch rollover. Cold startup intentionally refuses every inspected
+historical managed/control/launch/retirement row, including terminal history;
+retained rollover instead pages all named historical scopes before committing
+an audited transition. These are different authority paths, not interchangeable
+ways to reopen admission. The coordinating agent has not yet recorded the C4
+verification result in this checkpoint; [README](README.md) owns the latest
+commands, test counts and gap status. No native gate is claimed and no daily
+runtime, formal Scheduled Task or global entry was changed by this source work.

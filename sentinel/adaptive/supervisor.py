@@ -1,9 +1,11 @@
 """Resident guardian observation and bounded restore-only dispatch.
 
 Attach while the original guardian is alive, retaining its actual process
-object and the existing POLICY binding through RecoveryOwner. No PID/name
-polling, workload restart, termination, epoch replacement or admission release
-occurs here. A failed/partial inventory is never an all-caps proof. This is the
+object and the existing POLICY binding through RecoveryOwner. A separate
+created-child attach may use this same host's retained creation witness when
+its child died before attach. No PID/name polling, workload restart, termination,
+epoch replacement or admission release occurs here. A failed/partial inventory
+is never an all-caps proof. This is the
 resident consumer; installing a Scheduled Task or supplying the independent
 service host is a separate operational step.
 """
@@ -111,6 +113,17 @@ class GuardianSupervisor:
         """
         recovery = RecoveryOwner.capture(store, journal, guardian=guardian,
                                         guardian_epoch=guardian_epoch, **fixtures)
+        return cls._attach_recovery(store, recovery)
+
+    @classmethod
+    def attach_created(cls, store, journal, *, creation, guardian_epoch, **fixtures):
+        """Attach after verified early child death, never through a cold PID open."""
+        recovery = RecoveryOwner.capture_created(store, journal, creation=creation,
+                                                guardian_epoch=guardian_epoch, **fixtures)
+        return cls._attach_recovery(store, recovery)
+
+    @classmethod
+    def _attach_recovery(cls, store, recovery):
         owner = cls(store, recovery)
         try:
             owner._refresh_inventory()

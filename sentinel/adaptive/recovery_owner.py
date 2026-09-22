@@ -1,6 +1,9 @@
 """Restore-only takeover from a previously captured, exact guardian witness.
 
-Capture runs while that guardian is alive and the existing ledger is readable.
+Ordinary capture runs while that guardian is alive and the ledger is readable.
+The distinct created-child path accepts an already-dead guardian only through
+the same host's retained, verified CreateProcess witness. Neither path reopens
+an old PID or treats a persisted identity as proof of native death.
 It pins the real POLICY namespace and duplicates the retained guardian handle.
 Later restoration needs neither SQLite nor a live wrapper/root. A completely
 cold process with no captured binding/death witness is deliberately unsupported;
@@ -18,7 +21,7 @@ import os
 import threading
 from uuid import UUID, uuid5
 
-from .contracts import CpuControl, CpuControlMode, IdentityStatus, RecoveryManifest
+from .contracts import CpuControl, CpuControlMode, IdentityObservation, IdentityStatus, RecoveryManifest
 from .guardian_lifecycle import job_mutex_instance
 from .identity import VerifiedProcess
 from .native_job import JobAccess, NativeJob
@@ -30,6 +33,7 @@ from .windows import (NativePolicyMutex, NativePolicyMutexError, PolicyMutexLeas
 
 
 _CAPTURE = object()
+_CREATION = object()
 _INSTANCE_NAMESPACE = UUID("b6fb6083-6db5-41c9-a54a-39cb9000df21")
 _DISABLED = CpuControl(CpuControlMode.DISABLED, None)
 _IMMUTABLE = ("execution_id", "reservation", "spec_hash", "job_name", "creation_nonce",
@@ -43,6 +47,82 @@ class RecoveryResult:
     execution_id: str
     native_disabled: bool
     journal_settled: bool
+
+
+class RetainedGuardianCreation:
+    """Same-process custody minted directly from the host's CreateProcess result.
+
+    The factory is a trusted in-process integration boundary, never an IPC/CLI
+    input. Its caller must retain the actual creation handle through duplication.
+    A child may already be dead; verification and all later waits use this exact
+    object. This owns only the duplicate, not the caller's original handle.
+    """
+
+    def __init__(self, token):
+        if token is not _CREATION:
+            raise LifecycleError("guardian_creation_factory_required")
+        self._lock = threading.RLock()
+        self._creator_pid = os.getpid()
+        self._guardian_epoch = None
+        self._process = self._construction_error = None
+        self._closed = False
+
+    @classmethod
+    def from_creation_handle(cls, handle, *, expected_pid, expected_logon_id, guardian_epoch):
+        owner = cls(_CREATION)
+        try:
+            if (type(guardian_epoch) is not str or not 1 <= len(guardian_epoch) <= 128 or
+                    any(ord(char) < 32 for char in guardian_epoch)):
+                raise LifecycleError("recovery_epoch_invalid")
+            owner._guardian_epoch = guardian_epoch
+            owner._process = VerifiedProcess.duplicate_from_handle(handle,
+                expected_pid=expected_pid, expected_logon_id=expected_logon_id)
+            return owner
+        except BaseException as error:
+            owner._construction_error = error
+            error._guardian_creation_owner = owner
+            raise
+
+    @property
+    def process(self):
+        return self._process
+
+    @property
+    def guardian_epoch(self):
+        return self._guardian_epoch
+
+    @property
+    def creator_pid(self):
+        return self._creator_pid
+
+    def _verified_process(self, guardian_epoch):
+        with self._lock:
+            if (self._closed or self._construction_error is not None or
+                    self._creator_pid != os.getpid() or
+                    self._guardian_epoch != guardian_epoch or
+                    not isinstance(self._process, VerifiedProcess)):
+                raise LifecycleError("recovery_creation_witness_unverified")
+            return self._process
+
+    def close(self):
+        """Close only owned custody; existing cleanup quarantine rules apply."""
+        with self._lock:
+            if self._creator_pid != os.getpid():
+                raise LifecycleError("recovery_creation_owner_changed")
+            if self._closed:
+                return
+            try:
+                error = self._construction_error
+                if error is not None:
+                    accounted = bool(retained_owners(error))
+                    if not settle_retained(error) or (getattr(error, "__notes__", ()) and not accounted):
+                        raise LifecycleError("recovery_creation_custody_unsettled")
+                if self._process is not None:
+                    self._process.close()
+                self._closed = True
+            except BaseException as error:
+                error._guardian_creation_owner = self
+                raise
 
 
 class _Entry:
@@ -76,12 +156,36 @@ class RecoveryOwner:
     @classmethod
     def capture(cls, store, journal, *, guardian, guardian_epoch,
                 current=None, mutex_factory=None, job_opener=None):
+        return cls._capture(store, journal, guardian=guardian, guardian_epoch=guardian_epoch,
+            current=current, mutex_factory=mutex_factory, job_opener=job_opener,
+            creation=None, created=False)
+
+    @classmethod
+    def capture_created(cls, store, journal, *, creation, guardian_epoch,
+                        current=None, mutex_factory=None, job_opener=None):
+        """Capture a child already DEAD on this host's retained creation witness.
+
+        This does not enable cold adoption. The opaque creation owner was minted
+        in this process from its native creation handle, remains reachable, and
+        must match the existing epoch. Failure retains partial capture owners.
+        """
+        return cls._capture(store, journal, guardian=None, guardian_epoch=guardian_epoch,
+            current=current, mutex_factory=mutex_factory, job_opener=job_opener,
+            creation=creation, created=True)
+
+    @classmethod
+    def _capture(cls, store, journal, *, guardian, guardian_epoch, current,
+                 mutex_factory, job_opener, creation, created):
         owner = cls(_CAPTURE)
         owner.journal = journal
         owner._mutex_factory = mutex_factory or NativePolicyMutex
         owner._job_opener = job_opener or NativeJob.open
         owner._guardian_epoch = guardian_epoch
         try:
+            if created:
+                if type(creation) is not RetainedGuardianCreation:
+                    raise LifecycleError("recovery_creation_witness_unverified")
+                guardian = creation._verified_process(guardian_epoch)
             if getattr(store, "existing_path", False) is not True or not isinstance(guardian, VerifiedProcess):
                 raise LifecycleError("recovery_capture_unverified")
             if type(guardian_epoch) is not str or not guardian_epoch:
@@ -90,8 +194,13 @@ class RecoveryOwner:
             owner._validate_current()
             if guardian.identity.logon_id != owner._current.identity.logon_id or guardian.identity == owner._current.identity:
                 raise LifecycleError("recovery_guardian_binding_invalid")
-            if guardian.observe().status is not IdentityStatus.ALIVE:
-                raise LifecycleError("recovery_capture_guardian_not_alive")
+            expected_status = IdentityStatus.DEAD if created else IdentityStatus.ALIVE
+            refusal = ("recovery_capture_created_guardian_not_dead" if created
+                       else "recovery_capture_guardian_not_alive")
+            observed = guardian.observe()
+            if (type(observed) is not IdentityObservation or observed.identity != guardian.identity or
+                    observed.status is not expected_status):
+                raise LifecycleError(refusal)
             owner._guardian = guardian.duplicate()
             def read_binding():
                 with store._connection() as conn:
@@ -112,8 +221,13 @@ class RecoveryOwner:
                     # under the actual mutex, never a fabricated DB PolicyGuard.
                     if read_binding() != owner.binding:
                         raise LifecycleError("recovery_capture_binding_changed")
-                    if owner.observe_guardian().status is not IdentityStatus.ALIVE:
-                        raise LifecycleError("recovery_capture_guardian_not_alive")
+                    if created:
+                        creation._verified_process(guardian_epoch)
+                    observed = owner.observe_guardian()
+                    if (type(observed) is not IdentityObservation or
+                            observed.identity != owner.guardian_identity or
+                            observed.status is not expected_status):
+                        raise LifecycleError(refusal)
             owner._captured = True
             return owner
         except BaseException as error:

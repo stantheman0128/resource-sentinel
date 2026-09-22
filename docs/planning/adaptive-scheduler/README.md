@@ -49,7 +49,7 @@ cleanup 完成前保留 custody，未知 close 結果不會被當成退場。
 最後完整 adaptive 回歸 **108 個模組、2,800 tests 全過，455.257 秒，
 0 failures／errors／skips**。範圍為當時 Git 已追蹤的 adaptive tests 加上本次兩個
 guardian registration/startup 模組；確切清單留在本機
-`.local-adaptive/item4-regression-modules.txt`。命令為
+`.local-adaptive/item4-regression-modules-2800.txt`。命令為
 `C:\Python313\python.exe .local-adaptive\item4-regression.py`，透過下述日常 wrapper
 正常准入。此前 364 個 host/drain integration tests 通過（82.491 秒），新增
 startup 與 S3 foundation 的 157 個 targeted tests 亦通過（4.326 秒）。
@@ -74,6 +74,14 @@ loader error 或未跑的 native gate 算成 pass。
 | 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport 與接線](P2-DAILY-ACTIVATION.md)已完成 source installer、原始 owner 常駐 host，以及 Coordinator／Maintainer／lifecycle／legacy writer 接線。252 個 portable tests 與 27 個 S2 tests 合跑全過（279，10.587 秒）。真正 experiment lifetime provider、generation 正式退場及 native source handoff 仍缺；日常 grace 前提未解鎖，未執行安裝。 |
 | 6. console 驗收命令 | [P6 schedule／fixture／analyzer foundation](P6-RUNNER-CONTRACT.md)已提交，與 P4 portable 模組合跑 184 tests 通過（0.610 秒）；[S1/S2 與 ledger bridge 契約](S1-DAILY-BRIDGE-CONTRACT.md)、[S3 foundation](S3-REAL-HOST-RECOVERY.md)、[P4 cost engine](P4-OVERHEAD-RUNNER.md)另有 161 tests 通過（41.676 秒）。S2 隨後補強原 shell／console cleanup custody，27 tests 在上述 279 合跑中通過。這些 foundation 分包提交；真正 daily bridge、完整 orchestration、部分 fault cases、完整成本／A/B coverage 尚缺，不是只剩 console 執行。 |
 
+最新追加：項目 5 的同帳本 demand 與 retirement fence 已提交為 `1072786`／
+`a48925a`；native scope 和正向 release 仍未提供。項目 6 的 P6 矩陣編排及 raw
+reducer 已提交為 `ff6f31b`，S3 原始 action cutpoints／三個實際故障 driver／
+14×10 記錄器為 `7307055`；真正 native provider、部分故障 driver、A0 等價性及
+140 次完整實驗 orchestration 尚缺。[原始成員的 bounded memory 查詢](P4-MEMBER-MEMORY.md)
+已提交為 `2922e09`，以 private working set／private Commit、原始 process handles
+與完整 membership 證據計算；不使用共享 RSS，不完整採樣保持 unknown。
+
 以上是目前缺口；下列較早日期的段落保留其歷史測試範圍。Native S1–S3、完整
 P3–P6 都尚未通過。日常 config／Scheduled Task／啟動入口未修改。
 
@@ -84,8 +92,46 @@ generation 的正面退場契約。新增測試將繼續使用隔離帳本；任
 
 同帳本 experiment demand 的新增契約已先以 `ed0c2cf` 提交；
 [generation 正面退場契約](DAILY-GENERATION-RETIREMENT.md)為 `b281fd3`。
-兩者都不是已完成 native bridge 的聲明。退場之後的明確 fresh-generation
+日常 retirement fence 已實作並提交為 `a48925a`；同帳本 demand source 為
+`1072786`，P6 編排與 raw trace reducer 為 `ff6f31b`。新增 demand 使用原本日常
+reservation，不建立另一份容量；TTL、root exit 或未知 cleanup 都不能釋放它。
+P6 現已固定七情境、三組比較、十配對，以及獨立 noise calibration；完整矩陣為
+420 個比較 runs 加 420 個 calibration runs，尚未實際執行。
+
+上述三包合跑 **308 tests 通過，21.977 秒，0 failures／errors／skips**：
+
+```text
+C:\Python313\python.exe -m unittest tests.test_adaptive_daily_retirement_fence tests.test_adaptive_experiment_demand tests.test_adaptive_managed_admission tests.test_adaptive_admission_context tests.test_adaptive_abandon_admission tests.test_adaptive_coordinator tests.test_adaptive_orchestrator tests.test_adaptive_measurements tests.test_adaptive_scope_workload tests.test_adaptive_runner -q
+```
+
+測試依賴受保護的 dirty baseline 及相鄰未提交 retirement 整合；不是乾淨 clone
+或 native gate 的證據。Demand 尚未提供 native scope／admitted release；actual
+creation registry、日常 grant 同步／writer exclusion、canonical runner imports、
+A0 source equivalence 與 native cleanup bridge 仍待整合。退場之後的明確 fresh-generation
 restart 仍是 source 缺口；不能把關閉 keeper 說成恢復 admission-only。
+
+Memory／helper／P4／S3 合跑 459 tests（18.746 秒），458 通過，唯一 error 是 P4
+新增 fixture 直接建構缺少 35 個必填值的 `PolicyProfile()`。Memory 與 S3 全部通過；
+P4 fixture 已改用既有驗證過的 profile。此前 memory 第一輪 179 tests 有一個
+新 query 模組未列入結構白名單的 failure，以及一個不存在的 test module loader
+error；已補上 query-only 結構斷言並用正確 operator 模組執行這次合跑。
+
+P4 後續四模組重跑 **155 tests 全過（12.967 秒，0 failures／errors／skips）**。
+同時修正原始 callback 核對：兩個 builtin functions 不能只因 `__self__` 相同、
+`__func__` 都為空就視為同一個。實際 host 的 registry／operator poll／report
+write+flush 均納入成本，50 query scopes 共用同一個 256 records／100 ms budget；
+十個 managed Jobs 上限不變。只有預先指定 P4 類型的 artifact 使用 2 MiB 上限，
+其他 artifact 與 IPC 仍為 256 KiB。
+
+```text
+C:\Python313\python.exe -m unittest tests.test_adaptive_overhead_runner tests.test_adaptive_overhead_host tests.test_adaptive_capability_evidence tests.test_adaptive_capability_runner -q
+```
+
+P4 尚存的具體 source／native 缺口：actual provider 的 keeper role 必須綁定原始
+daily-generation owner，不能只提供任意同 logon 的 live process；現有 operator
+idle poll 可花 50 ms，尚未證明符合 tick p95；stderr reports 仍需實際 bounded
+storage 實作。既有 idle-after log bytes 不可大於 idle-before 的 gate 比正式計畫
+bounded growth 更嚴格，尚未放寬或忽略其失敗。所有 native 成本門檻仍未驗證。
 
 另修正 source keeper 在 stdout 失效時略過等待、持續忙轉的問題：診斷與 pacing
 分開，保持同一原始 operation，固定每個錯誤邊界只保留第一個錯誤。

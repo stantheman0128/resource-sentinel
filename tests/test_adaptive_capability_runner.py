@@ -155,6 +155,25 @@ class CapabilityProducerBoundaries(unittest.TestCase):
                 runner._write_new(path, {"data": "x" * runner.MAX_FILE_BYTES})
             self.assertFalse(path.exists())
 
+    def test_p4_larger_artifact_requires_explicit_expected_gate(self):
+        value = {"gate": "P4", "data": "x" * runner.MAX_FILE_BYTES}
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "P4.json"
+            for expected_gate in (None, "S1"):
+                with self.subTest(expected_gate=expected_gate):
+                    with self.assertRaisesRegex(runner.NativeRunBlocked, "native_artifact_oversized"):
+                        runner._write_new(path, value, expected_gate=expected_gate)
+                    self.assertFalse(path.exists())
+            runner._write_new(path, value, expected_gate="P4")
+            self.assertEqual(json.loads(path.read_text("utf-8")), value)
+
+    def test_p4_fixed_limit_refuses_oversize_before_open(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "P4.json"
+            with self.assertRaisesRegex(runner.NativeRunBlocked, "native_artifact_oversized"):
+                runner._write_new(path, {"data": "x" * runner.MAX_P4_FILE_BYTES}, expected_gate="P4")
+            self.assertFalse(path.exists())
+
     def evidence_run(self, directory):
         # Explicit in-process bookkeeping fixture, never constructor/native gate.
         instance = runner.NativeEvidenceRun.__new__(runner.NativeEvidenceRun)
@@ -179,6 +198,41 @@ class CapabilityProducerBoundaries(unittest.TestCase):
             artifact = json.loads((Path(temp) / "S1.json").read_text())
             self.assertEqual(bundle["run_id"], artifact["run_id"])
             self.assertEqual(bundle["artifacts"][0]["sha256"], result["artifact_sha256"])
+
+    def test_p4_publish_and_reread_use_fixed_expected_gate_bound(self):
+        with tempfile.TemporaryDirectory() as temp:
+            instance = self.evidence_run(temp)
+            value = {"synthetic_raw_data": "x" * runner.MAX_FILE_BYTES}
+            result = instance.publish_gate("P4", value)
+            self.assertEqual(result["measured_gates"], ["P4"])
+            self.assertFalse(result["promotion"])
+            self.assertGreater((Path(temp) / "P4.json").stat().st_size, runner.MAX_FILE_BYTES)
+            result = instance.publish_gate("S1", {})
+            self.assertEqual(result["measured_gates"], ["S1", "P4"])
+
+    def test_p4_contents_do_not_enlarge_another_gate_during_bundle_read(self):
+        with tempfile.TemporaryDirectory() as temp:
+            instance = self.evidence_run(temp)
+            # Construct untrusted bytes directly: caller expects S1 regardless
+            # of the enclosed P4 marker or its oversized native-looking body.
+            value = dict(schema_version=1, run_id=instance.record["run_id"],
+                gate="P4", evidence_source="native", data="x" * runner.MAX_FILE_BYTES)
+            (Path(temp) / "S1.json").write_bytes(runner.canonical(value))
+            with self.assertRaisesRegex(runner.evidence.CapabilityEvidenceError, "capability_evidence_oversized"):
+                instance.publish_gate("P4", {})
+            self.assertFalse((Path(temp) / "bundle.json").exists())
+
+    def test_p4_wrong_gate_or_truncated_envelope_never_publishes_bundle(self):
+        for truncated in (False, True):
+            with self.subTest(truncated=truncated), tempfile.TemporaryDirectory() as temp:
+                instance = self.evidence_run(temp)
+                value = dict(schema_version=1, run_id=instance.record["run_id"],
+                    gate="P4" if truncated else "S1", evidence_source="native", data={})
+                raw = runner.canonical(value)
+                (Path(temp) / "P4.json").write_bytes(raw[:-1] if truncated else raw)
+                with self.assertRaises(ValueError if truncated else runner.NativeRunBlocked):
+                    instance.publish_gate("S1", {})
+                self.assertFalse((Path(temp) / "bundle.json").exists())
 
     def test_build_change_before_publish_never_creates_artifact(self):
         with tempfile.TemporaryDirectory() as temp:

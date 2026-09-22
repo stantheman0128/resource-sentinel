@@ -98,15 +98,32 @@ def case_rows(recovery):
     return result
 
 
-def p4_data():
+def p4_data(profile=None):
+    if profile is None:
+        profile = replace(validate_policy_profile(json.loads(
+            (ROOT / "config/adaptive.example.json").read_text(encoding="utf-8"))), mode=Mode.ENFORCE)
     scales = []
     for jobs in (1, 10, 50):
         processes = [dict(identity=identity(100 + index),
-            role="helper" if index == 0 else "guardian" if index == 1 else "waiting_wrapper",
-            cpu_start_100ns=0, cpu_end_100ns=T) for index in range(jobs + 2)]
+            roles=(["helper"] if index == 0 else ["guardian"] if index == 1 else
+                ["accounting_keeper", "daily_activation", "supervisor"] if index == 2 else ["waiting_wrapper"]),
+            cpu_start_100ns=0, cpu_end_100ns=T) for index in range(jobs + 3)]
+        peaks = [45 * MIB, 45 * MIB, 10 * MIB] + [20 * MIB] * jobs
+        executions = [f"{jobs:08x}-1000-4000-8000-{index + 1:012x}" for index in range(jobs)]
+        host = dict(identity=identity(100), parent_identity=identity(102),
+            instance_id=f"{jobs:08x}-2000-4000-8000-000000000001",
+            operator_instance_id=f"{jobs:08x}-2000-4000-8000-000000000002",
+            scope_nonce=f"{jobs:032x}", config_revision=profile_revision(profile),
+            managed_execution_ids=executions[:10], query_only_execution_ids=executions[10:],
+            enroll_every_ticks=5, report_every_ticks=10, started_iteration=0, ended_iteration=600,
+            ticks=[[second + 1, int(second > 0 and second % 5 == 0),
+                int((second + 1) % 10 == 0), 1, 512 if (second + 1) % 10 == 0 else 0,
+                (second + 1) * T, second * T + 100_000, (second + 1) * T, 0, 0]
+                for second in range(600)])
         scales.append(dict(jobs=jobs, started_tick=0, ended_tick=600 * T,
             processes=processes, samples=[[second * T, second * T + 100_000,
-                                          100 * MIB, 20 * MIB] for second in range(600)],
+                90 * MIB, 20 * MIB, 100 * MIB, sum(peaks), list(peaks)] for second in range(600)],
+            host_loop=host,
             native_set_calls=0, sampling_cases=dict(membership_added=1, membership_removed=1,
                 inaccessible_identity=1, member_scan_timeout=1, subtraction_zero_samples=1,
                 unsafe_subtractions=0)))
@@ -171,7 +188,7 @@ class CapabilityEvidenceTests(unittest.TestCase):
             else self.topology.sha256} for row in case_rows(False)]
         self.data = {"S1": s1_data(), "S2": {"hosts": [dict(name="powershell51",
             executable_sha256="e" * 64, measured_topologies=[self.topology.to_dict()], cases=launch_cases)]},
-            "S3": {"cases": case_rows(True)}, "P4": p4_data(), "P5": p5_data()}
+            "S3": {"cases": case_rows(True)}, "P4": p4_data(self.profile), "P5": p5_data()}
         self.bundle = dict(schema_version=1, kind="native_capability_bundle", run_id=RUN,
             evidence_source="native", build=asdict(self.build), context=asdict(self.context),
             profile_revision=profile_revision(self.profile), artifacts=[])
@@ -425,9 +442,9 @@ class CapabilityEvidenceTests(unittest.TestCase):
         self.failed_gate("P4", "capability_cost_coverage_incomplete")
 
     def test_p4_missing_waiting_wrapper_or_shadow_write_denies(self):
-        self.data["P4"]["scales"][0]["processes"][-1]["role"] = "helper"
+        self.data["P4"]["scales"][0]["processes"][-1]["roles"] = ["helper"]
         self.failed_gate("P4", "capability_monitor_coverage_incomplete")
-        self.data["P4"] = p4_data()
+        self.data["P4"] = p4_data(self.profile)
         self.data["P4"]["scales"][0]["native_set_calls"] = 1
         self.failed_gate("P4", "capability_safety_invariant_failed")
 
@@ -440,6 +457,259 @@ class CapabilityEvidenceTests(unittest.TestCase):
     def test_p4_ten_job_overhead_failure_denies(self):
         self.data["P4"]["scales"][1]["processes"][0]["cpu_end_100ns"] = 600 * T
         self.failed_gate("P4", "capability_observer_budget_failed")
+
+    def test_p4_core_only_trace_without_actual_host_denies(self):
+        del self.data["P4"]["scales"][0]["host_loop"]
+        self.failed_gate("P4", "capability_schema_invalid")
+
+    def test_p4_every_observer_role_is_required(self):
+        original = deepcopy(self.data["P4"])
+        for role in ("supervisor", "accounting_keeper", "daily_activation"):
+            with self.subTest(role=role):
+                self.data["P4"] = deepcopy(original)
+                self.data["P4"]["scales"][0]["processes"][2]["roles"].remove(role)
+                self.failed_gate("P4", "capability_monitor_coverage_incomplete")
+
+    def test_p4_cohosted_observer_roles_are_measured_once(self):
+        scale = self.data["P4"]["scales"][0]
+        # One CPU row carrying three resident roles is within .05 units;
+        # charging that same process three times would exceed the existing cap.
+        scale["processes"][2]["cpu_end_100ns"] = 15 * T
+        result = self.authority().assess()
+        self.assertTrue(result.eligible, result)
+
+    def test_p4_distinct_observer_processes_are_all_charged(self):
+        scale = self.data["P4"]["scales"][0]
+        scale["processes"][2]["roles"] = ["supervisor"]
+        for pid, role in ((200, "accounting_keeper"), (201, "daily_activation")):
+            scale["processes"].append(dict(identity=identity(pid), roles=[role],
+                cpu_start_100ns=0, cpu_end_100ns=T))
+        for sample in scale["samples"]:
+            sample[6][2] = 4 * MIB
+            sample[6].extend([3 * MIB, 3 * MIB])
+        result = self.authority().assess()
+        self.assertTrue(result.eligible, result)
+        scale["processes"][-1]["cpu_end_100ns"] = 40 * T
+        self.failed_gate("P4", "capability_observer_budget_failed")
+
+    def test_p4_duplicate_identity_or_pid_cannot_be_charged_as_another_monitor(self):
+        original = deepcopy(self.data["P4"])
+        for same_birth in (True, False):
+            with self.subTest(same_birth=same_birth):
+                self.data["P4"] = deepcopy(original)
+                processes = self.data["P4"]["scales"][0]["processes"]
+                processes[2]["identity"] = deepcopy(processes[0]["identity"])
+                if not same_birth:
+                    processes[2]["identity"]["created_filetime_100ns"] = "999999"
+                self.failed_gate("P4", "capability_monitor_identity_invalid")
+
+    def test_p4_roles_must_be_sorted_unique_and_only_supported_aliases(self):
+        original = deepcopy(self.data["P4"])
+        for roles in (["supervisor", "accounting_keeper", "daily_activation"],
+                      ["supervisor", "supervisor"], ["helper", "supervisor"],
+                      ["waiting_wrapper", "supervisor"], ["unmeasured_observer"]):
+            with self.subTest(roles=roles):
+                self.data["P4"] = deepcopy(original)
+                self.data["P4"]["scales"][0]["processes"][2]["roles"] = roles
+                self.failed_gate("P4", "capability_monitor_identity_invalid")
+
+    def test_p4_every_memory_aggregate_is_derived_from_unique_processes(self):
+        original = deepcopy(self.data["P4"])
+        for index in (2, 3, 4, 5):
+            with self.subTest(field=index):
+                self.data["P4"] = deepcopy(original)
+                self.data["P4"]["scales"][0]["samples"][0][index] += 1
+                self.failed_gate("P4", "capability_monitor_memory_mismatch")
+
+    def test_p4_peak_vector_cannot_omit_an_observer(self):
+        self.data["P4"]["scales"][0]["samples"][0][6].pop()
+        self.failed_gate("P4", "capability_measurement_missing")
+
+    def test_p4_extra_resident_commit_uses_existing_memory_budget(self):
+        sample = self.data["P4"]["scales"][0]["samples"][0]
+        sample[6][2] += 61 * MIB
+        sample[4] += 61 * MIB
+        sample[5] += 61 * MIB
+        self.failed_gate("P4", "capability_observer_budget_failed")
+
+    def test_p4_host_binding_cannot_substitute_identity_parent_profile_or_endpoint(self):
+        original = deepcopy(self.data["P4"])
+        changes = (("identity", identity(999)), ("parent_identity", identity(999)),
+            ("config_revision", "0" * 64), ("scope_nonce", "not-a-scope"))
+        for field, value in changes:
+            with self.subTest(field=field):
+                self.data["P4"] = deepcopy(original)
+                self.data["P4"]["scales"][0]["host_loop"][field] = value
+                self.failed_gate("P4", "capability_host_loop_binding_invalid")
+        self.data["P4"] = deepcopy(original)
+        host = self.data["P4"]["scales"][0]["host_loop"]
+        host["operator_instance_id"] = host["instance_id"]
+        self.failed_gate("P4", "capability_host_loop_binding_invalid")
+
+    def test_p4_query_stress_cannot_overlap_managed_scope(self):
+        host = self.data["P4"]["scales"][2]["host_loop"]
+        host["query_only_execution_ids"][0] = host["managed_execution_ids"][0]
+        self.failed_gate("P4", "capability_host_loop_scope_invalid")
+
+    def test_p4_host_iteration_range_must_match_every_sample(self):
+        self.data["P4"]["scales"][0]["host_loop"]["ended_iteration"] += 1
+        self.failed_gate("P4", "capability_host_loop_coverage_incomplete")
+
+    def test_p4_host_iteration_refresh_report_and_operator_are_observed(self):
+        original = deepcopy(self.data["P4"])
+        for position, field, value in ((0, 0, 2), (5, 1, 0), (9, 2, 0),
+                                       (0, 3, 0), (9, 4, 0), (0, 4, 512)):
+            with self.subTest(position=position, field=field):
+                self.data["P4"] = deepcopy(original)
+                self.data["P4"]["scales"][0]["host_loop"]["ticks"][position][field] = value
+                self.failed_gate("P4", "capability_host_loop_coverage_incomplete")
+
+    def test_p4_host_flags_are_numeric_observations_not_booleans(self):
+        self.data["P4"]["scales"][0]["host_loop"]["ticks"][0][1] = False
+        self.failed_gate("P4", "capability_measurement_invalid")
+
+    def test_p4_nondefault_host_cadences_and_original_iteration_are_verified(self):
+        host = self.data["P4"]["scales"][0]["host_loop"]
+        host.update(started_iteration=17, ended_iteration=617,
+                    enroll_every_ticks=7, report_every_ticks=13)
+        for offset, tick in enumerate(host["ticks"]):
+            iteration = 18 + offset
+            tick[0] = iteration
+            tick[1] = int(iteration > 1 and (iteration - 1) % 7 == 0)
+            tick[2] = int(iteration % 13 == 0)
+            tick[4] = 512 if tick[2] else 0
+        result = self.authority().assess()
+        self.assertTrue(result.eligible, result)
+
+    def test_p4_zero_actual_refresh_or_report_total_cannot_pass(self):
+        original = deepcopy(self.data["P4"])
+        for cadence, index in (("enroll_every_ticks", 1), ("report_every_ticks", 2)):
+            with self.subTest(cadence=cadence):
+                self.data["P4"] = deepcopy(original)
+                host = self.data["P4"]["scales"][0]["host_loop"]
+                host[cadence] = 3600
+                for tick in host["ticks"]:
+                    tick[index] = 0
+                    if index == 2:
+                        tick[4] = 0
+                self.failed_gate("P4", "capability_host_loop_coverage_incomplete")
+
+    def test_p4_pacing_cannot_hide_wait_inside_tick_or_cross_next_sample(self):
+        original = deepcopy(self.data["P4"])
+        for position, field, value in ((0, 5, 0), (0, 6, 1), (0, 7, 100_000),
+                                       (0, 7, T + 1), (0, 9, 1), (599, 7, 600 * T + 1)):
+            with self.subTest(position=position, field=field):
+                self.data["P4"] = deepcopy(original)
+                self.data["P4"]["scales"][0]["host_loop"]["ticks"][position][field] = value
+                self.failed_gate("P4", "capability_host_loop_pacing_invalid")
+
+    def test_p4_wait_overrun_is_exact_not_a_hidden_zero(self):
+        tick = self.data["P4"]["scales"][0]["host_loop"]["ticks"][0]
+        tick[5] = 50_000
+        tick[9] = 50_000
+        result = self.authority().assess()
+        self.assertTrue(result.eligible, result)
+        tick[9] = 0
+        self.failed_gate("P4", "capability_host_loop_pacing_invalid")
+
+    def test_p4_complete_raw_trace_uses_fixed_larger_artifact_bound(self):
+        payload = encoded(dict(schema_version=1, run_id=RUN, gate="P4",
+            evidence_source="native", data=self.data["P4"]))
+        self.assertGreater(len(payload), ce._MAX_BYTES)
+        self.assertLessEqual(len(payload), ce._P4_MAX_BYTES)
+        result = self.authority().assess()
+        self.assertTrue(result.eligible, result)
+
+    def test_p4_artifact_over_fixed_bound_is_refused(self):
+        self.data["P4"] = {"padding": "x" * ce._P4_MAX_BYTES}
+        result = self.authority().assess()
+        self.assertFalse(result.eligible)
+        self.assertEqual(result.reason, "capability_evidence_oversized")
+
+    def test_p4_filename_and_payload_cannot_expand_another_expected_gate_bound(self):
+        authority = self.authority()
+        raw = (self.path / "P4.json").read_bytes()
+        self.bundle["artifacts"] = [dict(gate="S1", path="P4.json", sha256=sha(raw))]
+        payload = encoded(self.bundle)
+        (self.path / "bundle.json").write_bytes(payload)
+        authority.expected_bundle_sha256 = sha(payload)
+        result = authority.assess()
+        self.assertFalse(result.eligible)
+        self.assertEqual(result.reason, "capability_evidence_oversized")
+
+    def test_p4_expected_gate_still_rejects_wrong_gate_envelope(self):
+        authority = self.authority()
+        raw = encoded(dict(schema_version=1, run_id=RUN, gate="S1",
+            evidence_source="native", data={}))
+        (self.path / "P4.json").write_bytes(raw)
+        next(item for item in self.bundle["artifacts"] if item["gate"] == "P4")["sha256"] = sha(raw)
+        payload = encoded(self.bundle)
+        (self.path / "bundle.json").write_bytes(payload)
+        authority.expected_bundle_sha256 = sha(payload)
+        result = authority.assess()
+        self.assertFalse(result.eligible)
+        self.assertEqual(result.reason, "capability_artifact_binding_invalid")
+
+    def test_p4_truncated_trace_cannot_pass_even_with_matching_hash(self):
+        authority = self.authority()
+        raw = (self.path / "P4.json").read_bytes()[:-1]
+        (self.path / "P4.json").write_bytes(raw)
+        next(item for item in self.bundle["artifacts"] if item["gate"] == "P4")["sha256"] = sha(raw)
+        payload = encoded(self.bundle)
+        (self.path / "bundle.json").write_bytes(payload)
+        authority.expected_bundle_sha256 = sha(payload)
+        result = authority.assess()
+        self.assertFalse(result.eligible)
+        self.assertEqual(result.reason, "capability_evidence_unavailable")
+
+    def test_p4_artifact_decoder_keeps_protocol_limits_separate(self):
+        payload = encoded({"gate": "P4", "padding": "x" * ce._MAX_BYTES})
+        self.assertEqual(ce._artifact_json_loads(payload, expected_gate="P4")["gate"], "P4")
+        for decoder in (ce.strict_json_loads,
+                        lambda value: ce._artifact_json_loads(value, expected_gate="S1")):
+            with self.assertRaisesRegex(ValueError, "message too large"):
+                decoder(payload)
+
+    def test_p4_artifact_decoder_enforces_exact_fixed_bound(self):
+        payload = encoded({"padding": "x" * (ce._P4_MAX_BYTES - len(encoded({"padding": ""})))})
+        self.assertEqual(len(payload), ce._P4_MAX_BYTES)
+        self.assertEqual(len(ce._artifact_json_loads(payload, expected_gate="P4")["padding"]),
+                         ce._P4_MAX_BYTES - len(encoded({"padding": ""})))
+        with self.assertRaisesRegex(ValueError, "message too large"):
+            ce._artifact_json_loads(payload + b" ", expected_gate="P4")
+
+    def test_p4_large_artifact_decoder_preserves_duplicate_and_number_rejection(self):
+        prefix = b'{"padding":"' + b"x" * ce._MAX_BYTES + b'",'
+        for suffix in (b'"same":1,"same":2}', b'"number":NaN}', b'"number":Infinity}',
+                       b'"number":-Infinity}', b'"number":1e999}'):
+            with self.subTest(suffix=suffix), self.assertRaises(ValueError):
+                ce._artifact_json_loads(prefix + suffix, expected_gate="P4")
+
+    def test_p4_large_artifact_decoder_preserves_depth_utf8_and_truncation_rejection(self):
+        prefix = b'{"padding":"' + b"x" * ce._MAX_BYTES + b'",'
+        suffixes = (b'"nested":' + b"[" * 65 + b"0" + b"]" * 65 + b"}",
+                    b'"text":"\xff"}', b'"unfinished":')
+        for suffix in suffixes:
+            with self.subTest(suffix=suffix[:20]), self.assertRaises(ValueError):
+                ce._artifact_json_loads(prefix + suffix, expected_gate="P4")
+        with self.assertRaisesRegex(ValueError, "object required"):
+            ce._artifact_json_loads(b"[]", expected_gate="P4")
+
+    def test_p4_artifact_decoder_preserves_exact_integers_and_string_brackets(self):
+        value = {"padding": "x" * ce._MAX_BYTES, "integer": (1 << 63) - 1,
+                 "text": '[{\\"}]' * 100, "flag": True}
+        parsed = ce._artifact_json_loads(encoded(value), expected_gate="P4")
+        self.assertEqual(parsed, value)
+        self.assertIs(type(parsed["integer"]), int)
+        self.assertIs(type(parsed["flag"]), bool)
+        # The decoder preserves types; the existing typed measurement boundary
+        # continues rejecting bools, floats and integers outside its range.
+        original = deepcopy(self.data["P4"])
+        for number in (True, 1.0, 1 << 63):
+            with self.subTest(number=number):
+                self.data["P4"] = deepcopy(original)
+                self.data["P4"]["scales"][0]["processes"][0]["cpu_end_100ns"] = number
+                self.failed_gate("P4", "capability_measurement_invalid")
 
     def test_p5_all_equal_timestamps_and_missing_disabled_readback_deny(self):
         original = deepcopy(self.data["P5"])

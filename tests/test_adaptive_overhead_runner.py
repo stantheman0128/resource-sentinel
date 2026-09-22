@@ -8,7 +8,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
-from sentinel.adaptive.contracts import ProcessIdentity
+from sentinel.adaptive.contracts import IdentityStatus, ProcessIdentity
+from sentinel.adaptive.identity import VerifiedProcess
 from tests.windows import adaptive_cost_probe as cost
 from tests.windows import adaptive_overhead_native as native
 from tests.windows import adaptive_overhead_runner as runner
@@ -63,8 +64,8 @@ class NativeCostLayoutTests(unittest.TestCase):
 
 class P4ReducerTests(unittest.TestCase):
     def setUp(self):
-        self.roles = {identity(1): "helper", identity(2): "guardian",
-                      identity(3): "waiting_wrapper"}
+        self.roles = {identity(1): frozenset(("helper",)), identity(2): frozenset(("guardian",)),
+                      identity(3): frozenset(("waiting_wrapper",))}
 
     def test_exact_identity_join_ignores_snapshot_order(self):
         result = runner.process_endpoints(self.roles,
@@ -97,13 +98,28 @@ class P4ReducerTests(unittest.TestCase):
     def test_private_totals_use_actual_lifetime_peak_without_baseline_discount(self):
         self.assertEqual(runner.memory_totals(self.roles,
             [reading(1, private=20, peak=80), reading(2, private=30, peak=50),
-             reading(3, private=40, peak=90)]), (130, 90))
+             reading(3, private=40, peak=90)]), (130, 90, 130, 220, [80, 50, 90]))
 
     def test_each_wrapper_limit_uses_max_not_sum(self):
         roles = dict(self.roles)
-        roles[identity(4)] = "waiting_wrapper"
+        roles[identity(4)] = frozenset(("waiting_wrapper",))
         self.assertEqual(runner.memory_totals(roles,
-            [reading(1), reading(2), reading(3, private=30), reading(4, private=50)]), (40, 50))
+            [reading(1), reading(2), reading(3, private=30), reading(4, private=50)]),
+            (40, 50, 40, 120, [20, 20, 30, 50]))
+
+    def test_cohosted_observers_charged_once_and_roles_preserved(self):
+        roles = dict(self.roles)
+        roles[identity(4)] = frozenset(("supervisor", "accounting_keeper", "daily_activation"))
+        rows = [reading(1), reading(2), reading(3), reading(4, private=70)]
+        self.assertEqual(runner.memory_totals(roles, rows),
+            (40, 20, 110, 130, [20, 20, 20, 70]))
+        endpoints = runner.process_endpoints(roles, rows, rows)
+        self.assertEqual(endpoints[-1]["roles"],
+            ["accounting_keeper", "daily_activation", "supervisor"])
+
+    def test_peak_vector_uses_exact_process_inventory_order(self):
+        rows = [reading(3, private=3), reading(1, private=1), reading(2, private=2)]
+        self.assertEqual(runner.memory_totals(self.roles, rows)[-1], [1, 2, 3])
 
     def test_peak_below_current_refuses_inconsistent_sample(self):
         with self.assertRaisesRegex(runner.NativeRunBlocked, "peak_inconsistent"):
@@ -131,6 +147,52 @@ class P4ReducerTests(unittest.TestCase):
         values = dict.fromkeys(runner.CASE_KEYS, 0)
         with self.assertRaisesRegex(runner.NativeRunBlocked, "case_invalid"):
             runner.add_cases(values, dict(values, inaccessible_identity=True))
+
+
+class MonitorInventoryTests(unittest.TestCase):
+    def build(self):
+        owners = []
+        for pid in (1, 2, 3, 4):
+            owner = VerifiedProcess(None, None, identity(pid))
+            owner.observe = Mock(return_value=SimpleNamespace(identity=owner.identity,
+                                                               status=IdentityStatus.ALIVE))
+            owners.append(owner)
+        helper, guardian, wrapper, supervisor = owners
+        session = SimpleNamespace(helper=helper, guardian=guardian, wrappers=(wrapper,),
+            helper_host=SimpleNamespace(process=helper, parent_process=supervisor),
+            monitor_processes=(("helper", helper), ("guardian", guardian),
+                ("waiting_wrapper", wrapper), ("supervisor", supervisor),
+                ("accounting_keeper", supervisor), ("daily_activation", supervisor)))
+        return session, SimpleNamespace(logon_id=LOGON)
+
+    def test_original_cohosted_roles_keep_one_cpu_witness(self):
+        session, context = self.build()
+        witnesses, roles = runner.monitor_inventory(session, context, 1)
+        self.assertEqual(len(witnesses), 4)
+        self.assertEqual(roles[identity(4)], runner.COHOST_ROLES)
+
+    def test_missing_keeper_is_not_complete_monitoring(self):
+        session, context = self.build()
+        session.monitor_processes = session.monitor_processes[:-1]
+        with self.assertRaisesRegex(runner.NativeRunBlocked, "roles_incomplete"):
+            runner.monitor_inventory(session, context, 1)
+
+    def test_helper_cannot_be_relabeled_as_accounting_keeper(self):
+        session, context = self.build()
+        session.monitor_processes = (*session.monitor_processes[:4],
+            ("accounting_keeper", session.helper), session.monitor_processes[-1])
+        with self.assertRaisesRegex(runner.NativeRunBlocked, "coverage_incomplete"):
+            runner.monitor_inventory(session, context, 1)
+
+    def test_reopened_parent_with_same_identity_is_not_original_witness(self):
+        session, context = self.build()
+        original = session.helper_host.parent_process
+        other = VerifiedProcess(None, None, original.identity)
+        other.observe = original.observe
+        session.monitor_processes = (*session.monitor_processes[:3],
+            ("supervisor", other), *session.monitor_processes[4:])
+        with self.assertRaisesRegex(runner.NativeRunBlocked, "coverage_incomplete"):
+            runner.monitor_inventory(session, context, 1)
 
 
 class NativeAuditTests(unittest.TestCase):

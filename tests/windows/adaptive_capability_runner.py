@@ -34,6 +34,7 @@ FIXTURE = ROOT / "tests" / "fixtures" / "adaptive_cpu_worker.py"
 WINDOW_NS = 30_000_000_000
 ROUNDS = 10
 MAX_FILE_BYTES = 256 * 1024
+MAX_P4_FILE_BYTES = evidence._P4_MAX_BYTES
 
 
 class NativeRunBlocked(RuntimeError):
@@ -93,10 +94,13 @@ def canonical(value):
                       ensure_ascii=False, allow_nan=False).encode("utf-8")
 
 
-def _write_new(path, value):
-    """Never replace prior measurements, including after a failed run."""
+def _write_new(path, value, *, expected_gate=None):
+    """Never replace measurements or infer a larger bound from their contents."""
+    if expected_gate is not None and expected_gate not in {"S1", "S2", "S3", "P4", "P5", "P6"}:
+        raise NativeRunBlocked("native_gate_unknown")
+    maximum = MAX_P4_FILE_BYTES if expected_gate == "P4" else MAX_FILE_BYTES
     raw = canonical(value)
-    if len(raw) > MAX_FILE_BYTES:
+    if len(raw) > maximum:
         raise NativeRunBlocked("native_artifact_oversized")
     with path.open("xb") as stream:
         stream.write(raw)
@@ -468,7 +472,7 @@ class NativeEvidenceRun:
         self.assert_unchanged()
         path = self.directory / f"{gate}.json"
         digest = _write_new(path, dict(schema_version=1, run_id=self.record["run_id"],
-            gate=gate, evidence_source="native", data=data))
+            gate=gate, evidence_source="native", data=data), expected_gate=gate)
         # Bundle generation uses only this run's exact typed artifact envelope.
         # Its changing hash requires an explicit fresh pin by later consumers.
         references = []
@@ -476,8 +480,8 @@ class NativeEvidenceRun:
             artifact = self.directory / f"{name}.json"
             if not artifact.exists():
                 continue
-            raw, _ = evidence._read(artifact, MAX_FILE_BYTES)
-            value = strict_json_loads(raw)
+            raw, _ = evidence._read(artifact, MAX_P4_FILE_BYTES if name == "P4" else MAX_FILE_BYTES)
+            value = evidence._artifact_json_loads(raw, expected_gate=name)
             if (type(value) is not dict or set(value) != {"schema_version", "run_id", "gate", "evidence_source", "data"} or
                     value["schema_version"] != 1 or value["run_id"] != self.record["run_id"] or
                     value["gate"] != name or value["evidence_source"] != "native"):

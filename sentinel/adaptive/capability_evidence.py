@@ -58,6 +58,7 @@ from __future__ import annotations
 import ctypes as C
 from dataclasses import asdict, dataclass
 import hashlib
+import json
 import math
 import os
 from pathlib import Path
@@ -70,7 +71,7 @@ from typing import Mapping
 from uuid import UUID
 
 from sentinel.accounting import local_host_identity
-from .contracts import IdentityStatus, ProcessIdentity, strict_json_loads
+from .contracts import ContractViolation, IdentityStatus, MAX_JSON_DEPTH, ProcessIdentity, strict_json_loads
 from .decision import PolicyProfile
 from .host_authority import read_host_capability
 from .identity import VerifiedProcess
@@ -80,6 +81,10 @@ from .store import LifecycleError
 
 _ROOT = Path(__file__).resolve().parents[2]
 _MAX_BYTES = 256 * 1024
+# P4 retains per-process peaks and actual host-loop ticks at all three scales.
+# This fixed artifact-only limit is selected by the expected gate before read;
+# bundle, other gates, runtime protocols and IPC keep their existing bounds.
+_P4_MAX_BYTES = 2 * 1024 * 1024
 _MAX_BUILD_FILES = 256
 _MAX_BUILD_ENTRIES = 2048
 _MAX_BUILD_BYTES = 16 * 1024 * 1024
@@ -193,6 +198,68 @@ def _read(path, maximum):
     if len(payload) != before[2] or _fingerprint(path) != before:
         _reject("capability_evidence_changed")
     return payload, before
+
+
+def _artifact_json_loads(payload, *, expected_gate):
+    """Keep the protocol decoder's strictness with one fixed P4 file bound.
+
+    Selection is by the caller's already expected gate. Neither an envelope's
+    own gate field nor a pathname can enlarge another artifact or IPC message.
+    """
+    if expected_gate != "P4":
+        return strict_json_loads(payload)
+    if not isinstance(payload, (str, bytes)):
+        raise ContractViolation("JSON: UTF-8 payload required")
+    try:
+        size = len(payload.encode("utf-8")) if isinstance(payload, str) else len(payload)
+        if size > _P4_MAX_BYTES:
+            raise ContractViolation("JSON: message too large")
+
+        def pairs(values):
+            result = {}
+            for key, value in values:
+                if key in result:
+                    raise ContractViolation("JSON: duplicate key")
+                result[key] = value
+            return result
+
+        def invalid_constant(_):
+            raise ContractViolation("JSON: nonstandard number")
+
+        def finite_float(text):
+            value = float(text)
+            if not math.isfinite(value):
+                raise ContractViolation("JSON: nonfinite number")
+            return value
+
+        if isinstance(payload, bytes):
+            payload = payload.decode("utf-8", errors="strict")
+        depth, quoted, escaped = 0, False, False
+        for char in payload:
+            if quoted:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    quoted = False
+            elif char == '"':
+                quoted = True
+            elif char in "[{":
+                depth += 1
+                if depth > MAX_JSON_DEPTH:
+                    raise ContractViolation("JSON: nesting too deep")
+            elif char in "]}":
+                depth -= 1
+        result = json.loads(payload, object_pairs_hook=pairs, parse_constant=invalid_constant,
+                            parse_float=finite_float)
+    except (UnicodeError, ValueError, RecursionError) as error:
+        if isinstance(error, ContractViolation):
+            raise
+        raise ContractViolation("JSON: malformed payload") from None
+    if type(result) is not dict:
+        raise ContractViolation("JSON: object required")
+    return result
 
 
 def _sha(value):
@@ -652,7 +719,7 @@ def _p4(data, context, profile):
     _object(data, ("scales", "wrapper_cold_ns", "wrapper_warm_ns", "leak"))
     seen, notes = set(), []
     for row in _list(data["scales"], minimum=3, maximum=3):
-        _object(row, ("jobs", "started_tick", "ended_tick", "processes", "samples", "native_set_calls", "sampling_cases"))
+        _object(row, ("jobs", "started_tick", "ended_tick", "processes", "samples", "native_set_calls", "sampling_cases", "host_loop"))
         jobs = _integer(row["jobs"])
         if jobs not in {1, 10, 50} or jobs in seen:
             _reject("capability_cost_scope_invalid")
@@ -661,38 +728,120 @@ def _p4(data, context, profile):
         elapsed = end - start
         if elapsed < 600 * _TICKS:
             _reject("capability_cost_duration_missing")
-        identities, roles, delta = set(), [], 0
-        for process in _list(row["processes"], minimum=jobs + 2, maximum=jobs + 2):
-            _object(process, ("identity", "role", "cpu_start_100ns", "cpu_end_100ns"))
+        observer_roles = {"supervisor", "accounting_keeper", "daily_activation"}
+        role_members = {name: [] for name in observer_roles | {"helper", "guardian", "waiting_wrapper"}}
+        identities, pids, process_roles, delta = set(), set(), [], 0
+        processes = _list(row["processes"], minimum=1, maximum=55)
+        for process in processes:
+            _object(process, ("identity", "roles", "cpu_start_100ns", "cpu_end_100ns"))
             try:
                 identity = ProcessIdentity.from_dict(process["identity"])
             except Exception:
                 _reject("capability_monitor_identity_invalid")
-            if identity in identities or identity.logon_id != context.logon_id or process["role"] not in {"helper", "guardian", "waiting_wrapper"}:
+            roles = _list(process["roles"], maximum=len(role_members))
+            if (any(type(role) is not str or role not in role_members for role in roles)
+                    or roles != sorted(set(roles))
+                    or (len(roles) > 1 and not set(roles) <= observer_roles)
+                    or identity in identities or identity.pid in pids
+                    or identity.logon_id != context.logon_id):
                 _reject("capability_monitor_identity_invalid")
             identities.add(identity)
-            roles.append(process["role"])
+            pids.add(identity.pid)
+            process_roles.append(set(roles))
+            for role in roles:
+                role_members[role].append(identity)
             used = _integer(process["cpu_end_100ns"]) - _integer(process["cpu_start_100ns"])
             if not 0 <= used <= elapsed * context.logical_processors:
                 _reject("capability_cost_counter_invalid")
             delta += used
-        if roles.count("helper") != 1 or roles.count("guardian") != 1 or roles.count("waiting_wrapper") != jobs:
+        if any(len(members) != (jobs if role == "waiting_wrapper" else 1)
+               for role, members in role_members.items()):
             _reject("capability_monitor_coverage_incomplete")
         ticks, private_values, wrapper_values, previous, previous_end = [], [], [], start, start
-        for sample in _list(row["samples"], minimum=2):
-            # Compact positional raw samples keep a full 10-minute trace within
-            # the bounded artifact: [tick start, tick end, H+G Private Commit,
-            # maximum per-wrapper *additional* Private Commit].
-            _list(sample, minimum=4, maximum=4)
-            begin, finish, private_bytes, wrapper_bytes = (_integer(v) for v in sample)
+        samples = _list(row["samples"], minimum=2)
+        for sample in samples:
+            # Native peaks are in unique process-row order. Derive all buckets
+            # here so aliased infrastructure roles cannot be counted twice or
+            # extra resident observers disappear behind the original H+G total.
+            _list(sample, minimum=7, maximum=7)
+            begin, finish, helper_guardian, wrapper_bytes, resident, total = (
+                _integer(v) for v in sample[:6])
+            peaks = [_integer(value) for value in _list(sample[6],
+                minimum=len(processes), maximum=len(processes))]
+            expected_helper_guardian = sum(value for value, roles in zip(peaks, process_roles)
+                if roles & {"helper", "guardian"})
+            expected_wrappers = max(value for value, roles in zip(peaks, process_roles)
+                if "waiting_wrapper" in roles)
+            expected_resident = sum(value for value, roles in zip(peaks, process_roles)
+                if "waiting_wrapper" not in roles)
+            if (helper_guardian != expected_helper_guardian or wrapper_bytes != expected_wrappers
+                    or resident != expected_resident or total != sum(peaks)):
+                _reject("capability_monitor_memory_mismatch")
             if not previous_end <= begin < finish <= end or begin - previous > profile.sample_max_age_ms * 10_000:
                 _reject("capability_cost_coverage_incomplete")
             previous, previous_end = begin, finish
             ticks.append((finish - begin) * 100)
-            private_values.append(private_bytes)
+            # Charge all resident observers to the unchanged 160 MiB budget;
+            # newly introduced infrastructure gets no separate allowance.
+            private_values.append(resident)
             wrapper_values.append(wrapper_bytes)
         if end - previous > profile.sample_max_age_ms * 10_000:
             _reject("capability_cost_coverage_incomplete")
+        host = _object(row["host_loop"], ("identity", "parent_identity", "instance_id",
+            "operator_instance_id", "scope_nonce", "config_revision", "managed_execution_ids",
+            "query_only_execution_ids", "enroll_every_ticks", "report_every_ticks",
+            "started_iteration", "ended_iteration", "ticks"))
+        try:
+            helper_identity = ProcessIdentity.from_dict(host["identity"])
+            parent_identity = ProcessIdentity.from_dict(host["parent_identity"])
+        except Exception:
+            _reject("capability_host_loop_binding_invalid")
+        for name in ("instance_id", "operator_instance_id"):
+            _uuid(host[name])
+        if (helper_identity != role_members["helper"][0]
+                or parent_identity != role_members["supervisor"][0]
+                or host["instance_id"] == host["operator_instance_id"]
+                or type(host["scope_nonce"]) is not str
+                or re.fullmatch(r"[0-9a-f]{32}", host["scope_nonce"]) is None
+                or host["config_revision"] != profile_revision(profile)):
+            _reject("capability_host_loop_binding_invalid")
+        managed_count = min(jobs, 10)
+        managed = _list(host["managed_execution_ids"], minimum=managed_count, maximum=managed_count)
+        query_only = _list(host["query_only_execution_ids"],
+            minimum=jobs - managed_count, maximum=jobs - managed_count)
+        for execution_id in (*managed, *query_only):
+            _uuid(execution_id)
+        if (len(set((*managed, *query_only))) != jobs
+                or managed_count > profile.max_enrolled_jobs or profile.max_enrolled_jobs > 10):
+            _reject("capability_host_loop_scope_invalid")
+        enroll_every = _integer(host["enroll_every_ticks"], minimum=1, maximum=3600)
+        report_every = _integer(host["report_every_ticks"], minimum=1, maximum=3600)
+        first_iteration, last_iteration = (_integer(host[name])
+            for name in ("started_iteration", "ended_iteration"))
+        host_ticks = _list(host["ticks"], minimum=len(samples), maximum=len(samples))
+        if last_iteration - first_iteration != len(samples):
+            _reject("capability_host_loop_coverage_incomplete")
+        refreshes = reports = 0
+        for index, (sample, observation) in enumerate(zip(samples, host_ticks)):
+            _list(observation, minimum=10, maximum=10)
+            (iteration, refreshed, reported, operator_polls, report_bytes, deadline,
+             wait_started, wait_ended, skipped, overrun) = (_integer(value) for value in observation)
+            expected_iteration = first_iteration + index + 1
+            expected_refresh = expected_iteration > 1 and (expected_iteration - 1) % enroll_every == 0
+            expected_report = expected_iteration % report_every == 0
+            if (iteration != expected_iteration or refreshed != int(expected_refresh)
+                    or reported != int(expected_report) or operator_polls != 1
+                    or (report_bytes > 0) != expected_report):
+                _reject("capability_host_loop_coverage_incomplete")
+            next_begin = samples[index + 1][0] if index + 1 < len(samples) else end
+            if (deadline <= 0 or wait_started < sample[1] or wait_ended < wait_started
+                    or wait_ended < deadline or wait_ended > next_begin
+                    or overrun != max(0, wait_started - deadline)):
+                _reject("capability_host_loop_pacing_invalid")
+            refreshes += refreshed
+            reports += reported
+        if not refreshes or not reports:
+            _reject("capability_host_loop_coverage_incomplete")
         cpu, tick = delta / elapsed, _p95(ticks) / 1e9
         private, wrappers = max(private_values), max(wrapper_values)
         _zero_observations(row, ("native_set_calls",))
@@ -912,10 +1061,10 @@ class NativeEvidenceAuthority:
             if gate not in _PURPOSES["limited"] or gate in artifacts or type(name) is not str or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}\.json", name) or name == "bundle.json" or not _digest(reference["sha256"]):
                 _reject("capability_artifact_reference_invalid")
             artifact_path = self.directory / name
-            raw, checked = _read(artifact_path, _MAX_BYTES)
+            raw, checked = _read(artifact_path, _P4_MAX_BYTES if gate == "P4" else _MAX_BYTES)
             if _sha(raw) != reference["sha256"]:
                 _reject("capability_artifact_hash_mismatch")
-            artifact = _object(strict_json_loads(raw), ("schema_version", "run_id", "gate", "evidence_source", "data"))
+            artifact = _object(_artifact_json_loads(raw, expected_gate=gate), ("schema_version", "run_id", "gate", "evidence_source", "data"))
             if type(artifact["schema_version"]) is not int or artifact["schema_version"] != 1 or artifact["run_id"] != bundle["run_id"] or artifact["gate"] != gate:
                 _reject("capability_artifact_binding_invalid")
             if artifact["evidence_source"] != "native":

@@ -5,10 +5,10 @@ S2/S3. It must return retained original custody, not PIDs/receipts loaded from
 JSON. No such aggregate provider is activated by this module. Missing coverage
 refuses before native initialization or process creation. See P4-OVERHEAD-RUNNER.
 
-The local process executes the real ShadowHelper/FrameSampler and is charged as
-the helper, including its probe/orchestration cost. Guardian and waiting wrappers
-must be real hosts supplied by the provider. Fifty Jobs are read-only stress in
-five <=10 sampler shards, never fifty managed enrollments. Raw failed results
+The local process executes the original operational helper host and is charged
+including probe/orchestration cost. All additional resident observers are also
+charged once per exact process identity. Fifty Jobs are ten managed scopes plus
+forty query-only fixtures, never fifty managed enrollments. Raw failed results
 are preserved and are not promoted into passing capability evidence.
 """
 from __future__ import annotations
@@ -42,6 +42,9 @@ CASE_KEYS = ("membership_added", "membership_removed", "inaccessible_identity",
              "member_scan_timeout", "subtraction_zero_samples", "unsafe_subtractions")
 MAX_RAW_BYTES = 4 * 1024 * 1024
 MAX_LOG_FILES = 1024
+MONITOR_ROLES = frozenset(("helper", "guardian", "waiting_wrapper", "supervisor",
+                           "accounting_keeper", "daily_activation"))
+COHOST_ROLES = frozenset(("supervisor", "accounting_keeper", "daily_activation"))
 
 
 @dataclass(frozen=True)
@@ -91,12 +94,12 @@ def process_endpoints(roles, first, last):
             or set(initial) != set(final) or set(initial) != set(roles)):
         raise NativeRunBlocked("p4_monitor_identity_changed")
     rows = []
-    for identity, role in roles.items():
+    for identity, role_names in roles.items():
         before = _uint(initial[identity].cpu_100ns, "p4_cpu_counter_invalid")
         after = _uint(final[identity].cpu_100ns, "p4_cpu_counter_invalid")
         if after < before:
             raise NativeRunBlocked("p4_cpu_counter_reversed")
-        rows.append(dict(identity=identity.to_dict(), role=role,
+        rows.append(dict(identity=identity.to_dict(), roles=sorted(role_names),
                          cpu_start_100ns=before, cpu_end_100ns=after))
     return rows
 
@@ -104,21 +107,61 @@ def process_endpoints(roles, first, last):
 def memory_totals(roles, readings):
     if len(readings) != len(roles) or {row.identity for row in readings} != set(roles):
         raise NativeRunBlocked("p4_monitor_coverage_incomplete")
-    infrastructure, wrappers = 0, []
-    for row in readings:
+    infrastructure, helper_guardian, wrappers, peaks = 0, 0, [], []
+    lookup = {row.identity: row for row in readings}
+    for identity, role_names in roles.items():
+        row = lookup[identity]
         value = _uint(row.peak_private_bytes, "p4_private_counter_invalid")
         if value < _uint(row.private_bytes, "p4_private_counter_invalid"):
             raise NativeRunBlocked("p4_private_peak_inconsistent")
-        if roles[row.identity] == "waiting_wrapper":
+        peaks.append(value)
+        if role_names == frozenset(("waiting_wrapper",)):
             # Conservatively charge the WHOLE actual wrapper host. This is an
             # upper bound on additional Private Commit; no arbitrary idle-host
             # subtraction can hide wrapper cost or produce negative overhead.
             wrappers.append(value)
         else:
             infrastructure += value
+            if role_names & {"helper", "guardian"}:
+                helper_guardian += value
     if not wrappers:
         raise NativeRunBlocked("p4_waiting_wrappers_missing")
-    return infrastructure, max(wrappers)
+    return helper_guardian, max(wrappers), infrastructure, sum(peaks), peaks
+
+
+def monitor_inventory(session, context, jobs):
+    """Validate original witnesses and role incidence before identity dedup."""
+    inventory = getattr(session, "monitor_processes", None)
+    if type(inventory) is not tuple or len(inventory) != jobs + 5:
+        raise NativeRunBlocked("p4_monitor_roles_incomplete")
+    roles, owners, by_role = {}, {}, {}
+    for pair in inventory:
+        if type(pair) is not tuple or len(pair) != 2 or pair[0] not in MONITOR_ROLES:
+            raise NativeRunBlocked("p4_monitor_role_invalid")
+        role, owner = pair
+        if type(owner) is not VerifiedProcess:
+            raise NativeRunBlocked("p4_original_monitor_custody_required")
+        observed = owner.observe()
+        identity = owner.identity
+        if (observed.identity != identity or observed.status is not IdentityStatus.ALIVE
+                or identity.logon_id != context.logon_id):
+            raise NativeRunBlocked("p4_monitor_identity_unverified")
+        if role in roles.get(identity, ()):
+            raise NativeRunBlocked("p4_monitor_role_duplicate")
+        roles.setdefault(identity, set()).add(role)
+        owners.setdefault(identity, owner)
+        by_role.setdefault(role, []).append(owner)
+    if (len({identity.pid for identity in roles}) != len(roles)
+            or any(len(values) != (jobs if role == "waiting_wrapper" else 1)
+                   for role, values in by_role.items()) or set(by_role) != MONITOR_ROLES
+            or any(len(values) > 1 and not values <= COHOST_ROLES for values in roles.values())
+            or by_role["helper"][0] is not session.helper
+            or by_role["guardian"][0] is not session.guardian
+            or by_role["supervisor"][0] is not session.helper_host.parent_process
+            or set(by_role["waiting_wrapper"]) != set(session.wrappers)
+            or session.helper_host.process is not session.helper):
+        raise NativeRunBlocked("p4_monitor_coverage_incomplete")
+    return tuple(owners.values()), {identity: frozenset(values) for identity, values in roles.items()}
 
 
 def validate_audit(value, previous, *, guardian, nonce, now, maximum_age):
@@ -287,20 +330,9 @@ class P4Producer:
         logs = Path(session.log_directory).resolve(strict=True)
         if logs == directory.resolve() or logs in directory.resolve().parents:
             raise NativeRunBlocked("p4_raw_trace_in_runtime_logs")
-        witnesses = (session.helper, session.guardian, *session.wrappers)
         if len(session.wrappers) != jobs or len(session.jobs) != jobs:
             raise NativeRunBlocked("p4_cohort_cardinality_invalid")
-        identities = []
-        for owner in witnesses:
-            if not isinstance(owner, VerifiedProcess):
-                raise NativeRunBlocked("p4_original_monitor_custody_required")
-            observation = owner.observe()
-            if (observation.identity != owner.identity or observation.status is not IdentityStatus.ALIVE
-                    or owner.identity.logon_id != self.context.logon_id):
-                raise NativeRunBlocked("p4_monitor_identity_unverified")
-            identities.append(owner.identity)
-        if len(set(identities)) != len(identities):
-            raise NativeRunBlocked("p4_monitor_identity_duplicate")
+        witnesses, roles = monitor_inventory(session, self.context, jobs)
         for _, job in session.jobs:
             if (not isinstance(job, NativeJob) or job.access is not JobAccess.QUERY
                     or job.logon_sid != self.context.logon_id):
@@ -308,14 +340,14 @@ class P4Producer:
             cpu = job.query_cpu()
             if cpu.flags != 0:
                 raise NativeRunBlocked("p4_job_not_uncapped")
-        from tests.windows.adaptive_overhead_native import NativeCostProbe, ReadOnlyShadowSampler
+        from tests.windows.adaptive_overhead_native import NativeCostProbe, NativeHelperHostSampler
         probe = NativeCostProbe(witnesses)
-        sampler = ReadOnlyShadowSampler(self.profile, session.jobs)
-        self.local_owners.extend((probe, sampler))
+        self.local_owners.append(probe)
+        sampler = NativeHelperHostSampler(self.profile, session.jobs, host=session.helper_host,
+            report_stream=session.helper_report_stream, log_directory=logs)
+        self.local_owners.append(sampler)
         if sampler.logical_processors != self.context.logical_processors:
             raise NativeRunBlocked("p4_native_denominator_changed")
-        roles = {identities[0]: "helper", identities[1]: "guardian"}
-        roles.update((identity, "waiting_wrapper") for identity in identities[2:])
         return session, probe, sampler, roles, directory
 
     def _audit(self, session, previous, clock):
@@ -324,14 +356,8 @@ class P4Producer:
             nonce=session.scope_nonce, now=clock(),
             maximum_age=self.profile.sample_max_age_ms * 10_000)
 
-    def _pace(self, session, deadline, clock):
-        self._covered(session)
-        deadline += TICKS
-        now = clock()
-        if now < deadline:
-            time.sleep(min((deadline - now) / TICKS, 1.0))
-        # One iteration only. If late, drop missed ticks; no catch-up loop.
-        return max(deadline, clock())
+    def _pace(self, session, sampler):
+        return sampler.pace(lambda: self._covered(session))
 
     def _retire(self, session, probe, sampler):
         self._covered(session)
@@ -359,9 +385,8 @@ class P4Producer:
             # Prime actual machine/Job delta baselines outside steady-state
             # timing, then wait one covered second. Never count a cheap failed
             # or bootstrap sample as a complete measured helper tick.
-            prime = clock()
             sampler.tick()
-            self._pace(session, prime, clock)
+            self._pace(session, sampler)
             first = probe.read()
             # All starting counters precede the elapsed bracket, and every
             # ending counter follows it. Serial reads can overcharge CPU
@@ -369,25 +394,26 @@ class P4Producer:
             start = clock()
             if audit.installed_tick > start:
                 raise NativeRunBlocked("p4_native_set_audit_late")
-            samples, cases = [], dict.fromkeys(CASE_KEYS, 0)
-            deadline = start
+            samples, host_ticks, cases = [], [], dict.fromkeys(CASE_KEYS, 0)
+            started_iteration = session.helper_host._iterations
             while clock() - start < SCALE_SECONDS * TICKS:
                 self._covered(session)
                 begin, end, delta = sampler.tick()
                 if sampler.last_tick_warmup:
                     raise NativeRunBlocked("p4_sampling_warmup_restarted")
                 readings = probe.read()
-                private, wrappers = memory_totals(roles, readings)
+                memory = memory_totals(roles, readings)
                 add_cases(cases, delta)
-                samples.append([begin, end, private, wrappers])
+                samples.append([begin, end, *memory])
                 audit = self._audit(session, audit, clock)
-                trace.append(dict(sample=samples[-1], cases=delta,
+                host_tick = self._pace(session, sampler)
+                host_ticks.append(host_tick)
+                trace.append(dict(sample=samples[-1], host_tick=host_tick, cases=delta,
                     guardian_audit_sequence=audit.sequence, guardian_set_calls=audit.calls,
                     helper_set_calls=sampler.native_set_calls,
                     handles=[row.handles for row in readings]))
                 if audit.calls or sampler.native_set_calls:
                     raise NativeRunBlocked("p4_shadow_set_observed")
-                deadline = self._pace(session, deadline, clock)
             self._covered(session)
             end = clock()
             last = probe.read()
@@ -396,8 +422,9 @@ class P4Producer:
                 raise NativeRunBlocked("p4_shadow_set_observed")
             result = dict(jobs=jobs, started_tick=start, ended_tick=end,
                 processes=process_endpoints(roles, first, last), samples=samples,
-                native_set_calls=audit.calls + sampler.native_set_calls, sampling_cases=cases)
-            _write_new(directory / "scale.json", result)
+                native_set_calls=audit.calls + sampler.native_set_calls, sampling_cases=cases,
+                host_loop=sampler.host_record(session.scope_nonce, started_iteration, host_ticks))
+            _write_new(directory / "scale.json", result, expected_gate="P4")
             trace.close()
             self._retire(session, probe, sampler)
             return result
@@ -406,12 +433,12 @@ class P4Producer:
 
     def _idle(self, session, sampler, clock):
         session.enter_idle()
-        started = deadline = clock()
+        started = clock()
         seconds = max(IDLE_SETTLE_SECONDS, self.profile.sample_ring_frames + 1)
         while clock() - started < seconds * TICKS:
             self._covered(session)
             sampler.tick()
-            deadline = self._pace(session, deadline, clock)
+            self._pace(session, sampler)
 
     @staticmethod
     def _footprint(session, probe):
@@ -432,7 +459,7 @@ class P4Producer:
             before = self._footprint(session, probe)
             session.enter_stress()
             first_stress = self._footprint(session, probe)
-            start = deadline = clock()
+            start = clock()
             observations = [[start, *first_stress.values()]]
             while clock() - start < LEAK_SECONDS * TICKS:
                 self._covered(session)
@@ -443,10 +470,10 @@ class P4Producer:
                 if clock() - observations[-1][0] >= 60 * TICKS:
                     reading = self._footprint(session, probe)
                     observations.append([clock(), *reading.values()])
-                trace.append(dict(begin=begin, end=end, cases=cases,
+                host_tick = self._pace(session, sampler)
+                trace.append(dict(begin=begin, end=end, host_tick=host_tick, cases=cases,
                     guardian_audit_sequence=audit.sequence, guardian_set_calls=audit.calls,
                     helper_set_calls=sampler.native_set_calls))
-                deadline = self._pace(session, deadline, clock)
             end_reading = self._footprint(session, probe)
             end = clock()
             observations.append([end, *end_reading.values()])
@@ -479,11 +506,16 @@ class P4Producer:
                 # Its retained owner represents one actual wrapper attempt.
                 trial = session.prepare_wrapper_trial(kind=kind, iteration=index)
                 self._covered(session)
+                # Keep the actual helper running during wrapper trials too.
+                # Its pending ordinary wait is performed after ready, or by
+                # the cooperative callback once that same deadline is due.
+                # Waiting for admission is still outside the latency bracket.
+                sampler.tick()
                 start = clock()
                 trial.launch_once()
                 # Cooperative bridge services retained custody/admission while
                 # awaiting actual ready IPC; never process-running == ready.
-                trial.wait_ready(assert_covered=lambda: self._covered(session))
+                trial.wait_ready(assert_covered=lambda: self._service_wrapper_host(session, sampler, clock))
                 end = clock()
                 if not start < end:
                     raise NativeRunBlocked("p4_wrapper_clock_invalid")
@@ -491,12 +523,25 @@ class P4Producer:
                 trial.retire()
                 if trial.custody_pending is not False:
                     raise NativeRunBlocked("p4_wrapper_retirement_unverified")
+                self._pace(session, sampler)
                 audit = self._audit(session, audit, clock)
                 if audit.calls or sampler.native_set_calls:
                     raise NativeRunBlocked("p4_shadow_set_observed")
         _write_new(directory / "wrappers.json", result)
         self._retire(session, probe, sampler)
         return result
+
+    def _service_wrapper_host(self, session, sampler, clock):
+        self._covered(session)
+        pending = sampler._pending_tick
+        if pending is None:
+            raise NativeRunBlocked("p4_wrapper_helper_pacing_missing")
+        if clock() >= pending[5]:
+            # The wait is already due: no added sleep in the ready bracket.
+            # run_once includes real polling/reporting and its next deadline;
+            # that actual concurrent observer work remains charged to latency.
+            self._pace(session, sampler)
+            sampler.tick()
 
     def run(self):
         data = {"scales": []}
@@ -506,7 +551,7 @@ class P4Producer:
             data.update(self._wrappers())
             data["leak"] = self._leak()
             # Preserve actual failed measurements before applying the gate.
-            _write_new(self.directory / "P4-data.json", data)
+            _write_new(self.directory / "P4-data.json", data, expected_gate="P4")
             evidence._p4(data, self.context, self.profile)
             return data
         except BaseException as error:

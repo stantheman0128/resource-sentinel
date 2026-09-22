@@ -1,13 +1,15 @@
 # P3 item 4: operational lifecycle, exact release and rollback commands
 
-Date: 2026-09-22. Status: **implementation contract; native acceptance pending**.
+Date: 2026-09-22. Status: **source integrated; portable validation recorded in README;
+native acceptance pending**.
 
 This document specifies the remaining operational integration required by
 [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md) sections 3, 4, 7, 10/P3 and
 11.5. It preserves [C2 prelaunch retirement](P3-PRELAUNCH-RETIREMENT.md),
 [C4 supervisor failsafe](P3-SUPERVISOR-FAILSAFE.md), and the
 [finished-Job barrier contract](BARRIER-CLEAR-FINISHED-JOB.md). It is not evidence
-that the commands below already exist or that P3-P6 passed.
+that P3-P6 passed. The current implementation and test checkpoint is in
+[README.md](README.md); section 1 records the pre-implementation baseline.
 
 Production adaptive remains off. This implementation does not install a
 Scheduled Task, change daily configuration or global agent entrypoints, start a
@@ -134,6 +136,25 @@ process has neither the original unused credential nor the original native
 wrapper witness; it cannot recover that authority by reading the DB. Operator
 recovery is routed to a currently authorized retained owner instead.
 
+### Fresh guardian registration before the first command
+
+Operational endpoints need an exact epoch/logon before the first managed launch.
+The previous lazy publication in Job registration was insufficient for an empty
+host's status/drain path. `GuardianRegistration` now publishes the original
+guardian identity, epoch and logon atomically under one retained POLICY operation.
+Fresh publication requires the complete empty lifecycle/allocation/history and
+journal inventory. Matching strings or an absent row do not authorize cold
+adoption: a successor consumes the unchanged generation of a positively verified
+C4 epoch rollover. Existing exact identity/binding is idempotent.
+
+Lost acknowledgements retain the original before/after image and guard. Pending
+startup reuses the original host, store, journal and native guardian; interrupts
+cannot discard them or create replacement authority. Unknown cleanup remains
+resident and quarantined. A pending registration blocks `close()` before any
+native cleanup. An interrupt received while waiting causes drain after necessary
+startup settlement, without serving normal launch work. This is a startup
+publication fix, not a new recovery or native-control capability.
+
 ## 4. Terminal native custody and cleanup
 
 Native Job emptiness, terminal SQL state, capacity release, barrier settlement
@@ -231,9 +252,17 @@ boolean such as `user_authorized` is not native peer authentication.
 The guardian persists drain intent in its retained in-process state before
 acknowledging it: no new managed enrollment, tightening or renewal. Restore,
 uncapped frames, queries, lifecycle heartbeat and cleanup remain available.
-`GuardianControl.begin_drain` is only the control portion of this transition;
-the host must also stop serving launch requests on later ticks. Safety ticks
-still precede bounded RPC waits and follow reconciliation.
+`GuardianControl.begin_drain` is only the control portion of this transition.
+`GuardianLaunchOwner.begin_drain` permanently stops native Job creation and new
+claim authorization; the authenticated launch pipe stays available for
+retirement, BindRoot and exact-request reconciliation. A Prepare first reaching
+the original live owner during drain may retain a sealed never-created named
+scope/manifest within the same ten-scope bound. Its RESERVED informational reply
+grants no launch authority. Normal launch refuses it; exact duplicate recovery
+can proceed through existing CancelBeforeStart evidence and receipts. Claim
+replay only reports an already recorded request, without consuming a claim or
+binding a new fence. No cold owner or DB-only absence reconstructs this evidence.
+Safety ticks still precede bounded RPC waits and follow reconciliation.
 
 An off-mode ledger/config record states desired policy. It cannot attest to OS
 restore, process exit or released capacity. Change applicable durable policy
@@ -261,12 +290,23 @@ adoption is part of this item.
 
 ### Fenced off-mode transaction
 
-Add a host-owned `FencedOffOperation`, implemented as an adapter around the
-existing `RetainedPolicyOperation`. The supervisor's authenticated operation
-coordinator retains it; CLI code never writes mode directly. It accepts only
+Add a host-owned `FencedOffOperation` using the existing retained POLICY
+ownership and uncertainty rules, with an atomic per-request generation receipt.
+The supervisor retains the exact routed request and original child witness;
+the original guardian retains the sole off transaction. A lost child ACK must
+not cause the supervisor to start a competing off transaction. CLI code never
+writes mode directly. It accepts only
 the conservative off request, binding its request ID/payload to the existing
 policy instance/logon, guardian epoch and expected registry revision. No daily
 config file is written. No field in the request supplies native authority.
+
+The helper is bound to its original guardian epoch and control endpoint.
+Normal guardian replacement first drains and positively retires that helper,
+then rotates the supervisor logical instance/operator endpoint before starting
+the successor. Existing operation IDs never retarget. Guardian death before off
+acceptance without a surviving safe off authority, or a helper that cannot
+finish under the current policy, remains explicit pending/HOLD; neither is a
+successful rollback or permission to abandon the original witnesses.
 
 The operation follows the actual POLICY lifecycle:
 

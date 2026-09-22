@@ -310,6 +310,7 @@ class HelperHost:
         self._skipped_boundaries = 0
         self._last_reason = None
         self._deadline_100ns = None
+        self._registration_operation = None
 
     # --- startup ----------------------------------------------------------
 
@@ -399,17 +400,39 @@ class HelperHost:
             verify_infrastructure_candidate_locked,
         )
 
+        from .supervisor_reconcile import RetainedPolicyOperation
+        from .store import _ipc_read_transaction
+
         policy = self.store._policy
+        if self._registration_operation is None:
+            self._registration_operation = RetainedPolicyOperation(self.store)
+        operation = self._registration_operation
+        if operation._complete:
+            operation.reset_completed()
+        occupied = 0
+
+        def register():
+            nonlocal occupied
+            guard = policy.assert_held()
+            verify_infrastructure_candidate_locked(self.store, "helper", self.process)
+            initialize_registry_locked(self.store)
+            occupied = self._other_helpers(guard)
+            return register_infrastructure_locked(self.store, "helper", self.process) if not occupied else False
+
+        def registered_exactly():
+            identity = self.process.identity
+            with _ipc_read_transaction(self.store.db_path, timeout_ms=250) as conn:
+                rows = conn.execute("""SELECT pid, substr(created_filetime_100ns,1,21), schema_version
+                    FROM adaptive_infrastructure WHERE role='helper' AND logon_id=? LIMIT 2""",
+                    (identity.logon_id,)).fetchall()
+            return len(rows) == 1 and tuple(rows[0]) == (identity.pid, str(identity.created_filetime_100ns), 1)
+
         try:
-            guard = policy.prepare(policy.current_logon())
-            with policy.hold(guard):
-                verify_infrastructure_candidate_locked(self.store, "helper", self.process)
-                initialize_registry_locked(self.store)
-                occupied = self._other_helpers(guard)
-                if not occupied:
-                    register_infrastructure_locked(self.store, "helper", self.process)
+            result = operation._run(policy.current_logon(), register, registered_exactly)
         except Exception as error:
             raise HelperHostRefused("helper_host_registry_unavailable", _reason(error)) from None
+        if not result.complete:
+            raise HelperHostRefused("helper_host_registry_unavailable", result.reason)
         if occupied:
             raise HelperHostRefused("helper_host_registry_occupied", str(occupied))
         self.registered = True
@@ -629,11 +652,12 @@ class HelperHost:
             return False
         return not flags & (JOB_LIMIT_BREAKAWAY_OK | JOB_LIMIT_SILENT_BREAKAWAY_OK)
 
-    @staticmethod
-    def _discard(job):
+    def _discard(self, job):
         try:
             job.close()
         except BaseException as error:
+            self.jobs._retained.append(_Handle(job, "discard-" + uuid4().hex, False,
+                                                cleanup_unverified=True))
             return _reason(error)
         return None
 
@@ -747,14 +771,16 @@ class HelperHost:
         rule where an authority record belongs.
         """
         cleanup = []
+        if self._registration_operation is not None and self._registration_operation.pending:
+            raise HelperHostRefused("helper_host_registration_pending")
         for execution_id in self.jobs.enrolled:
             reason = self._release(execution_id)
             if reason is not None:
                 cleanup.append(reason)
-        self._started = False
-        if cleanup:
+        if cleanup or self.jobs.retained_uncertain:
             raise HelperHostRefused("helper_host_handle_cleanup_unverified",
                                     ",".join(sorted(set(cleanup))))
+        self._started = False
         return {"event": "helper_host_closed", "iterations": self._iterations,
                 "enrolled": len(self.jobs.enrolled), "registry_row_retained": self.registered,
                 "handles_retained_uncertain": self.jobs.retained_uncertain}
@@ -773,6 +799,12 @@ def build_parser():
                         help="ticks between enrollment refreshes")
     parser.add_argument("--report-every", type=int, default=DEFAULT_REPORT_EVERY,
                         help="ticks between metrics records")
+    for name in ("instance-id", "operator-instance-id", "parent-instance-id", "policy-instance-id",
+                 "guardian-epoch", "parent-created-filetime", "parent-logon-id",
+                 "guardian-created-filetime", "guardian-logon-id", "guardian-control-instance-id"):
+        parser.add_argument("--" + name, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--parent-pid", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--guardian-pid", type=int, default=None, help=argparse.SUPPRESS)
     return parser
 
 
@@ -782,13 +814,27 @@ def main(argv=None):
             or not 1 <= options.report_every <= 3600):
         emit({"event": "helper_host_refused", "reason": "helper_host_arguments_invalid"})
         return EXIT_REFUSED
-    host = HelperHost(data_dir=options.data_dir, profile_path=options.profile,
-                      enroll_every_ticks=options.enroll_every,
-                      report_every_ticks=options.report_every)
+    common = dict(data_dir=options.data_dir, profile_path=options.profile,
+                  enroll_every_ticks=options.enroll_every, report_every_ticks=options.report_every)
+    if any(getattr(options, name) is not None for name in (
+            "instance_id", "operator_instance_id", "parent_instance_id", "policy_instance_id",
+            "guardian_epoch", "parent_pid", "parent_created_filetime", "parent_logon_id",
+            "guardian_pid", "guardian_created_filetime", "guardian_logon_id", "guardian_control_instance_id")):
+        from .helper_control_host import OperationalHelperHost, operational_options, run_operational
+        try:
+            host = OperationalHelperHost(**common, **operational_options(options))
+        except Exception as error:
+            emit({"event": "helper_host_refused", "reason": _reason(error)})
+            return EXIT_REFUSED
+        return run_operational(host, iterations=options.iterations)
+    host = HelperHost(**common)
     try:
         emit(host.start())
     except HelperHostRefused as error:
         emit({"event": "helper_host_refused", "reason": error.reason, "detail": error.detail})
+        if host._registration_operation is not None and host._registration_operation.pending:
+            from .helper_control_host import retain_cleanup
+            return retain_cleanup(host)
         return EXIT_REFUSED
     code = EXIT_OK
     try:
@@ -810,6 +856,9 @@ def main(argv=None):
             emit(host.close())
         except HelperHostRefused as error:
             emit({"event": "helper_host_refused", "reason": error.reason, "detail": error.detail})
+            if host.jobs.retained_uncertain:
+                from .helper_control_host import retain_cleanup
+                return retain_cleanup(host)
             code = EXIT_FAILED
     return code
 

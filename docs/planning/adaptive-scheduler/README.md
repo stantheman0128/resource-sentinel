@@ -39,19 +39,48 @@ restore/floor、117 個 decision/helper 與 27 個 capability 針對性測試亦
 tests 全過（24.979 秒，0 failures／errors／skips）；此數包含尚在整合的 terminal
 與 transport 包，不是本提交單獨的乾淨 checkout 測試數。CLI／helper observer 另有
 110 tests 全過（14.175 秒），guardian operational host 57 tests 全過（1.009 秒）。
-Supervisor／helper host 與 off-recovery 整合仍在驗證，目標 4 尚未全部完成。
+後續操作通訊／發現包已提交為 `cae36bc`，生命週期收尾包為 `8bcd3eb`。
+Guardian／supervisor／helper、off-recovery 與 CLI 的 source 整合現已完成。
+新增原子 guardian identity／epoch／logon 登記，讓空白 host 在第一個工作之前
+就有可驗證的操作身分；登記 ACK 遺失或中斷保留同一 guard 與原持有者。
+Drain 保留 BindRoot／退場／原請求 replay 通道，停止新授權；terminal native
+cleanup 完成前保留 custody，未知 close 結果不會被當成退場。
+
+最後完整 adaptive 回歸 **108 個模組、2,800 tests 全過，455.257 秒，
+0 failures／errors／skips**。範圍為當時 Git 已追蹤的 adaptive tests 加上本次兩個
+guardian registration/startup 模組；確切清單留在本機
+`.local-adaptive/item4-regression-modules.txt`。命令為
+`C:\Python313\python.exe .local-adaptive\item4-regression.py`，透過下述日常 wrapper
+正常准入。此前 364 個 host/drain integration tests 通過（82.491 秒），新增
+startup 與 S3 foundation 的 157 個 targeted tests 亦通過（4.326 秒）。
+完整測試仍使用受保護的 dirty baseline，且當時 capability／A/B tracked tests
+有後續階段的未提交修改；這不是 clean-clone 或 native gate 已驗證的聲明。
+
+這輪故障紀錄：首次完整 2,774 tests 有 1 error，舊測試在 admission commit ACK
+遺失後直接索取 claim token。現改為確認 read-only reconciliation 不會結算原
+guard，也不能匯出 unsettled token；沒有放寬 production 契約。首次 off/terminal
+204 tests 有 1 failure／2 errors，分別修正已知拒絕逸出 POLICY 留下 nonce 的
+source 問題，以及超過 10 個 active Job 的歷史 fixture。首次 startup 79 tests
+有 11 errors，fixture 未建立 journal 目錄，修正後通過。另兩次 targeted 命令
+各誤列一個不存在的 test module，已用正確模組與最終完整回歸取代；沒有把
+loader error 或未跑的 native gate 算成 pass。
 
 | 目標項目 | 已驗證狀態／剩餘工作 |
 | --- | --- |
 | 1. 裁決 ② | 契約與 source 完成；完整 2,007 tests，最後 cleanup 修正後 102 tests 通過。 |
 | 2. 裁決 ④ | 契約與 source 完成；最後完整 adaptive 2,127 tests 通過。沒有舊 witness 的 cold adoption 仍不支援；native recovery 未驗證。 |
 | 3. helper sender | Source 接線、獨立 review 與完整 2,298 tests 通過。原生 capability bundle、actual launch/stdio scope producer 尚屬項目 4/6 的缺口，缺證據時不啟用控制。 |
-| 4. release／CLI | original-context cancellation、Prepare/Claim reconciliation、wrapper 收尾包已完成並通過上述 targeted tests；host/discovery/off-recovery/CLI 尚待完整整合回歸與提交。 |
-| 5. 全程容量覆蓋 | 尚缺能證明所有 live consumers 使用相同 lifetime accounting 的 provider；原日常 grace 前提仍不滿足，不能以測試 DB 假裝解鎖。 |
-| 6. console 驗收命令 | S1–S3／完整 §11.2／實測 A/B runner 尚未全部可執行；不能只包一層 CLI 就宣稱只剩使用者執行。 |
+| 4. release／CLI | Source 整合與完整 2,800 tests 通過；包含 exact discovery、typed operator transport、原子 off／audit、同 owner 收尾與三個 host 的 drain。Native 操作通訊、控制及恢復仍未驗證。 |
+| 5. 全程容量覆蓋 | Source generation／retained cohort／readiness transport 前置模組在本機通過 130 portable tests（5.026 秒），尚未納入本包；既有 writer 接線、常駐 generation owner、同日常 ledger 的真正 lifetime provider 與明確 source activation 仍待完成。日常 grace 前提未解鎖。 |
+| 6. console 驗收命令 | 已有部分 S1/S2 producer、S3 real-host foundation、P4 cost 與 P6 fixture/analyzer 的本機候選程式；整體 orchestration、部分 fault cases、完整成本／A/B coverage 尚缺。不是只剩 console 執行。 |
 
 以上是目前缺口；下列較早日期的段落保留其歷史測試範圍。Native S1–S3、完整
 P3–P6 都尚未通過。日常 config／Scheduled Task／啟動入口未修改。
+
+下一步是項目 5 的 actual writer／generation owner 接線，以及同一日常帳本的
+native evidence fixture 全程容量覆蓋。新增測試將繼續使用隔離帳本；任何實際
+日常 source activation 都需要獨立授權，不因 commit/push 自動執行。項目 6
+尚未完成的內容不能以 mock、空 provider、另外一個 DB 或假量測取代。
 
 本次命令均由日常 `C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1`
 正常准入（P2、HEAVY、1 CPU、1 GiB RAM、0 I/O slots），在 implementation worktree 執行：

@@ -60,7 +60,7 @@ def remaining_sleep(deadline: float) -> float:
 def main() -> int:
     default_data = Path(os.environ.get("USERPROFILE", str(Path.home()))) / ".resource-sentinel"
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", default=str(default_data))
+    parser.add_argument("--data-dir")
     sub = parser.add_subparsers(dest="command", required=True)
 
     admit = sub.add_parser("admit")
@@ -117,7 +117,13 @@ def main() -> int:
     adaptive_query.add_argument("--execution-id")
     adaptive_query.add_argument("--reservation-id")
     adaptive_query.add_argument("--limit", type=int, default=20)
+    from sentinel.adaptive.operational_cli import COMMANDS, dispatch, register_commands
+    register_commands(sub)
     args = parser.parse_args()
+    if args.command in COMMANDS:
+        return dispatch(args)
+    if args.data_dir is None:
+        args.data_dir = str(default_data)
     if args.command == "cancel":
         from sentinel.queue_cancellation import cancel_for_caller
         result = cancel_for_caller(args.data_dir, request_key=args.request_key, owner_pid=args.owner_pid)

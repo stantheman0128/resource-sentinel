@@ -819,16 +819,26 @@ class SupervisorHostTests(unittest.TestCase):
         self.assertEqual(retried["attached"], True)
         self.assertEqual(len(self.creation.created), 1)
 
-    def test_main_names_a_child_that_exists_when_startup_is_refused(self):
+    def test_main_retains_a_child_when_startup_is_refused_and_enters_resident_drain(self):
+        class ObservationBoundary(BaseException):
+            """End this synthetic observer without implying process cleanup."""
+
         host = self.started()
+        original = host.guardian
         refusal = SupervisorHostRefused("supervisor_host_attach_unavailable", "fixture")
         records = []
         with patch.object(module, "SupervisorHost", return_value=host), \
                 patch.object(host, "start", side_effect=refusal), \
-                patch.object(module, "emit", side_effect=records.append):
-            code = module.main(["--data-dir", str(self.directory),
-                                "--journal-dir", str(self.directory)])
-        self.assertEqual(code, EXIT_UNSETTLED)
+                patch.object(module, "emit", side_effect=records.append), \
+                patch.object(host, "supervise_until_stopped", side_effect=ObservationBoundary) as resident:
+            with self.assertRaises(ObservationBoundary):
+                module.main(["--data-dir", str(self.directory),
+                             "--journal-dir", str(self.directory)])
+        resident.assert_called_once_with()
+        self.assertTrue(host.draining)
+        self.assertIs(host.guardian, original)
+        self.assertFalse(self.startup.closed)
+        self.assertFalse(original.process.closed)
         self.assertEqual(records[-1]["guardian_created"], True)
         self.assertEqual(records[-1]["guardian_pid"], host.guardian.pid)
         self.assertEqual(records[-1]["guardian_epoch"], host.guardian.epoch)

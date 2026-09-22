@@ -38,17 +38,17 @@ refuses the next helper start as occupied, so no replacement is attempted then.
 Without a helper profile no helper child is created and no helper key appears in
 any record.
 
-The default mode ticks until the process is interrupted, which is the only stop
-condition this repository provides. Stopping does not stop the guardian. This
-host has no kill path at all, so it closes its own supervision and leaves the
-guardian running and unsupervised, and it says so. Nothing can re-adopt that
-guardian afterwards, because the creation handle that witnesses it cannot
-outlive this process. The same is true of the helper.
+An authenticated operator or local interrupt starts irreversible deliberate
+drain. Both replacement paths stop, while original-witness recovery, registry
+retirement and cleanup continue. A bounded observation or interrupt cannot make
+the main program discard the sole original child witnesses. There is no kill
+path, cold adoption, or workload cancellation.
 """
 from __future__ import annotations
 
 import argparse
 import ctypes as C
+from dataclasses import replace
 import json
 from pathlib import Path
 import re
@@ -81,8 +81,13 @@ class SupervisorHostRefused(RuntimeError):
 
 
 def emit(record, stream=None):
-    print(json.dumps(record, sort_keys=True, default=str),
-          file=sys.stderr if stream is None else stream, flush=True)
+    try:
+        print(json.dumps(record, sort_keys=True, default=str),
+              file=sys.stderr if stream is None else stream, flush=True)
+        return True
+    except Exception:
+        # Losing a diagnostics sink must not unwind the sole native custodian.
+        return False
 
 
 def _reason(error):
@@ -178,12 +183,14 @@ class _Creation:
 class _Guardian:
     """One started guardian: its creation handle, its witness and its epoch."""
 
-    def __init__(self, *, epoch, pid, creation_handle, process, creation_witness=None):
+    def __init__(self, *, epoch, pid, creation_handle, process, creation_witness=None, endpoints=None):
         self.epoch = epoch
         self.pid = pid
         self.creation_handle = creation_handle
         self.process = process
         self.creation_witness = creation_witness
+        for name, value in (endpoints or {}).items():
+            setattr(self, name, value)
 
 
 class _Helper:
@@ -194,10 +201,12 @@ class _Helper:
     received it.
     """
 
-    def __init__(self, *, pid, creation_handle, process):
+    def __init__(self, *, pid, creation_handle, process, endpoints=None):
         self.pid = pid
         self.creation_handle = creation_handle
         self.process = process
+        for name, value in (endpoints or {}).items():
+            setattr(self, name, value)
 
 
 class SupervisorHost:
@@ -210,7 +219,7 @@ class SupervisorHost:
         self.data_dir = Path(data_dir)
         self.journal_dir = Path(journal_dir)
         self.child_cwd = Path(_REPO_ROOT if child_cwd is None else child_cwd)
-        self.python_executable = sys.executable if python_executable is None else python_executable
+        self.python_executable = getattr(sys, "_base_executable", sys.executable) if python_executable is None else python_executable
         self.profile_path = profile_path
         self.max_guardians = max_guardians
         self.guardian_iterations = guardian_iterations
@@ -244,12 +253,29 @@ class SupervisorHost:
         self._guardian_settled = False
         self._rollover = self._replacement_epoch = None
         self._creation_unknown = False
+        self._creation_records = []
+        self._capture_errors = []
+        self._operator_cleanup_errors = []
         self._initial_start_operation = self._initial_start_result = None
         self._empty_check = self._empty_result = None
         self._empty_proof = False
         self._closed_handles = set()
         self._unknown_handles = set()
         self._closed = False
+        self.draining = False
+        self.operations = self.operator_service = self.operator_listener = None
+        self.discovery = self.descriptor = self.guardian_descriptor = None
+        self._operational_current = self._operational_error = None
+        self._initial_epoch = None
+        self._instance_id, self._operator_instance_id = str(uuid4()), str(uuid4())
+        self._guardian_endpoints = {}
+        self._helper_endpoints = None
+        self._helper_epoch_drain = None
+        self._helper_restart_pending = False
+        self._local_drain_request = None
+        self._drain_closed_children = set()
+        self._last_barrier = None
+        self._descriptor_removed = self._operator_closed = self._discovery_closed = False
 
     # --- startup ----------------------------------------------------------
 
@@ -293,6 +319,11 @@ class SupervisorHost:
                 self.startup.assert_fresh()
             if self.creation is None:
                 self.creation = _Creation()
+            if self.draining and self.guardian is None:
+                raise SupervisorHostRefused("supervisor_host_draining")
+            if self._initial_epoch is None:
+                self._initial_epoch = mint_guardian_epoch()
+            self._ensure_operations(self._initial_epoch)
             self.guardian = self._start_initial_guardian()
         except Exception as error:
             self.cold_reason = _reason(error)
@@ -305,12 +336,11 @@ class SupervisorHost:
                   "guardian_pid": self.guardian.pid, "pid": self.capability.pid,
                   "capability": self.capability.to_dict(), "attached": True,
                   "attach_reason": None}
-        if self.helper_profile_path is not None:
+        if self.helper_profile_path is not None and self.operations is None:
             record["helper"] = self._start_helper_supervision()
-        # Attach reads the guardian epoch from the ledger, and a guardian writes
-        # it only when it prepares its first execution. On a fresh ledger the
-        # first attach is therefore refused. The child already exists, so this
-        # host stays up unattached and retries every iteration.
+        # Attach can race the child's atomic identity/epoch publication. The
+        # child already exists, so retry with its original witness every tick;
+        # no managed workload is required to establish the initial binding.
         try:
             self.supervisor = self._attach(self.guardian)
         except SupervisorHostRefused as error:
@@ -323,7 +353,274 @@ class SupervisorHost:
                      "--guardian-epoch", epoch, "--iterations", str(self.guardian_iterations)]
         if self.profile_path is not None:
             arguments += ["--profile", str(self.profile_path)]
+        if self._operational_current is not None:
+            names = self._guardian_endpoints.setdefault(epoch, {
+                name: str(uuid4()) for name in ("instance_id", "operator_instance_id",
+                    "launch_instance_id", "query_instance_id", "control_instance_id")})
+            for name, value in names.items():
+                arguments += ["--" + name.replace("_", "-"), value]
+            arguments += self._parent_arguments()
         return arguments
+
+    def _parent_arguments(self):
+        identity = self._operational_current.identity
+        return ["--policy-instance-id", self.binding.instance_id,
+                "--parent-instance-id", self._instance_id,
+                "--parent-pid", str(identity.pid),
+                "--parent-created-filetime", str(identity.created_filetime_100ns),
+                "--parent-logon-id", identity.logon_id]
+
+    # --- operational discovery and conservative requests -------------------
+
+    def _ensure_operations(self, epoch):
+        """Use the original singleton's self handle, never reopen a PID."""
+        if self.operations is not None:
+            if self.operations.epoch != epoch:
+                raise SupervisorHostRefused("supervisor_host_operator_epoch_changed")
+            return
+        current = getattr(self.startup, "_current", None)
+        if current is None:
+            # Explicit synthetic host-order fixtures do not construct native
+            # startup custody. Production SupervisorStartup.assert_fresh checks
+            # its retained current handle before this point.
+            return
+        from .host_discovery import HostDiscovery, HostDescriptor, EndpointLocator
+        from .operator_transport import OperatorService
+        from .pipe_windows import NativePipeEndpoint, NativePipeListener
+        from .supervisor_operations import SupervisorHostOperations
+        self._operational_current = current
+        endpoint = NativePipeEndpoint(current.identity.logon_id, self._operator_instance_id, current.identity)
+        self.operations = SupervisorHostOperations(self, instance_id=self._instance_id,
+            policy_instance_id=self.binding.instance_id, guardian_epoch=epoch, current=current)
+        self.operator_service = OperatorService(endpoint, instance_id=self._instance_id,
+            policy_instance_id=self.binding.instance_id, guardian_epoch=epoch, handler=self.operations)
+        try:
+            self.operator_listener = NativePipeListener(endpoint)
+            self.discovery = HostDiscovery(self.data_dir, logon_id=current.identity.logon_id)
+            record = HostDescriptor(self._instance_id, self.binding.instance_id, current.identity.logon_id,
+                epoch, "supervisor", current.identity, (EndpointLocator("operator", endpoint),), "starting", 1)
+            self.discovery.publish_instance(record, expected=None, owner_process=current)
+            self.descriptor = record
+        except BaseException as error:
+            self._operational_error = error
+            raise
+
+    def _refresh_descriptor(self):
+        if self.discovery is None or self.descriptor is None or self.guardian is None:
+            return
+        child = None
+        try:
+            if not self._guardian_settled:
+                names = self._guardian_endpoints[self.guardian.epoch]
+                child = self.discovery.read_guardian(parent_identity=self._operational_current.identity,
+                    parent_instance_id=self._instance_id, child_identity=self.guardian.process.identity,
+                    instance_id=names["instance_id"], policy_instance_id=self.binding.instance_id,
+                    guardian_epoch=self.guardian.epoch)
+                expected = {role: names[role + "_instance_id"] for role in ("operator", "launch", "query", "control")}
+                if any(expected.get(item.role) != item.endpoint.instance_id for item in child.endpoints):
+                    raise SupervisorHostRefused("supervisor_host_child_endpoint_changed")
+                observed = self.guardian.process.observe()
+                from .contracts import IdentityStatus
+                if observed.status is not IdentityStatus.ALIVE or observed.identity != child.host_identity:
+                    child = None
+            self.guardian_descriptor = child
+            state = "draining" if self.draining else "ready" if child is not None and child.state == "ready" else "unavailable"
+            if self.descriptor.guardian == child and self.descriptor.state == state:
+                return
+            record = replace(self.descriptor, guardian=child, state=state, revision=self.descriptor.revision + 1)
+            self.discovery.publish_instance(record, expected=self.descriptor,
+                owner_process=self._operational_current,
+                child_process=None if child is None else self.guardian.process)
+            self.descriptor = record
+        except Exception as error:
+            self.guardian_descriptor = None
+            # An unpublished child is still starting; it is not readiness and
+            # does not invalidate the retained death/recovery owner.
+            if self.operations is not None:
+                self.operations.last_error = error
+            if (getattr(error, "publication_may_have_occurred", False) or
+                    getattr(self.discovery, "_quarantined", False)):
+                self._operational_error = error
+
+    def _rotate_operations(self, epoch):
+        if self.operations is None:
+            return
+        if self.draining or self.operations.operations:
+            raise SupervisorHostRefused("supervisor_host_operator_operation_retained")
+        if self._operational_error is not None:
+            raise SupervisorHostRefused("supervisor_host_operator_cleanup_unverified")
+        # Exact compare/removal comes before a fresh logical instance. An old
+        # request/endpoint is never rebound to the successor's guardian epoch.
+        try:
+            if self.descriptor is not None:
+                self.discovery.remove_instance(self.descriptor, owner_process=self._operational_current)
+            self.operator_listener.close()
+            self.discovery.close()
+        except BaseException as error:
+            self._operational_error = error
+            raise
+        self.operations = self.operator_service = self.operator_listener = None
+        self.discovery = self.descriptor = self.guardian_descriptor = None
+        self._instance_id, self._operator_instance_id = str(uuid4()), str(uuid4())
+        self._ensure_operations(epoch)
+
+    def begin_drain(self):
+        """Irreversible in-process intent, published before every child RPC."""
+        self.draining = True
+
+    def _runtime_observation(self):
+        from .store import _ipc_read_transaction
+        with _ipc_read_transaction(self.store.db_path, timeout_ms=250) as conn:
+            row = conn.execute("SELECT * FROM adaptive_runtime WHERE singleton=1").fetchone()
+            if row is None:
+                raise LifecycleError("operator_ledger_unavailable")
+            runtime = dict(row)
+            if (self.binding is None or runtime["policy_instance_id"] != self.binding.instance_id or
+                    runtime["policy_logon_id"] != self.binding.logon_id or
+                    self.guardian is not None and runtime["guardian_epoch"] not in {"", self.guardian.epoch}):
+                raise LifecycleError("operator_ledger_binding_changed")
+            slot = conn.execute("SELECT slot_state FROM adaptive_control_slot WHERE singleton=1").fetchone()
+        return runtime, slot
+
+    def request_local_drain(self):
+        self.begin_drain()
+        if self.operations is None:
+            return
+        from .operator_messages import OperatorOperation, OperatorRequest
+        if self._local_drain_request is None:
+            try:
+                runtime, _ = self._runtime_observation()
+                self._local_drain_request = OperatorRequest(str(uuid4()), OperatorOperation.DRAIN,
+                    self._instance_id, self.binding.instance_id, self.operations.epoch,
+                    expected_registry_revision=runtime["registry_revision"])
+            except Exception as error:
+                self.operations.last_error = error
+                return
+        self.operations(self._local_drain_request, caller_identity=self._operational_current.identity)
+
+    def _operational_recovery_pending(self):
+        if self.unverified or self.unsettled_captures or self._creation_unknown or self._unknown_handles:
+            return True
+        if self._operator_cleanup_errors:
+            return True
+        known = {id(item) for item in [self.guardian, self.helper, *self.retired, *self.retired_helpers] if item is not None}
+        if any(item.get("child") is not None and id(item["child"]) not in known for item in self._creation_records):
+            return True
+        if self.operations is not None:
+            from .pipe_windows import _GLOBAL_REGISTRY
+            status = _GLOBAL_REGISTRY.status()
+            expected = 0 if self._operator_closed else 1
+            if status.pending or status.quarantined or status.resources > expected:
+                return True
+        if any(result is None or not result.complete for result in self._registry_results.values()):
+            return True
+        if any(operation is not None and getattr(operation, "pending", False) is True for operation in
+                (self._initial_start_operation, self._empty_check, self.janitor,
+                 getattr(self._rollover, "_policy_operation", None), *self._registry_retirements.values())):
+            return True
+        if self.supervisor is not None and (getattr(self.supervisor, "_integrity_error", None) is not None or
+                getattr(self.supervisor, "errors", ()) or getattr(self.supervisor, "drain_errors", ())):
+            return True
+        return False
+
+    def _retain_operator_error(self, error):
+        """Retain native peer cleanup hidden behind a sanitized RPC failure."""
+        seen = set()
+        current = error
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            if (getattr(current, "_identity_handle_cleanup", ()) or
+                    getattr(current, "_native_close_outcome_unknown", False)):
+                if all(item is not current for item in self._operator_cleanup_errors):
+                    self._operator_cleanup_errors.append(current)
+            current = getattr(current, "_operator_cause", None) or getattr(current, "__cause__", None)
+
+    def _reap_operator_cleanup(self):
+        from .identity import retry_identity_cleanup
+        from .pipe_windows import _GLOBAL_REGISTRY, NativeDeadline
+        _GLOBAL_REGISTRY.reap(NativeDeadline.after_ms(100), max_ops=4)
+        if self._operator_cleanup_errors:
+            error = self._operator_cleanup_errors[0]
+            if getattr(error, "_native_close_outcome_unknown", False):
+                return
+            try:
+                retry_identity_cleanup(error)
+            except Exception:
+                return
+            self._operator_cleanup_errors.pop(0)
+
+    def _drain_children_settled(self):
+        if self._operational_recovery_pending() or self.supervisor is not None:
+            return False
+        if self.guardian is not None and not self._guardian_settled or self.helper is not None:
+            return False
+        return not self.cold_reason
+
+    def _custody_snapshot(self):
+        children = [*self.retired, *self.retired_helpers]
+        if self.guardian is not None:
+            children.append(self.guardian)
+        remaining = len({id(item) for item in children if id(item) not in self._drain_closed_children})
+        if self.helper is not None:
+            remaining += 1
+        remaining += len(self.unverified) + len(self.unsettled_captures) + int(self._creation_unknown)
+        result = dict(settled=False, remaining_custody=remaining,
+                      reason="operator_supervisor_custody_pending")
+        try:
+            runtime, slot = self._runtime_observation()
+            result.update(mode_off=runtime["mode"] == "off", registry_revision=runtime["registry_revision"],
+                          barrier_cleared=runtime["admission_barrier"] == "NONE")
+            result["settled"] = (self._drain_children_settled() and remaining == 0 and
+                result["mode_off"] and (slot is None or slot[0] == "RESTORED") and
+                result["barrier_cleared"] and runtime["policy_entry_nonce"] is None and
+                self._operational_error is None)
+            if result["settled"]:
+                result["reason"] = "operator_instance_drained"
+        except Exception:
+            result["reason"] = "operator_ledger_unavailable"
+        return result
+
+    def _operational_tick(self):
+        self._refresh_descriptor()
+        if self.operations is None:
+            return
+        self._reap_operator_cleanup()
+        if (self.helper_profile_path is not None and self.helper is None and
+                (self.started_helpers == 0 or self._helper_restart_pending) and not self.draining):
+            if self.guardian_descriptor is not None and self.guardian_descriptor.state == "ready":
+                result = self._start_helper_supervision()
+                if result["started"]:
+                    self._helper_restart_pending = False
+        try:
+            self.operations.tick()
+        except BaseException as error:
+            self.operations.last_error = error
+            self._retain_operator_error(error)
+            if not isinstance(error, Exception):
+                self.begin_drain()
+                raise
+        try:
+            self.operator_service.serve_once(self.operator_listener, timeout_ms=750)
+        except Exception as error:
+            self.operations.last_error = error
+            self._retain_operator_error(error)
+        # Observation/RPC follows a recovery tick, never replaces it. Recheck
+        # the janitor afterwards so a request cannot postpone owned cleanup.
+        self._last_barrier = self._reconcile_barrier()
+        if self.draining:
+            for child in [*self.retired, *self.retired_helpers,
+                    *([self.guardian] if self.guardian is not None and self._guardian_settled else [])]:
+                if id(child) in self._drain_closed_children:
+                    continue
+                key = ("guardian" if hasattr(child, "epoch") else "helper", id(child))
+                result = self._registry_results.get(key)
+                if result is None or not result.complete:
+                    continue
+                try:
+                    self._close_retired_child(child)
+                    self._drain_closed_children.add(id(child))
+                except Exception as error:
+                    self.operations.last_error = error
 
     def _start_initial_guardian(self):
         # No SQLite transaction spans CreateProcess; POLICY still serializes
@@ -340,6 +637,8 @@ class SupervisorHost:
             # must never hide an already-created child or cause another Create.
             if self.guardian is not None:
                 return False
+            if self.draining:
+                return False  # settle the original guard without a late Create
             try:
                 self.startup.assert_fresh_locked()
             except _ColdHold as error:
@@ -347,7 +646,7 @@ class SupervisorHost:
                     raise
                 refusal = error
             if refusal is None:
-                self.guardian = self._start_guardian()
+                self.guardian = self._start_guardian(epoch=self._initial_epoch)
             return False
 
         result = self._initial_start_operation._run(self.binding.logon_id,
@@ -368,6 +667,8 @@ class SupervisorHost:
 
     def _start_guardian(self, *, previous_epoch=None, epoch=None):
         """Create the child, then build its witness from the creation handle."""
+        if self.draining:
+            raise SupervisorHostRefused("supervisor_host_draining")
         if self.started_guardians >= self.max_guardians:
             raise SupervisorHostRefused("supervisor_host_guardian_budget_exhausted")
         if self._creation_unknown or self.unverified or self.unsettled_captures:
@@ -377,12 +678,16 @@ class SupervisorHost:
         # child process, so this cannot be a check after the fact.
         if previous_epoch is not None and epoch == previous_epoch:
             raise SupervisorHostRefused("supervisor_host_epoch_reused")
+        arguments = self._child_arguments(epoch)
+        retained = {"role": "guardian", "epoch": epoch}
+        self._creation_records.append(retained)
         self._creation_unknown = True
         try:
-            info = self.creation.create(self.python_executable, self._child_arguments(epoch),
-                                        self.child_cwd)
-        except SupervisorHostRefused as error:
-            if error.reason == "supervisor_host_create_failed":
+            retained["info"] = self.creation.create(self.python_executable, arguments, self.child_cwd)
+            info = retained["info"]
+        except BaseException as error:
+            retained["error"] = error
+            if isinstance(error, SupervisorHostRefused) and error.reason == "supervisor_host_create_failed":
                 self._creation_unknown = False
             raise
         self._creation_unknown = False
@@ -390,8 +695,14 @@ class SupervisorHost:
         try:
             self.creation.close_handle(int(info.hThread))
             creation_witness = self._capture_guardian_creation(handle, int(info.dwProcessId), epoch)
+            retained["witness"] = creation_witness
             process = creation_witness.process
+            child = _Guardian(epoch=epoch, pid=int(info.dwProcessId), creation_handle=handle,
+                process=process, creation_witness=creation_witness, endpoints=self._guardian_endpoints.get(epoch))
+            retained["child"] = child
         except BaseException as error:
+            retained["error"] = error
+            self._capture_errors.append(error)
             # The child is running and this handle is the only witness of it.
             # It is retained and reported, never closed here and never replaced
             # by a PID lookup later.
@@ -406,12 +717,23 @@ class SupervisorHost:
             raise SupervisorHostRefused("supervisor_host_guardian_unverified",
                                         _reason(error)) from None
         self.started_guardians += 1
-        return _Guardian(epoch=epoch, pid=int(info.dwProcessId), creation_handle=handle,
-                         process=process, creation_witness=creation_witness)
+        return child
 
     def _helper_arguments(self):
-        return ["-m", "sentinel.adaptive.helper_host",
+        arguments = ["-m", "sentinel.adaptive.helper_host",
                 "--data-dir", str(self.data_dir), "--profile", str(self.helper_profile_path)]
+        if self._operational_current is not None:
+            if self.guardian_descriptor is None or self.guardian_descriptor.state != "ready":
+                raise SupervisorHostRefused("supervisor_host_guardian_endpoint_unavailable")
+            self._helper_endpoints = {name: str(uuid4()) for name in ("instance_id", "operator_instance_id")}
+            for name, value in self._helper_endpoints.items():
+                arguments += ["--" + name.replace("_", "-"), value]
+            identity = self.guardian.process.identity
+            arguments += self._parent_arguments() + ["--guardian-epoch", self.guardian.epoch,
+                "--guardian-pid", str(identity.pid), "--guardian-created-filetime", str(identity.created_filetime_100ns),
+                "--guardian-logon-id", identity.logon_id,
+                "--guardian-control-instance-id", self.guardian.control_instance_id]
+        return arguments
 
     def _start_helper(self):
         """Create the helper child, then build its witness from that handle.
@@ -424,16 +746,22 @@ class SupervisorHost:
         """
         from .identity import VerifiedProcess
 
+        if self.draining:
+            raise SupervisorHostRefused("supervisor_host_draining")
         if self.started_helpers >= self.max_helpers:
             raise SupervisorHostRefused("supervisor_host_helper_budget_exhausted")
         if self._creation_unknown or self.unverified or self.unsettled_captures:
             raise SupervisorHostRefused("supervisor_host_creation_unsettled")
+        arguments = self._helper_arguments()
+        retained = {"role": "helper"}
+        self._creation_records.append(retained)
         self._creation_unknown = True
         try:
-            info = self.creation.create(self.python_executable, self._helper_arguments(),
-                                        self.child_cwd)
-        except SupervisorHostRefused as error:
-            if error.reason == "supervisor_host_create_failed":
+            retained["info"] = self.creation.create(self.python_executable, arguments, self.child_cwd)
+            info = retained["info"]
+        except BaseException as error:
+            retained["error"] = error
+            if isinstance(error, SupervisorHostRefused) and error.reason == "supervisor_host_create_failed":
                 self._creation_unknown = False
             raise
         self._creation_unknown = False
@@ -443,7 +771,13 @@ class SupervisorHost:
             process = VerifiedProcess.duplicate_from_handle(
                 handle, expected_pid=int(info.dwProcessId),
                 expected_logon_id=self.capability_logon())
+            retained["witness"] = process
+            child = _Helper(pid=int(info.dwProcessId), creation_handle=handle, process=process,
+                            endpoints=self._helper_endpoints)
+            retained["child"] = child
         except BaseException as error:
+            retained["error"] = error
+            self._capture_errors.append(error)
             # Same rule as the guardian. The child is running, this handle is
             # the only witness of it, so it is retained and reported here and
             # never replaced by a PID lookup later.
@@ -454,7 +788,7 @@ class SupervisorHost:
             raise SupervisorHostRefused("supervisor_host_helper_unverified",
                                         _reason(error)) from None
         self.started_helpers += 1
-        return _Helper(pid=int(info.dwProcessId), creation_handle=handle, process=process)
+        return child
 
     def _start_helper_supervision(self):
         """Start the one helper child at startup. A failure here stops nothing.
@@ -490,31 +824,67 @@ class SupervisorHost:
                     creation=guardian.creation_witness, guardian_epoch=guardian.epoch)
             return GuardianSupervisor.attach(self.store, self.journal, guardian=guardian.process,
                                              guardian_epoch=guardian.epoch)
-        except Exception as error:
+        except BaseException as error:
             # Capture succeeded and only the first inventory read failed. The
             # attach contract is to keep that same supervisor, so it is adopted
             # here and its next tick reads the inventory again.
             captured = getattr(error, "supervisor_owner", None)
             if captured is not None:
+                if not isinstance(error, Exception):
+                    self.supervisor = captured  # custody before interrupt escape
+                    raise
                 return captured
             # A failed capture leaves its partial owner on the exception. It is
             # closed here, and one that cannot be closed is kept and reported.
             partial = getattr(error, "_recovery_owner", None)
             if partial is not None:
+                retained = {"owner": partial, "epoch": guardian.epoch,
+                            "reason": "supervisor_capture_cleanup_pending"}
+                self.unsettled_captures.append(retained)
+                if not isinstance(error, Exception):
+                    retained["reason"] = "supervisor_capture_interrupted"
+                    raise
                 try:
                     partial.close()
-                except Exception as cleanup:
-                    self.unsettled_captures.append({"owner": partial, "epoch": guardian.epoch,
-                                                    "reason": _reason(cleanup)})
+                    self.unsettled_captures.remove(retained)
+                except BaseException as cleanup:
+                    retained["reason"] = _reason(cleanup)
+                    self._capture_errors.append(cleanup)
+                    if not isinstance(cleanup, Exception):
+                        raise
+            if not isinstance(error, Exception):
+                raise
             raise SupervisorHostRefused("supervisor_host_attach_unavailable",
                                         _reason(error)) from None
 
     # --- one bounded iteration --------------------------------------------
 
     def run_once(self):
+        record = self._run_recovery_once()
+        self._operational_tick()
+        if self.draining:
+            record["draining"] = True
+            record["custody"] = self._custody_snapshot()
+        return record
+
+    def _run_recovery_once(self):
         from .contracts import IdentityStatus
 
         barrier = self._reconcile_barrier()
+        if self.cold_reason is not None:
+            if self.draining:
+                # Existing creation may have committed before POLICY cleanup
+                # failed. Settle that same operation, never create a new child.
+                if self._initial_start_operation is not None and self._initial_start_operation.pending:
+                    try:
+                        self._start_initial_guardian()
+                    except Exception as error:
+                        self.cold_reason = _reason(error)
+                if self.guardian is not None and not self._operational_recovery_pending():
+                    self.cold_reason = None
+                else:
+                    return {"event": "supervisor_host_iteration", "state": "COLD_RECOVERY_HOLD",
+                            "reason": self.cold_reason, "draining": True, "barrier": barrier}
         if self.cold_reason is not None:
             if getattr(self.startup, "can_retry_acquire", False) is True:
                 try:
@@ -602,16 +972,37 @@ class SupervisorHost:
             return {"complete": False, "pending": True, "reason": _reason(error)}
 
     def supervise_until_stopped(self):
-        """Tick until the process is interrupted. The guardian is left alone."""
+        """Remain resident through requested drain and exact custody cleanup."""
         iterations = 0
-        try:
-            while True:
+        while True:
+            try:
+                if self.draining and self._local_drain_request is None and self.operations is not None and not self.operations.operations:
+                    self.request_local_drain()
                 emit(self.run_once())
                 iterations += 1
+                if self.draining and self._custody_snapshot()["settled"]:
+                    return {"event": "supervisor_host_stopping", "reason": "drain_settled",
+                            "iterations": iterations}
                 self._sleep(self.tick_interval_sec)
-        except KeyboardInterrupt:
-            return {"event": "supervisor_host_stopping", "reason": "interrupted",
-                    "iterations": iterations}
+            except KeyboardInterrupt:
+                self.begin_drain()
+                emit({"event": "supervisor_host_stopping", "reason": "drain_requested",
+                      "iterations": iterations})
+                try:
+                    self.request_local_drain()
+                except (Exception, KeyboardInterrupt) as error:
+                    if self.operations is not None:
+                        self.operations.last_error = error
+            except Exception as error:
+                # Failure is retained by its original owners. An uncaught
+                # ordinary exception must not turn into silent witness loss.
+                self.begin_drain()
+                emit({"event": "supervisor_host_draining", "reason": _reason(error),
+                      "iterations": iterations})
+                try:
+                    self._sleep(self.tick_interval_sec)
+                except KeyboardInterrupt:
+                    pass
 
     def _observed_status(self):
         """What the retained witness reports now. A failed observation is unknown."""
@@ -716,15 +1107,25 @@ class SupervisorHost:
             self.supervisor = None
             self._guardian_settled = True
         previous = self.guardian
-        removed, registry_reason = self._unregister("guardian", previous)
+        cached = self._registry_results.get(("guardian", id(previous)))
+        if self.draining and cached is not None and cached.complete:
+            removed, registry_reason = cached.changed, None
+        else:
+            removed, registry_reason = self._unregister("guardian", previous)
         registry = {"registry_removed": removed, "registry_reason": registry_reason}
         if registry_reason is not None:
             return {"started": False, "reason": "supervisor_host_guardian_row_retained", **registry}
+        if self.draining:
+            return {"started": False, "reason": "supervisor_host_draining", **registry}
+        if self.helper is not None and self.operations is not None:
+            self._request_helper_epoch_drain()
+            return {"started": False, "reason": "supervisor_host_helper_epoch_retained", **registry}
         if self.started_guardians >= self.max_guardians:
             return {"started": False, "reason": "supervisor_host_guardian_budget_exhausted",
                     **registry}
         try:
             epoch = self._rollover_epoch(previous)
+            self._rotate_operations(epoch)
             replacement = self._start_guardian(previous_epoch=previous.epoch, epoch=epoch)
         except Exception as error:
             return {"started": False, "reason": _reason(error), **registry}
@@ -824,6 +1225,24 @@ class SupervisorHost:
 
     # --- the helper child --------------------------------------------------
 
+    def _request_helper_epoch_drain(self):
+        """Retire the old helper before changing its immutable epoch binding."""
+        if self.helper is None or self.operations is None:
+            return
+        from .operator_messages import OperatorOperation as Op, OperatorRequest
+        try:
+            if self._helper_epoch_drain is None:
+                runtime, _ = self._runtime_observation()
+                request = OperatorRequest(str(uuid4()), Op.DRAIN, self._instance_id,
+                    self.binding.instance_id, self.guardian.epoch,
+                    expected_registry_revision=runtime["registry_revision"])
+                self._helper_epoch_drain = self.operations._target("helper", request)
+            child, request, client = self._helper_epoch_drain
+            if self.helper is child and self.operations._alive(child):
+                client.request(request, timeout_ms=250)
+        except Exception as error:
+            self.operations.last_error = error
+
     def _supervise_helper(self):
         """Observe the helper witness once. Only DEAD leads to anything.
 
@@ -869,6 +1288,16 @@ class SupervisorHost:
             return record
         self.helper = None
         self.retired_helpers.append(dead)
+        if self.draining:
+            record["reason"] = "supervisor_host_draining"
+            return record
+        if self.operations is not None:
+            # The next helper must be bound to the guardian currently proven
+            # ready. Do not reuse an old control endpoint across epoch rollover.
+            self._helper_restart_pending = True
+            self._helper_epoch_drain = None
+            record["reason"] = "supervisor_host_helper_ready_pending"
+            return record
         try:
             replacement = self._start_helper()
         except SupervisorHostRefused as error:
@@ -893,6 +1322,8 @@ class SupervisorHost:
         """
         if self._closed:
             return dict(self._close_record)
+        if self.draining and not self._drain_children_settled():
+            raise SupervisorHostRefused("supervisor_host_custody_unsettled")
         if any(result is None or not result.complete for result in self._registry_results.values()):
             raise SupervisorHostRefused("supervisor_host_registry_retirement_pending")
         if self._creation_unknown:
@@ -917,6 +1348,12 @@ class SupervisorHost:
         for retired in closed_children:
             try:
                 self._close_retired_child(retired)
+                self._drain_closed_children.add(id(retired))
+            except Exception as error:
+                cleanup.append(_reason(error))
+        if self.draining and self.operations is not None and not cleanup:
+            try:
+                self._close_operational()
             except Exception as error:
                 cleanup.append(_reason(error))
         if self.startup is not None and not cleanup:
@@ -938,6 +1375,23 @@ class SupervisorHost:
             self._closed = True
             self._close_record = dict(record)
         return record
+
+    def _close_operational(self):
+        if self._operational_error is not None:
+            raise SupervisorHostRefused("supervisor_host_operator_cleanup_unverified")
+        if not self._custody_snapshot()["settled"]:
+            raise SupervisorHostRefused("supervisor_host_custody_unsettled")
+        # The exact descriptor is removed while its original self handle and
+        # lifetime fence are still held. No old owner removes a successor.
+        if not self._descriptor_removed and self.descriptor is not None:
+            self.discovery.remove_instance(self.descriptor, owner_process=self._operational_current)
+            self._descriptor_removed = True
+        if not self._operator_closed:
+            self.operator_listener.close()
+            self._operator_closed = True
+        if not self._discovery_closed:
+            self.discovery.close()
+            self._discovery_closed = True
 
     def _close_retired_child(self, child):
         # The duplicate owns its own unknown-close quarantine. Retain an
@@ -964,12 +1418,12 @@ class SupervisorHost:
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="sentinel.adaptive.supervisor_host",
-        description="Start one guardian and observe it for a bounded number of ticks.")
+        description="Own one guardian and retain custody through explicit drain.")
     parser.add_argument("--data-dir", required=True, help="directory holding sentinel.db")
     parser.add_argument("--journal-dir", required=True, help="recovery manifest directory")
     parser.add_argument("--iterations", type=int, default=0,
-                        help="0 ticks until the process is interrupted; a positive "
-                             "value is the bounded test and diagnostic mode")
+                        help="0 serves until drain; a positive value requests drain "
+                             "after this many observation ticks (cleanup may continue)")
     parser.add_argument("--guardian-iterations", type=int, default=0,
                         help="iterations passed to the guardian child; 0 leaves the "
                              "child running until it is interrupted")
@@ -1000,29 +1454,55 @@ def main(argv=None):
                           max_helpers=options.max_helpers)
     try:
         emit(host.start())
-    except SupervisorHostRefused as error:
+    except (Exception, KeyboardInterrupt) as error:
         # A refusal after the child was created leaves a guardian behind. The
         # record names it, and that case is not a clean refusal.
-        child = host.guardian is not None or bool(host.unverified) or host._creation_unknown
-        emit({"event": "supervisor_host_refused", "reason": error.reason, "detail": error.detail,
+        child = (host.guardian is not None or bool(host.unverified) or host._creation_unknown or
+                 host.unsettled_captures or any(item.get("child") is not None for item in host._creation_records) or
+                 getattr(host.startup, "policy_pending", False) is True)
+        emit({"event": "supervisor_host_refused", "reason": _reason(error), "detail": getattr(error, "detail", None),
               "guardian_created": child,
               "guardian_epoch": None if host.guardian is None else host.guardian.epoch,
               "guardian_pid": None if host.guardian is None else host.guardian.pid,
               "unverified": list(host.unverified)})
-        return EXIT_UNSETTLED if child else EXIT_REFUSED
+        if not child:
+            return EXIT_REFUSED
+        host.begin_drain()
     try:
         if options.iterations == 0:
             emit(host.supervise_until_stopped())
         else:
             for _ in range(options.iterations):
                 emit(host.run_once())
+                if host.draining:
+                    break
+            host.request_local_drain()
+            emit(host.supervise_until_stopped())
     except KeyboardInterrupt:
         emit({"event": "supervisor_host_stopping", "reason": "interrupted"})
-    try:
-        record = host.close()
-    except SupervisorHostRefused as error:
-        emit({"event": "supervisor_host_refused", "reason": error.reason, "detail": error.detail})
-        return EXIT_UNSETTLED
+        host.begin_drain()
+        emit(host.supervise_until_stopped())
+    except Exception as error:
+        emit({"event": "supervisor_host_stopping", "reason": _reason(error)})
+        host.begin_drain()
+        emit(host.supervise_until_stopped())
+    # A failed final close still owns its exact native objects. Stay resident
+    # through a known retry or quarantined outcome. Never tick a closed listener
+    # merely because final singleton cleanup remains unfinished.
+    while True:
+        try:
+            record = host.close()
+            if not record["cleanup_errors"]:
+                break
+            emit(record)
+        except (Exception, KeyboardInterrupt) as pending:
+            emit({"event": "supervisor_host_draining", "reason": _reason(pending)})
+        try:
+            if not host._drain_children_settled():
+                emit(host.run_once())
+            host._sleep(host.tick_interval_sec)
+        except (Exception, KeyboardInterrupt) as pending:
+            emit({"event": "supervisor_host_draining", "reason": _reason(pending)})
     emit(record)
     # A child with no witness or a partial capture that would not close is not
     # a clean exit, even though the supervision itself settled.

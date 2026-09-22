@@ -816,7 +816,8 @@ class ZeroSetStructureTests(unittest.TestCase):
             "sentinel.adaptive.helper", "sentinel.adaptive.host_authority",
             "sentinel.adaptive.identity", "sentinel.adaptive.legacy_writer",
             "sentinel.adaptive.machine_sampler", "sentinel.adaptive.native_job",
-            "sentinel.adaptive.sampler", "sentinel.adaptive.store"})
+            "sentinel.adaptive.sampler", "sentinel.adaptive.store",
+            "sentinel.adaptive.helper_control_host", "sentinel.adaptive.supervisor_reconcile"})
 
     def test_it_imports_nothing_that_can_set_a_cap_or_reach_a_guardian(self):
         self.assertEqual(imported_modules(PACKAGE / "helper_host.py") & DENIED_MODULES, set())

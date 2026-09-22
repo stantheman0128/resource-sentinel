@@ -32,6 +32,7 @@ from sentinel.adaptive.identity import IdentityUnavailable, VerifiedProcess
 from sentinel.adaptive.ipc import IpcError
 from sentinel.adaptive.pipe_windows import NativePipeError
 from sentinel.adaptive.store import LifecycleError, LifecycleStore
+from sentinel.adaptive.terminal_custody import TerminalCleanupResult
 from tests.fixtures.adaptive_evidence import FixturePolicyProvider
 from tests.test_adaptive_host_authority import SYNTHETIC, live_capability_refusal
 
@@ -116,12 +117,37 @@ class Listener:
         self.closed = True
 
 
+class PipeRegistryFixture:
+    """Explicit host-owned cleanup status; never touches a global native pipe."""
+    def __init__(self):
+        self.calls = []
+        self.status = SimpleNamespace(resources=0, pending=0, quarantined=0)
+
+    def reap(self, deadline, *, max_ops):
+        self.calls.append((deadline, max_ops))
+        return self.status
+
+
+def install_pipe_fixture(case):
+    registry = PipeRegistryFixture()
+    for patcher in (patch("sentinel.adaptive.pipe_windows._GLOBAL_REGISTRY", registry),
+                    patch("sentinel.adaptive.pipe_windows.NativeDeadline.after_ms", return_value=object())):
+        patcher.start()
+        case.addCleanup(patcher.stop)
+    return registry
+
+
 class Lifecycle:
     def __init__(self, events):
         self.events = events
         self.retained = []
         self.errors = {}
         self.results = {}
+        self.cleanup_started = set()
+        self.retire_errors = {}
+        self.retire_results = {}
+        self.fence_close_error = None
+        self.fences_closed = False
 
     @property
     def retained_execution_ids(self):
@@ -134,13 +160,53 @@ class Lifecycle:
         return self.results.get(execution_id, SimpleNamespace(
             execution_id=execution_id, state="RUNNING", active_processes=1, terminal=False))
 
+    def terminal_cleanup_started(self, execution_id):
+        return execution_id in self.cleanup_started
+
+    def close_retained_fences(self):
+        if self.fences_closed:
+            return
+        self.events.append(("close_recovery_fence",))
+        if self.fence_close_error is not None:
+            raise self.fence_close_error
+        self.fences_closed = True
+
+    def retire_terminal(self, execution_id, *, now=None):
+        self.events.append(("retire_terminal", execution_id))
+        if execution_id in self.retire_errors:
+            raise self.retire_errors[execution_id]
+        result = self.retire_results.get(execution_id, TerminalCleanupResult(
+            execution_id, True, False, False, "guardian_terminal_retired", ()))
+        if result.complete:
+            self.retained.remove(execution_id)
+            self.cleanup_started.discard(execution_id)
+        return result
+
 
 class Owner:
     def retire_completed_pending(self):
         return []
 
     def __init__(self, events):
+        self.events = events
         self.lifecycle = Lifecycle(events)
+        self.draining = False
+        self.new_authorizations = []
+        self.recovery_requests = []
+
+    def begin_drain(self):
+        self.events.append(("owner_begin_drain",))
+        self.draining = True
+
+    def dispatch_fixture(self, operation):
+        """Explicit owner boundary for host wiring, not native authority proof."""
+        if operation in {"prepare", "claim"}:
+            if self.draining:
+                raise LifecycleError("guardian_draining")
+            self.new_authorizations.append(operation)
+        else:
+            self.recovery_requests.append(operation)
+        return operation
 
     @property
     def retained_execution_ids(self):
@@ -191,6 +257,7 @@ class GuardianHostTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.directory = Path(temporary.name)
         self.events = []
+        self.pipe_registry = install_pipe_fixture(self)
         self.host = self.build()
 
     def build(self):
@@ -278,6 +345,7 @@ class GuardianHostTests(unittest.TestCase):
                 patch("sentinel.adaptive.guardian.GuardianLaunchOwner", return_value=owner), \
                 patch.object(host, "_register"), patch.object(host, "_endpoints"), \
                 patch.object(host, "_control_endpoint"), \
+                patch.object(host, "_operator_endpoint"), \
                 patch("sentinel.adaptive.capability_evidence.NativeEvidenceAuthority",
                       return_value=evidence_authority) as evidence, \
                 patch("sentinel.adaptive.guardian_floor.FloorPublisher", return_value=publisher) as floor, \
@@ -368,25 +436,30 @@ class GuardianHostTests(unittest.TestCase):
             self.host.run_once()
         self.assertEqual(self.events, [("tick", 1000)])
 
-    def test_finished_barrier_clear_follows_post_reconcile_sweep_and_retries_failure(self):
-        self.host.owner.lifecycle.retained = [EXECUTION]
-        self.host.owner.lifecycle.results[EXECUTION] = SimpleNamespace(
+    def test_finished_retirement_follows_sweep_and_retains_pending_bookkeeping(self):
+        lifecycle = self.host.owner.lifecycle
+        lifecycle.retained = [EXECUTION]
+        lifecycle.results[EXECUTION] = SimpleNamespace(
             execution_id=EXECUTION, state="FINISHED", active_processes=0, terminal=True)
-        self.host.control.barrier_errors[EXECUTION] = LifecycleError("fixture_bookkeeping_pending")
+        lifecycle.retire_results[EXECUTION] = TerminalCleanupResult(
+            EXECUTION, False, True, False, "fixture_bookkeeping_pending", ())
         first = self.host.run_once()
         self.assertEqual(self.events[-3:], [
-            ("reconcile", EXECUTION), ("tick", 1000), ("clear_finished", EXECUTION)])
+            ("reconcile", EXECUTION), ("tick", 1000), ("retire_terminal", EXECUTION)])
         self.assertEqual(first["barrier_clears"], [])
-        self.assertEqual(first["barrier_clear_errors"], [
-            {"execution_id": EXECUTION, "reason": "fixture_bookkeeping_pending"}])
+        self.assertEqual(first["barrier_clear_errors"], [])
+        self.assertEqual(first["terminal_retirements"], [{"execution_id": EXECUTION,
+            "complete": False, "pending": True, "reason": "fixture_bookkeeping_pending"}])
         self.assertEqual(self.host.retained_execution_ids(), (EXECUTION,))
-        self.host.control.barrier_errors.clear()
+        lifecycle.retire_results.clear()
         second = self.host.run_once()
         self.assertEqual(second["barrier_clear_errors"], [])
-        self.assertEqual(second["barrier_clears"], [
-            {"execution_id": EXECUTION, "barrier_cleared": True}])
-        self.assertEqual([event for event in self.events if event[0] == "clear_finished"],
-                         [("clear_finished", EXECUTION), ("clear_finished", EXECUTION)])
+        self.assertEqual(second["terminal_retirements"], [{"execution_id": EXECUTION,
+            "complete": True, "pending": False, "reason": "guardian_terminal_retired"}])
+        self.assertEqual(self.host.retained_execution_ids(), ())
+        self.assertEqual([event for event in self.events if event[0] == "retire_terminal"],
+                         [("retire_terminal", EXECUTION), ("retire_terminal", EXECUTION)])
+        self.assertFalse(any(event[0] == "clear_finished" for event in self.events))
 
     def test_reconcile_failure_does_not_claim_a_finished_barrier_clear(self):
         self.host.owner.lifecycle.retained = [EXECUTION]
@@ -394,6 +467,7 @@ class GuardianHostTests(unittest.TestCase):
         record = self.host.run_once()
         self.assertEqual(record["barrier_clears"], [])
         self.assertEqual(record["barrier_clear_errors"], [])
+        self.assertEqual(record["terminal_retirements"], [])
         self.assertFalse(any(event[0] == "clear_finished" for event in self.events))
 
     def test_control_frame_ack_summary_preserves_each_observation_without_wire_bindings(self):
@@ -435,25 +509,27 @@ class GuardianHostTests(unittest.TestCase):
 
         def serving_restore():
             self.assertTrue(self.host.control.draining)
-            self.assertEqual(self.events[:2], [("begin_drain",), ("tick", 1000)])
+            self.assertTrue(self.host.owner.draining)
+            self.assertEqual(self.events[:3], [("owner_begin_drain",), ("begin_drain",), ("tick", 1000)])
 
         self.host.control_service.before_serve = serving_restore
         record = self.host.run_once(serve_launch=False)
-        self.assertIsNone(record["launch_rpc"])
+        self.assertTrue(record["launch_rpc"]["served"])
         self.assertTrue(record["control_rpc"]["served"])
         self.assertFalse(record["control_rpc"]["result"]["bookkeeping_settled"])
         self.assertTrue(record["query_rpc"]["served"])
         self.assertEqual([event[0] for event in self.events],
-                         ["begin_drain", "tick", "control", "query", "tick"])
+                         ["owner_begin_drain", "begin_drain", "tick", "launch", "control", "query", "tick"])
 
-    def test_drain_still_accepts_an_empty_frame_ack_without_launch_or_apply(self):
+    def test_drain_accepts_an_empty_frame_and_keeps_the_launch_recovery_pipe(self):
         self.host.control_service.result = ControlFrameAck(
             request_id=REQUEST, guardian_epoch=EPOCH, policy_epoch="fixture-policy",
             sampler_epoch="fixture-sampler", clock_epoch="fixture-clock", sample_seq=8,
             registry_revision=10, config_revision="b" * 64, results=())
         record = self.host.run_once(serve_launch=False)
         self.assertTrue(self.host.control.draining)
-        self.assertIsNone(record["launch_rpc"])
+        self.assertTrue(record["launch_rpc"]["served"])
+        self.assertTrue(self.host.owner.draining)
         self.assertEqual(record["control_rpc"], {"served": True,
                                                 "result": {"sample_seq": 8, "results": []}})
 
@@ -464,11 +540,12 @@ class GuardianHostTests(unittest.TestCase):
         self.assertEqual(record["exiting"], False)
         self.assertEqual(record["retained"], ["execution-a"])
         self.assertEqual(record["iterations"], 2)
-        # New launches stop, while restore/frame RPCs and queries still reach
-        # their services. GuardianControl owns the restriction on new caps.
+        # The launch owner refuses new authorization, while the same launch
+        # pipe remains available for Bind/Cancel and lost-acknowledgement replay.
         self.assertEqual([event[0] for event in self.events
                           if event[0] in {"launch", "control", "query"}],
-                         ["control", "query", "control", "query"])
+                         ["launch", "control", "query", "launch", "control", "query"])
+        self.assertTrue(self.host.owner.draining)
         self.assertFalse(self.host.launch_listener.closed)
 
     def test_the_drain_returns_only_once_custody_clears(self):
@@ -598,9 +675,12 @@ class GuardianRegistrationTests(unittest.TestCase):
         self.backend = ProcessBackend()
 
     def build(self, process=None):
+        from sentinel.adaptive.recovery_journal import RecoveryJournal
         host = GuardianHost(data_dir=self.directory, journal_dir=self.directory / "recovery",
                             guardian_epoch=EPOCH)
         host.store = self.store
+        (self.directory / "recovery").mkdir(exist_ok=True)
+        host.journal = RecoveryJournal(self.directory / "recovery")
         host.guardian = self.backend.process(GUARDIAN) if process is None else process
         return host
 
@@ -636,7 +716,8 @@ class GuardianRegistrationTests(unittest.TestCase):
             "(role,pid,created_filetime_100ns,logon_id,schema_version) VALUES('guardian',?,?,?,1)",
             [(identity.pid, str(identity.created_filetime_100ns), identity.logon_id)
              for identity in identities])
-        conn.execute("UPDATE adaptive_runtime SET guardian_epoch=? WHERE singleton=1", (epoch,))
+        conn.execute("UPDATE adaptive_runtime SET guardian_epoch=?,active_logon_id=? WHERE singleton=1",
+                     (epoch, LOGON if epoch else ""))
 
     def assert_registration_refused_without_registry_change(self, host, reason):
         before = self.registry_rows()

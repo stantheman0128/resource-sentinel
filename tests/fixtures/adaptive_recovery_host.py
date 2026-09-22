@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager, ExitStack
+from dataclasses import asdict
 import os
 from pathlib import Path
+import sqlite3
 import sys
+import threading
 import time
 from uuid import uuid4
 
@@ -25,7 +28,8 @@ from tests.windows.adaptive_recovery_runner import (
 ROLES = ("supervisor", "guardian", "helper", "wrapper")
 CONTROL_FAULTS = {
     "intent_before", "intent_after_set_before", "set_after_query_before",
-    "query_after_audit_before", "lease_renewal", "guardian_hang",
+    "query_after_audit_before", "lease_renewal", "guardian_hang", "root_exit_after",
+    "audit_unavailable",
 }
 _CLEANUP_HOLDS = []
 
@@ -88,6 +92,69 @@ def load_case(directory):
     return directory, spec, value
 
 
+class AuditOutage:
+    """One thread owns a real isolated SQLite write lock through withdrawal."""
+    def __init__(self, hooks, entry):
+        self.hooks, self.entry = hooks, entry
+        self.ready, self.done = threading.Event(), threading.Event()
+        self.error, self.locked, self.thread = None, False, None
+        self.path = Path(hooks.control.store.db_path).resolve(strict=True)
+        daily = (Path.home() / ".resource-sentinel").resolve()
+        _require(hooks.directory in self.path.parents and daily not in self.path.parents,
+                 "s3_audit_daily_directory_forbidden")
+        daily_ledger = daily / "sentinel.db"
+        _require(not daily_ledger.exists() or not self.path.samefile(daily_ledger),
+                 "s3_audit_daily_ledger_alias")
+
+    def start(self):
+        _require(self.thread is None, "s3_audit_owner_already_started")
+        self.thread = threading.Thread(target=self._run, name="s3-isolated-audit-lock", daemon=False)
+        self.thread.start()
+        remaining = (self.hooks.spec.deadline_tick - _tick()) / 10_000_000
+        if not self.ready.wait(max(0, min(1., remaining))) or self.error is not None or not self.locked:
+            raise RecoveryRunUnavailable("s3_audit_lock_unavailable")
+
+    def _run(self):
+        connection = None
+        details = dict(point="audit_unavailable", execution_id=self.entry.execution_id,
+            job_nonce=self.entry.job.nonce, role="guardian", source="sqlite_transaction")
+        try:
+            self.hooks.spec.check_time(_tick())
+            connection = sqlite3.connect(self.path.as_uri() + "?mode=rw", uri=True,
+                                         timeout=.25, isolation_level=None)
+            connection.execute("BEGIN IMMEDIATE")
+            self.locked = True
+            self.hooks.raw.append("audit_lock_acquired", tick=_tick(), **details)
+            self.ready.set()
+            while (_tick() < self.hooks.spec.deadline_tick and
+                   not (self.hooks.directory / "release-audit").exists()):
+                time.sleep(.02)
+        except BaseException as error:
+            self.error = error
+            self.ready.set()
+        finally:
+            # Only this thread ever touches its connection. No external raw
+            # handle close or retry substitutes for a positive rollback/close.
+            if connection is not None:
+                try:
+                    connection.rollback()
+                    connection.close()
+                    was_locked = self.locked
+                    self.locked = False
+                except BaseException as error:
+                    self.error = error
+                    retain_cleanup((self, connection), error)
+                else:
+                    if was_locked:
+                        try:
+                            self.hooks.raw.append("audit_lock_released", tick=_tick(), **details)
+                        except BaseException as error:
+                            # The connection already closed positively. A log
+                            # failure invalidates evidence, not that close ACK.
+                            self.error = error
+            self.done.set()
+
+
 class FaultHooks:
     """Real method boundary instrumentation, restricted to one native owner.
 
@@ -99,6 +166,14 @@ class FaultHooks:
         self.directory, self.spec, self.role, self.raw = directory, spec, role, raw
         self.control = self.host = None
         self.fired = False
+        self.observed = False
+        self.audit_outage = None
+        self._proposal_context = None
+        self._published_intent = None
+        self._latest_native_write = None
+
+    def armed(self, point):
+        return self.spec.case == point and (self.directory / "arm-fault").exists()
 
     def scope(self, job=None):
         from sentinel.adaptive.identity import VerifiedProcess
@@ -120,15 +195,65 @@ class FaultHooks:
         _require(entry.job.accounting().active_processes > 0, "s3_fault_no_live_workload")
         return entry
 
-    def hit(self, point, *, job=None):
-        if self.fired or self.spec.case != point or not (self.directory / "arm-fault").exists():
+    @contextmanager
+    def proposal_context(self, proposal, entry, *, previous_lease=None):
+        previous = self._proposal_context, self._published_intent
+        self._proposal_context = (proposal, entry, previous_lease)
+        self._published_intent = None
+        try:
+            yield
+        finally:
+            self._proposal_context, self._published_intent = previous
+
+    def cutpoint(self, point, entry, manifest, action_id, desired, *, action=None, native_set=None):
+        if self.fired or not self.armed(point):
+            return None
+        from sentinel.adaptive.contracts import ControlProposal, RecoveryManifest
+        _require(self._proposal_context is not None, "s3_original_control_context_missing")
+        proposal, original_entry, previous_lease = self._proposal_context
+        _require(original_entry is entry and type(proposal) is ControlProposal and
+                 type(manifest) is RecoveryManifest and proposal.execution_id == entry.execution_id and
+                 manifest.execution_id == entry.execution_id and manifest.creation_nonce == entry.job.nonce,
+                 "s3_original_control_context_mismatch")
+        return self.raw.append("control_cutpoint", tick=_tick(), point=point,
+            execution_id=entry.execution_id, job_nonce=entry.job.nonce,
+            actor_identity=self.control.owner.guardian.identity.to_dict(),
+            boundary="set_after_query_before" if point == "guardian_hang" else point,
+            manifest=manifest.to_dict(), proposal=proposal.to_dict(), action_id=action_id,
+            desired=desired.to_dict(), action=None if action is None else asdict(action),
+            native_set_attempt_id=None if native_set is None else native_set["attempt_id"],
+            previous_lease_deadline_tick_100ns=previous_lease)
+
+    def hit(self, point, *, job=None, cutpoint=None):
+        if self.fired or not self.armed(point):
             return
         self.spec.check_time(_tick())
         entry = self.scope(job)
+        if point in {"intent_before", "intent_after_set_before", "set_after_query_before",
+                     "query_after_audit_before", "lease_renewal", "guardian_hang"}:
+            _require(cutpoint is not None and any(item is cutpoint for item in self.raw.records) and
+                     cutpoint.get("point") == point and cutpoint.get("execution_id") == entry.execution_id and
+                     cutpoint.get("job_nonce") == entry.job.nonce,
+                     "s3_control_cutpoint_missing")
+        extra = {}
+        if point == "root_exit_after":
+            root = entry.root.observe()
+            if root.status is IdentityStatus.ALIVE:
+                return
+            _require(root.identity == entry.root.identity and root.status is IdentityStatus.DEAD,
+                     "s3_original_root_exit_unverified")
+            if entry.job.query_cpu().flags != 5:
+                return
+            extra["root_identity"] = root.identity.to_dict()
+            self.raw.append("root_exit_observed", tick=_tick(), point=point,
+                execution_id=entry.execution_id, job_nonce=entry.job.nonce,
+                observed_identity=root.identity.to_dict(), source="retained_root_witness",
+                active_processes=entry.job.accounting().active_processes, exit_code=entry.root.exit_code())
         self.fired = True
         self.raw.append("fault_injected", tick=_tick(), point=point, role=self.role,
             execution_id=entry.execution_id, job_nonce=entry.job.nonce,
-            mechanism="original_fixture_self_exit" if point != "guardian_hang" else "original_fixture_wait")
+            actor_identity=self.control.owner.guardian.identity.to_dict(),
+            mechanism="original_fixture_self_exit" if point != "guardian_hang" else "original_fixture_wait", **extra)
         if point == "guardian_hang":
             # Keep the actual held POLICY/Job fences; no Suspend/Resume. This
             # measures a real hung owner. Releasing the wait is fixture cleanup,
@@ -136,10 +261,75 @@ class FaultHooks:
             while not (self.directory / "release-hang").exists() and _tick() < self.spec.deadline_tick:
                 time.sleep(.02)
             return
-        self.raw.append("process_fault_termination", tick=_tick(), role=self.role,
+        self.raw.append("process_fault_termination", tick=_tick(), role=self.role, point=point,
             execution_id=entry.execution_id, job_nonce=entry.job.nonce,
+            actor_identity=self.control.owner.guardian.identity.to_dict(),
             original_creation_handle_verified=True, mechanism="original_fixture_self_exit")
         # Only this exact process is faulted. No PID/name lookup or taskkill.
+        os._exit(197)
+
+    def audit_failure(self):
+        """Hold an actual writer lock; invoke the real audit unchanged."""
+        if (not self.armed("audit_unavailable") or
+                (self.directory / "release-audit").exists() or _tick() >= self.spec.deadline_tick):
+            return
+        if self.audit_outage is None:
+            entry = self.scope()
+            # Only test recovery of a restriction that really exists now.
+            if entry.job.query_cpu().flags != 5:
+                return
+            self.audit_outage = AuditOutage(self, entry)
+            self.audit_outage.start()
+            self.fired = True
+            self.raw.append("fault_injected", tick=_tick(), point=self.spec.case, role="guardian",
+                execution_id=entry.execution_id, job_nonce=entry.job.nonce,
+                actor_identity=self.control.owner.guardian.identity.to_dict(),
+                mechanism="isolated_audit_write_failure")
+
+    def audit_error(self, error):
+        if (self.audit_outage is not None and self.audit_outage.locked and not self.observed and
+                isinstance(error, sqlite3.OperationalError) and
+                type(getattr(error, "sqlite_errorcode", None)) is int and
+                error.sqlite_errorcode & 0xff in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}):
+            entry = self.audit_outage.entry
+            self.raw.append("fault_observed", tick=_tick(), point=self.spec.case, role="guardian",
+                execution_id=entry.execution_id, job_nonce=entry.job.nonce,
+                observed_identity=self.control.owner.guardian.identity.to_dict(),
+                source="audit_write_exception", effect="audit_write_failed",
+                sqlite_errorcode=error.sqlite_errorcode)
+            self.observed = True
+
+    def wrapper_loss(self, launcher):
+        """Fault only this original, successfully bound fixture wrapper."""
+        if self.fired or not self.armed("wrapper_loss"):
+            return
+        from sentinel.adaptive.identity import VerifiedProcess
+        from sentinel.adaptive.launcher import ManagedLauncher
+        from sentinel.adaptive.native_launcher import CreatedProcess
+        from sentinel.adaptive.native_job import NativeJob
+        self.spec.check_time(_tick())
+        _require(self.role == "wrapper" and type(launcher) is ManagedLauncher and launcher._bound and
+                 type(launcher.job) is NativeJob and type(launcher.process) is CreatedProcess,
+                 "s3_original_bound_wrapper_required")
+        current = launcher.admission._process
+        _require(type(current) is VerifiedProcess and current.identity.pid == os.getpid(),
+                 "s3_fault_process_not_original")
+        observed = current.observe()
+        _require(observed.identity == current.identity and observed.status is IdentityStatus.ALIVE and
+                 current.is_in_job(launcher.job.handle) is False and
+                 launcher.process.full_identity(expected_logon_id=current.identity.logon_id) == launcher._root and
+                 launcher.process.is_in_job(launcher.job) is True and
+                 launcher.job.accounting().active_processes > 0,
+                 "s3_fault_infrastructure_scope_invalid")
+        if launcher.job.query_cpu().flags != 5:
+            return
+        self.fired = True
+        values = dict(point="wrapper_loss", role="wrapper", execution_id=launcher.execution_id,
+            job_nonce=launcher.job.nonce, actor_identity=current.identity.to_dict(),
+            mechanism="original_fixture_self_exit")
+        self.raw.append("fault_injected", tick=_tick(), **values)
+        self.raw.append("process_fault_termination", tick=_tick(),
+            original_creation_handle_verified=True, **values)
         os._exit(197)
 
     def install_guardian(self, stack, authority_factory):
@@ -160,28 +350,83 @@ class FaultHooks:
                 authority.bind_existing(control.owner, proposal.execution_id)
             return original_apply(control, proposal, **kwargs)
         stack.enter_context(_replace(original_constructor, "apply", apply))
+        original_begin = original_constructor._begin_locked
+        def begin(control, proposal, entry, *args, **kwargs):
+            with hooks.proposal_context(proposal, entry):
+                return original_begin(control, proposal, entry, *args, **kwargs)
+        stack.enter_context(_replace(original_constructor, "_begin_locked", begin))
         original_intent = original_constructor._publish_intent
-        def intent(control, *args, **kwargs):
-            hooks.hit("intent_before")
-            value = original_intent(control, *args, **kwargs)
-            hooks.hit("intent_after_set_before")
+        def intent(control, entry, row, action_id, desired, **kwargs):
+            if hooks.armed("intent_before") and not hooks.fired:
+                manifest = control.lifecycle._manifest(entry, row)
+                cut = hooks.cutpoint("intent_before", entry, manifest, action_id, desired)
+                hooks.hit("intent_before", cutpoint=cut)
+            value = original_intent(control, entry, row, action_id, desired, **kwargs)
+            hooks._published_intent = (entry, value, action_id, desired)
+            cut = hooks.cutpoint("intent_after_set_before", entry, value, action_id, desired)
+            hooks.hit("intent_after_set_before", cutpoint=cut)
             return value
         stack.enter_context(_replace(original_constructor, "_publish_intent", intent))
         original_flush = original_constructor._flush
-        def flush(control, *args, **kwargs):
-            hooks.hit("query_after_audit_before")
-            return original_flush(control, *args, **kwargs)
+        def flush(control, execution_id, row):
+            if hooks._proposal_context is not None:
+                proposal, entry, _ = hooks._proposal_context
+                actions = [item for item in control._actions.get(execution_id, ())
+                           if item.execution_id == proposal.execution_id and
+                              item.decision_seq == proposal.decision_seq]
+                if len(actions) == 1 and actions[0].action_state in {"APPLIED", "RENEWED"}:
+                    action = actions[0]
+                    point = "query_after_audit_before" if action.action_state == "APPLIED" else "lease_renewal"
+                    if hooks.armed(point) and not hooks.fired:
+                        manifest = control.lifecycle._manifest(entry, row)
+                        from sentinel.adaptive.contracts import CpuControl, CpuControlMode
+                        desired = CpuControl(CpuControlMode.HARD_CAP, action.desired_rate_bp)
+                        cut = hooks.cutpoint(point, entry, manifest, action.action_id, desired, action=action)
+                        hooks.hit(point, cutpoint=cut)
+            hooks.audit_failure()
+            try:
+                return original_flush(control, execution_id, row)
+            except BaseException as error:
+                hooks.audit_error(error)
+                raise
         stack.enter_context(_replace(original_constructor, "_flush", flush))
         original_renew = original_constructor._renew_locked
-        def renew(control, *args, **kwargs):
-            hooks.hit("lease_renewal")
-            return original_renew(control, *args, **kwargs)
+        def renew(control, proposal, entry, episode, *args, **kwargs):
+            with hooks.proposal_context(proposal, entry, previous_lease=episode.lease_deadline_tick_100ns):
+                return original_renew(control, proposal, entry, episode, *args, **kwargs)
         stack.enter_context(_replace(original_constructor, "_renew_locked", renew))
+        original_tick = original_constructor.tick
+        def tick(control, *args, **kwargs):
+            # Query the original root before the real production safety sweep.
+            # A live child keeps the allocation regardless of that root's death.
+            if hooks.armed("root_exit_after") and not hooks.fired:
+                with control.owner._lock:
+                    ids = control.owner.lifecycle.retained_execution_ids
+                    if len(ids) == 1:
+                        with control.owner.lifecycle._scope(control.owner.lifecycle._entry(ids[0])):
+                            hooks.hit("root_exit_after")
+            if hooks.armed("wrapper_loss") and not hooks.observed:
+                for entry in tuple(control.owner.lifecycle._entries.values()):
+                    observed = entry.wrapper.observe()
+                    if observed.identity == entry.wrapper.identity and observed.status is IdentityStatus.DEAD:
+                        hooks.raw.append("fault_observed", tick=_tick(), point="wrapper_loss", role="wrapper",
+                            execution_id=entry.execution_id, job_nonce=entry.job.nonce,
+                            observed_identity=observed.identity.to_dict(), source="retained_wrapper_witness")
+                        hooks.observed = True
+            return original_tick(control, *args, **kwargs)
+        stack.enter_context(_replace(original_constructor, "tick", tick))
         original_set = NativeJob.set_cpu_rate_unverified
         def set_rate(job, value):
             result = original_set(job, value)
-            hooks.hit("set_after_query_before", job=job)
-            hooks.hit("guardian_hang", job=job)
+            captured = hooks._published_intent
+            native = hooks._latest_native_write
+            if (captured is not None and captured[0].job is job and native is not None and
+                    native[0] is job and native[1]["desired_flags"] == 5 and
+                    native[1]["desired_rate_bp"] == value):
+                entry, manifest, action_id, desired = captured
+                for point in ("set_after_query_before", "guardian_hang"):
+                    cut = hooks.cutpoint(point, entry, manifest, action_id, desired, native_set=native[1])
+                    hooks.hit(point, job=job, cutpoint=cut)
             return result
         stack.enter_context(_replace(NativeJob, "set_cpu_rate_unverified", set_rate))
 
@@ -222,7 +467,8 @@ class FaultHooks:
                 except BaseException as error:
                     hooks._instrumentation_error = error
                 raise
-            hooks.raw.append("cpu_write", tick=_tick(), **details)
+            receipt = hooks.raw.append("cpu_write", tick=_tick(), **details)
+            hooks._latest_native_write = (job, receipt)
             if record_error is not None:
                 hooks._instrumentation_error = record_error
                 raise record_error
@@ -271,7 +517,7 @@ def run_role(directory, role, arguments):
              "s3_daily_scope_unverified")
     from tests.windows.adaptive_win32 import require_supported_host
     require_supported_host()
-    raw = RawEvents(spec, directory / ("actor-" + role + ".jsonl"))
+    raw = RawEvents(spec, directory / ("actor-" + role + "-" + str(os.getpid()) + ".jsonl"))
     hooks = FaultHooks(directory, spec, role, raw)
     factory = _authority_factory(value, coverage)
     with ExitStack() as stack:
@@ -309,8 +555,11 @@ def run_role(directory, role, arguments):
                     if self.guardian is not None and not self._s3_death_observed:
                         observed = self.guardian.process.observe()
                         if observed.identity == self.guardian.process.identity and observed.status is IdentityStatus.DEAD:
-                            raw.append("fault_observed", tick=_tick(), role="guardian",
-                                observed_identity=observed.identity.to_dict(), source="retained_creation_witness")
+                            known = () if self.supervisor is None else tuple(self.supervisor._known.items())
+                            if len(known) == 1:
+                                raw.append("fault_observed", tick=_tick(), role="guardian", point=spec.case,
+                                    execution_id=known[0][0], job_nonce=known[0][1],
+                                    observed_identity=observed.identity.to_dict(), source="retained_creation_witness")
                             self._s3_death_observed = True
                     if (directory / "stop-hosts").exists():
                         self.begin_drain()
@@ -354,6 +603,11 @@ def run_role(directory, role, arguments):
         from sentinel.adaptive.launcher import ManagedLauncher
         original_host = wrapper_host.WrapperHost
         class ObservedWrapper(original_host):
+            def _check_interrupt(self):
+                super()._check_interrupt()
+                if self.launcher is not None:
+                    hooks.wrapper_loss(self.launcher)
+
             def _build_launcher(self, launch_spec):
                 holder = {}
                 def create(job, application, command_line, **kwargs):
@@ -376,7 +630,7 @@ def run_role(directory, role, arguments):
 
             def _wait(self):
                 result = super()._wait()
-                raw.append("root_exit_observed", tick=_tick(), execution_id=self.launcher.execution_id,
+                raw.append("wrapper_root_wait_completed", tick=_tick(), execution_id=self.launcher.execution_id,
                            active_processes=self.launcher.job.accounting().active_processes)
                 return result
         stack.enter_context(_replace(wrapper_host, "WrapperHost", ObservedWrapper))

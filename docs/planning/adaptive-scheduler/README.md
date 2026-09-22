@@ -71,7 +71,7 @@ loader error 或未跑的 native gate 算成 pass。
 | 2. 裁決 ④ | 契約與 source 完成；最後完整 adaptive 2,127 tests 通過。沒有舊 witness 的 cold adoption 仍不支援；native recovery 未驗證。 |
 | 3. helper sender | Source 接線、獨立 review 與完整 2,298 tests 通過。原生 capability bundle、actual launch/stdio scope producer 尚屬項目 4/6 的缺口，缺證據時不啟用控制。 |
 | 4. release／CLI | Source 整合與完整 2,800 tests 通過；包含 exact discovery、typed operator transport、原子 off／audit、同 owner 收尾與三個 host 的 drain。Native 操作通訊、控制及恢復仍未驗證。 |
-| 5. 全程容量覆蓋 | Source generation／retained cohort／readiness transport 前置模組在本機通過 130 portable tests（5.026 秒），尚未納入本包；既有 writer 接線、常駐 generation owner、同日常 ledger 的真正 lifetime provider 與明確 source activation 仍待完成。日常 grace 前提未解鎖。 |
+| 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport 前置模組](P2-DAILY-ACTIVATION.md)已作為獨立 foundation 提交，通過 130 portable tests（5.026 秒）；既有 writer 接線、常駐 generation owner、真正 lifetime provider 與明確 source activation 仍待完成。日常 grace 前提未解鎖。 |
 | 6. console 驗收命令 | 已有部分 S1/S2 producer、S3 real-host foundation、P4 cost 與 P6 fixture/analyzer 的本機候選程式；整體 orchestration、部分 fault cases、完整成本／A/B coverage 尚缺。不是只剩 console 執行。 |
 
 以上是目前缺口；下列較早日期的段落保留其歷史測試範圍。Native S1–S3、完整
@@ -81,6 +81,18 @@ P3–P6 都尚未通過。日常 config／Scheduled Task／啟動入口未修改
 native evidence fixture 全程容量覆蓋。新增測試將繼續使用隔離帳本；任何實際
 日常 source activation 都需要獨立授權，不因 commit/push 自動執行。項目 6
 尚未完成的內容不能以 mock、空 provider、另外一個 DB 或假量測取代。
+
+項目 5 foundation 的檢驗命令（同樣透過日常 wrapper、隔離 fixture）為：
+
+```text
+C:\Python313\python.exe -m unittest tests.test_adaptive_daily_generation tests.test_adaptive_daily_prerequisites tests.test_adaptive_daily_cohort tests.test_adaptive_daily_bootstrap tests.test_adaptive_daily_readiness_transport -q
+```
+
+第一次混合 199 tests 有 3 failures／27 errors，來源是新 fixture 的 Mock 未宣告
+`assert_held`／`assert_retired` 方法，以及 UNKNOWN identity 缺少必要 reason。
+修正明確測試介面後，上述 130 tests 全過，未放寬 source 檢查。新增 inspector
+只能核對 baseline，不能安裝或解鎖容量。Readiness 必須經過原持有者、真實 peer
+驗證與 cleanup；它本身也不是 capacity/adoption 授權。尚未執行日常 migration。
 
 本次命令均由日常 `C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1`
 正常准入（P2、HEAVY、1 CPU、1 GiB RAM、0 I/O slots），在 implementation worktree 執行：

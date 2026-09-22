@@ -522,6 +522,7 @@ def clear_locked(conn, row, runtime, guard, *, samples, now_tick_100ns,
     operator bypass; anything missing raises and the barrier stays.
     """
     _transaction(conn)
+    _require_no_off_inventory_hold(conn)
     if (not _integer(now_tick_100ns, minimum=1) or type(required_samples) is not int or
             not 1 <= required_samples <= 64 or type(sample_max_age_ms) is not int or
             not 1 <= sample_max_age_ms <= 60_000):
@@ -570,6 +571,7 @@ def clear_finished_locked(conn, row, runtime, guard, *, slot_id, cleared_at):
     fresh uncapped samples are untouched.
     """
     _transaction(conn)
+    _require_no_off_inventory_hold(conn)
     if not _uuid(slot_id) or not _wall_clock(cleared_at):
         raise ControlSlotError("invalid_control_slot_request")
     slot = query_locked(conn, runtime, guard)
@@ -632,3 +634,9 @@ def require_archive_clear(conn, row):
                 "owner_pid": row["wrapper_pid"], "owner_created_filetime_100ns": row["wrapper_created_filetime_100ns"]}
     if any(slot[key] != value for key, value in expected.items()):
         raise ControlSlotError("control_slot_binding_mismatch")
+
+
+def _require_no_off_inventory_hold(conn):
+    from .operational_policy import active_off_hold
+    if active_off_hold(conn) is not None:
+        raise ControlSlotError("off_inventory_recovery_pending")

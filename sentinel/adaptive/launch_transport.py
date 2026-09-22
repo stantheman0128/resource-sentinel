@@ -236,7 +236,7 @@ def _check_result(request, result):
             (type(request) is not PrepareExecutionRequest and result.job_nonce != request.job_nonce)):
         raise IpcError("launch_result_binding_mismatch")
     if request.operation == "PrepareExecution":
-        valid = result.state == "PREPARED" and not result.launch_authorized
+        valid = result.state in {"RESERVED", "PREPARED"} and not result.launch_authorized
     elif request.operation == "ClaimLaunch":
         valid = result.launch_authorized or result.duplicate
     elif request.operation == "CancelBeforeStart":
@@ -306,6 +306,10 @@ class LaunchService:
 
     def __init__(self, db_path, endpoint: NativePipeEndpoint, owner):
         self.db_path, self.endpoint, self.owner = db_path, endpoint, owner
+
+    def begin_drain(self):
+        """Keep serving authenticated reconciliation while the owner seals launch."""
+        self.owner.begin_drain()
 
     def serve_once(self, listener, *, timeout_ms=1000):
         if listener.endpoint != self.endpoint:

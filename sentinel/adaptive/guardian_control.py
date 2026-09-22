@@ -141,6 +141,7 @@ class GuardianControl:
         self._high_streak = 0
         self._frame_failure = None
         self._latest_frame_ack = None
+        self.lifecycle._terminal_control = self
         # Serve control_begin ourselves and delegate everything else to the
         # provider already installed. No production provider yields this
         # operation for an adopted execution, and neither guardian.py nor
@@ -929,6 +930,8 @@ class GuardianControl:
         tick = self.clock()
         if raw.flags & 1:
             raise LifecycleError("restore_unverified")
+        if entry.terminal:
+            self._reconcile_terminal_audit(entry)
         if getattr(episode, "restore_action", None) is None:
             seq = episode.decision_seq + 1
             self._seq_floor[entry.execution_id] = seq
@@ -1027,6 +1030,11 @@ class GuardianControl:
             for execution_id, episode in list(self._episodes.items()):
                 if episode.restored:
                     continue
+                if self.lifecycle.terminal_cleanup_started(execution_id):
+                    # The lifecycle published cleanup only after the exact
+                    # disabled/terminal/slot proof and clean fence exit. Its
+                    # observer already settled this episode before any close.
+                    raise LifecycleError("guardian_terminal_control_unsettled")
                 entry = self.lifecycle._entry(execution_id)
                 with self.lifecycle._scope(entry):
                     reason = None
@@ -1102,17 +1110,30 @@ class GuardianControl:
             episode = self._episodes.get(execution_id)
             if episode is None or not episode.restored:
                 raise LifecycleError("control_episode_unrestored")
+            deferred = None
             with self.lifecycle._scope(entry):
                 runtime = self._runtime()
                 row = self.store.query(execution_id, existing_path=True)
-                return self.store.clear_recovery_hold_locked(execution_id,
-                    caller=entry.wrapper.identity, expected_revision=row["state_revision"],
-                    expected_registry_revision=runtime["registry_revision"],
-                    slot_id=episode.slot_id,
-                    uncapped_samples=tuple(self._samples.get(execution_id, ())),
-                    now_tick_100ns=now,
-                    required_samples=self.profile.admission_release_uncapped_samples,
-                    sample_max_age_ms=self.profile.sample_max_age_ms)
+                try:
+                    result = self.store.clear_recovery_hold_locked(execution_id,
+                        caller=entry.wrapper.identity, expected_revision=row["state_revision"],
+                        expected_registry_revision=runtime["registry_revision"],
+                        slot_id=episode.slot_id,
+                        uncapped_samples=tuple(self._samples.get(execution_id, ())),
+                        now_tick_100ns=now,
+                        required_samples=self.profile.admission_release_uncapped_samples,
+                        sample_max_age_ms=self.profile.sample_max_age_ms)
+                except LifecycleError as error:
+                    if (str(error) != "off_inventory_recovery_pending" or getattr(error, "__notes__", ())
+                            or getattr(error.__cause__, "__notes__", ())):
+                        raise
+                    # The known inventory-wide owner must finish this clear.
+                    # Leave POLICY cleanly so its audit and the next real frame
+                    # can proceed; uncertain SQL/native cleanup still escapes.
+                    deferred = error
+            if deferred is not None:
+                raise deferred
+            return result
 
     def clear_finished_admission_barrier(self, execution_id, *, now=None):
         """Plan 7.4 clarification C3, for a Job this guardian already finished.
@@ -1125,26 +1146,50 @@ class GuardianControl:
         terminal evidence. Complete evidence or the barrier stays.
         """
         with self.owner._lock:
-            entry = self.lifecycle._entry(execution_id)
-            episode = self._episodes.get(execution_id)
-            if episode is None or not episode.restored:
-                raise LifecycleError("control_episode_unrestored")
-            with self.lifecycle._scope(entry):
-                runtime = self._runtime()
-                row = self.store.query(execution_id, existing_path=True)
-                if row["state"] != "FINISHED":
-                    raise LifecycleError("control_execution_unfinished")
-                # The owner's rule asks for a Job read as empty now, so the
-                # retained Job is queried again before the ledger is asked.
-                count, _ = self.lifecycle._members(entry)
-                if count != 0:
-                    raise LifecycleError("finished_job_not_empty")
-                if self.lifecycle._control(entry) != DISABLED:
-                    raise LifecycleError("restore_unverified")
-                # A finished row has no allocation left, so the manifest is
-                # reconciled against the terminal archive.
-                manifest = self.lifecycle._manifest(entry, row, terminal=True)
-                return self.store.clear_recovery_hold_finished_locked(execution_id,
-                    caller=entry.wrapper.identity, expected_revision=row["state_revision"],
-                    expected_registry_revision=runtime["registry_revision"],
-                    slot_id=episode.slot_id, manifest=manifest, now=now)
+            return self.lifecycle.settle_finished_barrier(execution_id, now=now)
+
+    def _terminal_prepare_locked(self, entry):
+        """Audit lifecycle-initiated native restoration before proof exits."""
+        self.store._policy.assert_held()
+        episode = self._episodes.get(entry.execution_id)
+        if episode is not None and not episode.restored:
+            self._audit_restore(entry, episode, "terminal_lifecycle_restored")
+
+    def _reconcile_terminal_audit(self, entry):
+        """Resolve the original terminal audit even if a safety tick retries it."""
+        self.store._policy.assert_held()
+        pending = tuple(self._actions.get(entry.execution_id, ()))
+        if pending:
+            from .control_slot import _ACTION_FIELDS
+            with self.store._connection() as conn:
+                table = conn.execute("SELECT type FROM sqlite_master WHERE name='adaptive_actions'").fetchone()
+                if table is None:
+                    found = (None,) * len(pending)
+                elif table[0] != "table":
+                    raise LifecycleError("control_actions_schema_unsupported")
+                else:
+                    found = tuple(conn.execute("SELECT " + ",".join(_ACTION_FIELDS) +
+                        " FROM adaptive_actions WHERE guardian_epoch=? AND execution_id=? AND decision_seq=?",
+                        (action.guardian_epoch, action.execution_id, action.decision_seq)).fetchone()
+                        for action in pending)
+            if any(row is not None for row in found):
+                if any(row is None or tuple(row) != tuple(getattr(action, key) for key in _ACTION_FIELDS)
+                       for row, action in zip(found, pending)):
+                    raise LifecycleError("guardian_terminal_audit_binding_changed")
+                # The exact original atomic batch committed before its ACK
+                # failed. Preserve action IDs; never append another restore.
+                self._actions[entry.execution_id] = []
+
+    def _terminal_cleanup_published(self, entry):
+        """Pure local notification following complete native/durable proof.
+
+        It grants no proof itself and is never exposed by the wire protocol.
+        Native readback and restoration audit have already completed inside the
+        lifecycle's proof scope; no more Job queries are allowed during close.
+        """
+        episode = self._episodes.get(entry.execution_id)
+        if episode is not None:
+            episode.restored = True
+            episode.lease_deadline_tick_100ns = None
+        self._samples.pop(entry.execution_id, None)
+        self._frame_executions.discard(entry.execution_id)

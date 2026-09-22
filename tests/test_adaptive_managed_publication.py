@@ -354,7 +354,22 @@ class ManagedPublicationTests(unittest.TestCase):
         self.assertEqual(events, ["commit_ack"])
         self.assertEqual(self.counts(), (0, 1, 1))
         self.assertIsNotNone(self.runtime()["policy_entry_nonce"])
-        self.assertEqual(context.launch_claim_token(), token)
+        with self.assertRaisesRegex(ManagedAdmissionUnavailable, "managed_submission_unsettled"):
+            context.launch_claim_token()
+        # Read-only publication visibility does not settle the original writer
+        # or export a launch claim. Preserve its original guard and private
+        # token; owned settlement is covered by the abandonment tests.
+        guard = context._submission_guard
+        with patch.object(PolicyCoordinator, "prepare", side_effect=AssertionError("new guard")):
+            result = self.coordinator.reconcile_managed(context)
+        self.assertTrue(result["submission_cleanup_pending"])
+        self.assertEqual(result["state"], "RESERVED")
+        self.assertIs(context._submission_guard, guard)
+        self.assertIsNotNone(self.runtime()["policy_entry_nonce"])
+        self.assertEqual(self.counts(), (0, 1, 1))
+        self.assertEqual(context._claim_token, token)
+        with self.assertRaisesRegex(ManagedAdmissionUnavailable, "managed_submission_unsettled"):
+            context.launch_claim_token()
         self.assertFalse(self.policy.active)
 
     def test_connection_close_failure_retains_committed_publication_and_uncertain_nonce(self):

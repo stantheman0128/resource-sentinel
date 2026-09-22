@@ -10,14 +10,15 @@ Its retained restore-only consumer may disable a positively owned CPU cap.
 Custody survives wrapper/root exit and query/DB failures. POLICY and the same
 per-execution mutex span observation through the store transaction. A terminal
 archive, verified disabled control and settled manifest precede handle cleanup.
-The future service/supervisor must still provide authenticated launch transfer,
-restore handling and cross-guardian recovery; construction proves none of those.
+The authenticated host supplies launch transfer and retained supervisor recovery;
+constructing this consumer alone proves neither native capability nor custody.
 """
 from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
 import os
+import re
 import threading
 from uuid import UUID, uuid4, uuid5
 
@@ -61,6 +62,8 @@ class _Custody:
         self.restore_previous = self.restore_candidate = None
         self.restore_slot_id = self.restore_error = None
         self.restore_integrity_error = None
+        self.terminal_cleanup = None
+        self.terminal_cleanup_error = None
 
 
 class GuardianLifecycle:
@@ -122,6 +125,21 @@ class GuardianLifecycle:
         if entry is None or entry.closed:
             raise LifecycleError("guardian_custody_missing")
         return entry
+
+    def terminal_cleanup_started(self, execution_id):
+        """A retained proof/cleanup stage, never inferred from a terminal row."""
+        with self._lock:
+            entry = self._entries.get(execution_id)
+            return entry is not None and entry.terminal_cleanup is not None
+
+    def close_retained_fences(self):
+        """Close only the now-unused original global recovery mutex."""
+        self._restorer.close()
+
+    @staticmethod
+    def _queryable(entry):
+        if getattr(entry, "terminal_cleanup", None) is not None:
+            raise LifecycleError("guardian_terminal_cleanup_started")
 
     def _manifest(self, entry, row, *, terminal=False):
         if entry.restore_integrity_error is not None:
@@ -224,6 +242,7 @@ class GuardianLifecycle:
 
     @contextmanager
     def _scope(self, entry):
+        self._queryable(entry)
         self._restorer.check_fence()
         try:
             with self._normal_scope(entry):
@@ -308,6 +327,7 @@ class GuardianLifecycle:
 
     @staticmethod
     def _control(entry):
+        GuardianLifecycle._queryable(entry)
         raw = entry.job.query_cpu()
         flags, rate = raw.flags, raw.rate_bp
         if type(flags) is not int or not 0 <= flags < 1 << 32:
@@ -320,6 +340,7 @@ class GuardianLifecycle:
 
     @staticmethod
     def _members(entry):
+        GuardianLifecycle._queryable(entry)
         count = entry.job.accounting().active_processes
         members = tuple(entry.job.active_pids())
         if (type(count) is not int or not 0 <= count <= 4096 or count != len(members) or
@@ -381,6 +402,7 @@ class GuardianLifecycle:
     def reconcile(self, execution_id, *, now=None):
         with self._lock:
             entry = self._entry(execution_id)
+            self._queryable(entry)
             entry.restore_native_disabled = False
             attempts = entry.restore_attempts
             try:
@@ -399,6 +421,7 @@ class GuardianLifecycle:
         """
         with self._lock:
             entry = self._entry(execution_id)
+            self._queryable(entry)
             entry.restore_native_disabled = False
             attempts = entry.restore_attempts
             try:
@@ -478,19 +501,147 @@ class GuardianLifecycle:
                 entry.terminal = True
             return result
 
-    def close_terminal(self, execution_id):
+    def _terminal_proof_locked(self, entry, *, now=None):
+        """Native terminal proof and the applicable C3 obligation, under fences."""
+        guard = self.store._policy.assert_held()
+        row = self.store.query(entry.execution_id, existing_path=True)
+        if row["state"] != "FINISHED":
+            raise LifecycleError("control_execution_unfinished")
+        manifest = self._manifest(entry, row, terminal=True)
+        count, _ = self._members(entry)
+        if count != 0:
+            raise LifecycleError("finished_job_not_empty")
+        if self._control(entry) != _DISABLED:
+            raise LifecycleError("restore_unverified")
+        if (manifest.original != _DISABLED or manifest.pending_intent is not None or
+                manifest.last_applied not in (None, _DISABLED) or entry.restore_candidate is not None or
+                entry.journal_cleanup_error is not None or entry.restore_pending):
+            raise LifecycleError("guardian_terminal_unverified")
+        root = entry.root.observe()
+        if (root.identity != manifest.root_identity or root.status is not IdentityStatus.DEAD or
+                str(entry.root.exit_code()) != row["root_outcome"]):
+            raise LifecycleError("guardian_root_outcome_mismatch")
+        observer = getattr(self, "_terminal_control", None)
+        if observer is not None:
+            observer._terminal_prepare_locked(entry)
+        slot = self.store.query_control_slot_locked()
+        with self.store._connection() as conn:
+            runtime = self.store._policy.revalidate(conn, guard)
+        result = {"execution_id": entry.execution_id, "admission_barrier": runtime["admission_barrier"],
+                  "registry_revision": runtime["registry_revision"], "duplicate": True,
+                  "applicable_slot": slot is not None and slot["execution_id"] == entry.execution_id,
+                  "barrier_cleared": runtime["admission_barrier"] == "NONE"}
+        if result["applicable_slot"]:
+            if slot["slot_state"] != "RESTORED":
+                raise LifecycleError("control_slot_unrestored")
+            if runtime["admission_barrier"] == "RECOVERY_HOLD":
+                result.update(self.store.clear_recovery_hold_finished_locked(entry.execution_id,
+                    caller=entry.wrapper.identity, expected_revision=row["state_revision"],
+                    expected_registry_revision=runtime["registry_revision"], slot_id=slot["slot_id"],
+                    manifest=manifest, now=now))
+                result["barrier_cleared"] = result["admission_barrier"] == "NONE"
+            elif runtime["admission_barrier"] != "NONE":
+                raise LifecycleError("guardian_terminal_barrier_unsettled")
+        result["_terminal_slot_proof"] = dict(slot) if result["applicable_slot"] else None
+        return row, manifest, guard.binding, result
+
+    def settle_finished_barrier(self, execution_id, *, now=None):
+        """C3 with exact durable/native proof, including never-controlled Jobs."""
         with self._lock:
             entry = self._entry(execution_id)
-            if (not entry.terminal or self._scope_entry is not None or self._pending_policy is not None or
+            _, _, _, result = self._finished_proof(entry, now=now)
+            observer = getattr(self, "_terminal_control", None)
+            if observer is not None:
+                observer._terminal_cleanup_published(entry)
+            result.pop("_terminal_slot_proof", None)
+            return result
+
+    def _finished_proof(self, entry, *, now=None, retiring=False):
+        refused = None
+        with self._scope(entry):
+            try:
+                if retiring:
+                    from .operational_policy import assert_terminal_retirement_allowed_locked
+                    assert_terminal_retirement_allowed_locked(self.store, entry.execution_id)
+                proof = self._terminal_proof_locked(entry, now=now)
+            except LifecycleError as error:
+                if str(error) != "off_inventory_recovery_pending":
+                    raise
+                # A known operational generation still needs this queryable
+                # custody. Cleanly relinquish POLICY so its owner can finish
+                # that inventory; retaining this refusal's nonce deadlocks it.
+                refused = error
+        if refused is not None:
+            raise refused
+        return proof
+
+    def _retire_terminal(self, execution_id, *, now=None):
+        from .terminal_custody import TerminalCustody
+        with self._lock:
+            entry = self._entry(execution_id)
+            if entry.terminal_cleanup is None and (
+                    not entry.terminal or self._scope_entry is not None or
                     entry.journal_cleanup_error is not None or entry.restore_pending or
                     entry.mutex_error is not None or self._restorer.fence_error is not None):
                 raise LifecycleError("guardian_custody_unsettled")
-            # Each object retains its own known-failure/unknown-close custody;
-            # exceptions leave all references here rather than dropping them.
-            entry.root.close()
-            entry.wrapper.close()
-            entry.job.close()
-            if entry.mutex is not None:
-                entry.mutex.close()
+            if entry.terminal_cleanup is None:
+                row, manifest, binding, result = self._finished_proof(entry, now=now, retiring=True)
+                # Neither a FINISHED label nor entering the scope publishes
+                # cleanup authority. Both native proof and fence exit did.
+                entry.terminal_cleanup = TerminalCustody(entry, row, manifest, binding,
+                    slot_proof=result["_terminal_slot_proof"])
+                entry.terminal_cleanup.proof_published = True
+                observer = getattr(self, "_terminal_control", None)
+                if observer is not None:
+                    observer._terminal_cleanup_published(entry)
+            custody = entry.terminal_cleanup
+            if custody.quarantined:
+                raise LifecycleError("guardian_terminal_cleanup_quarantined")
+            custody.verify(self, entry)
+            custody.close_remaining()
+            if custody.receipt_operation is None:
+                from .terminal_receipt import TerminalReceiptOperation
+                custody.receipt_operation = TerminalReceiptOperation(self, custody)
+            receipt = custody.receipt_operation.tick(entry)
+            if not receipt.complete:
+                custody.quarantined = custody.quarantined or receipt.quarantined
+                return custody.result(reason=receipt.reason or "guardian_terminal_receipt_pending")
             del self._entries[execution_id]
             entry.closed = True
+            return custody.result(complete=True, reason="guardian_terminal_retired")
+
+    def retire_terminal(self, execution_id, *, now=None):
+        """One bounded attempt; retain every owner until complete cleanup."""
+        from .terminal_custody import TerminalCleanupResult
+        try:
+            return self._retire_terminal(execution_id, now=now)
+        except BaseException as error:
+            with self._lock:
+                entry = self._entries.get(execution_id)
+                if entry is None:
+                    raise
+                entry.terminal_cleanup_error = error
+                custody = entry.terminal_cleanup
+                if custody is not None:
+                    custody.error = error
+                    if not isinstance(error, Exception):
+                        custody.quarantined = True
+                if not isinstance(error, Exception):
+                    raise
+                quarantined = bool(self._restorer.fence_error is not None or
+                                   custody is not None and custody.quarantined)
+                reason = getattr(error, "reason", str(error))
+                if type(reason) is not str or re.fullmatch(r"[a-z][a-z0-9_]{0,95}", reason) is None:
+                    reason = "guardian_terminal_cleanup_pending"
+                if quarantined:
+                    reason = "guardian_terminal_cleanup_quarantined"
+                return TerminalCleanupResult(execution_id, False, True, quarantined,
+                    reason,
+                    () if custody is None else custody.closed_owners)
+
+    def close_terminal(self, execution_id):
+        """Strict compatibility entry point over the retained cleanup owner."""
+        result = self._retire_terminal(execution_id)
+        if not result.complete:
+            raise LifecycleError(result.reason)
+        return result

@@ -147,6 +147,21 @@ class LaunchCodecTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(IpcError):
                 transport.LaunchResult.from_dict(result.to_dict() | change)
 
+    def test_prepare_retirement_scope_and_claim_replay_never_carry_authority(self):
+        request = self.requests()[0]
+        for duplicate in (False, True):
+            with self.subTest(duplicate=duplicate):
+                result = transport.LaunchResult(EXECUTION, "a" * 64, EPOCH, "RESERVED", 1,
+                    f"Local\\ResourceSentinel.Job.{EXECUTION}.{NONCE}", NONCE, False, duplicate)
+                transport._check_result(request, result)
+                with self.assertRaises(IpcError):
+                    replace(result, launch_authorized=True)
+        claim = self.requests()[1]
+        replay = replace(result, state="PREPARED", duplicate=True)
+        transport._check_result(claim, replay)
+        with self.assertRaises(IpcError):
+            transport._check_result(claim, replace(replay, duplicate=False))
+
 
 class LedgerOwner:
     """Fixed synthetic operation results, but actual admitted-auth revalidation."""
@@ -328,6 +343,16 @@ class LaunchTransportTests(unittest.TestCase):
                 self.assertTrue(all(d is self.owner.calls[-1][2] for d in connection.deadlines))
         self.assertEqual(len(self.owner.calls), 5)
         self.assertEqual(tuple(self.conn().execute("SELECT state,state_revision,claim_consumed FROM managed_executions").fetchone()), before)
+
+    def test_service_drain_delegates_to_owner_and_keeps_reconciliation_dispatch(self):
+        with patch.object(self.owner, "begin_drain", create=True) as begin:
+            self.service.begin_drain()
+            begin.assert_called_once_with()
+            for operation in ("PrepareExecution", "ClaimLaunch", "BindRoot", "CancelBeforeStart", "StartFailed"):
+                with self.subTest(operation=operation):
+                    self.serve(self.service_connection(self.request(operation)))
+                    self.assertEqual(self.owner.calls[-1][0], operation)
+        self.assertEqual(len(self.owner.calls), 5)
 
     def test_client_uses_actual_managed_private_mac_and_never_exports_raw_command(self):
         for operation in ("PrepareExecution", "BindRoot", "ClaimLaunch", "CancelBeforeStart", "StartFailed"):

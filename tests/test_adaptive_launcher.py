@@ -734,6 +734,20 @@ class ManagedLauncherTests(unittest.TestCase):
                     launcher.launch_once(**STDIO)
                 self.assert_sealed(launcher, h, native_count=0)
 
+    def test_informational_partial_results_never_authorize_ordinary_launch(self):
+        for stage, state, revision in (("prepare", "RESERVED", 1), ("claim", "PREPARED", 1)):
+            for duplicate in (False, True):
+                with self.subTest(stage=stage, duplicate=duplicate):
+                    h = Harness()
+                    h.client.responses[stage] = result(state, revision, duplicate=duplicate)
+                    launcher = h.admitted()
+                    with self.assertRaises(module.ManagedLaunchError):
+                        launcher.launch_once(**STDIO)
+                    self.assertEqual([call[0] for call in h.client.calls],
+                                     ["prepare"] if stage == "prepare" else ["prepare", "claim"])
+                    self.assertEqual(h.job_factory.call_count, int(stage == "claim"))
+                    self.assert_sealed(launcher, h, native_count=0)
+
     def test_changed_cmd_resolution_after_claim_seals_without_create(self):
         h = Harness()
         h.resolver.side_effect = [CMD, r"C:\other\cmd.exe"]
@@ -1183,6 +1197,57 @@ class ManagedLauncherTests(unittest.TestCase):
         h.job_factory.assert_not_called()
         h.native_launch.assert_not_called()
 
+    def test_partial_prepare_information_retires_original_named_scope_without_claim(self):
+        h = Harness()
+        h.client.responses["prepare"] = OSError("fixture_partial_prepare_ack_lost")
+        launcher = h.admitted()
+        with self.assertRaises(OSError):
+            launcher.launch_once(**STDIO)
+        first = dict(h.client.calls[0][1])
+        h.client.responses["prepare"] = result("RESERVED", 1, duplicate=True)
+        h.client.responses["cancel"] = result("CANCELLED_BEFORE_START", 2)
+        h.store.row.update(state="RESERVED", state_revision=1, claim_consumed=0, launch_in_flight=0)
+
+        outcome = launcher.abandon_once()
+
+        self.assertTrue(outcome["settled"])
+        self.assertTrue(outcome["closed"])
+        self.assertEqual([call[0] for call in h.client.calls], ["prepare", "prepare", "cancel"])
+        self.assertEqual(h.client.calls[1][1], first)
+        self.assertEqual(h.client.calls[2][1]["expected_revision"], 1)
+        self.assertEqual(h.client.calls[2][1]["job_nonce"], NONCE)
+        self.assertNotEqual(h.client.calls[2][1]["request_id"], first["request_id"])
+        self.assertEqual(h.coordinator.cancel_calls, [])
+        self.assertEqual(len(h.coordinator.calls), 1)
+        self.assertEqual(h.admission.close_calls, 1)
+        self.assertFalse(launcher._claim_attempted)
+        h.job_factory.assert_not_called()
+        h.native_launch.assert_not_called()
+
+    def test_nonduplicate_or_unadvanced_partial_prepare_cannot_settle_abandonment(self):
+        for revision, duplicate in ((1, False), (0, True)):
+            with self.subTest(revision=revision, duplicate=duplicate):
+                h = Harness()
+                h.client.responses["prepare"] = OSError("fixture_partial_prepare_ack_lost")
+                launcher = h.admitted()
+                with self.assertRaises(OSError):
+                    launcher.launch_once(**STDIO)
+                original = dict(h.client.calls[-1][1])
+                h.client.responses["prepare"] = result("RESERVED", revision, duplicate=duplicate)
+                h.store.row.update(state="RESERVED", state_revision=revision,
+                                   claim_consumed=0, launch_in_flight=0)
+
+                outcome = launcher.abandon_once()
+
+                self.assertFalse(outcome["settled"])
+                self.assertFalse(outcome["closed"])
+                self.assertEqual([call[0] for call in h.client.calls], ["prepare", "prepare"])
+                self.assertEqual(h.client.calls[-1][1], original)
+                self.assertEqual(h.coordinator.cancel_calls, [])
+                self.assertEqual(h.admission.close_calls, 0)
+                self.assertEqual(h.job.close_calls, 0)
+                h.native_launch.assert_not_called()
+
     def test_prepared_job_open_failure_uses_cancel_without_exporting_claim(self):
         h = Harness()
         h.job_factory.side_effect = OSError("fixture_open_failed")
@@ -1196,19 +1261,45 @@ class ManagedLauncherTests(unittest.TestCase):
         self.assertFalse(launcher._claim_attempted)
         h.native_launch.assert_not_called()
 
-    def test_unknown_claim_replays_same_request_for_retirement_only(self):
+    def test_unknown_claim_retires_without_replaying_claim(self):
         h = Harness()
         h.client.responses["claim"] = OSError("fixture_claim_ack_lost")
         launcher = h.admitted()
         with self.assertRaises(OSError):
             launcher.launch_once(**STDIO)
-        first = h.client.calls[1][1]
-        h.client.responses["claim"] = result("LAUNCHING", 2, duplicate=True)
+        first = dict(h.client.calls[1][1])
+        h.client.responses["claim"] = AssertionError("abandonment must not replay ClaimLaunch")
         h.client.responses["start_failed"] = result("START_FAILED", 3)
         self.assertTrue(launcher.abandon_once()["settled"])
-        self.assertEqual([call[0] for call in h.client.calls], ["prepare", "claim", "claim", "start_failed"])
-        self.assertEqual(h.client.calls[2][1], first)
+        self.assertEqual([call[0] for call in h.client.calls], ["prepare", "claim", "start_failed"])
+        self.assertEqual(h.client.calls[1][1], first)
+        self.assertEqual(h.client.calls[2][1]["expected_revision"], 2)
         self.assertEqual(h.coordinator.cancel_calls, [])
+        h.native_launch.assert_not_called()
+
+    def test_first_claim_refused_during_drain_retires_prepared_scope_without_new_claim(self):
+        h = Harness()
+        h.client.responses["claim"] = OSError("fixture_first_claim_refused_during_drain")
+        launcher = h.admitted()
+        with self.assertRaises(OSError):
+            launcher.launch_once(**STDIO)
+        h.client.responses["claim"] = AssertionError("draining guardian must not receive another ClaimLaunch")
+        h.client.responses["start_failed"] = result("START_FAILED", 2)
+        h.store.row.update(state="PREPARED", state_revision=1, claim_consumed=0, launch_in_flight=0)
+
+        outcome = launcher.abandon_once()
+
+        self.assertTrue(outcome["settled"])
+        self.assertTrue(outcome["closed"])
+        self.assertEqual([call[0] for call in h.client.calls], ["prepare", "claim", "start_failed"])
+        retirement = h.client.calls[-1][1]
+        self.assertEqual(retirement["expected_revision"], 1)
+        self.assertEqual(retirement["job_nonce"], NONCE)
+        self.assertNotEqual(retirement["request_id"], h.client.calls[1][1]["request_id"])
+        self.assertEqual(h.coordinator.cancel_calls, [])
+        self.assertEqual(len(h.coordinator.calls), 1)
+        self.assertEqual(h.job.close_calls, 1)
+        self.assertEqual(h.admission.close_calls, 1)
         h.native_launch.assert_not_called()
 
     def test_unknown_create_and_unverified_retained_root_never_claim_start_failed(self):

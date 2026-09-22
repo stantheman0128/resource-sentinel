@@ -371,33 +371,68 @@ class ControlProposalClient:
         return self._send(request, timeout_ms=timeout_ms)
 
     def _send(self, proposal, *, timeout_ms=1000):
-        outcome_unknown = False
+        return _send_operation(self.endpoint, self.caller, proposal, timeout_ms=timeout_ms)
+
+
+class ObservationClient:
+    """Explicit drain-only frame sender, with no proposal or restore API.
+
+    Construction never creates a ControlProposalClient. The private exchange
+    retains identical peer authentication, bounded framing, deadline and ACK
+    checks. Sending a frame grants no control or admission-release authority;
+    guardian alone checks and consumes actual uncapped observations.
+    """
+    def __init__(self, endpoint: NativePipeEndpoint, *, caller_process_or_identity):
+        identity = getattr(caller_process_or_identity, "identity", caller_process_or_identity)
+        if not isinstance(identity, ProcessIdentity):
+            raise ControlTransportError("control_caller_identity_required")
+        if identity.logon_id != endpoint.logon_id:
+            raise ControlTransportError("control_client_logon_mismatch")
+        self.endpoint, self.caller = endpoint, identity
+
+    def observe_uncapped(self, frame, *, request_id, guardian_epoch, policy_epoch,
+                         timeout_ms=1000) -> ControlFrameAck:
         try:
-            _request_kind(proposal)
-            deadline = NativeDeadline.after_ms(timeout_ms)
-            message = request_envelope(proposal)
-            with NativePipeConnection.connect(self.endpoint, deadline) as connection:
-                # Pin the actual server process before a single byte is written.
-                # No identity claimed on the wire can establish this.
-                with connection.verified_peer(self.endpoint.server_identity) as peer:
-                    _live(connection, peer, self.endpoint.server_identity)
-                    outcome_unknown = True  # A partial write may still arrive.
-                    write_frame(connection, message, deadline)
-                    challenge = read_frame(connection, deadline)
-                    _check_challenge(challenge, proposal, self.endpoint, self.caller)
-                    _live(connection, peer, self.endpoint.server_identity)
-                    ack = decode_ack(read_frame(connection, deadline), proposal, challenge)
-                    _live(connection, peer, self.endpoint.server_identity)
-                    _remaining(deadline)
-            _remaining(deadline)
-            return ack
-        except Exception as error:
-            reason = getattr(error, "reason", "control_rpc_failed")
-            if type(reason) is not str or _REASON.fullmatch(reason) is None:
-                reason = "control_rpc_failed"
-            raise ControlTransportError(reason, outcome_unknown=outcome_unknown) from None
-        except BaseException as error:
-            # Keep interrupts, and keep the uncertainty with them rather than
-            # letting a caller infer that an interrupted call never arrived.
-            error.control_outcome_unknown = outcome_unknown
-            raise
+            request = ControlFrameRequest(request_id, guardian_epoch, policy_epoch, frame)
+        except (ContractViolation, ValueError, TypeError):
+            raise ControlTransportError("control_invalid_frame_request") from None
+        return _send_operation(self.endpoint, self.caller, request, timeout_ms=timeout_ms)
+
+
+def _send_operation(endpoint, caller, proposal, *, timeout_ms):
+    """Shared private wire operation; callers expose only their allowed API."""
+    outcome_unknown = False
+    try:
+        _request_kind(proposal)
+        deadline = NativeDeadline.after_ms(timeout_ms)
+        message = request_envelope(proposal)
+        with NativePipeConnection.connect(endpoint, deadline) as connection:
+            # Pin the actual server process before a single byte is written.
+            # No identity claimed on the wire can establish this.
+            with connection.verified_peer(endpoint.server_identity) as peer:
+                _live(connection, peer, endpoint.server_identity)
+                outcome_unknown = True  # A partial write may still arrive.
+                write_frame(connection, message, deadline)
+                challenge = read_frame(connection, deadline)
+                _check_challenge(challenge, proposal, endpoint, caller)
+                _live(connection, peer, endpoint.server_identity)
+                ack = decode_ack(read_frame(connection, deadline), proposal, challenge)
+                _live(connection, peer, endpoint.server_identity)
+                _remaining(deadline)
+        _remaining(deadline)
+        return ack
+    except Exception as error:
+        reason = getattr(error, "reason", "control_rpc_failed")
+        if type(reason) is not str or _REASON.fullmatch(reason) is None:
+            reason = "control_rpc_failed"
+        failure = ControlTransportError(reason, outcome_unknown=outcome_unknown)
+        # Sanitization changes the public reason, not private native custody.
+        # Traceback/cause owners may still hold an overlapped operation, buffer
+        # or exact process handle whose cleanup did not complete.
+        failure._control_cause = error
+        raise failure from None
+    except BaseException as error:
+        # Keep interrupts, and keep the uncertainty with them rather than
+        # letting a caller infer that an interrupted call never arrived.
+        error.control_outcome_unknown = outcome_unknown
+        raise

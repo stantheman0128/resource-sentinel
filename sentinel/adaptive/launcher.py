@@ -442,7 +442,7 @@ class ManagedLauncher:
                 _remember(error, self)
                 raise
 
-    def _prepare_original(self, timeout_ms):
+    def _prepare_original(self, timeout_ms, *, reconciliation=False):
         # Publish both boundaries before RPC. A RESERVED row cannot disprove
         # an in-flight Prepare; only this original request may reconcile it.
         self._prepare_attempted = True
@@ -450,10 +450,12 @@ class ManagedLauncher:
         prepared = self._rpc(self.client.prepare_execution,
             expected_revision=self._admitted["state_revision"],
             request_id=self._request_ids["prepare"], timeout_ms=timeout_ms)
-        prepared = self._result(prepared, states={"PREPARED"},
+        prepared = self._result(prepared, states={"RESERVED", "PREPARED"} if reconciliation else {"PREPARED"},
             minimum_revision=self._admitted["state_revision"] + 1)
         if prepared.launch_authorized:
             raise ManagedLaunchError("launcher_prepare_authorized_launch")
+        if prepared.state == "RESERVED" and not prepared.duplicate:
+            raise ManagedLaunchError("launcher_prepare_replay_required")
         self._prepared = prepared
         return prepared
 
@@ -565,12 +567,12 @@ class ManagedLauncher:
                             return record
                     else:
                         if self._prepared is None:
-                            self._prepare_original(timeout_ms)
-                        if self._claim_attempted and self._claim is None:
-                            self._claim_original(timeout_ms)
+                            self._prepare_original(timeout_ms, reconciliation=True)
                         # Do not advance an unclaimed request just to cancel.
-                        # After a claim, guardian native lifetime-zero proof
-                        # (not this local flag) must authorize StartFailed.
+                        # A Claim first delivered during drain may have no slot;
+                        # retirement must not depend on replaying or consuming it.
+                        # Guardian lifetime-zero proof authorizes StartFailed
+                        # for both an unconsumed and an already consumed claim.
                         kind = "start_failed" if self._claim_attempted else "cancel"
                         self.retire_before_start(kind=kind, timeout_ms=timeout_ms)
                 self.close_local()

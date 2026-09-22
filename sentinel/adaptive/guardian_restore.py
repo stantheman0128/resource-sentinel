@@ -51,6 +51,7 @@ class GuardianRestorer:
         self.owner = lifecycle
         self.binding = self.policy_mutex = None
         self.fence_error = None
+        self.closed = False
         self._emergency_entry = self._emergency_thread = None
 
     def poison(self, error):
@@ -58,8 +59,27 @@ class GuardianRestorer:
             self.fence_error = error
 
     def check_fence(self):
+        if self.closed:
+            raise LifecycleError("guardian_restore_fence_closed")
         if self.fence_error is not None:
             raise LifecycleError("guardian_restore_fence_uncertain")
+
+    def close(self):
+        """Retire the original global recovery fence after all custody settles."""
+        with self.owner._lock:
+            if self.closed:
+                return
+            self.check_fence()
+            if (self.owner.retained_execution_ids or self.owner._pending_policy is not None or
+                    self.owner._scope_entry is not None or self._emergency_entry is not None):
+                raise LifecycleError("guardian_restore_fence_still_owned")
+            if self.policy_mutex is not None:
+                try:
+                    self.policy_mutex.close()
+                except BaseException as error:
+                    self.poison(error)
+                    raise
+            self.closed = True
 
     def note_fence_failure(self, error):
         notes = getattr(error, "__notes__", ())
@@ -91,6 +111,7 @@ class GuardianRestorer:
             raise
 
     def _normal(self, entry):
+        self.owner._queryable(entry)
         guard = self.owner.store._policy.assert_held()
         if (self.owner._scope_entry is not entry or
                 self.owner._scope_thread != threading.get_ident() or
@@ -215,6 +236,7 @@ class GuardianRestorer:
     def emergency(self, entry):
         """Native-only recovery, including when no DB connection can be made."""
         with self.owner._lock:
+            self.owner._queryable(entry)
             self.check_fence()
             if (not entry.validated or self.binding is None or self.policy_mutex is None or
                     entry.mutex is None or self.owner._scope_entry is not None or

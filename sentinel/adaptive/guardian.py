@@ -99,7 +99,13 @@ class GuardianLaunchOwner:
         self._failed_peers = {}
         self._uncertain = []
         self._lock = self.lifecycle._lock
+        self._draining = False
         self.store.evidence_provider = self.evidence_scope
+
+    def begin_drain(self):
+        """Permanently stop new Job creation and launch grants, retaining cleanup."""
+        with self._lock:
+            self._draining = True
 
     @property
     def retained_execution_ids(self):
@@ -172,13 +178,28 @@ class GuardianLaunchOwner:
                 row["job_nonce"] != entry.creation_nonce or row["guardian_epoch"] != self.guardian_epoch):
             raise LifecycleError("guardian_launch_scope_mismatch")
 
-    def _covered(self, entry, row):
+    def _covered(self, entry, row, *, recovery=False):
         self._check_entry(entry, row)
         self.store.assert_authenticated_allocation(row, caller=entry.wrapper.identity, expected_auth=entry.auth)
-        self._authority("assert_ready")
-        self._authority("assert_covered", row)
+        if not recovery:
+            self._authority("assert_ready")
+            self._authority("assert_covered", row)
 
-    def _record_request(self, request, peer, auth):
+    def _record_request(self, request, peer, auth, *, replay_only=False):
+        if replay_only:
+            # POLICY remains held through the exact request check and the
+            # store's authenticated replay. A refused request never seeds a slot.
+            guard = self.store._policy.assert_held()
+            with self.store._connection() as conn:
+                self.store._policy.revalidate(conn, guard)
+                recorded = conn.execute("""SELECT execution_id,operation,request_id,payload_hash,spec_hash,guardian_epoch
+                    FROM adaptive_launch_requests WHERE (execution_id=? AND operation=?) OR request_id=? LIMIT 2""",
+                    (request.execution_id, request.operation, request.request_id)).fetchall()
+            if not recorded:
+                raise LifecycleError("guardian_launch_draining")
+            if len(recorded) != 1 or tuple(recorded[0]) != (request.execution_id, request.operation,
+                    request.request_id, request.payload_hash(), request.spec_hash, request.guardian_epoch):
+                raise LifecycleError("launch_request_mismatch")
         return self.store.record_launch_request_locked(request.execution_id, request.operation,
             request.request_id, request.payload_hash(), caller=peer.identity, expected_auth=auth,
             guardian_epoch=request.guardian_epoch)
@@ -219,7 +240,8 @@ class GuardianLaunchOwner:
     def prepare_execution(self, request, peer, auth_record, deadline):
         with self._lock:
             row = self._authenticate(request, peer, auth_record, deadline)
-            self._authority("assert_ready")
+            if not self._draining:
+                self._authority("assert_ready")
             if request.execution_id in self._failed_peers:
                 raise LifecycleError("guardian_peer_transfer_reconciliation_required")
             entry = self._pending.get(request.execution_id)
@@ -245,6 +267,8 @@ class GuardianLaunchOwner:
                     primary.add_note("guardian_wrapper_custody_retained")
                     raise
             with self.lifecycle._scope(entry):
+                if self._draining:
+                    return self._prepare_retirement_scope(request, peer, auth_record, entry, deadline)
                 if entry.retirement_sealed:
                     raise LifecycleError("guardian_launch_retirement_sealed")
                 row = self.store.query(request.execution_id, existing_path=True)
@@ -281,6 +305,35 @@ class GuardianLaunchOwner:
                     expected_revision=row["state_revision"], expected_auth=auth_record)
                 self._deadline(deadline)
                 return self._result(request, row, duplicate=duplicate)
+
+    def _prepare_retirement_scope(self, request, peer, auth_record, entry, deadline):
+        """Keep the original wrapper's cleanup route without ever creating a Job.
+
+        A Prepare first delivered after drain may retain a bounded, sealed,
+        never-created owner. Only its exact request can recover this scope;
+        normal launch rejects RESERVED and Claim cannot grant new authority.
+        """
+        row = self.store.query(request.execution_id, existing_path=True)
+        self._covered(entry, row, recovery=True)
+        duplicate = self._record_request(request, peer, auth_record)
+        if row["state"] not in {"RESERVED", "PREPARED"}:
+            raise LifecycleError("guardian_launch_recovery_required")
+        entry.retirement_sealed = True
+        if row["job_name"] is None:
+            row = self.store.register_job_scope(request.execution_id, caller=peer.identity,
+                expected_revision=row["state_revision"], guardian_epoch=self.guardian_epoch,
+                job_name=entry.job_name, job_nonce=entry.creation_nonce, expected_auth=auth_record)
+        if entry.job is None and not entry.create_attempted:
+            if entry.record is None:
+                entry.record = self._initial_record(entry, row)
+            if not entry.manifest_created:
+                self._publish_initial(entry)
+        # Named-scope registration must advance a first RESERVED admission.
+        # The informational response never stands in for completed preparation.
+        if row["state_revision"] <= request.expected_revision:
+            raise LifecycleError("guardian_launch_recovery_required")
+        self._deadline(deadline)
+        return self._result(request, row, duplicate=duplicate)
 
     def _initial_record(self, entry, row):
         entry.assert_job_creation_unattempted()
@@ -344,6 +397,8 @@ class GuardianLaunchOwner:
             if entry is None or request.job_nonce != entry.creation_nonce:
                 raise LifecycleError("guardian_launch_scope_missing")
             with self.lifecycle._scope(entry):
+                if self._draining:
+                    return self._claim_replay_during_drain(request, peer, auth_record, entry, deadline)
                 if entry.retirement_sealed:
                     raise LifecycleError("guardian_launch_retirement_sealed")
                 self._covered(entry, row)
@@ -361,6 +416,29 @@ class GuardianLaunchOwner:
                     expected_auth=auth_record)
                 return self._result(request, result, authorized=result["launch_authorized"],
                     duplicate=result["duplicate"])
+
+    def _claim_replay_during_drain(self, request, peer, auth_record, entry, deadline):
+        from .store import _revalidate_launch_auth
+
+        self._record_request(request, peer, auth_record, replay_only=True)
+        guard = self.store._policy.assert_held()
+        with self.store._connection() as conn:
+            conn.execute("BEGIN")
+            self.store._policy.revalidate(conn, guard)
+            _revalidate_launch_auth(conn, request.execution_id, peer.identity, auth_record)
+            row = self.store._get(conn, request.execution_id)
+            self._check_entry(entry, row)
+            self.store._authenticate_claim(row, peer.identity, self.store._claim_digest(request.claim_token),
+                request.spec_hash, request.guardian_epoch)
+            self.store._require_authenticated_allocation(conn, row)
+            if not row["claim_consumed"]:
+                self.store._require_revision(row, request.expected_revision)
+                if row["state"] != "PREPARED" or row["launch_sealed"]:
+                    raise LifecycleError("guardian_launch_recovery_required")
+            else:
+                self.store._assert_launch_fence(conn, row, version=request.launch_fence_version)
+            self._deadline(deadline)
+            return self._result(request, row, duplicate=True)
 
     def _retirement_evidence(self, entry, row, operation):
         """Observe before SQL; the caller retains POLICY and the launch fence."""
@@ -569,7 +647,7 @@ class GuardianLaunchOwner:
             with self.lifecycle._scope(entry):
                 if entry.journal_cleanup_error is not None:
                     raise LifecycleError("guardian_journal_cleanup_unverified")
-                self._covered(entry, row)
+                self._covered(entry, row, recovery=self._draining)
                 duplicate = self._record_request(request, peer, auth_record)
                 if row["state"] not in {"LAUNCHING", "START_UNKNOWN", "RUNNING"} or not row["claim_consumed"]:
                     raise LifecycleError("guardian_launch_not_claimed")
@@ -652,7 +730,7 @@ class GuardianLaunchOwner:
                     raise LifecycleError("guardian_retirement_request_required")
                 yield self._retirement_evidence(entry, row, operation)
                 return
-            self._covered(entry, row)
+            self._covered(entry, row, recovery=self._draining and operation in {"register_scope", "bind_root"})
             count = members = None
             durable = disabled = excluded = False
             if entry.job is not None:

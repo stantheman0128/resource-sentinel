@@ -160,8 +160,11 @@ lifetime peak private Commit in
 
 The actual-host contract above supersedes the earlier direct core-loop
 measurement. The old standalone core producer has been removed. Source and
-portable tests now express the contract; central verification is pending for
-this amendment, and no native host overhead result has been certified.
+portable tests now express the contract. Central verification passed 155 tests
+in 12.967 seconds (zero failures, errors or skips), covering the overhead runner,
+actual-host adapter and both capability-evidence modules. The run used normal
+daily Sentinel admission and the protected dirty baseline. No native host
+overhead result has been certified.
 
 The current production operator poll has a 50 ms timeout inside `run_once()`.
 That wait is included in tick cost and may by itself prevent the unchanged

@@ -136,14 +136,15 @@ class _Handle:
     membership_provable: bool
     unreadable: bool = False
     cleanup_unverified: bool = False
+    member_cleanup_error: BaseException | None = None
 
 
 class JobHandleSource:
     """Per-Job accounting over QUERY handles the host already opened.
 
-    The sampler contract forbids a backend from opening, scanning or
-    enumerating on the sampler's behalf, so read() performs exactly one bounded
-    accounting query on a handle that the host's enrollment step opened. A read
+    read() performs exactly one bounded accounting query on a handle that the
+    host's enrollment step opened. Optional begin_sample() performs one bounded
+    managed-member memory batch, sharing a deadline across all enrolled Jobs. A read
     that fails raises JobSamplingError with a sanitized FrameError; it never
     reports an unknown value as a zero.
 
@@ -158,8 +159,9 @@ class JobHandleSource:
     accounting covers the whole execution, and neither can a Job whose limits
     could not be read, so both are reported as incomplete membership.
 
-    Memory stays unknown. No per-Job private working set or private commit query
-    exists in this repository, and an absent query is never answered with a zero.
+    Missing or partial memory scans stay unknown. A successful scan is used only
+    once in its current capture and while the Job's accounting stamp still
+    matches. A failed memory scan does not suppress cumulative Job CPU reads.
     """
 
     def __init__(self):
@@ -167,6 +169,13 @@ class JobHandleSource:
         # A handle whose close outcome is unknown is retained here and never
         # read again, so cleanup custody is not dropped on the floor.
         self._retained: list[_Handle] = []
+        self._memory_scanner = None
+        self._memory_budget_source = None
+        self._memory_budget = None
+        self._memory_results = {}
+        self._memory_scan_failure = None
+        self.last_memory_scan = ()
+        self.memory_sample_started_tick = None
 
     @property
     def enrolled(self) -> tuple[str, ...]:
@@ -174,7 +183,62 @@ class JobHandleSource:
 
     @property
     def retained_uncertain(self) -> int:
-        return len(self._retained)
+        memory = 0 if self._memory_scanner is None else self._memory_scanner.retained_uncertain
+        return len(self._retained) + memory
+
+    @property
+    def memory_scanner(self):
+        return self._memory_scanner
+
+    @property
+    def memory_budget_source(self):
+        return self._memory_budget_source
+
+    def configure_memory(self, scanner, budget_source=None):
+        """Bind an in-process scanner; no serialized permission/measurement seam.
+
+        A P4 stress coordinator can supply the same typed budget to multiple
+        bounded query-only sources. Each source still executes its actual scan.
+        Changing an owner with cached/uncertain handles would abandon custody.
+        """
+        if scanner is not self._memory_scanner and self._memory_scanner is not None:
+            if self._memory_scanner.cached_members or self._memory_scanner.retained_uncertain:
+                raise ValueError("helper_memory_scanner_owned")
+        if budget_source is not None and not callable(budget_source):
+            raise ValueError("helper_memory_budget_source_invalid")
+        self._memory_scanner, self._memory_budget_source = scanner, budget_source
+        self._memory_results = {}
+        self.last_memory_scan = ()
+        self.memory_sample_started_tick = None
+
+    def retry_memory_cleanup(self):
+        if self._memory_scanner is not None:
+            self._memory_scanner.retry_cleanup()
+
+    def begin_sample(self, started_tick, execution_ids):
+        """Observe only managed Jobs, outside any SQLite/POLICY scope."""
+        self.memory_sample_started_tick = started_tick
+        self._memory_results = {}
+        self.last_memory_scan = ()
+        self._memory_budget = None
+        if self._memory_scanner is None:
+            return
+        try:
+            from .member_memory import NativeScanBudget
+            budget = (NativeScanBudget(started_tick) if self._memory_budget_source is None
+                      else self._memory_budget_source())
+            if type(budget) is not NativeScanBudget:
+                raise ValueError("helper_memory_budget_unavailable")
+            self._memory_budget = budget
+            jobs = {key: self._entries[key].job for key in execution_ids
+                    if key in self._entries and self._entries[key].membership_provable}
+            self.last_memory_scan = self._memory_scanner.scan_frame(
+                jobs, started_tick, budget=budget)
+            self._memory_results = {item.execution_id: item for item in self.last_memory_scan}
+        except Exception as error:
+            # Keep the original error reachable in case it owns native cleanup.
+            # No cached previous frame can leak through this failure.
+            self._memory_scan_failure = error
 
     def unreadable(self) -> tuple[str, ...]:
         return tuple(sorted(key for key, entry in self._entries.items() if entry.unreadable))
@@ -191,16 +255,30 @@ class JobHandleSource:
 
     def release(self, execution_id: str) -> str | None:
         """Close one handle. Returns a stable reason when the outcome is unknown."""
-        entry = self._entries.pop(execution_id, None)
+        entry = self._entries.get(execution_id)
         if entry is None:
             return None
+        # Publish cleanup custody before either owner can enter native cleanup.
+        # A scanner interruption must not drop the still-open borrowed Job.
+        entry.cleanup_unverified = True
+        self._retained.append(entry)
+        del self._entries[execution_id]
+        memory_reason = None
+        if self._memory_scanner is not None:
+            try:
+                memory_reason = self._memory_scanner.release(execution_id)
+            except BaseException as error:
+                entry.member_cleanup_error = error
+                memory_reason = "member_cleanup_unverified"
+        self._memory_results.pop(execution_id, None)
         try:
             entry.job.close()
         except BaseException as error:
-            entry.cleanup_unverified = True
-            self._retained.append(entry)
             return _reason(error)
-        return None
+        if entry.member_cleanup_error is None:
+            self._retained.remove(entry)
+            entry.cleanup_unverified = False
+        return memory_reason
 
     def read(self, execution_id: str) -> JobReading:
         entry = self._entries.get(execution_id)
@@ -221,11 +299,19 @@ class JobHandleSource:
             entry.unreadable = True
             raise JobSamplingError(_frame_error("measurement_inconsistent",
                                                 "helper_job_accounting", execution_id))
+        memory = self._memory_results.pop(execution_id, None)
+        usable = (memory is not None and memory.reason == "ok" and
+                  memory.started_tick == self.memory_sample_started_tick and
+                  memory.active_processes == active and
+                  memory.total_processes == getattr(accounting, "total_processes", None) and
+                  self._memory_budget is not None and
+                  execution_id not in self._memory_budget.invalid_execution_ids)
         return JobReading(cpu_100ns=cpu,
                           active_processes=active if entry.membership_provable else None,
                           membership_complete=entry.membership_provable,
                           counter_epoch=entry.counter_epoch,
-                          private_working_set_bytes=None, private_commit_bytes=None)
+                          private_working_set_bytes=memory.private_working_set_bytes if usable else None,
+                          private_commit_bytes=memory.private_commit_bytes if usable else None)
 
 
 class MachineObservationSource:
@@ -285,7 +371,8 @@ class HelperHost:
 
     def __init__(self, *, data_dir, profile_path=None,
                  enroll_every_ticks=DEFAULT_ENROLL_EVERY, report_every_ticks=DEFAULT_REPORT_EVERY,
-                 sleep=time.sleep, clock=None, machine_source=None, open_job=None):
+                 sleep=time.sleep, clock=None, machine_source=None, open_job=None,
+                 memory_scanner=None):
         self.data_dir = Path(data_dir)
         self.profile_path = Path(DEFAULT_PROFILE if profile_path is None else profile_path)
         self.enroll_every_ticks = enroll_every_ticks
@@ -296,6 +383,8 @@ class HelperHost:
         # interrupt-time source, or both are supplied by an in-process fixture.
         self._clock = clock
         self._machine_source = machine_source
+        self._native_sources = clock is None and machine_source is None
+        self._supplied_memory_scanner = memory_scanner
         self._opener = self._open_job if open_job is None else open_job
         self.capability = None
         self.profile = None
@@ -335,6 +424,7 @@ class HelperHost:
         # The sampler is built before the registry row exists, because a row
         # written and then abandoned would block the next helper start.
         self._sources()
+        self._configure_memory()
         try:
             self.sampler = FrameSampler(profile=self.profile, backend=self.jobs,
                                         machine_source=self._machine_source, clock=self._clock)
@@ -489,6 +579,13 @@ class HelperHost:
         self._clock = backend.tick
         self._machine_source = MachineObservationSource(MachineSampler(backend=backend))
 
+    def _configure_memory(self):
+        if self._supplied_memory_scanner is not None:
+            self.jobs.configure_memory(self._supplied_memory_scanner)
+        elif self._native_sources:
+            from .member_memory import NativeMemberMemoryScanner
+            self.jobs.configure_memory(NativeMemberMemoryScanner(clock=self._clock))
+
     @staticmethod
     def _open_job(name, nonce, logon_id):
         """Open one existing Job with query rights and nothing else."""
@@ -507,6 +604,10 @@ class HelperHost:
         """
         if not self._started:
             raise HelperHostRefused("helper_host_not_started")
+        # Operational drain already refreshes enrollment before deciding that
+        # inventory/cleanup is complete. Known failed member closes therefore
+        # have an accessible retry path; unknown outcomes stay quarantined.
+        self.jobs.retry_memory_cleanup()
         try:
             candidates, truncated, invalid = self._ledger_candidates()
         except LifecycleError as error:
@@ -537,6 +638,10 @@ class HelperHost:
             else:
                 failed += 1
         self._left_out = max(0, len(candidates) - len(self.jobs.enrolled))
+        if cleanup:
+            self.jobs.retry_memory_cleanup()
+            if not self.jobs.retained_uncertain:
+                cleanup = [reason for reason in cleanup if reason != "member_cleanup_unverified"]
         return self._enrollment_record(opened, released, failed, cleanup, invalid, truncated, None)
 
     def _enrollment_record(self, opened, released, failed, cleanup, invalid, truncated, ledger):
@@ -773,10 +878,14 @@ class HelperHost:
         cleanup = []
         if self._registration_operation is not None and self._registration_operation.pending:
             raise HelperHostRefused("helper_host_registration_pending")
+        self.jobs.retry_memory_cleanup()
         for execution_id in self.jobs.enrolled:
             reason = self._release(execution_id)
             if reason is not None:
                 cleanup.append(reason)
+        self.jobs.retry_memory_cleanup()
+        if not self.jobs.retained_uncertain:
+            cleanup = [reason for reason in cleanup if reason != "member_cleanup_unverified"]
         if cleanup or self.jobs.retained_uncertain:
             raise HelperHostRefused("helper_host_handle_cleanup_unverified",
                                     ",".join(sorted(set(cleanup))))

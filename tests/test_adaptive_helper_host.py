@@ -815,12 +815,33 @@ class ZeroSetStructureTests(unittest.TestCase):
             "uuid", "sentinel.adaptive.contracts", "sentinel.adaptive.decision",
             "sentinel.adaptive.helper", "sentinel.adaptive.host_authority",
             "sentinel.adaptive.identity", "sentinel.adaptive.legacy_writer",
-            "sentinel.adaptive.machine_sampler", "sentinel.adaptive.native_job",
+            "sentinel.adaptive.machine_sampler", "sentinel.adaptive.member_memory",
+            "sentinel.adaptive.native_job",
             "sentinel.adaptive.sampler", "sentinel.adaptive.store",
             "sentinel.adaptive.helper_control_host", "sentinel.adaptive.supervisor_reconcile"})
 
     def test_it_imports_nothing_that_can_set_a_cap_or_reach_a_guardian(self):
         self.assertEqual(imported_modules(PACKAGE / "helper_host.py") & DENIED_MODULES, set())
+
+    def test_member_memory_dependency_is_query_only(self):
+        # Adding a dependency to the host allowlist also checks its own surface;
+        # a new helper import must not hide a control or process-spawning path.
+        path = PACKAGE / "member_memory.py"
+        self.assertEqual(imported_modules(path), {
+            "__future__", "ctypes", "dataclasses", "os", "sys", "typing", "winreg",
+            "sentinel.adaptive.contracts", "sentinel.adaptive.identity"})
+        self.assertEqual(named(path) & (DENIED_NAMES | {
+            "SetInformationProcess", "SetProcessWorkingSetSize", "EmptyWorkingSet",
+            "TerminateProcess", "SuspendThread", "ResumeThread", "CreateProcessW",
+            "CreateJobObjectW", "OpenJobObjectW", "Popen", "subprocess",
+        }), set())
+
+    def test_member_memory_native_exports_are_only_read_queries(self):
+        tree = ast.parse((PACKAGE / "member_memory.py").read_text(encoding="utf-8"))
+        exports = {node.attr for node in ast.walk(tree)
+                   if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                   and node.value.id == "kernel"}
+        self.assertEqual(exports, {"K32GetProcessMemoryInfo", "GetCurrentProcess"})
 
     def test_its_source_names_no_job_mutation_and_no_proposal(self):
         self.assertEqual(named(PACKAGE / "helper_host.py") & DENIED_NAMES, set())

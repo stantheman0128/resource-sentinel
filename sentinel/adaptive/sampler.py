@@ -19,9 +19,9 @@ no journal and no admission or capacity output: a Job whose rate fell because it
 was capped simply reports a lower measured value, which no consumer of this
 module may read as free capacity.
 
-Per-Job memory attribution has no backend in this repository yet, so a reading
-without private working set and private commit bytes is reported as unknown
-memory plus a memory_attribution_unavailable error, never as zero.
+The helper's optional begin_sample hook performs one managed-member memory
+batch, bounded across all Jobs. A reading without complete private working set
+and private commit bytes remains unknown plus memory_attribution_unavailable.
 """
 
 from __future__ import annotations
@@ -84,8 +84,8 @@ class JobReading:
     holds. counter_epoch changes whenever the backend can no longer relate this
     reading to the previous one, which invalidates the delta.
 
-    Memory fields are optional because no per-Job private working set or private
-    commit query exists in this package. None means unknown, never zero.
+    Memory fields are optional: a complete bounded member scan may be unavailable.
+    None means unknown, never zero.
     """
 
     cpu_100ns: int | None
@@ -110,9 +110,11 @@ class JobReading:
 class JobAccountingSource(Protocol):
     """Per-Job accounting over a handle or scope the caller already holds.
 
-    The backend receives only the enrolled execution id. It must not open, scan
-    or enumerate anything on behalf of this sampler, and it must raise
-    JobSamplingError rather than return fabricated values.
+    read receives only the enrolled execution id and performs one accounting
+    query. Optional begin_sample(started_tick, execution_ids) may query members
+    of those retained Jobs within one shared 256-record/100-ms bound. It must
+    never scan the entire machine, and memory failure must leave read usable for
+    CPU accounting. The backend owns every handle and uncertain cleanup owner.
     """
 
     def read(self, execution_id: str) -> JobReading:
@@ -198,6 +200,11 @@ class JobSampler:
         frames: list[JobFrame] = []
         errors: list[FrameError] = []
         reset = False
+        begin = getattr(self._backend, "begin_sample", None)
+        if begin is not None:
+            # The native JobHandleSource handles ordinary memory failures here,
+            # retaining cleanup while leaving every Job CPU query available.
+            begin(start, tuple(self._baselines))
         for execution_id in tuple(self._baselines):
             frame, job_errors, job_reset = self._one(execution_id)
             frames.append(frame)

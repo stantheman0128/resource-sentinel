@@ -7,17 +7,21 @@ never happened. No assertion depends on elapsed time, because a timer proves
 nothing about reaction time or restore time.
 """
 
+from dataclasses import replace
 import io
+import json
 import unittest
 
 from tests.benchmarks.adaptive_ab import (
     BenchmarkDataError, CacheState, CheckStatus, Comparison, DEFAULT_SCENARIOS, DryRunRunner,
-    EvidenceSource, FixedConditions, MIN_PAIRS_PER_SCENARIO, OrderPosition, PairedRun,
+    EvidenceSource, FixedConditions, HeadroomAttribution, NativeCapInterval, NoiseEvidence,
+    MIN_PAIRS_PER_SCENARIO, OrderPosition, PairedRun, Schedule,
     Preconditions, RunMetrics, RunRecord, ScenarioClass, Variant, Verdict, analyze_comparison,
     build_schedule, check_a0_b_regression, check_cpu_contention, check_neutral_scenario,
     check_observer_cost,
     median, overall_verdict, paired_differences, parse_evidence_source, percentile, pair_records,
     precondition_failures, relative_changes, render_report, schedule_order_counts, spread,
+    parse_run_record, run_record_to_dict, check_measurement_safety, validate_schedule,
 )
 
 SEED = "p6-order-seed-0001"
@@ -27,7 +31,9 @@ GOOD_PRECONDITIONS = Preconditions(True, True, True, True)
 
 
 def conditions(anomaly=False, commit="0b2f378"):
-    return FixedConditions(commit, "10.0.26340.1", 12, "High performance", CacheState.WARM, anomaly)
+    return FixedConditions(commit, "10.0.26340.1", 12, "High performance", CacheState.WARM,
+                           anomaly, "a" * 64, 2, "b" * 64, "c" * 64,
+                           tuple((variant, "d" * 64) for variant in Variant))
 
 
 def metrics(foreground_p95=100.0, makespan=100.0, units=100.0, states=(), queue_wait=1.0):
@@ -42,21 +48,37 @@ def metrics(foreground_p95=100.0, makespan=100.0, units=100.0, states=(), queue_
         time_in_state_s=tuple(states),
         peak_private_commit_mib=120.0,
         peak_physical_mib=150.0,
-        min_headroom_mib=4096.0,
+        min_physical_headroom_mib=4096.0,
+        min_commit_headroom_mib=8192.0,
         monitor_cpu_units=0.04,
         monitor_commit_mib=140.0,
         api_errors=0,
         restore_time_s=1.2,
         coverage_fraction=1.0,
+        physical_headroom_attribution=HeadroomAttribution.WITHIN_RESERVE,
+        commit_headroom_attribution=HeadroomAttribution.WITHIN_RESERVE,
+        physical_headroom_evidence_id="physical-samples",
+        commit_headroom_evidence_id="commit-samples",
+        native_cap_intervals=tuple(NativeCapInterval("fixture", 0, int(duration * 1e7),
+                                                     5, 2000, state)
+                                   for state, duration in states if state.startswith("CAPPED")),
+        native_cap_audit_complete=True,
+        native_cap_write_audit_sha256="e" * 64,
+        native_cap_readback_sha256="f" * 64,
     )
 
 
 def record(variant, pair_index, foreground_p95=100.0, makespan=100.0, units=100.0,
            scenario=CPU_SCENARIO, scenario_class=ScenarioClass.CPU_CONTENTION,
            source=EvidenceSource.MEASURED, preconditions=GOOD_PRECONDITIONS,
-           conditions_override=None, states=(), order=OrderPosition.FIRST):
+           conditions_override=None, states=(), order=None, comparison=Comparison.A1_B,
+           schedule_pairs=10):
+    scheduled = build_schedule([(scenario, scenario_class)], SEED, schedule_pairs,
+                               [comparison]).slots[pair_index]
+    if order is None:
+        order = OrderPosition.FIRST if variant is scheduled.first_variant else OrderPosition.SECOND
     return RunRecord(
-        run_id=f"{scenario}-{variant.value}-{pair_index}",
+        run_id=f"{comparison.value}-{scenario}-{variant.value}-{pair_index}",
         scenario=scenario,
         scenario_class=scenario_class,
         variant=variant,
@@ -67,6 +89,8 @@ def record(variant, pair_index, foreground_p95=100.0, makespan=100.0, units=100.
         conditions=conditions_override or conditions(),
         preconditions=preconditions,
         metrics=metrics(foreground_p95, makespan, units, states),
+        comparison=comparison,
+        slot_id=scheduled.slot_id,
         note="fabricated, no run happened",
     )
 
@@ -76,13 +100,17 @@ def dataset(pair_count, baseline_variant, treatment_variant, baseline_p95=100.0,
             baseline_units=100.0, treatment_units=95.0, source=EvidenceSource.MEASURED,
             scenario=CPU_SCENARIO, scenario_class=ScenarioClass.CPU_CONTENTION):
     """A clean set of pairs that meets every threshold the plan names."""
+    comparison = {(Variant.A0, Variant.A1): Comparison.A0_A1,
+                  (Variant.A1, Variant.B): Comparison.A1_B,
+                  (Variant.A0, Variant.B): Comparison.A0_B}[(baseline_variant, treatment_variant)]
     records = []
     for index in range(pair_count):
         records.append(record(baseline_variant, index, baseline_p95, baseline_makespan,
-                              baseline_units, scenario, scenario_class, source))
+                              baseline_units, scenario, scenario_class, source,
+                              comparison=comparison, schedule_pairs=max(10, pair_count)))
         records.append(record(treatment_variant, index, treatment_p95, treatment_makespan,
                               treatment_units, scenario, scenario_class, source,
-                              order=OrderPosition.SECOND))
+                              comparison=comparison, schedule_pairs=max(10, pair_count)))
     return records
 
 
@@ -94,9 +122,62 @@ def pairs_of(baseline_values, treatment_values, scenario_class=ScenarioClass.CPU
         pairs.append(PairedRun(
             scenario, index,
             record(Variant.A1, index, base[0], base[1], base[2], scenario, scenario_class),
-            record(Variant.B, index, treat[0], treat[1], treat[2], scenario, scenario_class,
-                   order=OrderPosition.SECOND)))
+            record(Variant.B, index, treat[0], treat[1], treat[2], scenario, scenario_class)))
     return pairs
+
+
+# These are fixture helpers, not production fallbacks. Existing scalar-boundary
+# tests explicitly receive an independently built schedule and fabricated noise
+# calibration so they can isolate the threshold they are exercising. The strict
+# API tests below call raw_* to verify that absent provenance cannot pass.
+raw_analyze_comparison = analyze_comparison
+raw_pair_records = pair_records
+raw_check_neutral_scenario = check_neutral_scenario
+raw_check_observer_cost = check_observer_cost
+raw_check_a0_b_regression = check_a0_b_regression
+
+
+def fixture_schedule(records, comparison, scenario):
+    selected = [item for item in records if item.comparison is comparison and item.scenario == scenario]
+    kind = selected[0].scenario_class if selected else ScenarioClass.CPU_CONTENTION
+    count = max(10, max((item.pair_index + 1 for item in selected), default=10))
+    return build_schedule([(scenario, kind)], SEED, count, [comparison])
+
+
+def fixture_noise(reference, magnitude=0.05, source=EvidenceSource.MEASURED, count=10):
+    return NoiseEvidence(
+        reference.comparison, reference.scenario, reference.seed,
+        {Comparison.A0_A1: Variant.A0, Comparison.A1_B: Variant.A1,
+         Comparison.A0_B: Variant.A0}[reference.comparison], reference.conditions, source,
+        "fabricated-calibration-not-measurement",
+        tuple((100.0, 100.0 * (1 + magnitude)) for _ in range(count)),
+        tuple((100.0, 100.0 * (1 + magnitude)) for _ in range(count)),
+        tuple((f"cal-{index}-a", f"cal-{index}-b") for index in range(count)))
+
+
+def analyze_comparison(records, comparison, scenario, kind, min_pairs=10):
+    selected = [item for item in records if item.comparison is comparison and item.scenario == scenario]
+    return raw_analyze_comparison(
+        records, comparison, scenario, kind, min_pairs,
+        schedule=fixture_schedule(records, comparison, scenario),
+        noise=fixture_noise(selected[0]) if selected else None)
+
+
+def pair_records(records, comparison, scenario):
+    return raw_pair_records(records, comparison, scenario,
+                            schedule=fixture_schedule(records, comparison, scenario))
+
+
+def check_neutral_scenario(pairs):
+    return raw_check_neutral_scenario(pairs, fixture_noise(pairs[0].baseline))
+
+
+def check_observer_cost(pairs):
+    return raw_check_observer_cost(pairs, fixture_noise(pairs[0].baseline))
+
+
+def check_a0_b_regression(pairs, kind):
+    return raw_check_a0_b_regression(pairs, kind, fixture_noise(pairs[0].baseline))
 
 
 class ScheduleTests(unittest.TestCase):
@@ -153,13 +234,11 @@ class SchemaTests(unittest.TestCase):
 
     def test_metrics_reject_decreasing_percentiles(self):
         with self.assertRaises(BenchmarkDataError):
-            RunMetrics(10.0, 5.0, 20.0, 1.0, 1.0, 0.0, 0.0, (), 1.0, 1.0, 1.0, 0.0, 0.0, 0,
-                       None, 1.0)
+            replace(metrics(), foreground_p50_ms=10.0, foreground_p95_ms=5.0)
 
     def test_metrics_reject_coverage_above_one(self):
         with self.assertRaises(BenchmarkDataError):
-            RunMetrics(1.0, 2.0, 3.0, 1.0, 1.0, 0.0, 0.0, (), 1.0, 1.0, 1.0, 0.0, 0.0, 0,
-                       None, 1.5)
+            replace(metrics(), coverage_fraction=1.5)
 
     def test_time_in_state_is_readable(self):
         record_with_states = record(Variant.B, 0, states=(("CAPPED_L1", 4.0), ("OBSERVING", 9.0)))
@@ -171,8 +250,7 @@ class PreconditionTests(unittest.TestCase):
     def test_failed_precondition_excludes_the_run_and_is_counted(self):
         failed = Preconditions(True, False, True, True)
         records = dataset(10, Variant.A1, Variant.B)
-        records[1] = record(Variant.B, 0, 80.0, 105.0, 95.0, preconditions=failed,
-                            order=OrderPosition.SECOND)
+        records[1] = record(Variant.B, 0, 80.0, 105.0, 95.0, preconditions=failed)
         pairs, excluded = pair_records(records, Comparison.A1_B, CPU_SCENARIO)
         self.assertEqual(len(pairs), 9)
         self.assertEqual(len(excluded), 2)
@@ -193,8 +271,7 @@ class PreconditionTests(unittest.TestCase):
     def test_mismatched_fixed_conditions_exclude_the_pair(self):
         records = dataset(10, Variant.A1, Variant.B)
         records[1] = record(Variant.B, 0, 80.0, 105.0, 95.0,
-                            conditions_override=conditions(commit="deadbee"),
-                            order=OrderPosition.SECOND)
+                            conditions_override=conditions(commit="deadbee"))
         pairs, excluded = pair_records(records, Comparison.A1_B, CPU_SCENARIO)
         self.assertEqual(len(pairs), 9)
         self.assertEqual(len(excluded), 2)
@@ -203,7 +280,7 @@ class PreconditionTests(unittest.TestCase):
 
     def test_duplicate_run_for_one_slot_is_rejected(self):
         records = dataset(10, Variant.A1, Variant.B)
-        records.append(record(Variant.B, 0, 80.0, 105.0, 95.0, order=OrderPosition.SECOND))
+        records.append(record(Variant.B, 0, 80.0, 105.0, 95.0))
         with self.assertRaises(BenchmarkDataError):
             pair_records(records, Comparison.A1_B, CPU_SCENARIO)
 
@@ -314,8 +391,7 @@ class NeutralThresholdBoundaryTests(unittest.TestCase):
                          ScenarioClass.IO_BOUND, NEUTRAL_SCENARIO)
         capped = PairedRun(NEUTRAL_SCENARIO, 0, pairs[0].baseline,
                            record(Variant.B, 0, 100.0, 100.0, 100.0, NEUTRAL_SCENARIO,
-                                  ScenarioClass.IO_BOUND, states=(("CAPPED_L1", 3.0),),
-                                  order=OrderPosition.SECOND))
+                                  ScenarioClass.IO_BOUND, states=(("CAPPED_L1", 3.0),)))
         checks = {check.name: check for check in check_neutral_scenario([capped] + pairs[1:])}
         self.assertIs(checks["no unrelated cap applied"].status, CheckStatus.FAIL)
 
@@ -522,11 +598,275 @@ class VerdictTests(unittest.TestCase):
                     treatment_units=100.0, scenario="mixed_roles",
                     scenario_class=ScenarioClass.MIXED_ROLES),
             Comparison.A0_B, "mixed_roles", ScenarioClass.MIXED_ROLES)
-        self.assertIs(overall_verdict([a1b, a0a1, a0b]), Verdict.NO_THRESHOLD_DEFINED)
+        self.assertIs(overall_verdict([a1b, a0a1, a0b]), Verdict.INSUFFICIENT_DATA)
         synthetic = analyze_comparison(
             dataset(10, Variant.A1, Variant.B, source=EvidenceSource.SYNTHETIC),
             Comparison.A1_B, CPU_SCENARIO, ScenarioClass.CPU_CONTENTION)
         self.assertIs(overall_verdict([synthetic, a0a1, a0b]), Verdict.NOT_MEASURED)
+
+
+class EvidenceIdentityTests(unittest.TestCase):
+    def analyze(self, records, comparison=Comparison.A1_B, scenario=CPU_SCENARIO,
+                kind=ScenarioClass.CPU_CONTENTION, **kwargs):
+        return raw_analyze_comparison(records, comparison, scenario, kind, **kwargs)
+
+    def test_independent_schedule_is_required_even_when_all_numbers_win(self):
+        result = self.analyze(dataset(10, Variant.A1, Variant.B))
+        self.assertIs(result.verdict, Verdict.INSUFFICIENT_DATA)
+        self.assertEqual(len(result.pairs), 0)
+        self.assertTrue(all("schedule" in item.reasons[0] for item in result.excluded))
+
+    def test_full_comparison_identity_prevents_cross_comparison_reuse(self):
+        first = dataset(10, Variant.A0, Variant.A1)
+        second = dataset(10, Variant.A0, Variant.B)
+        together = first + second
+        schedule = build_schedule([(CPU_SCENARIO, ScenarioClass.CPU_CONTENTION)], SEED)
+        pairs, excluded = raw_pair_records(together, Comparison.A0_B, CPU_SCENARIO, schedule=schedule)
+        self.assertEqual(len(pairs), 10)
+        self.assertFalse(excluded)
+        self.assertTrue(all(pair.baseline.comparison is Comparison.A0_B for pair in pairs))
+        missing = [item for item in together if item.comparison is not Comparison.A0_B
+                   or item.variant is not Variant.A0]
+        pairs, excluded = raw_pair_records(missing, Comparison.A0_B, CPU_SCENARIO, schedule=schedule)
+        self.assertEqual(len(pairs), 0)
+        self.assertEqual(len(excluded), 10)
+
+    def test_wrong_slot_id_seed_or_order_each_excludes_exact_pair(self):
+        for changes in ({"slot_id": "0" * 64}, {"seed": "different"},
+                        {"order_position": OrderPosition.FIRST}):
+            records = dataset(10, Variant.A1, Variant.B)
+            target = next(index for index, item in enumerate(records)
+                          if item.order_position is OrderPosition.SECOND)
+            records[target] = replace(records[target], **changes)
+            schedule = fixture_schedule(records, Comparison.A1_B, CPU_SCENARIO)
+            result = self.analyze(records, schedule=schedule)
+            self.assertIs(result.verdict, Verdict.INSUFFICIENT_DATA)
+            self.assertEqual(len(result.pairs), 9)
+
+    def test_schedule_order_cannot_be_rewritten_after_measurement(self):
+        schedule = build_schedule([(CPU_SCENARIO, ScenarioClass.CPU_CONTENTION)], SEED)
+        first = schedule.slots[0]
+        changed = replace(first, first_variant=first.second_variant, second_variant=first.first_variant)
+        tampered = replace(schedule, slots=(changed,) + schedule.slots[1:])
+        with self.assertRaisesRegex(BenchmarkDataError, "differs from seed"):
+            validate_schedule(tampered)
+
+    def test_renaming_scenario_class_cannot_select_a_more_favorable_threshold(self):
+        with self.assertRaisesRegex(BenchmarkDataError, "scenario_class"):
+            self.analyze(dataset(10, Variant.A1, Variant.B), kind=ScenarioClass.NO_PRESSURE)
+
+    def test_pair_minimum_cannot_be_lowered_by_call_argument(self):
+        with self.assertRaises(BenchmarkDataError):
+            self.analyze(dataset(10, Variant.A1, Variant.B), min_pairs=1)
+
+    def test_all_fixed_condition_pins_are_compared(self):
+        changes = ({"dataset_sha256": "1" * 64}, {"task_count": 3},
+                   {"ui_probe_sha256": "1" * 64}, {"collector_scope_sha256": "1" * 64},
+                   {"build_variant_sha256": tuple((variant, "1" * 64) for variant in Variant)})
+        for change in changes:
+            records = dataset(10, Variant.A1, Variant.B)
+            records[0] = replace(records[0], conditions=replace(records[0].conditions, **change))
+            pairs, excluded = pair_records(records, Comparison.A1_B, CPU_SCENARIO)
+            self.assertEqual(len(pairs), 9, change)
+            self.assertEqual(len(excluded), 2, change)
+
+    def test_conditions_cannot_drift_together_between_pairs(self):
+        records = dataset(10, Variant.A1, Variant.B)
+        for index in (0, 1):
+            records[index] = replace(records[index], conditions=replace(records[index].conditions,
+                                                                        task_count=3))
+        with self.assertRaisesRegex(BenchmarkDataError, "vary between pairs"):
+            analyze_comparison(records, Comparison.A1_B, CPU_SCENARIO, ScenarioClass.CPU_CONTENTION)
+
+
+class NoiseEvidenceTests(unittest.TestCase):
+    def data(self, degradation=0.01):
+        records = dataset(10, Variant.A1, Variant.B, treatment_p95=100 * (1 + degradation),
+                          treatment_makespan=100 * (1 + degradation), treatment_units=100,
+                          scenario=NEUTRAL_SCENARIO, scenario_class=ScenarioClass.IO_BOUND)
+        schedule = fixture_schedule(records, Comparison.A1_B, NEUTRAL_SCENARIO)
+        return records, schedule
+
+    def analyze(self, records, schedule, noise=None):
+        return raw_analyze_comparison(records, Comparison.A1_B, NEUTRAL_SCENARIO,
+                                      ScenarioClass.IO_BOUND, schedule=schedule, noise=noise)
+
+    def test_under_five_percent_without_measured_noise_is_not_a_pass(self):
+        records, schedule = self.data()
+        result = self.analyze(records, schedule)
+        self.assertIs(result.verdict, Verdict.INSUFFICIENT_DATA)
+        self.assertTrue(any(check.status is CheckStatus.UNVERIFIED for check in result.checks))
+
+    def test_observed_regression_must_fit_the_actual_empirical_envelope(self):
+        records, schedule = self.data(0.02)
+        result = self.analyze(records, schedule, fixture_noise(records[0], magnitude=0.01))
+        self.assertIs(result.verdict, Verdict.FAIL)
+        checks = {check.name: check for check in result.checks}
+        self.assertIs(checks["makespan degradation median"].status, CheckStatus.PASS)
+        self.assertIs(checks["makespan_s within measured noise"].status, CheckStatus.FAIL)
+
+    def test_noise_above_five_percent_cannot_loosen_acceptance(self):
+        records, schedule = self.data(0.01)
+        result = self.analyze(records, schedule, fixture_noise(records[0], magnitude=0.08))
+        self.assertIs(result.verdict, Verdict.INSUFFICIENT_DATA)
+
+    def test_synthetic_noise_is_not_native_measurement(self):
+        records, schedule = self.data()
+        result = self.analyze(records, schedule,
+                              fixture_noise(records[0], source=EvidenceSource.SYNTHETIC))
+        self.assertIs(result.verdict, Verdict.NOT_MEASURED)
+
+    def test_fewer_than_ten_calibration_pairs_is_insufficient(self):
+        records, schedule = self.data()
+        self.assertIs(self.analyze(records, schedule, fixture_noise(records[0], count=9)).verdict,
+                      Verdict.INSUFFICIENT_DATA)
+
+    def test_calibration_cannot_reuse_the_treatment_observations(self):
+        records, schedule = self.data()
+        noise = fixture_noise(records[0])
+        noise = replace(noise, repeat_run_ids=((records[0].run_id, "other-id"),)
+                        + noise.repeat_run_ids[1:])
+        self.assertIs(self.analyze(records, schedule, noise).verdict, Verdict.INSUFFICIENT_DATA)
+
+    def test_noise_with_a_different_dataset_or_seed_cannot_pass(self):
+        records, schedule = self.data()
+        noise = fixture_noise(records[0])
+        for changed in (replace(noise, seed="other"),
+                        replace(noise, conditions=replace(noise.conditions, dataset_sha256="1" * 64))):
+            self.assertIs(self.analyze(records, schedule, changed).verdict, Verdict.INSUFFICIENT_DATA)
+
+
+class NativeAndHeadroomEvidenceTests(unittest.TestCase):
+    def test_recovering_baseline_cap_counts_even_without_capped_state_time(self):
+        pairs = pairs_of([(100, 100, 100)] * 10, [(100, 100, 100)] * 10,
+                         ScenarioClass.IO_BOUND, NEUTRAL_SCENARIO)
+        interval = NativeCapInterval("owned", 100, 200, 5, 10000, "RECOVERING")
+        changed = replace(pairs[0].treatment, metrics=replace(pairs[0].treatment.metrics,
+                                                            native_cap_intervals=(interval,)))
+        pairs[0] = replace(pairs[0], treatment=changed)
+        checks = {item.name: item for item in check_neutral_scenario(pairs)}
+        self.assertIs(checks["no unrelated cap applied"].status, CheckStatus.FAIL)
+
+    def test_zero_duration_enable_event_is_not_rounded_into_no_cap(self):
+        pairs = pairs_of([(100, 100, 100)], [(100, 100, 100)])
+        interval = NativeCapInterval("owned", 100, 100, 5, 2000, "RECOVERING")
+        pairs[0] = replace(pairs[0], treatment=replace(pairs[0].treatment,
+                           metrics=replace(pairs[0].treatment.metrics, native_cap_intervals=(interval,))))
+        checks = {item.name: item for item in check_neutral_scenario(pairs)}
+        self.assertIs(checks["no unrelated cap applied"].status, CheckStatus.FAIL)
+
+    def test_sampled_absence_without_complete_audit_is_unverified(self):
+        records = dataset(10, Variant.A1, Variant.B)
+        records[0] = replace(records[0], metrics=replace(records[0].metrics,
+                                                       native_cap_audit_complete=False))
+        self.assertIs(analyze_comparison(records, Comparison.A1_B, CPU_SCENARIO,
+                                         ScenarioClass.CPU_CONTENTION).verdict,
+                      Verdict.INSUFFICIENT_DATA)
+
+    def test_reserve_attribution_is_independent_for_physical_and_commit(self):
+        for resource in ("physical", "commit"):
+            records = dataset(10, Variant.A1, Variant.B)
+            records[1] = replace(records[1], metrics=replace(records[1].metrics, **{
+                f"min_{resource}_headroom_mib": 3000,
+                f"{resource}_headroom_attribution": HeadroomAttribution.NEW_ADMISSION}))
+            result = analyze_comparison(records, Comparison.A1_B, CPU_SCENARIO,
+                                         ScenarioClass.CPU_CONTENTION)
+            self.assertIs(result.verdict, Verdict.FAIL)
+            check = next(item for item in result.checks if item.name == f"{resource} reserve and attribution")
+            self.assertIs(check.status, CheckStatus.FAIL)
+
+    def test_unknown_reserve_cause_prevents_promotion(self):
+        records = dataset(10, Variant.A1, Variant.B)
+        records[1] = replace(records[1], metrics=replace(records[1].metrics,
+                             min_commit_headroom_mib=3000,
+                             commit_headroom_attribution=HeadroomAttribution.UNKNOWN))
+        self.assertIs(analyze_comparison(records, Comparison.A1_B, CPU_SCENARIO,
+                                         ScenarioClass.CPU_CONTENTION).verdict,
+                      Verdict.INSUFFICIENT_DATA)
+
+    def test_external_deficit_is_reported_without_a_prevention_claim(self):
+        pairs = pairs_of([(100, 100, 100)], [(80, 105, 95)])
+        pairs[0] = replace(pairs[0], treatment=replace(pairs[0].treatment,
+                           metrics=replace(pairs[0].treatment.metrics,
+                             min_physical_headroom_mib=3000,
+                             physical_headroom_attribution=HeadroomAttribution.UNMANAGED)))
+        checks = {item.name: item for item in check_measurement_safety(pairs)}
+        check = checks["physical reserve and attribution"]
+        self.assertIs(check.status, CheckStatus.NOT_APPLICABLE)
+        self.assertIn("not claimed as prevented", check.detail)
+
+
+class CompleteMatrixTests(unittest.TestCase):
+    def matrix(self):
+        result = []
+        for scenario, kind in DEFAULT_SCENARIOS:
+            for comparison, variants in ((Comparison.A0_A1, (Variant.A0, Variant.A1)),
+                                         (Comparison.A1_B, (Variant.A1, Variant.B)),
+                                         (Comparison.A0_B, (Variant.A0, Variant.B))):
+                records = dataset(10, *variants, treatment_p95=80 if kind is ScenarioClass.CPU_CONTENTION
+                                  and comparison is not Comparison.A0_A1 else 100,
+                                  treatment_makespan=100, treatment_units=100,
+                                  scenario=scenario, scenario_class=kind)
+                result.append(analyze_comparison(records, comparison, scenario, kind))
+        return result
+
+    def test_seven_scenarios_by_three_comparisons_are_all_required(self):
+        complete = self.matrix()
+        self.assertEqual(len(complete), 21)
+        self.assertIs(overall_verdict(complete), Verdict.NO_THRESHOLD_DEFINED)
+        for omitted in range(21):
+            self.assertIs(overall_verdict(complete[:omitted] + complete[omitted + 1:]),
+                          Verdict.INSUFFICIENT_DATA)
+
+    def test_duplicate_matrix_cell_does_not_replace_a_missing_cell(self):
+        complete = self.matrix()
+        complete[0] = complete[1]
+        self.assertIs(overall_verdict(complete), Verdict.INSUFFICIENT_DATA)
+
+    def test_reused_run_id_across_comparisons_is_not_independent_measurement(self):
+        complete = self.matrix()
+        other_id = complete[0].pairs[0].baseline.run_id
+        item = complete[1]
+        changed = replace(item.pairs[0], baseline=replace(item.pairs[0].baseline, run_id=other_id))
+        complete[1] = replace(item, pairs=(changed,) + item.pairs[1:])
+        self.assertIs(overall_verdict(complete), Verdict.INSUFFICIENT_DATA)
+
+    def test_comparisons_for_one_scenario_must_use_the_same_variant_build_pins(self):
+        complete = self.matrix()
+        item = complete[0]
+        changed_pairs = []
+        for pair in item.pairs:
+            changed_pairs.append(replace(pair,
+                baseline=replace(pair.baseline, conditions=replace(pair.baseline.conditions,
+                                   build_variant_sha256=tuple((variant, "2" * 64) for variant in Variant))),
+                treatment=replace(pair.treatment, conditions=replace(pair.treatment.conditions,
+                                   build_variant_sha256=tuple((variant, "2" * 64) for variant in Variant)))))
+        complete[0] = replace(item, pairs=tuple(changed_pairs))
+        self.assertIs(overall_verdict(complete), Verdict.INSUFFICIENT_DATA)
+
+
+class SerializationTests(unittest.TestCase):
+    def test_strict_roundtrip_keeps_identity_provenance_and_split_headroom(self):
+        original = record(Variant.B, 0)
+        self.assertEqual(parse_run_record(run_record_to_dict(original)), original)
+        self.assertEqual(parse_run_record(json.dumps(run_record_to_dict(original))), original)
+
+    def test_missing_unknown_duplicate_and_oversize_fields_are_rejected(self):
+        raw = run_record_to_dict(record(Variant.B, 0))
+        missing = dict(raw)
+        missing.pop("comparison")
+        unknown = dict(raw, auto_promote=True)
+        for payload in (missing, unknown, '{"run_id":"a","run_id":"b"}', " " * (2 * 1024 * 1024 + 1)):
+            with self.assertRaises(BenchmarkDataError):
+                parse_run_record(payload)
+
+    def test_metric_strings_nan_and_false_identity_do_not_coerce(self):
+        for change in ({"makespan_s": "1"}, {"makespan_s": float("nan")},
+                       {"native_cap_audit_complete": 1}):
+            raw = run_record_to_dict(record(Variant.B, 0))
+            raw["metrics"].update(change)
+            with self.assertRaises(BenchmarkDataError):
+                parse_run_record(raw)
 
 
 class ReportTests(unittest.TestCase):

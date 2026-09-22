@@ -6,11 +6,10 @@ comparison required by docs/planning/adaptive-scheduler/IMPLEMENTATION-PLAN.md
 sections 11.1 to 11.4. It measures nothing. It launches nothing, touches no
 running process, and reads neither the live Sentinel database nor its config.
 
-Why it is built before anything can run: variant B needs a CPU actuator that
-does not exist yet, so no measured A1 or B data can exist yet either. The plan
-is explicit that none of its thresholds have been measured ("這些是本plan提出的
-門檻；沒有任何一項已在本輪測得", section 11.2). The harness therefore refuses to
-turn fabricated numbers into a pass:
+Native implementation and native acceptance evidence are distinct. This pure
+analyzer consumes independently pinned measurements from a concrete runner;
+it cannot establish those measurements itself. It refuses to turn fabricated
+numbers or incomplete provenance into a pass:
 
   - every run record carries an evidence source, measured or synthetic;
   - one synthetic record anywhere in a comparison forces the verdict
@@ -35,9 +34,11 @@ in the check detail instead of inventing one; those gaps are listed in PLAN_GAPS
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 from enum import Enum
 import argparse
+import hashlib
+import json
 import math
 import random
 import sys
@@ -81,6 +82,13 @@ def _typed(value, cls, name):
 def _text(value, name, max_length=200):
     if type(value) is not str or not value.strip() or len(value) > max_length:
         raise BenchmarkDataError(f"{name}: non-empty text required")
+    return value
+
+
+def _sha256(value, name):
+    if (type(value) is not str or len(value) != 64
+            or any(char not in "0123456789abcdef" for char in value)):
+        raise BenchmarkDataError(f"{name}: lowercase SHA256 required")
     return value
 
 
@@ -178,6 +186,17 @@ class CheckStatus(str, Enum):
     PASS = "pass"
     FAIL = "fail"
     NOT_APPLICABLE = "not_applicable"
+    UNVERIFIED = "unverified"
+
+
+class HeadroomAttribution(str, Enum):
+    WITHIN_RESERVE = "within_reserve"
+    NEW_ADMISSION = "new_admission_overbooking"
+    EXISTING = "existing"
+    UNMANAGED = "unmanaged"
+    EXEMPT = "exempt"
+    MIXED_EXTERNAL = "mixed_external"
+    UNKNOWN = "unknown"
 
 
 # --- thresholds quoted from plan section 11.3 --------------------------------
@@ -219,8 +238,11 @@ PLAN_GAPS = (
     "rule scenarios or to 5 percent in neutral rule scenarios.",
     "Plan 11.3 names no threshold for the unmanaged CPU pressure, mixed role and "
     "mixed duration scenarios; those report NO_THRESHOLD_DEFINED.",
-    "Plan 11.3 lists 「minimum headroom」 without saying whether it is physical or "
-    "commit, so the schema carries one field and the report prints it as given.",
+    "Physical and Commit headroom are separate observations. External deficits "
+    "are reported with their evidence and are never claimed as prevented by B.",
+    "Noise uses a predeclared maximum absolute paired change from at least ten "
+    "same-variant repeat pairs. This empirical envelope is not a confidence "
+    "interval; noisy or missing calibration cannot establish neutral performance.",
     "Plan 11.3 says 「樣本小就說樣本小」 but names no sample size above which a "
     "statistical guarantee may be claimed, so every result is reported as small.",
 )
@@ -245,6 +267,8 @@ class PairSlot:
         _text(self.scenario, "scenario")
         _typed(self.scenario_class, ScenarioClass, "scenario_class")
         _int(self.pair_index, "pair_index", 0, 1 << 20)
+        _typed(self.first_variant, Variant, "first_variant")
+        _typed(self.second_variant, Variant, "second_variant")
         pair = COMPARISON_VARIANTS[self.comparison]
         if {self.first_variant, self.second_variant} != set(pair):
             raise BenchmarkDataError("variants: order must cover exactly the compared pair")
@@ -252,6 +276,12 @@ class PairSlot:
     @property
     def order_label(self) -> str:
         return f"{self.first_variant.value}{self.second_variant.value}"
+
+    @property
+    def slot_id(self) -> str:
+        payload = [self.comparison.value, self.scenario, self.scenario_class.value,
+                   self.pair_index]
+        return hashlib.sha256(json.dumps(payload, separators=(",", ":")).encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -263,8 +293,12 @@ class Schedule:
     def __post_init__(self):
         _text(self.seed, "seed")
         _int(self.pairs_per_scenario, "pairs_per_scenario", 1, 1 << 16)
-        if not self.slots:
+        if type(self.slots) is not tuple or not self.slots:
             raise BenchmarkDataError("slots: schedule is empty")
+        for slot in self.slots:
+            _typed(slot, PairSlot, "slot")
+        if len({slot.slot_id for slot in self.slots}) != len(self.slots):
+            raise BenchmarkDataError("slots: duplicate comparison/scenario/pair")
 
 
 def build_schedule(
@@ -289,6 +323,8 @@ def build_schedule(
             f"pairs_per_scenario: plan section 11.3 requires at least {MIN_PAIRS_PER_SCENARIO}")
     if not comparisons:
         raise BenchmarkDataError("comparisons: at least one comparison required")
+    if len(set(comparisons)) != len(comparisons):
+        raise BenchmarkDataError("comparisons: duplicate comparison")
 
     seen = set()
     slots = []
@@ -332,6 +368,11 @@ class FixedConditions:
     power_plan: str
     cache_state: CacheState
     thermal_or_power_anomaly: bool
+    dataset_sha256: str
+    task_count: int
+    ui_probe_sha256: str
+    collector_scope_sha256: str
+    build_variant_sha256: tuple[tuple[Variant, str], ...]
 
     def __post_init__(self):
         _text(self.commit, "commit")
@@ -341,13 +382,28 @@ class FixedConditions:
         _typed(self.cache_state, CacheState, "cache_state")
         if type(self.thermal_or_power_anomaly) is not bool:
             raise BenchmarkDataError("thermal_or_power_anomaly: boolean required")
+        for name in ("dataset_sha256", "ui_probe_sha256", "collector_scope_sha256"):
+            _sha256(getattr(self, name), name)
+        _int(self.task_count, "task_count", 1, 1 << 20)
+        if (type(self.build_variant_sha256) is not tuple
+                or len(self.build_variant_sha256) != len(Variant)):
+            raise BenchmarkDataError("build_variant_sha256: all three variant pins required")
+        variants = []
+        for variant, digest in self.build_variant_sha256:
+            _typed(variant, Variant, "build variant")
+            _sha256(digest, "build variant digest")
+            variants.append(variant)
+        if set(variants) != set(Variant):
+            raise BenchmarkDataError("build_variant_sha256: missing or duplicate variant")
 
     @property
     def comparable_key(self) -> tuple:
         """Everything that must match across a pair. The anomaly flag excludes a
         run on its own, so it is not part of the match key."""
         return (self.commit, self.os_build, self.logical_processors,
-                self.power_plan, self.cache_state)
+                self.power_plan, self.cache_state, self.dataset_sha256, self.task_count,
+                self.ui_probe_sha256, self.collector_scope_sha256,
+                tuple(sorted(self.build_variant_sha256)))
 
 
 @dataclass(frozen=True)
@@ -372,6 +428,37 @@ class Preconditions:
 
 
 @dataclass(frozen=True)
+class NativeCapInterval:
+    """Actual native ENABLE interval, from the write audit plus Query readbacks.
+
+    A baseline rate remains a cap while ENABLE is set, including RECOVERING.
+    Even a zero-duration observed enable event counts as a cap, because clock
+    resolution must not hide a short write. State labels never establish absence.
+    """
+
+    execution_id: str
+    start_tick_100ns: int
+    end_tick_100ns: int
+    flags: int
+    rate_bp: int
+    state: str
+
+    def __post_init__(self):
+        _text(self.execution_id, "execution_id")
+        _int(self.start_tick_100ns, "start_tick_100ns")
+        _int(self.end_tick_100ns, "end_tick_100ns", self.start_tick_100ns)
+        _int(self.flags, "flags", 0, (1 << 32) - 1)
+        _int(self.rate_bp, "rate_bp", 0, 10000)
+        _text(self.state, "state", 64)
+        if not self.flags & 1 or self.rate_bp == 0:
+            raise BenchmarkDataError("native cap interval: positive ENABLE rate required")
+
+    @property
+    def seconds(self):
+        return (self.end_tick_100ns - self.start_tick_100ns) / 10000000.0
+
+
+@dataclass(frozen=True)
 class RunMetrics:
     """Plan section 11.3 報告: the per run figures the report has to carry."""
 
@@ -385,12 +472,21 @@ class RunMetrics:
     time_in_state_s: tuple[tuple[str, float], ...]
     peak_private_commit_mib: float
     peak_physical_mib: float
-    min_headroom_mib: float
+    min_physical_headroom_mib: float
+    min_commit_headroom_mib: float
     monitor_cpu_units: float
     monitor_commit_mib: float
     api_errors: int
     restore_time_s: float | None
     coverage_fraction: float
+    physical_headroom_attribution: HeadroomAttribution
+    commit_headroom_attribution: HeadroomAttribution
+    physical_headroom_evidence_id: str
+    commit_headroom_evidence_id: str
+    native_cap_intervals: tuple[NativeCapInterval, ...]
+    native_cap_audit_complete: bool
+    native_cap_write_audit_sha256: str
+    native_cap_readback_sha256: str
 
     def __post_init__(self):
         for name in ("foreground_p50_ms", "foreground_p95_ms", "foreground_p99_ms",
@@ -399,7 +495,21 @@ class RunMetrics:
                      "monitor_cpu_units", "monitor_commit_mib"):
             _num(getattr(self, name), name)
         _num(self.makespan_s, "makespan_s", 0.0, allow_minimum=False)
-        _finite(self.min_headroom_mib, "min_headroom_mib")
+        for kind in ("physical", "commit"):
+            value = _finite(getattr(self, f"min_{kind}_headroom_mib"), f"{kind} headroom")
+            attribution = getattr(self, f"{kind}_headroom_attribution")
+            _typed(attribution, HeadroomAttribution, f"{kind} attribution")
+            _text(getattr(self, f"{kind}_headroom_evidence_id"), f"{kind} evidence id")
+            if attribution is HeadroomAttribution.WITHIN_RESERVE and value < 4096:
+                raise BenchmarkDataError(f"{kind}: within_reserve contradicts measured minimum")
+        if type(self.native_cap_audit_complete) is not bool:
+            raise BenchmarkDataError("native_cap_audit_complete: boolean required")
+        _sha256(self.native_cap_write_audit_sha256, "native_cap_write_audit_sha256")
+        _sha256(self.native_cap_readback_sha256, "native_cap_readback_sha256")
+        if type(self.native_cap_intervals) is not tuple or len(self.native_cap_intervals) > 10000:
+            raise BenchmarkDataError("native_cap_intervals: bounded tuple required")
+        for interval in self.native_cap_intervals:
+            _typed(interval, NativeCapInterval, "native cap interval")
         _num(self.coverage_fraction, "coverage_fraction", 0.0, 1.0)
         _int(self.api_errors, "api_errors", 0, 1 << 32)
         if self.restore_time_s is not None:
@@ -439,6 +549,8 @@ class RunRecord:
     conditions: FixedConditions
     preconditions: Preconditions
     metrics: RunMetrics
+    comparison: Comparison
+    slot_id: str
     note: str = ""
 
     def __post_init__(self):
@@ -453,8 +565,89 @@ class RunRecord:
         _typed(self.conditions, FixedConditions, "conditions")
         _typed(self.preconditions, Preconditions, "preconditions")
         _typed(self.metrics, RunMetrics, "metrics")
+        _typed(self.comparison, Comparison, "comparison")
+        _sha256(self.slot_id, "slot_id")
+        if self.variant not in COMPARISON_VARIANTS[self.comparison]:
+            raise BenchmarkDataError("variant: not part of this comparison")
         if type(self.note) is not str or len(self.note) > 500:
             raise BenchmarkDataError("note: text up to 500 characters")
+
+
+MAX_RUN_RECORD_BYTES = 2 * 1024 * 1024
+
+
+def run_record_to_dict(record: RunRecord) -> dict:
+    _typed(record, RunRecord, "record")
+    payload = json.dumps(asdict(record), separators=(",", ":"), allow_nan=False)
+    if len(payload.encode("utf-8")) > MAX_RUN_RECORD_BYTES:
+        raise BenchmarkDataError("run record exceeds 2 MiB")
+    return json.loads(payload)
+
+
+def parse_run_record(value: str | bytes | dict) -> RunRecord:
+    """Strict closed schema, bounded JSON and no implicit measured defaults.
+
+    This validates observations, not their authenticity. Native producers must
+    retain and verify the raw artifacts named by the audit and readback hashes.
+    Parsing cannot turn a fixture or a caller-supplied measured label into L4.
+    """
+    def unique_object(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise BenchmarkDataError(f"duplicate JSON key: {key}")
+            result[key] = item
+        return result
+
+    def closed(raw, cls):
+        if type(raw) is not dict or set(raw) != {field.name for field in fields(cls)}:
+            raise BenchmarkDataError(f"{cls.__name__}: exact schema fields required")
+        return dict(raw)
+
+    def bounded_array(raw, name, maximum=10000):
+        if type(raw) is not list or len(raw) > maximum:
+            raise BenchmarkDataError(f"{name}: bounded JSON array required")
+        return raw
+
+    try:
+        if isinstance(value, bytes):
+            if len(value) > MAX_RUN_RECORD_BYTES:
+                raise BenchmarkDataError("run record exceeds 2 MiB")
+            value = value.decode("utf-8")
+        if type(value) is str:
+            if len(value.encode("utf-8")) > MAX_RUN_RECORD_BYTES:
+                raise BenchmarkDataError("run record exceeds 2 MiB")
+            value = json.loads(value, object_pairs_hook=unique_object)
+        elif type(value) is dict:
+            if len(json.dumps(value, allow_nan=False).encode("utf-8")) > MAX_RUN_RECORD_BYTES:
+                raise BenchmarkDataError("run record exceeds 2 MiB")
+        raw = closed(value, RunRecord)
+        condition = closed(raw["conditions"], FixedConditions)
+        condition["cache_state"] = CacheState(condition["cache_state"])
+        pins = bounded_array(condition["build_variant_sha256"], "build variants", 3)
+        if any(type(pair) is not list or len(pair) != 2 for pair in pins):
+            raise BenchmarkDataError("build variants: pairs required")
+        condition["build_variant_sha256"] = tuple((Variant(pair[0]), pair[1]) for pair in pins)
+        raw["conditions"] = FixedConditions(**condition)
+        raw["preconditions"] = Preconditions(**closed(raw["preconditions"], Preconditions))
+        metric = closed(raw["metrics"], RunMetrics)
+        states = bounded_array(metric["time_in_state_s"], "time in state", 100)
+        if any(type(pair) is not list or len(pair) != 2 for pair in states):
+            raise BenchmarkDataError("time in state: pairs required")
+        metric["time_in_state_s"] = tuple(tuple(pair) for pair in states)
+        metric["native_cap_intervals"] = tuple(
+            NativeCapInterval(**closed(interval, NativeCapInterval))
+            for interval in bounded_array(metric["native_cap_intervals"], "native cap intervals"))
+        for kind in ("physical", "commit"):
+            key = f"{kind}_headroom_attribution"
+            metric[key] = HeadroomAttribution(metric[key])
+        raw["metrics"] = RunMetrics(**metric)
+        for key, cls in (("comparison", Comparison), ("variant", Variant),
+                         ("scenario_class", ScenarioClass), ("order_position", OrderPosition)):
+            raw[key] = cls(raw[key])
+        return RunRecord(**raw)
+    except (ValueError, TypeError, UnicodeError, RecursionError) as error:
+        raise BenchmarkDataError(f"invalid run record: {type(error).__name__}") from error
 
 
 def precondition_failures(record: RunRecord) -> tuple[str, ...]:
@@ -502,6 +695,8 @@ def pair_records(
     records: Sequence[RunRecord],
     comparison: Comparison,
     scenario: str,
+    *,
+    schedule: Schedule | None = None,
 ) -> tuple[tuple[PairedRun, ...], tuple[ExcludedRun, ...]]:
     """Match baseline and treatment runs by pair index, excluding unusable runs.
 
@@ -511,18 +706,38 @@ def pair_records(
     baseline_variant, treatment_variant = COMPARISON_VARIANTS[comparison]
     excluded: list[ExcludedRun] = []
     by_slot: dict[tuple[int, Variant], RunRecord] = {}
+    scheduled = {}
+    if schedule is not None:
+        validate_schedule(schedule)
+        scheduled = {slot.slot_id: slot for slot in schedule.slots}
+    seen_ids = set()
+    seen_keys = set()
 
     for record in records:
-        if record.scenario != scenario or record.variant not in (baseline_variant, treatment_variant):
-            continue
-        reasons = precondition_failures(record)
-        if reasons:
-            excluded.append(ExcludedRun(record.run_id, record.scenario, record.variant,
-                                        record.pair_index, reasons))
+        if (record.comparison is not comparison or record.scenario != scenario
+                or record.variant not in (baseline_variant, treatment_variant)):
             continue
         key = (record.pair_index, record.variant)
-        if key in by_slot:
-            raise BenchmarkDataError("pair_index: duplicate run for one variant and pair")
+        if record.run_id in seen_ids or key in seen_keys:
+            raise BenchmarkDataError("duplicate run identity or comparison/scenario/pair/variant")
+        seen_ids.add(record.run_id)
+        seen_keys.add(key)
+        reasons = list(precondition_failures(record))
+        slot = scheduled.get(record.slot_id)
+        if schedule is None:
+            reasons.append("independent preregistered schedule not supplied")
+        elif slot is None:
+            reasons.append("slot absent from preregistered schedule")
+        elif (record.seed != schedule.seed or slot.comparison is not record.comparison
+              or slot.scenario != record.scenario or slot.scenario_class is not record.scenario_class
+              or slot.pair_index != record.pair_index):
+            reasons.append("record identity or seed differs from preregistered schedule")
+        elif ((record.order_position is OrderPosition.FIRST) != (record.variant is slot.first_variant)):
+            reasons.append("record order differs from preregistered schedule")
+        if reasons:
+            excluded.append(ExcludedRun(record.run_id, record.scenario, record.variant,
+                                        record.pair_index, tuple(reasons)))
+            continue
         by_slot[key] = record
 
     pairs: list[PairedRun] = []
@@ -541,6 +756,73 @@ def pair_records(
             continue
         pairs.append(PairedRun(scenario, index, baseline, treatment))
     return tuple(pairs), tuple(excluded)
+
+
+def validate_schedule(schedule: Schedule) -> None:
+    """Verify supplied order against its independently recorded seed and count."""
+    _typed(schedule, Schedule, "schedule")
+    scenarios = tuple(dict.fromkeys((slot.scenario, slot.scenario_class) for slot in schedule.slots))
+    comparisons = tuple(dict.fromkeys(slot.comparison for slot in schedule.slots))
+    expected = build_schedule(scenarios, schedule.seed, schedule.pairs_per_scenario, comparisons)
+    if schedule.slots != expected.slots:
+        raise BenchmarkDataError("schedule: order or slot inventory differs from seed")
+
+
+@dataclass(frozen=True)
+class NoiseEvidence:
+    """Predeclared empirical envelope from independent same-variant repeat pairs.
+
+    The estimator is the maximum absolute paired relative change, separately
+    for foreground p95 and makespan. It is deliberately not a confidence bound.
+    At least ten repeat pairs with the same fixed conditions are required. An
+    envelope above the plan's 5% ceiling is too noisy and needs more evidence;
+    it can never be enlarged to excuse a regression. Each raw pair must be a
+    same-variant repeat, not the treatment/baseline comparison being judged.
+    """
+
+    comparison: Comparison
+    scenario: str
+    seed: str
+    variant: Variant
+    conditions: FixedConditions
+    evidence_source: EvidenceSource
+    evidence_id: str
+    foreground_p95_pairs_ms: tuple[tuple[float, float], ...]
+    makespan_pairs_s: tuple[tuple[float, float], ...]
+    repeat_run_ids: tuple[tuple[str, str], ...]
+    method: str = "max_absolute_paired_change"
+
+    def __post_init__(self):
+        _typed(self.comparison, Comparison, "comparison")
+        _typed(self.variant, Variant, "variant")
+        if self.variant is not COMPARISON_VARIANTS[self.comparison][0]:
+            raise BenchmarkDataError("noise: baseline same-variant calibration required")
+        _text(self.scenario, "scenario")
+        _text(self.seed, "seed")
+        _text(self.evidence_id, "evidence_id")
+        _typed(self.conditions, FixedConditions, "conditions")
+        object.__setattr__(self, "evidence_source", parse_evidence_source(self.evidence_source))
+        if self.method != "max_absolute_paired_change":
+            raise BenchmarkDataError("noise: unsupported predeclared estimator")
+        count = len(self.foreground_p95_pairs_ms)
+        if count != len(self.makespan_pairs_s) or count != len(self.repeat_run_ids) or count > 10000:
+            raise BenchmarkDataError("noise: paired observations and identities must match")
+        seen = set()
+        for raw in (self.foreground_p95_pairs_ms, self.makespan_pairs_s, self.repeat_run_ids):
+            if type(raw) is not tuple:
+                raise BenchmarkDataError("noise: immutable paired observations required")
+            for item in raw:
+                if type(item) is not tuple or len(item) != 2:
+                    raise BenchmarkDataError("noise: two-element pairs required")
+        for left, right in self.foreground_p95_pairs_ms + self.makespan_pairs_s:
+            _num(left, "noise baseline", allow_minimum=False)
+            _num(right, "noise repeat", allow_minimum=False)
+        for identities in self.repeat_run_ids:
+            for identity in identities:
+                _text(identity, "noise run identity")
+                if identity in seen:
+                    raise BenchmarkDataError("noise: repeated calibration run identity")
+                seen.add(identity)
 
 
 # --- pure statistics ---------------------------------------------------------
@@ -690,7 +972,84 @@ def check_cpu_contention(pairs: Sequence[PairedRun]) -> tuple[ThresholdCheck, ..
     )
 
 
-def check_neutral_scenario(pairs: Sequence[PairedRun]) -> tuple[ThresholdCheck, ...]:
+def _noise_checks(pairs: Sequence[PairedRun], noise: NoiseEvidence | None,
+                  *, label="plan 11.3") -> tuple[ThresholdCheck, ...]:
+    reason = None
+    reference = pairs[0].baseline
+    if noise is None:
+        reason = "independent same-variant noise evidence is missing"
+    elif noise.evidence_source is not EvidenceSource.MEASURED:
+        reason = "synthetic noise is not measured evidence"
+    elif len(noise.repeat_run_ids) < MIN_PAIRS_PER_SCENARIO:
+        reason = "at least ten independent same-variant repeat pairs required"
+    elif (noise.comparison is not reference.comparison or noise.scenario != reference.scenario
+          or noise.seed != reference.seed
+          or noise.conditions.comparable_key != reference.conditions.comparable_key
+          or noise.conditions.thermal_or_power_anomaly):
+        reason = "noise identity, seed or fixed conditions differ from the comparison"
+    elif ({identity for identities in noise.repeat_run_ids for identity in identities}
+          & {record.run_id for pair in pairs for record in (pair.baseline, pair.treatment)}):
+        reason = "comparison observations cannot be reused as noise calibration"
+    checks = []
+    for metric, raw_name in (("makespan_s", "makespan_pairs_s"),
+                             ("foreground_p95_ms", "foreground_p95_pairs_ms")):
+        baseline, treatment = _metric_values(pairs, metric)
+        observed = max(0.0, median(relative_changes(baseline, treatment)))
+        envelope = None
+        why = reason
+        if why is None:
+            raw = getattr(noise, raw_name)
+            envelope = max(abs((right - left) / left) for left, right in raw)
+            if envelope > NEUTRAL_MAX_MEDIAN_DEGRADATION:
+                why = "measured noise exceeds the 5 percent ceiling; collect more paired evidence"
+        status = (CheckStatus.UNVERIFIED if why is not None else
+                  CheckStatus.PASS if observed <= envelope else CheckStatus.FAIL)
+        checks.append(ThresholdCheck(
+            f"{metric} within measured noise", status, observed, envelope,
+            f"{label}: " + (why or "maximum absolute paired repeat change; no statistical guarantee")))
+    return tuple(checks)
+
+
+def _native_absence_check(records: Sequence[RunRecord], name: str) -> ThresholdCheck:
+    count = sum(len(record.metrics.native_cap_intervals) for record in records)
+    complete = all(record.metrics.native_cap_audit_complete for record in records)
+    status = (CheckStatus.FAIL if count else
+              CheckStatus.PASS if complete else CheckStatus.UNVERIFIED)
+    return ThresholdCheck(name, status, float(count), 0.0,
+                          "native ENABLE events/intervals including RECOVERING baseline; "
+                          "absence requires complete write audit plus Query readback coverage")
+
+
+def check_measurement_safety(pairs: Sequence[PairedRun]) -> tuple[ThresholdCheck, ...]:
+    """Keep independent reserve/native evidence visible before performance gains."""
+    records = [record for pair in pairs for record in (pair.baseline, pair.treatment)]
+    checks = []
+    complete = all(record.metrics.native_cap_audit_complete for record in records)
+    checks.append(ThresholdCheck("native cap evidence complete",
+                                 CheckStatus.PASS if complete else CheckStatus.UNVERIFIED,
+                                 None, None, "write audit and readback coverage for every run"))
+    uncapped = [record for record in records if record.variant in (Variant.A0, Variant.A1)]
+    if uncapped:
+        checks.append(_native_absence_check(uncapped, "A0/A1 have no Sentinel CPU caps"))
+    for resource in ("physical", "commit"):
+        minimum = min(getattr(record.metrics, f"min_{resource}_headroom_mib") for record in records)
+        unknown = any(getattr(record.metrics, f"{resource}_headroom_attribution")
+                      is HeadroomAttribution.UNKNOWN for record in records)
+        overbooking = any(getattr(record.metrics, f"min_{resource}_headroom_mib") < 4096
+                          and getattr(record.metrics, f"{resource}_headroom_attribution")
+                          is HeadroomAttribution.NEW_ADMISSION for record in records)
+        external = minimum < 4096 and not unknown and not overbooking
+        status = (CheckStatus.FAIL if overbooking else CheckStatus.UNVERIFIED if unknown else
+                  CheckStatus.NOT_APPLICABLE if external else CheckStatus.PASS)
+        checks.append(ThresholdCheck(
+            f"{resource} reserve and attribution", status, minimum, 4096.0,
+            "new admission overbooking fails; unknown cause remains unverified; "
+            "external deficit is not claimed as prevented by B"))
+    return tuple(checks)
+
+
+def check_neutral_scenario(pairs: Sequence[PairedRun],
+                           noise: NoiseEvidence | None = None) -> tuple[ThresholdCheck, ...]:
     """Plan section 11.3, no pressure, I/O dominated and memory dominated scenarios."""
     if not pairs:
         raise BenchmarkDataError("check_neutral_scenario: no pairs")
@@ -698,9 +1057,6 @@ def check_neutral_scenario(pairs: Sequence[PairedRun]) -> tuple[ThresholdCheck, 
     makespan_degradation = median(relative_changes(base_makespan, treat_makespan))
     base_p95, treat_p95 = _metric_values(pairs, "foreground_p95_ms")
     p95_degradation = median(relative_changes(base_p95, treat_p95))
-    capped_seconds = sum(pair.treatment.metrics.seconds_in(state)
-                         for pair in pairs for state in CAPPED_STATE_NAMES)
-
     return (
         ThresholdCheck(
             "makespan degradation median",
@@ -714,15 +1070,12 @@ def check_neutral_scenario(pairs: Sequence[PairedRun]) -> tuple[ThresholdCheck, 
             else CheckStatus.FAIL,
             p95_degradation, NEUTRAL_MAX_MEDIAN_DEGRADATION,
             "plan 11.3: at most 5 percent, and within measured noise"),
-        ThresholdCheck(
-            "no unrelated cap applied",
-            CheckStatus.PASS if capped_seconds == 0.0 else CheckStatus.FAIL,
-            capped_seconds, 0.0,
-            "plan 11.3: B must not apply an unrelated cap in these scenarios"),
-    )
+        _native_absence_check([pair.treatment for pair in pairs], "no unrelated cap applied"),
+    ) + _noise_checks(pairs, noise)
 
 
-def check_observer_cost(pairs: Sequence[PairedRun]) -> tuple[ThresholdCheck, ...]:
+def check_observer_cost(pairs: Sequence[PairedRun],
+                        noise: NoiseEvidence | None = None) -> tuple[ThresholdCheck, ...]:
     """A0 to A1 under clarification C1: A1 sets no cap, so the neutral rule applies.
 
     Plan 11.3 names no A0 to A1 number. C1 reuses the plan's own neutral rule of
@@ -757,11 +1110,12 @@ def check_observer_cost(pairs: Sequence[PairedRun]) -> tuple[ThresholdCheck, ...
             f"{CLARIFICATION_LABEL_C1}: the plan 11.2 monitor CPU rows are keyed on "
             "enrolled Job count, which the run record does not carry, so this is "
             "reported for human judgement"),
-    )
+    ) + _noise_checks(pairs, noise, label=CLARIFICATION_LABEL_C1)
 
 
 def check_a0_b_regression(pairs: Sequence[PairedRun],
-                          scenario_class: ScenarioClass) -> tuple[ThresholdCheck, ...]:
+                          scenario_class: ScenarioClass,
+                          noise: NoiseEvidence | None = None) -> tuple[ThresholdCheck, ...]:
     """Plan section 11.3 veto: if A0 to B regresses overall, B is not promoted.
 
     The plan gives no tolerance for 倒退. Clarification C2 reads the veto with the
@@ -821,6 +1175,9 @@ def check_a0_b_regression(pairs: Sequence[PairedRun],
             makespan_change, NEUTRAL_MAX_MEDIAN_DEGRADATION,
             f"{CLARIFICATION_LABEL_C2}: the plan 11.3 neutral tolerance of 5 percent, "
             "applied to the A0 baseline"))
+        checks.extend(_noise_checks(pairs, noise, label=CLARIFICATION_LABEL_C2))
+        checks.append(_native_absence_check(
+            [pair.treatment for pair in pairs], "no unrelated cap applied"))
     return tuple(checks)
 
 
@@ -846,6 +1203,9 @@ def analyze_comparison(
     scenario: str,
     scenario_class: ScenarioClass,
     min_pairs: int = MIN_PAIRS_PER_SCENARIO,
+    *,
+    schedule: Schedule | None = None,
+    noise: NoiseEvidence | None = None,
 ) -> ComparisonAnalysis:
     """Pair, validate, check and rule on one comparison in one scenario.
 
@@ -859,13 +1219,17 @@ def analyze_comparison(
     _typed(comparison, Comparison, "comparison")
     _text(scenario, "scenario")
     _typed(scenario_class, ScenarioClass, "scenario_class")
-    _int(min_pairs, "min_pairs", 1, 1 << 16)
+    _int(min_pairs, "min_pairs", MIN_PAIRS_PER_SCENARIO, 1 << 16)
 
     baseline_variant, treatment_variant = COMPARISON_VARIANTS[comparison]
     relevant = [record for record in records
-                if record.scenario == scenario
+                if record.comparison is comparison and record.scenario == scenario
                 and record.variant in (baseline_variant, treatment_variant)]
-    pairs, excluded = pair_records(records, comparison, scenario)
+    if any(record.scenario_class is not scenario_class for record in relevant):
+        raise BenchmarkDataError("scenario_class: requested class differs from records")
+    pairs, excluded = pair_records(records, comparison, scenario, schedule=schedule)
+    if len({pair.baseline.conditions.comparable_key for pair in pairs}) > 1:
+        raise BenchmarkDataError("fixed conditions vary between pairs in one comparison")
     notes = [COMPARISON_SCOPE[comparison], sample_size_statement(len(pairs))]
 
     sources = {record.evidence_source for record in relevant}
@@ -879,19 +1243,27 @@ def analyze_comparison(
         if scenario_class in CPU_RULE_SCENARIOS and comparison is Comparison.A1_B:
             checks = check_cpu_contention(pairs)
         elif scenario_class in NEUTRAL_RULE_SCENARIOS and comparison is Comparison.A1_B:
-            checks = check_neutral_scenario(pairs)
+            checks = check_neutral_scenario(pairs, noise)
         elif comparison is Comparison.A0_A1:
-            checks = check_observer_cost(pairs)
+            checks = check_observer_cost(pairs, noise)
         elif comparison is Comparison.A0_B:
-            checks = check_a0_b_regression(pairs, scenario_class)
+            checks = check_a0_b_regression(pairs, scenario_class, noise)
+
+    performance_checks = checks
+    if (noise is not None and noise.evidence_source is EvidenceSource.SYNTHETIC
+            and any("within measured noise" in check.name for check in performance_checks)):
+        evidence = EvidenceSource.SYNTHETIC
+    if pairs:
+        checks += check_measurement_safety(pairs)
 
     verdict = _verdict(comparison, scenario_class, pairs, relevant, evidence, checks,
-                       min_pairs, notes)
+                       min_pairs, notes, performance_checks)
     return ComparisonAnalysis(comparison, scenario, scenario_class, evidence, pairs,
                               excluded, checks, verdict, tuple(notes))
 
 
-def _verdict(comparison, scenario_class, pairs, relevant, evidence, checks, min_pairs, notes):
+def _verdict(comparison, scenario_class, pairs, relevant, evidence, checks, min_pairs, notes,
+             performance_checks):
     if evidence is EvidenceSource.SYNTHETIC:
         notes.append("at least one record is synthetic, so no threshold result counts as evidence")
         return Verdict.NOT_MEASURED
@@ -902,17 +1274,20 @@ def _verdict(comparison, scenario_class, pairs, relevant, evidence, checks, min_
     if len(pairs) < min_pairs:
         notes.append(f"{len(pairs)} valid pairs, plan section 11.3 requires at least {min_pairs}")
         return Verdict.INSUFFICIENT_DATA
-    if not checks:
+    if any(check.status is CheckStatus.FAIL for check in checks):
+        return Verdict.FAIL
+    if any(check.status is CheckStatus.UNVERIFIED for check in checks):
+        notes.append("noise, native audit or reserve attribution remains unverified")
+        return Verdict.INSUFFICIENT_DATA
+    if not performance_checks:
         notes.append("plan section 11.3 states no threshold for this comparison and scenario")
         return Verdict.NO_THRESHOLD_DEFINED
     if (comparison is Comparison.A1_B and scenario_class in CPU_RULE_SCENARIOS
-            and all(check.status is CheckStatus.NOT_APPLICABLE for check in checks)):
+            and all(check.status is CheckStatus.NOT_APPLICABLE for check in performance_checks)):
         notes.append("A1 foreground p95 is already low, so this scenario shows no problem "
                      "worth controlling")
         return Verdict.NO_PROBLEM_TO_CONTROL
-    if any(check.status is CheckStatus.FAIL for check in checks):
-        return Verdict.FAIL
-    if all(check.status is CheckStatus.NOT_APPLICABLE for check in checks):
+    if all(check.status is CheckStatus.NOT_APPLICABLE for check in performance_checks):
         notes.append("plan section 11.3 states no threshold for this comparison and scenario")
         return Verdict.NO_THRESHOLD_DEFINED
     return Verdict.PROMOTE_ELIGIBLE
@@ -929,17 +1304,30 @@ VERDICT_PRECEDENCE = (
 
 
 def overall_verdict(analyses: Sequence[ComparisonAnalysis]) -> Verdict:
-    """The worst verdict across the analyses, with all three comparisons required.
+    """Require the complete seven-scenario by three-comparison matrix.
 
     Plan section 11.3: "不能只選A1↔B而隱藏基礎設施造成的退步". A missing comparison
     is therefore insufficient data, not a silent pass.
     """
     if not analyses:
         return Verdict.INSUFFICIENT_DATA
-    if {analysis.comparison for analysis in analyses} != set(Comparison):
-        if any(analysis.verdict is Verdict.NOT_MEASURED for analysis in analyses):
-            return Verdict.NOT_MEASURED
+    if any(analysis.verdict is Verdict.NOT_MEASURED for analysis in analyses):
+        return Verdict.NOT_MEASURED
+    required = {(comparison, name, kind) for name, kind in DEFAULT_SCENARIOS
+                for comparison in Comparison}
+    actual = [(item.comparison, item.scenario, item.scenario_class) for item in analyses]
+    if len(set(actual)) != len(actual) or set(actual) != required:
         return Verdict.INSUFFICIENT_DATA
+    records = [record for item in analyses for pair in item.pairs
+               for record in (pair.baseline, pair.treatment)]
+    if len({record.run_id for record in records}) != len(records):
+        return Verdict.INSUFFICIENT_DATA
+    if len({record.seed for record in records}) != 1:
+        return Verdict.INSUFFICIENT_DATA
+    for scenario, _kind in DEFAULT_SCENARIOS:
+        if len({record.conditions.comparable_key for record in records
+                if record.scenario == scenario}) != 1:
+            return Verdict.INSUFFICIENT_DATA
     for verdict in VERDICT_PRECEDENCE:
         if any(analysis.verdict is verdict for analysis in analyses):
             return verdict
@@ -990,6 +1378,9 @@ def render_report(
     _text(seed, "seed")
     if not analyses:
         raise BenchmarkDataError("render_report: no analyses")
+    if any(record.seed != seed for item in analyses for pair in item.pairs
+           for record in (pair.baseline, pair.treatment)):
+        raise BenchmarkDataError("report seed differs from analyzed records")
     sources = {analysis.evidence_source for analysis in analyses}
     if EvidenceSource.SYNTHETIC in sources:
         header_source = "synthetic, not evidence for any threshold"
@@ -1038,6 +1429,35 @@ def render_report(
                 f"p75 {_num_text(distribution.p75)}, maximum {_num_text(distribution.maximum)}",
                 "",
             ]
+            lines += [
+                "Per-run resource evidence (MiB); external deficits are not prevention claims:",
+                "",
+                "| run | p50/p99 ms | queue p50/p95 s | private/physical peak MiB | "
+                "physical/Commit minimum MiB | physical/Commit attribution | "
+                "monitor CPU/Commit MiB | API errors | restore s | coverage | native cap events |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            ]
+            for pair in analysis.pairs:
+                for record in (pair.baseline, pair.treatment):
+                    metric = record.metrics
+                    lines.append(
+                        f"| {record.run_id} | {metric.foreground_p50_ms:.2f}/{metric.foreground_p99_ms:.2f} "
+                        f"| {metric.queue_wait_p50_s:.2f}/{metric.queue_wait_p95_s:.2f} "
+                        f"| {metric.peak_private_commit_mib:.2f}/{metric.peak_physical_mib:.2f} "
+                        f"| {metric.min_physical_headroom_mib:.2f}/{metric.min_commit_headroom_mib:.2f} "
+                        f"| {metric.physical_headroom_attribution.value}/{metric.commit_headroom_attribution.value} "
+                        f"| {metric.monitor_cpu_units:.4f}/{metric.monitor_commit_mib:.2f} "
+                        f"| {metric.api_errors} | {_num_text(metric.restore_time_s)} "
+                        f"| {metric.coverage_fraction:.3f} | {len(metric.native_cap_intervals)} |")
+            lines.append("")
+            for pair in analysis.pairs:
+                for record in (pair.baseline, pair.treatment):
+                    lines.append(f"- {record.run_id}: states {record.metrics.time_in_state_s}; "
+                                 f"headroom evidence {record.metrics.physical_headroom_evidence_id}, "
+                                 f"{record.metrics.commit_headroom_evidence_id}; native write/readback "
+                                 f"{record.metrics.native_cap_write_audit_sha256}/"
+                                 f"{record.metrics.native_cap_readback_sha256}")
+            lines.append("")
         if analysis.excluded:
             lines += ["Excluded runs:", ""]
             for item in analysis.excluded:
@@ -1069,8 +1489,8 @@ class BenchmarkRunner(Protocol):
     """What a later stage has to implement to produce measured records.
 
     An implementation launches the workload for one slot and one variant and
-    returns a record whose evidence source is measured. Nothing in this module
-    implements that, because no CPU actuator exists to make variant B real.
+    returns a record with complete raw measurement provenance. Nothing in this
+    pure module launches workloads or proves a native gate.
     """
 
     def run(self, slot: PairSlot, variant: Variant) -> RunRecord:

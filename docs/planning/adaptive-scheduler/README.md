@@ -72,7 +72,7 @@ loader error 或未跑的 native gate 算成 pass。
 | 3. helper sender | Source 接線、獨立 review 與完整 2,298 tests 通過。原生 capability bundle、actual launch/stdio scope producer 尚屬項目 4/6 的缺口，缺證據時不啟用控制。 |
 | 4. release／CLI | Source 整合與完整 2,800 tests 通過；包含 exact discovery、typed operator transport、原子 off／audit、同 owner 收尾與三個 host 的 drain。Native 操作通訊、控制及恢復仍未驗證。 |
 | 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport 前置模組](P2-DAILY-ACTIVATION.md)已作為獨立 foundation 提交，通過 130 portable tests（5.026 秒）；既有 writer 接線、常駐 generation owner、真正 lifetime provider 與明確 source activation 仍待完成。日常 grace 前提未解鎖。 |
-| 6. console 驗收命令 | 已有部分 S1/S2 producer、S3 real-host foundation、P4 cost 與 P6 fixture/analyzer 的本機候選程式；整體 orchestration、部分 fault cases、完整成本／A/B coverage 尚缺。不是只剩 console 執行。 |
+| 6. console 驗收命令 | [P6 schedule／fixture／analyzer foundation](P6-RUNNER-CONTRACT.md)已獨立提交，與 P4 portable 模組合跑 184 tests 通過（0.610 秒）；S1/S2 producer、S3 real-host foundation、P4 cost 仍有本機候選程式。整體 orchestration、部分 fault cases、完整成本／A/B coverage 尚缺，不是只剩 console 執行。 |
 
 以上是目前缺口；下列較早日期的段落保留其歷史測試範圍。Native S1–S3、完整
 P3–P6 都尚未通過。日常 config／Scheduled Task／啟動入口未修改。

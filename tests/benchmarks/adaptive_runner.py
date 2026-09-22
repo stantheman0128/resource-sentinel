@@ -460,6 +460,17 @@ def build_parser():
     analyze.add_argument("--records", required=True, type=Path)
     analyze.add_argument("--noise", type=Path)
     analyze.add_argument("--output", required=True, type=Path)
+    register = commands.add_parser("register-matrix", help="Pin all source, scenario and run identities before native work")
+    register.add_argument("--seed", required=True)
+    register.add_argument("--pairs", type=int, default=10)
+    register.add_argument("--profile-file", type=Path, required=True)
+    register.add_argument("--capability-bundle", type=Path, required=True)
+    register.add_argument("--baseline-source-manifest", type=Path, required=True)
+    register.add_argument("--cache-state", choices=("warm", "cold"), default="warm")
+    register.add_argument("--output", type=Path, required=True)
+    matrix = commands.add_parser("run-matrix", help="Execute the whole paired matrix through original native authorities")
+    matrix.add_argument("--registration", type=Path, required=True)
+    matrix.add_argument("--evidence-dir", type=Path, required=True)
     measure = commands.add_parser("measure-fixture", help="Observe a bounded public command after real continuous admission")
     measure.add_argument("--scenario", choices=[name for name, _ in DEFAULT_SCENARIOS], required=True)
     measure.add_argument("--evidence-dir", type=Path, required=True)
@@ -483,6 +494,40 @@ def main(argv=None):
             return 0
         if args.command == "analyze":
             print(json.dumps(analyze_files(args.schedule, args.records, args.noise, args.output)))
+            return 0
+        if args.command == "register-matrix":
+            from tests.benchmarks.adaptive_orchestrator import create_registration, required_episodes
+            registration = create_registration(root=ROOT, order_seed=args.seed, pairs_per_scenario=args.pairs,
+                profile_path=args.profile_file, capability_bundle=args.capability_bundle,
+                baseline_source_manifest=args.baseline_source_manifest, cache_state=args.cache_state)
+            _write_new(args.output, asdict(registration))
+            print(json.dumps({"status": "registered", "registration_sha256": registration.sha256,
+                              "episodes": len(required_episodes(registration)), "promotion_permitted": False}))
+            return 0
+        if args.command == "run-matrix":
+            from tests.benchmarks.adaptive_orchestrator import MatrixUnsettled, parse_registration, run_native_matrix
+            registration = parse_registration(_read_json(args.registration))
+            try:
+                result = run_native_matrix(registration, args.evidence_dir)
+            except MatrixUnsettled as pending:
+                try:
+                    print(json.dumps({"status": "pending", "reason": pending.reason,
+                                      "original_native_owner_retained": True}), flush=True)
+                except BaseException:
+                    # A lost console must not discard the native owner while
+                    # the original authority is restoring/draining its scope.
+                    pass
+                while True:
+                    try:
+                        if pending.recover_once():
+                            return 3
+                        time.sleep(1)
+                    except (Exception, KeyboardInterrupt):
+                        try:
+                            time.sleep(1)
+                        except KeyboardInterrupt:
+                            pass
+            print(json.dumps(result))
             return 0
         spec = FixtureSpec(args.scenario, args.tasks, args.units, args.memory_mib, args.seconds)
         result = run_raw_fixture(args.evidence_dir, spec)

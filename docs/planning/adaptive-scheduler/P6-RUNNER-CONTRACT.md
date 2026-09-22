@@ -1,7 +1,8 @@
 # P6 schedule, evidence schema and external measurement producer
 
-Status: source foundation and portable tests verified; native execution has
-not been performed. This document does not close P6, grant a capability, or
+Status: the initial source foundation and portable tests were verified. The
+subsequent whole-matrix coordinator, raw reducer and scope fixture await central
+tests; native execution has not been performed. This document does not close P6, grant a capability, or
 authorize daily-runtime activation. Formal plan §11.1–§11.4 remains authoritative.
 
 ## Scope and current limit
@@ -20,6 +21,14 @@ wrapper path, managed A1/B lifecycle, complete native cap write/readback audit,
 monitoring-process cost, or clean between-run CPU/Commit return merely by
 running a Python command. Those are explicit missing qualifications in its
 artifact; it never fabricates a `RunRecord` with zeros or `True` preconditions.
+
+The subsequent source adds `adaptive_orchestrator.py` and
+`adaptive_measurements.py`. `run-matrix` coordinates the complete experiment
+through an original in-process native pass owner; it does not upgrade the raw
+fixture command into an A/B result. The required real provider bridge is still
+unavailable. The coordinator, reducers and native workload fixtures are
+independently implemented and remain executable only when that bridge supplies
+actual authority and observations.
 
 The current continuous-admission prerequisite rejects execution. The real daily
 Coordinator's live consumer cohort and persistent demand floor must be deployed
@@ -169,7 +178,10 @@ C:\Python313\python.exe scripts/adaptive-ab.py measure-fixture --scenario cpu_bo
 This currently records a blocked prerequisite before any fixture launch unless
 the actual retained daily continuous-admission provider is available. Passing an
 alternate data directory is not offered. Four public fixture scenarios are
-implemented; the three scope-sensitive scenarios are explicitly blocked.
+supported by the raw command; it continues to reject the three scope-sensitive
+scenarios. The whole-matrix coordinator specifies all seven. Its separate native
+scope fixture implements unmanaged CPU and root/child lifetimes, while actual
+mixed-role/grant construction belongs to the retained native bridge.
 
 Once verified native producers supply the complete strict RunRecord and noise
 schemas, the read-only report command is:
@@ -184,6 +196,113 @@ native cap write/readback audit, exact monitor/wrapper cost coverage, queue/stat
 intervals, between-run native empty/disabled and baseline return, three
 scope-sensitive scenarios, and fixed non-private IDE/terminal interaction
 observations. None is replaced by portable test results or a `measured` label.
+
+## Whole-matrix execution contract
+
+`register-matrix` creates an immutable registration containing the seed, pair
+count, actual source-byte hashes (including uncommitted implementation), policy
+profile hash, capability bundle hash, baseline-source-manifest hash and cache
+condition. These pins describe intended measurements; they are not native
+authority. The real bridge must check them against the actual running cohort,
+original baseline and capability scope before starting.
+
+The fixed matrix has seven scenarios and all three comparisons. At the minimum
+ten pairs it executes 420 comparison runs plus 420 independent same-baseline
+noise runs. Calibration is preregistered and collected before comparison runs;
+no treatment outcome selects its calibration. Every run gets a deterministic
+unique UUID derived from registration/comparison/scenario/pair/variant/purpose
+and repeat index. Only one episode owns native workload scope at a time.
+
+Each episode persists its intent before opening authority or launching. The
+bridge registers its own custody before any side effect in `open_episode`.
+The coordinator verifies baseline, calls `start()` exactly once, captures real
+observations, then requires positive restore, native empty, bookkeeping and
+custody cleanup before reducing data or starting the next episode. A failed
+sample, unsafe native result, disk-write failure or interruption does not retry
+the workload. Recovery holds the same original pass and episode owners. Missing,
+unknown or failed custody metadata is not a positive cleanup result.
+
+The native bridge API is narrow and fixed to this experiment:
+
+```text
+real_daily_coverage.open_p6_pass(registration, directory) -> original pass owner
+pass: assert_unchanged(), open_episode(spec, directory), recover_once(), close()
+pass: pending_custody (explicit bool; False only after positive settlement)
+episode: run_id, verify_baseline(), start(), observe(), restore_and_drain()
+episode: cleanup_complete, finish_trace() -> NativeEpisodeObservation
+```
+
+`pending_custody` reports unresolved or live episode custody; holding the pass
+registration/fence alone does not make it true. `cleanup_complete` is a retained
+native result, not a JSON receipt. The pass owner retains partial construction
+before returning an episode. Invalid bridge returns, admission exceptions that
+retain an owner, or failure while recording a blocked prerequisite preserve the
+original coverage authority. A rejected unexpected native object is retained
+as unverified custody rather than given a guessed recovery method.
+Pass and daily coverage obligations are both retained: settling only the pass
+cannot publish a complete result or finish recovery. Separately retained
+acquisition custody remains a blocker too. A broken console or failure to write
+the blocked artifact cannot discard those original objects.
+
+This bridge is under implementation in the shared native validation work. Its
+absence currently stops `run-matrix` before a workload. A static prerequisite
+report, ordinary reservation ID, callback returning success, or alternate DB
+cannot implement it.
+
+The native baseline helper requires ten contiguous measured reference windows
+and five contiguous return windows with the same clock/conditions. Return CPU
+and Commit must fit the previously observed maxima, with native prior scopes
+empty, caps disabled, original cleanup settled, and physical/Commit reserves
+intact. No guessed tolerance or value from capped usage changes this envelope.
+The bridge must produce these observations from actual native/read-only sources;
+the pure helper itself cannot prove them.
+
+The raw reducer validates complete UI/machine/process/state/lifecycle coverage.
+Admission wait is included in batch makespan, and the last surviving child's
+finish determines the end. Independently enumerated monitor and wrapper
+identities must have exact counter coverage; missing identities cannot become
+zero cost. CPU includes bounded collection tails, and Private Commit is clearly
+labelled a sum-of-process-peaks upper bound, not a simultaneous batch peak.
+Precise Job/control coverage may be zero for unmanaged work while its raw
+observations remain complete.
+
+Each demand also pins its original owner, role, priority and scope artifact.
+Enabled caps require owned background P2/P3 work. A clock/policy/epoch/logon-bound
+grant audit covers the full execution scope with contiguous revisioned windows,
+explicit original authorization and unchanged original deadlines; cap overlap
+with a live scoped grant rejects the trace. These checks observe existing grant
+authority and never create, renew or revoke a lease.
+
+For A0 or unmanaged work outside a Job, every original live fixture member needs
+native `IsProcessInJob(NULL)=False` observations covering its lifetime. No disabled
+Job query is manufactured for this scope. A trace with no owned Jobs may honestly
+have empty cap execution, event and writer inventories; missing process or grant
+observations still cannot become empty evidence.
+
+Native provenance binds raw trace, run, clock, artifacts, variant, seed, purpose
+and comparison slot where applicable. Calibration has its own purpose and no
+invented comparison slot. The reducer's provenance checks describe integrity
+and binding, not proof that an arbitrary caller invoked Windows APIs. Only the
+native bridge issues those receipts, and later gate verification must inspect
+the original artifacts.
+
+Per-episode safety stops the remaining matrix for API errors, incomplete audit,
+prohibited A0/A1 or neutral B caps, overlapping native victims, new-admission
+reserve losses or unknown attribution. The full matrix result aggregates every
+required run and separately exposes the analyzer verdict. Even a complete
+measured matrix cannot itself enable LIMITED mode; missing qualitative policy
+for mixed/unmanaged performance remains explicit.
+
+Example source-pinned registration and execution:
+
+```powershell
+C:\Python313\python.exe scripts/adaptive-ab.py register-matrix --seed p6-review-001 --pairs 10 --profile-file C:\isolated\p6\profile.json --capability-bundle C:\isolated\capability\bundle.json --baseline-source-manifest C:\isolated\p6\baseline-source.json --cache-state warm --output C:\isolated\p6\registration.json
+C:\Python313\python.exe scripts/adaptive-ab.py run-matrix --registration C:\isolated\p6\registration.json --evidence-dir C:\isolated\p6\new-pass
+```
+
+No source, config, DB, Scheduled Task or policy entrypoint is deployed by these
+commands. Native trials continue to require the separate proven authority and
+authorized runtime preparation.
 
 Portable validation targets:
 
@@ -203,3 +322,9 @@ The tests used the protected dirty integration baseline and adjacent uncommitted
 work. They do not establish a clean-clone run, complete A0/A1/B orchestration,
 native measurement, or permission to promote. No native measurement/control or
 daily runtime change was performed.
+
+Additional central targets for the subsequent source (not run by the subtask):
+
+```powershell
+C:\Python313\python.exe -m unittest tests.test_adaptive_orchestrator tests.test_adaptive_measurements tests.test_adaptive_scope_workload -q
+```

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import replace
 import io
 import json
@@ -13,6 +14,20 @@ import zipfile
 
 from tests.benchmarks import adaptive_runner as runner
 from tests.fixtures import adaptive_workload as workload
+
+
+@contextmanager
+def fabricated_raw_run(*, scope=None, setup_error=None):
+    """Pure fault seam: no native provider, process or sampler is executed."""
+    scope = Mock() if scope is None else scope
+    custody = runner.RawAdmissionCustody(scope, finisher=scope.finish)
+    with tempfile.TemporaryDirectory() as parent, patch.object(runner, "_require_platform"), \
+            patch.object(runner, "_real_admission", return_value=custody), \
+            patch.object(runner, "_source_state", return_value={}, side_effect=setup_error), \
+            patch.object(runner, "_power_plan", return_value="fixed"), \
+            patch.object(runner.WindowsFixtureObserver, "measure", return_value={
+                "status": "observed", "ab_record_produced": False, "promotion_permitted": False}):
+        yield Path(parent) / "run", custody, scope
 
 
 class FixtureSpecificationTests(unittest.TestCase):
@@ -97,7 +112,8 @@ class RealAdmissionBoundaryTests(unittest.TestCase):
         raw = {"status": "observed", "ab_record_produced": False, "promotion_permitted": False,
                "missing_qualifications": ["native_cap_write_audit"]}
         with tempfile.TemporaryDirectory() as parent, patch.object(runner, "_require_platform"), \
-                patch.object(runner, "_real_admission", return_value=admission), \
+                patch.object(runner, "_real_admission", return_value=runner.RawAdmissionCustody(
+                    admission, finisher=admission.finish)), \
                 patch.object(runner, "_source_state", return_value={}), \
                 patch.object(runner, "_power_plan", return_value="fixed"), \
                 patch.object(runner.WindowsFixtureObserver, "measure", return_value=raw):
@@ -111,7 +127,8 @@ class RealAdmissionBoundaryTests(unittest.TestCase):
         admission.finish.side_effect = [runner.MeasurementBlocked("cleanup_unknown"), None]
         raw = {"status": "observed", "ab_record_produced": False, "promotion_permitted": False}
         with tempfile.TemporaryDirectory() as parent, patch.object(runner, "_require_platform"), \
-                patch.object(runner, "_real_admission", return_value=admission), \
+                patch.object(runner, "_real_admission", return_value=runner.RawAdmissionCustody(
+                    admission, finisher=admission.finish)), \
                 patch.object(runner, "_source_state", return_value={}), \
                 patch.object(runner, "_power_plan", return_value="fixed"), \
                 patch.object(runner.WindowsFixtureObserver, "measure", return_value=raw):
@@ -124,6 +141,254 @@ class RealAdmissionBoundaryTests(unittest.TestCase):
             pending.retry()
             self.assertTrue(json.loads((directory / "cleanup-settled.json").read_text())["admission_cleanup_settled"])
             self.assertEqual(admission.finish.call_count, 2)
+
+    def test_failed_initial_coverage_check_retains_original_validated_finisher(self):
+        scope = Mock(spec_set=["assert_covered", "acknowledge_fixture_exit", "finish"])
+        primary = KeyboardInterrupt()
+        scope.assert_covered.side_effect = primary
+        with patch("tests.windows.adaptive_admission.require_continuous_admission", return_value=scope), \
+                self.assertRaises(runner.RawAcquisitionPending) as caught:
+            runner._real_admission(runner.FixtureSpec("cpu_bound_build", 1, 1))
+        pending = caught.exception
+        self.assertIs(pending.custody.scope, scope)
+        self.assertIs(pending.primary, primary)
+        scope.finish.assert_not_called()
+        pending.custody.finish()
+        scope.finish.assert_called_once_with()
+
+    def test_unknown_scope_does_not_get_a_guessed_finish_call(self):
+        scope = type("IncompleteScope", (), {"finish": Mock()})()
+        with patch("tests.windows.adaptive_admission.require_continuous_admission", return_value=scope), \
+                self.assertRaises(runner.RawAcquisitionPending) as caught:
+            runner._real_admission(runner.FixtureSpec("cpu_bound_build", 1, 1))
+        self.assertIs(caught.exception.custody.scope, scope)
+        with self.assertRaisesRegex(runner.MeasurementBlocked, "cleanup_api_unavailable"):
+            caught.exception.custody.finish()
+        scope.finish.assert_not_called()
+
+    def test_provider_partial_acquisition_preserves_all_native_owners(self):
+        from tests.windows.adaptive_capability_runner import NativeRunUnsettled
+        scope, extra = Mock(), object()
+        primary = NativeRunUnsettled(scope, additional_custody=extra)
+        with tempfile.TemporaryDirectory() as parent, patch.object(runner, "_require_platform"), \
+                patch("tests.windows.adaptive_admission.require_continuous_admission", side_effect=primary), \
+                patch.object(runner.subprocess, "Popen") as launch, \
+                self.assertRaises(runner.PendingAdmissionCleanup) as caught:
+            runner.run_raw_fixture(Path(parent) / "run", runner.FixtureSpec("cpu_bound_build", 1, 1))
+        held = caught.exception
+        self.assertIs(held.scope, scope)
+        self.assertIs(held.primary, primary)
+        self.assertIs(held.custody.additional_custody.additional_custody, extra)
+        self.assertIsNone(held.custody.finisher)
+        launch.assert_not_called()
+        scope.finish.assert_not_called()
+
+    def test_native_custody_from_initial_coverage_check_blocks_raw_finish(self):
+        from tests.windows.adaptive_capability_runner import NativeRunUnsettled
+        scope = Mock(spec_set=["assert_covered", "acknowledge_fixture_exit", "finish"])
+        extra = object()
+        primary = NativeRunUnsettled(object(), additional_custody=extra)
+        scope.assert_covered.side_effect = primary
+        with patch("tests.windows.adaptive_admission.require_continuous_admission", return_value=scope), \
+                self.assertRaises(runner.RawAcquisitionPending) as caught:
+            runner._real_admission(runner.FixtureSpec("cpu_bound_build", 1, 1))
+        custody = caught.exception.custody
+        self.assertIs(custody.additional_custody, primary)
+        with self.assertRaisesRegex(runner.MeasurementBlocked, "cleanup_api_unavailable"):
+            custody.finish()
+        scope.finish.assert_not_called()
+
+    def test_initial_coverage_failure_is_cleaned_before_returning_blocked(self):
+        scope = Mock(spec_set=["assert_covered", "acknowledge_fixture_exit", "finish"])
+        scope.assert_covered.side_effect = runner.MeasurementBlocked("fixture_coverage_failed")
+        with tempfile.TemporaryDirectory() as parent, patch.object(runner, "_require_platform"), \
+                patch("tests.windows.adaptive_admission.require_continuous_admission", return_value=scope), \
+                patch.object(runner.subprocess, "Popen") as launch:
+            result = runner.run_raw_fixture(Path(parent) / "run", runner.FixtureSpec("cpu_bound_build", 1, 1))
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["reason"], "fixture_coverage_failed")
+        self.assertTrue(result["admission_cleanup_settled"])
+        scope.finish.assert_called_once_with()
+        launch.assert_not_called()
+
+    def test_throwing_diagnostic_property_cannot_skip_original_scope_cleanup(self):
+        class BadDiagnostic(Exception):
+            @property
+            def reason(self):
+                raise OSError("fixture diagnostic getter failed")
+        scope = Mock(spec_set=["assert_covered", "acknowledge_fixture_exit", "finish"])
+        scope.assert_covered.side_effect = BadDiagnostic()
+        with tempfile.TemporaryDirectory() as parent, patch.object(runner, "_require_platform"), \
+                patch("tests.windows.adaptive_admission.require_continuous_admission", return_value=scope):
+            result = runner.run_raw_fixture(Path(parent) / "run", runner.FixtureSpec("cpu_bound_build", 1, 1))
+        self.assertEqual(result["reason"], "ab_error_reason_unavailable")
+        self.assertTrue(result["admission_cleanup_settled"])
+        scope.finish.assert_called_once_with()
+
+
+class RawCleanupFailureTests(unittest.TestCase):
+    def test_original_interrupt_cannot_bypass_failed_cleanup(self):
+        primary = KeyboardInterrupt()
+        with fabricated_raw_run(setup_error=primary) as (directory, custody, scope):
+            scope.finish.side_effect = OSError("fixture cleanup failed")
+            with self.assertRaises(runner.PendingAdmissionCleanup) as caught:
+                runner.run_raw_fixture(directory, runner.FixtureSpec("cpu_bound_build", 1, 1))
+            self.assertIs(caught.exception.custody, custody)
+            self.assertIs(caught.exception.primary, primary)
+            self.assertFalse(custody.cleanup_complete)
+
+    def test_throwing_cleanup_diagnostic_still_retains_pending_owner(self):
+        class BadDiagnostic(Exception):
+            @property
+            def reason(self):
+                raise KeyboardInterrupt()
+        with fabricated_raw_run() as (directory, custody, scope):
+            primary = BadDiagnostic()
+            scope.finish.side_effect = primary
+            with self.assertRaises(runner.PendingAdmissionCleanup) as caught:
+                runner.run_raw_fixture(directory, runner.FixtureSpec("cpu_bound_build", 1, 1))
+            self.assertIs(caught.exception.custody, custody)
+            self.assertIs(caught.exception.primary, primary)
+            self.assertEqual(caught.exception.reason, "ab_error_reason_unavailable")
+
+    def test_explicit_native_custody_from_finish_cannot_disappear_on_retry(self):
+        from tests.windows.adaptive_capability_runner import NativeRunUnsettled
+        with fabricated_raw_run() as (directory, custody, scope):
+            primary = NativeRunUnsettled(object(), additional_custody=object())
+            scope.finish.side_effect = [primary, None]
+            with self.assertRaises(runner.PendingAdmissionCleanup) as caught:
+                runner.run_raw_fixture(directory, runner.FixtureSpec("cpu_bound_build", 1, 1))
+            self.assertIs(custody.additional_custody, primary)
+            with self.assertRaisesRegex(runner.MeasurementBlocked, "cleanup_api_unavailable"):
+                caught.exception.retry()
+            scope.finish.assert_called_once_with()
+
+    def test_explicit_native_custody_from_observer_is_retained_before_finish(self):
+        from tests.windows.adaptive_capability_runner import NativeRunUnsettled
+        with fabricated_raw_run() as (directory, custody, scope):
+            primary = NativeRunUnsettled(object(), additional_custody=object())
+            with patch.object(runner.WindowsFixtureObserver, "measure", side_effect=primary), \
+                    self.assertRaises(runner.PendingAdmissionCleanup) as caught:
+                runner.run_raw_fixture(directory, runner.FixtureSpec("cpu_bound_build", 1, 1))
+            self.assertIs(custody.additional_custody, primary)
+            self.assertIs(caught.exception.primary, primary)
+            scope.finish.assert_not_called()
+
+    def test_interrupt_inside_finish_retains_same_scope(self):
+        for error in (KeyboardInterrupt(), SystemExit(2)):
+            with self.subTest(error=type(error).__name__), fabricated_raw_run() as (directory, custody, scope):
+                scope.finish.side_effect = error
+                with self.assertRaises(runner.PendingAdmissionCleanup) as caught:
+                    runner.run_raw_fixture(directory, runner.FixtureSpec("cpu_bound_build", 1, 1))
+                self.assertIs(caught.exception.scope, scope)
+                self.assertIs(caught.exception.primary, error)
+
+    def test_evidence_failure_does_not_replace_pending_cleanup(self):
+        for write_error in (OSError("fixture disk full"), KeyboardInterrupt()):
+            with self.subTest(error=type(write_error).__name__), fabricated_raw_run() as (directory, custody, scope):
+                scope.finish.side_effect = OSError("fixture cleanup failed")
+                with patch.object(runner, "_write_new", side_effect=write_error), \
+                        self.assertRaises(runner.PendingAdmissionCleanup) as caught:
+                    runner.run_raw_fixture(directory, runner.FixtureSpec("cpu_bound_build", 1, 1))
+                self.assertIs(caught.exception.custody, custody)
+                self.assertIs(caught.exception.__cause__, write_error)
+
+    def test_evidence_failure_after_positive_cleanup_does_not_refinish(self):
+        with fabricated_raw_run() as (directory, custody, scope):
+            with patch.object(runner, "_write_new", side_effect=OSError("fixture disk full")), \
+                    self.assertRaises(OSError):
+                runner.run_raw_fixture(directory, runner.FixtureSpec("cpu_bound_build", 1, 1))
+            self.assertTrue(custody.cleanup_complete)
+            custody.finish()
+            scope.finish.assert_called_once_with()
+
+    def test_retry_publication_failure_does_not_repeat_native_finish_or_overwrite(self):
+        scope = Mock()
+        custody = runner.RawAdmissionCustody(scope, finisher=scope.finish)
+        pending = runner.PendingAdmissionCleanup(custody, Path("unused"), {}, "fixture_pending")
+        with patch.object(runner, "_write_new", side_effect=OSError("fixture disk full")) as publish:
+            first = pending.retry()
+            second = pending.retry()
+        self.assertIs(first, second)
+        self.assertTrue(first["admission_cleanup_settled"])
+        self.assertFalse(first["cleanup_evidence_written"])
+        self.assertEqual(first["cleanup_evidence_error"], "OSError")
+        scope.finish.assert_called_once_with()
+        publish.assert_called_once()
+
+    def test_original_interrupt_is_rethrown_only_after_positive_cleanup(self):
+        primary = KeyboardInterrupt()
+        with fabricated_raw_run(setup_error=primary) as (directory, custody, scope):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                runner.run_raw_fixture(directory, runner.FixtureSpec("cpu_bound_build", 1, 1))
+            self.assertIs(caught.exception, primary)
+            self.assertTrue(custody.cleanup_complete)
+            scope.finish.assert_called_once_with()
+
+    def test_broken_pending_console_does_not_discard_recovery(self):
+        custody = runner.RawAdmissionCustody(object())
+        pending = runner.PendingAdmissionCleanup(custody, Path("unused"), {}, "fixture_pending")
+        pending.retry = Mock(return_value={"admission_cleanup_settled": True})
+        with patch.object(runner, "run_raw_fixture", side_effect=pending), \
+                patch("builtins.print", side_effect=BrokenPipeError("fixture console closed")):
+            result = runner.main(["measure-fixture", "--scenario", "cpu_bound_build", "--units", "1",
+                                  "--evidence-dir", "unused"])
+        self.assertEqual(result, 3)
+        pending.retry.assert_called_once_with()
+
+
+class RawFixtureCustodyTests(unittest.TestCase):
+    def test_launch_attempt_is_registered_before_constructor_and_never_replayed(self):
+        owner = runner.RawFixtureCustody()
+        primary = KeyboardInterrupt()
+        def partial_create(*args, **kwargs):
+            self.assertEqual(len(owner.launches), 1)
+            self.assertIsNone(owner.launches[0]["process"])
+            raise primary
+        with patch.object(runner.subprocess, "Popen", side_effect=partial_create) as create, \
+                self.assertRaises(KeyboardInterrupt):
+            owner.launch(["fixture"], stop_file=Path("unused"))
+        self.assertIs(owner.launches[0]["error"], primary)
+        for _ in range(2):
+            with self.assertRaisesRegex(runner.MeasurementBlocked, "fixture_custody_pending"):
+                owner.cleanup()
+        create.assert_called_once()
+
+    def test_failed_first_cleanup_still_attempts_second_original_child(self):
+        owner = runner.RawFixtureCustody()
+        first, second = Mock(), Mock()
+        with patch.object(runner.subprocess, "Popen", side_effect=[first, second]):
+            owner.launch(["first"], stop_file=Path("one"))
+            owner.launch(["second"], stop_file=Path("two"))
+        with patch.object(runner, "_wait_cooperatively", side_effect=[OSError("fixture stop failed"), None]) as wait, \
+                self.assertRaisesRegex(runner.MeasurementBlocked, "fixture_custody_pending"):
+            owner.cleanup()
+        self.assertEqual([call.args[0] for call in wait.call_args_list], [first, second])
+        self.assertFalse(owner.launches[0]["settled"])
+        self.assertTrue(owner.launches[1]["settled"])
+        with patch.object(runner, "_wait_cooperatively") as wait:
+            owner.cleanup()
+        wait.assert_called_once_with(first, Path("one"))
+
+    def test_unknown_child_creation_prevents_admission_finish(self):
+        scope = Mock()
+        custody = runner.RawAdmissionCustody(scope, finisher=scope.finish)
+        custody.fixture = runner.RawFixtureCustody()
+        with patch.object(runner.subprocess, "Popen", side_effect=OSError("fixture partial creation")), \
+                self.assertRaises(OSError):
+            custody.fixture.launch(["fixture"], stop_file=Path("unused"))
+        with self.assertRaisesRegex(runner.MeasurementBlocked, "fixture_custody_pending"):
+            custody.finish()
+        self.assertFalse(custody.cleanup_complete)
+        scope.finish.assert_not_called()
+
+    def test_already_exited_original_child_needs_no_stop_file_write(self):
+        child, stop = Mock(), Mock()
+        child.poll.return_value = 0
+        stop.touch.side_effect = OSError("fixture disk unavailable")
+        runner._wait_cooperatively(child, stop)
+        stop.touch.assert_not_called()
+        child.wait.assert_not_called()
 
 
 class ScheduleArtifactTests(unittest.TestCase):

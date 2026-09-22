@@ -71,8 +71,8 @@ loader error 或未跑的 native gate 算成 pass。
 | 2. 裁決 ④ | 契約與 source 完成；最後完整 adaptive 2,127 tests 通過。沒有舊 witness 的 cold adoption 仍不支援；native recovery 未驗證。 |
 | 3. helper sender | Source 接線、獨立 review 與完整 2,298 tests 通過。後續 original launch/stdio provenance、guardian scope 比對與 helper proposal adapter 已接線，344 targeted tests 通過（30.960 秒，含 30 個專用 scope tests）。實際 S2 topology producer／native bundle／新增採集成本仍未驗證，缺證據不啟用控制。 |
 | 4. release／CLI | Source 整合與完整 2,800 tests 通過；包含 exact discovery、typed operator transport、原子 off／audit、同 owner 收尾與三個 host 的 drain。後續 rootless C2 post-close receipt 已補上，保持原 terminal state，不偽造 FINISHED；新增 29 個案例。232 targeted tests 中 231 通過，唯一錯誤文字預期修正後單獨重跑通過，production 未因該失敗改動。沒有原始 close 證據的舊歷史仍 unknown。Native 操作通訊、控制及恢復仍未驗證。 |
-| 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport 與接線](P2-DAILY-ACTIVATION.md)已完成 source installer、原始 owner 常駐 host，以及 Coordinator／Maintainer／lifecycle／legacy writer 接線。252 個 portable tests 與 27 個 S2 tests 合跑全過（279，10.587 秒）。真正 experiment lifetime provider、generation 正式退場及 native source handoff 仍缺；日常 grace 前提未解鎖，未執行安裝。 |
-| 6. console 驗收命令 | [P6 schedule／fixture／analyzer foundation](P6-RUNNER-CONTRACT.md)已提交，與 P4 portable 模組合跑 184 tests 通過（0.610 秒）；[S1/S2 與 ledger bridge 契約](S1-DAILY-BRIDGE-CONTRACT.md)、[S3 foundation](S3-REAL-HOST-RECOVERY.md)、[P4 cost engine](P4-OVERHEAD-RUNNER.md)另有 161 tests 通過（41.676 秒）。S2 隨後補強原 shell／console cleanup custody，27 tests 在上述 279 合跑中通過。這些 foundation 分包提交；真正 daily bridge、完整 orchestration、部分 fault cases、完整成本／A/B coverage 尚缺，不是只剩 console 執行。 |
+| 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport 與接線](P2-DAILY-ACTIVATION.md)已完成 installer、常駐 owner 與日常 consumers 接線，279 tests 通過（10.587 秒）。同帳本 demand／retirement fence 已提交，與 P6 合跑 308 tests 通過（21.977 秒）。真正 native experiment provider、generation 完整退場與 fresh restart 仍待整合；未執行日常安裝，grace 前提未解鎖。 |
+| 6. console 驗收命令 | [P6 矩陣編排與 raw reducer](P6-RUNNER-CONTRACT.md)、[S1/S2 bridge 契約](S1-DAILY-BRIDGE-CONTRACT.md)、[S3 精確故障點與 14×10 記錄器](S3-REAL-HOST-RECOVERY.md)、[P4 實際 host 成本量測](P4-OVERHEAD-RUNNER.md)已提交。最新 P4 155 tests 通過（12.967 秒）；S3／memory／helper 在 459 合跑中通過，唯一 P4 fixture error 已修正並重跑。Actual provider、部分 S3 故障 driver／完整 orchestration、A0 等價性與 bounded telemetry／非阻塞 operator source 仍缺；不是只剩 console 執行。 |
 
 最新追加：項目 5 的同帳本 demand 與 retirement fence 已提交為 `1072786`／
 `a48925a`；native scope 和正向 release 仍未提供。項目 6 的 P6 矩陣編排及 raw
@@ -86,7 +86,7 @@ reducer 已提交為 `ff6f31b`，S3 原始 action cutpoints／三個實際故障
 P3–P6 都尚未通過。日常 config／Scheduled Task／啟動入口未修改。
 
 下一步是項目 5 同一日常帳本的 native evidence fixture 全程容量覆蓋，以及
-generation 的正面退場契約。新增測試將繼續使用隔離帳本；任何實際
+generation 的正面退場實作與驗證。新增測試將繼續使用隔離帳本；任何實際
 日常 source activation 都需要獨立授權，不因 commit/push 自動執行。項目 6
 尚未完成的內容不能以 mock、空 provider、另外一個 DB 或假量測取代。
 
@@ -132,6 +132,17 @@ daily-generation owner，不能只提供任意同 logon 的 live process；現�
 idle poll 可花 50 ms，尚未證明符合 tick p95；stderr reports 仍需實際 bounded
 storage 實作。既有 idle-after log bytes 不可大於 idle-before 的 gate 比正式計畫
 bounded growth 更嚴格，尚未放寬或忽略其失敗。所有 native 成本門檻仍未驗證。
+
+舊 raw-only measurement runner 已補上 partial acquisition、`Popen` 前的原始
+launch custody、雙 child cleanup、Ctrl+C／artifact／stdout 失敗保留，以及完成後
+不可重複 native finish。新增 20 案例；兩模組 **70 tests 通過（1.727 秒，
+0 failures／errors／skips）**。首次 70 tests 有四個 fixture errors，全部是 Mock
+未宣告 `assert_covered` 介面；改用明確 `spec_set` 後重跑，未放寬 production。
+Raw provider 仍被阻擋；此修補不代表 A0 qualification 或 native P6 完成。
+
+```text
+C:\Python313\python.exe -m unittest tests.test_adaptive_runner tests.test_adaptive_orchestrator -q
+```
 
 另修正 source keeper 在 stdout 失效時略過等待、持續忙轉的問題：診斷與 pacing
 分開，保持同一原始 operation，固定每個錯誤邊界只保留第一個錯誤。

@@ -43,18 +43,130 @@ class MeasurementBlocked(RuntimeError):
         super().__init__(reason)
 
 
+def _error_reason(error):
+    """Diagnostics cannot throw through an original-custody cleanup boundary."""
+    try:
+        reason = getattr(error, "reason", None)
+        if (type(reason) is str and 1 <= len(reason) <= 128 and
+                all(char in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.:" for char in reason)):
+            return reason
+        name = type(error).__name__
+        return name if type(name) is str and 1 <= len(name) <= 128 else "ab_operation_failed"
+    except BaseException:
+        return "ab_error_reason_unavailable"
+
+
+class RawAdmissionCustody:
+    """Original objects retained by the raw observer; never admission authority.
+
+    Only _real_admission may acquire a scope. The finisher is captured from that
+    scope's existing raw API after complete interface validation. A different
+    native provider's objects are retained without guessing cleanup methods.
+    """
+    def __init__(self, scope, *, finisher=None, additional_custody=None):
+        self.scope, self.finisher = scope, finisher
+        self.additional_custody = additional_custody
+        self.fixture = None
+        self.cleanup_complete = False
+
+    def retain_error(self, error):
+        from tests.windows.adaptive_capability_runner import NativeRunUnsettled
+        if isinstance(error, NativeRunUnsettled):
+            if self.additional_custody is None:
+                self.additional_custody = error
+            elif self.additional_custody is not error:
+                self.additional_custody = (self.additional_custody, error)
+
+    def finish(self):
+        if self.cleanup_complete:
+            return
+        if self.fixture is not None:
+            self.fixture.cleanup()
+        if self.additional_custody is not None or self.finisher is None:
+            raise MeasurementBlocked("ab_original_raw_cleanup_api_unavailable")
+        # This API must independently verify its original lifetime obligation;
+        # root exit or a fixture JSON record is not a substitute for that proof.
+        try:
+            self.finisher()
+        except BaseException as error:
+            self.retain_error(error)
+            raise
+        self.cleanup_complete = True
+
+
+class RawAcquisitionPending(MeasurementBlocked):
+    def __init__(self, custody, primary):
+        self.custody, self.primary = custody, primary
+        super().__init__("ab_original_acquisition_custody_pending")
+
+
+class RawFixtureCustody:
+    """Pre-register each launch attempt and retain its original Popen object.
+
+    Popen can throw after CreateProcess succeeds. An unreturned child remains
+    unknown custody; a None reference never proves no child was created.
+    """
+    def __init__(self):
+        self.launches = []
+
+    def launch(self, args, *, stop_file, **kwargs):
+        if len(self.launches) >= 2:
+            raise MeasurementBlocked("ab_raw_launch_inventory_exceeded")
+        slot = {"process": None, "stop_file": stop_file, "settled": False, "error": None}
+        self.launches.append(slot)
+        try:
+            slot["process"] = subprocess.Popen(args, **kwargs)
+            return slot["process"]
+        except BaseException as error:
+            slot["error"] = error
+            raise
+
+    def cleanup(self):
+        errors = []
+        for slot in self.launches:
+            if slot["settled"]:
+                continue
+            process = slot["process"]
+            if process is None:
+                errors.append(slot["error"])
+                continue
+            try:
+                _wait_cooperatively(process, slot["stop_file"])
+                slot["settled"] = True
+            except BaseException as error:
+                slot["error"] = error
+                errors.append(error)
+        if errors:
+            error = MeasurementBlocked("ab_original_fixture_custody_pending")
+            # Keep every launch slot, Popen owner, and partial-creation traceback
+            # even if cleanup of one process failed before another was tried.
+            error.fixture_custody = self
+            raise error from next((item for item in errors if item is not None), None)
+
+
 class PendingAdmissionCleanup(MeasurementBlocked):
     """Keep the original authority alive across a failed finish attempt."""
-    def __init__(self, scope, directory, artifact, reason):
-        self.scope, self.directory, self.artifact = scope, directory, artifact
+    def __init__(self, custody, directory, artifact, reason, *, primary=None):
+        self.custody, self.scope = custody, custody.scope
+        self.directory, self.artifact, self.primary = directory, artifact, primary
+        self.publication_attempted = False
         super().__init__(reason)
 
     def retry(self):
-        self.scope.finish()
+        self.custody.finish()
         self.artifact["admission_cleanup_settled"] = True
-        _write_new(self.directory / "cleanup-settled.json", {
-            "schema_version": 1, "admission_cleanup_settled": True,
-            "ab_record_produced": False, "promotion_permitted": False})
+        if not self.publication_attempted:
+            self.publication_attempted = True
+            try:
+                _write_new(self.directory / "cleanup-settled.json", {
+                    "schema_version": 1, "admission_cleanup_settled": True,
+                    "ab_record_produced": False, "promotion_permitted": False})
+                self.artifact["cleanup_evidence_written"] = True
+            except BaseException as error:
+                # Positive cleanup remains positive if publication fails. Do not
+                # re-finish old native handles or overwrite a partial artifact.
+                self.artifact["cleanup_evidence_written"] = False
+                self.artifact["cleanup_evidence_error"] = _error_reason(error)
         return self.artifact
 
 
@@ -221,14 +333,28 @@ def _real_admission(spec):
     raises. A None/JSON receipt is not accepted as a lifetime authority.
     """
     from tests.windows.adaptive_admission import require_continuous_admission
-    scope = require_continuous_admission()
-    if scope is None or isinstance(scope, (dict, list, str, int, bool)):
+    from tests.windows.adaptive_capability_runner import NativeRunUnsettled
+    try:
+        scope = require_continuous_admission()
+    except NativeRunUnsettled as primary:
+        # S1Runtime/ExperimentDemand is not the raw fixture API. Preserve its
+        # original exception and every additional owner without duck adaptation.
+        custody = RawAdmissionCustody(primary.coverage, additional_custody=primary)
+        raise RawAcquisitionPending(custody, primary) from primary
+    if scope is None or isinstance(scope, (dict, list, tuple, str, int, float, bool)):
         raise MeasurementBlocked("ab_retained_continuous_scope_unavailable")
-    for name in ("assert_covered", "acknowledge_fixture_exit", "finish"):
-        if not callable(getattr(scope, name, None)):
+    custody = RawAdmissionCustody(scope)
+    try:
+        methods = {name: getattr(scope, name, None) for name in
+                   ("assert_covered", "acknowledge_fixture_exit", "finish")}
+        if any(not callable(method) for method in methods.values()):
             raise MeasurementBlocked("ab_retained_continuous_scope_unavailable")
-    scope.assert_covered(spec.demand)
-    return scope
+        custody.finisher = methods["finish"]
+        methods["assert_covered"](spec.demand)
+        return custody
+    except BaseException as primary:
+        custody.retain_error(primary)
+        raise RawAcquisitionPending(custody, primary) from primary
 
 
 def fixture_command(spec, directory):
@@ -283,6 +409,8 @@ def _safe_capacity(sample, demand):
 
 def _wait_cooperatively(process, stop_file):
     """An observation timeout or Ctrl-C cannot discard the original child."""
+    if process.poll() is not None:
+        return
     stop_file.touch(exist_ok=True)
     while process.poll() is None:
         try:
@@ -302,8 +430,11 @@ class WindowsFixtureObserver:
     def __init__(self, directory, spec):
         self.directory, self.spec = Path(directory), spec
 
-    def measure(self, admission):
+    def measure(self, admission, *, custody):
         from sentinel.adaptive.machine_sampler import _WindowsBackend
+        if type(custody) is not RawAdmissionCustody or custody.scope is not admission or custody.fixture is not None:
+            raise MeasurementBlocked("ab_original_raw_custody_required")
+        fixture_custody = custody.fixture = RawFixtureCustody()
         directory, spec = self.directory, self.spec
         backend = _WindowsBackend()
         initial = _machine_sample(backend)
@@ -322,7 +453,7 @@ class WindowsFixtureObserver:
         complete_exit = False
         try:
             with (directory / "probe.log").open("xb") as probe_log:
-                probe = subprocess.Popen(ui_args, stdout=probe_log, stderr=probe_log)
+                probe = fixture_custody.launch(ui_args, stop_file=ui_stop, stdout=probe_log, stderr=probe_log)
                 ready_deadline = time.monotonic() + 10
                 while not ui_ready.is_file():
                     if probe.poll() is not None or time.monotonic() >= ready_deadline:
@@ -334,7 +465,7 @@ class WindowsFixtureObserver:
                 admission.assert_covered(spec.demand)
                 with (directory / "workload.log").open("xb") as log:
                     workload_started = time.monotonic_ns()
-                    workload = subprocess.Popen(command, cwd=directory, stdout=log, stderr=log)
+                    workload = fixture_custody.launch(command, stop_file=work_stop, cwd=directory, stdout=log, stderr=log)
                     deadline = time.monotonic() + spec.seconds + 10
                     next_sample = time.monotonic() + 1
                     while workload.poll() is None:
@@ -365,12 +496,10 @@ class WindowsFixtureObserver:
                 complete_exit = True
                 samples.append(_machine_sample(backend))
         except BaseException as error:
-            errors.append(getattr(error, "reason", type(error).__name__))
+            custody.retain_error(error)
+            errors.append(_error_reason(error))
         finally:
-            if workload is not None:
-                _wait_cooperatively(workload, work_stop)
-            if probe is not None:
-                _wait_cooperatively(probe, ui_stop)
+            fixture_custody.cleanup()
         probe_data = _read_json(ui_result) if ui_result.is_file() else None
         if probe_data is None or probe_data.get("status") != "measured":
             errors.append("ab_ui_probe_measurement_unavailable")
@@ -418,33 +547,55 @@ def run_raw_fixture(directory, spec):
         if not ancestor.is_dir() or ancestor.is_symlink() or getattr(info, "st_file_attributes", 0) & 0x400:
             raise MeasurementBlocked("ab_evidence_parent_redirected")
     directory.mkdir(parents=False)
-    admission = None
+    custody = None
     output = {"schema_version": 1, "artifact_type": "p6_raw_fixture_observation",
               "status": "blocked", "reason": None, "fixture": asdict(spec),
               "ab_record_produced": False, "promotion_permitted": False}
-    pending = None
+    pending = primary = None
     try:
         _require_platform()
-        admission = _real_admission(spec)
+        custody = _real_admission(spec)
+        if type(custody) is not RawAdmissionCustody:
+            # A future bridge must not silently replace this exact raw-only
+            # handoff contract with a receipt or another native owner type.
+            unknown = custody
+            custody = RawAdmissionCustody(unknown, additional_custody=unknown)
+            raise MeasurementBlocked("ab_original_raw_custody_required")
         pins = _source_state()
         pins["power_plan_sha256"] = _power_plan()
-        output = WindowsFixtureObserver(directory, spec).measure(admission)
+        output = WindowsFixtureObserver(directory, spec).measure(custody.scope, custody=custody)
         output["pins"] = pins
-    except Exception as error:
-        output["reason"] = getattr(error, "reason", type(error).__name__)
-    finally:
-        if admission is not None:
-            # The provider owns positive cleanup verification and keeps any
-            # uncertainty retained. No release-on-root-exit heuristic here.
-            try:
-                admission.finish()
-            except Exception as error:
-                reason = getattr(error, "reason", type(error).__name__)
-                output.update(status="pending", reason=reason, admission_cleanup_settled=False)
-                pending = PendingAdmissionCleanup(admission, directory, output, reason)
-    _write_new(directory / "raw-run.json", output)
+    except RawAcquisitionPending as error:
+        custody, primary = error.custody, error.primary
+        output["reason"] = _error_reason(primary)
+    except BaseException as error:
+        primary = error
+        if custody is not None:
+            custody.retain_error(error)
+        output["status"] = "failed" if custody is not None else "blocked"
+        output["reason"] = _error_reason(error)
+    if custody is not None:
+        try:
+            custody.finish()
+            output["admission_cleanup_settled"] = True
+        except BaseException as cleanup_error:
+            reason = _error_reason(cleanup_error)
+            output.update(status="pending", reason=reason, admission_cleanup_settled=False)
+            pending = PendingAdmissionCleanup(custody, directory, output, reason,
+                                               primary=primary if primary is not None else cleanup_error)
+    try:
+        _write_new(directory / "raw-run.json", output)
+    except BaseException as write_error:
+        if pending is not None:
+            pending.add_note("ab_raw_failure_evidence_write_failed")
+            raise pending from write_error
+        if primary is not None and not isinstance(primary, Exception):
+            raise primary from write_error
+        raise
     if pending is not None:
-        raise pending
+        raise pending from pending.primary
+    if primary is not None and not isinstance(primary, Exception):
+        raise primary
     return output
 
 
@@ -535,21 +686,24 @@ def main(argv=None):
                           "ab_record_produced": False, "promotion_permitted": False}))
         return 0 if result["status"] == "observed" else 3
     except PendingAdmissionCleanup as pending:
-        print(json.dumps({"status": "pending", "reason": pending.reason,
-                          "original_admission_scope_retained": True}), flush=True)
+        try:
+            print(json.dumps({"status": "pending", "reason": pending.reason,
+                              "original_admission_scope_retained": True}), flush=True)
+        except BaseException:
+            pass
         # No second workload or replacement scope. An interrupted observer must
         # not abandon the original daily reservation's cleanup witness.
         while True:
             try:
                 pending.retry()
                 return 3
-            except (Exception, KeyboardInterrupt):
+            except BaseException:
                 try:
                     time.sleep(1)
-                except KeyboardInterrupt:
+                except BaseException:
                     pass
     except Exception as error:
-        print(json.dumps({"status": "blocked", "reason": getattr(error, "reason", type(error).__name__),
+        print(json.dumps({"status": "blocked", "reason": _error_reason(error),
                           "ab_record_produced": False, "promotion_permitted": False}))
         return 3
 

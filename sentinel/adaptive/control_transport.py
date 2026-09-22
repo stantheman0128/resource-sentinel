@@ -1,10 +1,7 @@
-"""Authenticated, bounded helper-to-guardian ControlProposal transport.
+"""Authenticated, bounded helper-to-guardian control transport.
 
-This carries one message of plan section 5.5: the helper's control proposal,
-holding an execution, epochs, sequence numbers, a fresh sample reference and one
-typed actuator target. It accepts no arbitrary PID and no arbitrary
-SetInformation class, because the only thing it can carry is the typed
-ControlProposal contract.
+The closed union carries proposals, at-most-ten Job aggregates or exact scoped
+restore requests. It accepts no arbitrary PID, command or SetInformation class.
 
 The service grants no authority. It decodes one frame, authenticates the caller
 against the infrastructure registry, hands the typed proposal to GuardianControl
@@ -28,9 +25,9 @@ acknowledgement is bound to the proposal it sent. Once the proposal frame may
 have reached the guardian, any later failure is an uncertain outcome. The client
 never retries by itself, and it never invents a new request id or sequence.
 
-Nothing wires a host process to this service yet, and this machine cannot
-produce native evidence because a foreign parent Job blocks the supported host
-check.
+Every request, challenge and response binds operation kind and policy epoch.
+Mixed old/new endpoints lacking these fields fail closed; there is no legacy
+wire fallback. Transport success proves no Windows control capability or gate.
 """
 from __future__ import annotations
 
@@ -39,6 +36,7 @@ import secrets
 
 from .contracts import (ApplyAck, ContractViolation, ControlProposal, MAX_MESSAGE_BYTES,
                         ProcessIdentity)
+from .control_messages import (ControlFrameAck, ControlFrameRequest, ControlRestoreRequest, RestoreAck)
 from .ipc import (IpcError, PROTOCOL_MAJOR, _hex, _identity, _live, _remaining, _shape, _uuid,
                   read_frame, write_frame)
 from .legacy_writer import MAX_INFRASTRUCTURE, _INFRA_COLUMNS
@@ -121,14 +119,35 @@ def registered_helper(db_path, endpoint: NativePipeEndpoint, *,
 # --- wire format --------------------------------------------------------------
 
 
-def request_envelope(proposal: ControlProposal) -> dict:
-    return {"version": PROTOCOL_MAJOR, "kind": "ControlProposalRequest",
-            "request_id": proposal.request_id, "proposal": proposal.to_dict()}
+_REQUEST_KINDS = {ControlProposal: "ControlProposalRequest", ControlFrameRequest: "ControlFrameRequest",
+                  ControlRestoreRequest: "ControlRestoreRequest"}
+_ACK_TYPES = {ControlProposal: ApplyAck, ControlFrameRequest: ControlFrameAck, ControlRestoreRequest: RestoreAck}
+
+
+def _request_kind(request):
+    try:
+        return _REQUEST_KINDS[type(request)]
+    except KeyError:
+        raise ControlTransportError("control_invalid_request") from None
+
+
+def request_envelope(request) -> dict:
+    """Closed operation union; old envelopes lacking binding fail closed."""
+    kind = _request_kind(request)
+    message = {"version": PROTOCOL_MAJOR, "kind": kind, "request_id": request.request_id,
+               "guardian_epoch": request.guardian_epoch, "policy_epoch": request.policy_epoch}
+    if type(request) is ControlProposal:
+        message["proposal"] = request.to_dict()
+    elif type(request) is ControlFrameRequest:
+        message["frame"] = request.frame.to_dict()
+    else:
+        message.update(execution_id=request.execution_id, reason=request.reason)
+    return message
 
 
 def decode_proposal(value) -> ControlProposal:
     """Validate one wire message into the typed contract, or refuse it."""
-    _shape(value, "ControlProposalRequest", {"proposal"})
+    _shape(value, "ControlProposalRequest", {"proposal", "guardian_epoch", "policy_epoch"})
     payload = value["proposal"]
     if type(payload) is not dict:
         raise ControlTransportError("control_invalid_proposal")
@@ -136,9 +155,28 @@ def decode_proposal(value) -> ControlProposal:
         proposal = ControlProposal.from_dict(payload)
     except (ContractViolation, ValueError, TypeError, KeyError, OverflowError, RecursionError):
         raise ControlTransportError("control_invalid_proposal") from None
-    if proposal.request_id != value["request_id"]:
+    if any(getattr(proposal, name) != value[name] for name in ("request_id", "guardian_epoch", "policy_epoch")):
         raise ControlTransportError("control_request_binding_mismatch")
     return proposal
+
+
+def decode_request(value):
+    if type(value) is not dict:
+        raise ControlTransportError("control_invalid_request")
+    kind = value.get("kind")
+    if kind == "ControlProposalRequest":
+        return decode_proposal(value)
+    if type(kind) is not str or kind not in {"ControlFrameRequest", "ControlRestoreRequest"}:
+        raise IpcError("ipc_unexpected_message")
+    payload_fields = {"frame"} if kind == "ControlFrameRequest" else {"execution_id", "reason"}
+    _shape(value, kind, {"guardian_epoch", "policy_epoch", *payload_fields})
+    data = {name: value[name] for name in ("request_id", "guardian_epoch", "policy_epoch", *payload_fields)}
+    data["schema_version"] = PROTOCOL_MAJOR
+    cls = ControlFrameRequest if kind == "ControlFrameRequest" else ControlRestoreRequest
+    try:
+        return cls.from_dict(data)
+    except (ContractViolation, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+        raise ControlTransportError("control_invalid_request") from None
 
 
 def _challenge(proposal, endpoint, caller):
@@ -151,16 +189,18 @@ def _challenge(proposal, endpoint, caller):
     return {"version": PROTOCOL_MAJOR, "kind": "ControlChallenge",
             "request_id": proposal.request_id, "nonce": secrets.token_hex(32),
             "endpoint_id": endpoint.instance_id, "guardian_epoch": proposal.guardian_epoch,
+            "policy_epoch": proposal.policy_epoch, "operation": _request_kind(proposal),
             "server": endpoint.server_identity.to_dict(), "client": caller.to_dict()}
 
 
 def _check_challenge(value, proposal, endpoint, caller):
-    _shape(value, "ControlChallenge", {"nonce", "endpoint_id", "guardian_epoch", "server", "client"})
+    _shape(value, "ControlChallenge", {"nonce", "endpoint_id", "guardian_epoch", "policy_epoch", "operation", "server", "client"})
     _hex(value["nonce"])
     _uuid(value["endpoint_id"])
     if (value["request_id"] != proposal.request_id or
             value["endpoint_id"] != endpoint.instance_id or
             value["guardian_epoch"] != proposal.guardian_epoch or
+            value["policy_epoch"] != proposal.policy_epoch or value["operation"] != _request_kind(proposal) or
             _identity(value["server"]) != endpoint.server_identity or
             _identity(value["client"]) != caller):
         raise ControlTransportError("control_challenge_binding_mismatch")
@@ -168,7 +208,8 @@ def _check_challenge(value, proposal, endpoint, caller):
 
 def _ack_envelope(proposal, challenge, ack):
     return {"version": PROTOCOL_MAJOR, "kind": "ControlAck", "request_id": proposal.request_id,
-            "nonce": challenge["nonce"], "ack": ack.to_dict()}
+            "guardian_epoch": proposal.guardian_epoch, "policy_epoch": proposal.policy_epoch,
+            "operation": _request_kind(proposal), "nonce": challenge["nonce"], "ack": ack.to_dict()}
 
 
 def _check_ack(proposal, ack):
@@ -179,26 +220,45 @@ def _check_ack(proposal, ack):
     caller as a parsed acknowledgement. That is the conservative direction: the
     proposer has to resynchronize rather than read a refusal it cannot bind.
     """
-    if not isinstance(ack, ApplyAck):
+    cls = _ACK_TYPES.get(type(proposal))
+    if cls is None or type(ack) is not cls:
         raise ControlTransportError("control_invalid_ack")
-    if (ack.request_id != proposal.request_id or ack.execution_id != proposal.execution_id or
+    try:
+        # Validate trusted-owner output too, before publishing it. The wire
+        # decoder repeats this independently on the receiving helper.
+        cls.from_dict(ack.to_dict())
+    except (ContractViolation, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+        raise ControlTransportError("control_invalid_ack") from None
+    if (ack.request_id != proposal.request_id or
             ack.guardian_epoch != proposal.guardian_epoch or
-            ack.policy_epoch != proposal.policy_epoch or
-            ack.decision_seq != proposal.decision_seq):
+            ack.policy_epoch != proposal.policy_epoch):
+        raise ControlTransportError("control_ack_binding_mismatch")
+    if type(proposal) is ControlProposal:
+        if ack.execution_id != proposal.execution_id or ack.decision_seq != proposal.decision_seq:
+            raise ControlTransportError("control_ack_binding_mismatch")
+    elif type(proposal) is ControlFrameRequest:
+        frame = proposal.frame
+        if (ack.sampler_epoch != frame.sampler_epoch or ack.clock_epoch != frame.clock_epoch or
+                ack.sample_seq != frame.sample_seq or
+                not {item.execution_id for item in ack.results} <= {job.execution_id for job in frame.jobs}):
+            raise ControlTransportError("control_ack_binding_mismatch")
+    elif ack.execution_id != proposal.execution_id:
         raise ControlTransportError("control_ack_binding_mismatch")
     return ack
 
 
-def decode_ack(value, proposal, challenge) -> ApplyAck:
-    _shape(value, "ControlAck", {"nonce", "ack"})
+def decode_ack(value, proposal, challenge) -> ApplyAck | ControlFrameAck | RestoreAck:
+    _shape(value, "ControlAck", {"nonce", "ack", "operation", "guardian_epoch", "policy_epoch"})
     _hex(value["nonce"])
-    if value["request_id"] != proposal.request_id or value["nonce"] != challenge["nonce"]:
+    if (value["request_id"] != proposal.request_id or value["nonce"] != challenge["nonce"] or
+            value["operation"] != _request_kind(proposal) or value["guardian_epoch"] != proposal.guardian_epoch or
+            value["policy_epoch"] != proposal.policy_epoch):
         raise ControlTransportError("control_response_binding_mismatch")
     payload = value["ack"]
     if type(payload) is not dict:
         raise ControlTransportError("control_invalid_ack")
     try:
-        ack = ApplyAck.from_dict(payload)
+        ack = _ACK_TYPES[type(proposal)].from_dict(payload)
     except (ContractViolation, ValueError, TypeError, KeyError, OverflowError, RecursionError):
         raise ControlTransportError("control_invalid_ack") from None
     return _check_ack(proposal, ack)
@@ -222,8 +282,8 @@ class ControlProposalService:
         self.endpoint = endpoint
         self.control = control
 
-    def serve_once(self, listener, *, timeout_ms=1000) -> ApplyAck:
-        """Serve exactly one connection and return the ApplyAck that was sent."""
+    def serve_once(self, listener, *, timeout_ms=1000) -> ApplyAck | ControlFrameAck | RestoreAck:
+        """Serve one authenticated closed operation and its typed response."""
         if listener.endpoint != self.endpoint:
             raise ControlTransportError("control_endpoint_mismatch")
         deadline = NativeDeadline.after_ms(timeout_ms)
@@ -242,12 +302,20 @@ class ControlProposalService:
         # before and after the owner call, as in the other two services.
         with connection.verified_peer(caller) as peer:
             _live(connection, peer, caller)
-            proposal = decode_proposal(read_frame(connection, deadline))
+            proposal = decode_request(read_frame(connection, deadline))
             _live(connection, peer, caller)
             challenge = _challenge(proposal, self.endpoint, caller)
             write_frame(connection, challenge, deadline)
             _live(connection, peer, caller)
-            ack = self.control.apply(proposal)
+            # Native peer observation may itself consume the remaining budget.
+            # Do not start an owner operation after the total RPC deadline.
+            _remaining(deadline)
+            if type(proposal) is ControlProposal:
+                ack = self.control.apply(proposal, helper_identity=peer.identity)
+            elif type(proposal) is ControlFrameRequest:
+                ack = self.control.observe_control_frame(proposal, helper_identity=peer.identity)
+            else:
+                ack = self.control.restore_control_request(proposal, helper_identity=peer.identity)
             _remaining(deadline)
             _live(connection, peer, caller)
             _check_ack(proposal, ack)
@@ -283,10 +351,29 @@ class ControlProposalClient:
         and a retry must reuse the same request id and the same decision
         sequence so the guardian can answer with the original acknowledgement.
         """
+        if type(proposal) is not ControlProposal:
+            raise ControlTransportError("control_proposal_required")
+        return self._send(proposal, timeout_ms=timeout_ms)
+
+    def observe_uncapped(self, frame, *, request_id, guardian_epoch, policy_epoch, timeout_ms=1000) -> ControlFrameAck:
+        try:
+            request = ControlFrameRequest(request_id, guardian_epoch, policy_epoch, frame)
+        except (ContractViolation, ValueError, TypeError):
+            raise ControlTransportError("control_invalid_frame_request") from None
+        return self._send(request, timeout_ms=timeout_ms)
+
+    def request_restore(self, execution_id, *, request_id, guardian_epoch, policy_epoch,
+                        reason, timeout_ms=1000) -> RestoreAck:
+        try:
+            request = ControlRestoreRequest(request_id, guardian_epoch, policy_epoch, execution_id, reason)
+        except (ContractViolation, ValueError, TypeError):
+            raise ControlTransportError("control_invalid_restore_request") from None
+        return self._send(request, timeout_ms=timeout_ms)
+
+    def _send(self, proposal, *, timeout_ms=1000):
         outcome_unknown = False
         try:
-            if not isinstance(proposal, ControlProposal):
-                raise ControlTransportError("control_proposal_required")
+            _request_kind(proposal)
             deadline = NativeDeadline.after_ms(timeout_ms)
             message = request_envelope(proposal)
             with NativePipeConnection.connect(self.endpoint, deadline) as connection:

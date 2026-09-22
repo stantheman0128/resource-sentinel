@@ -1,13 +1,15 @@
-"""Runnable guardian process host: py -m sentinel.adaptive.guardian_host.
+"""Runnable guardian host; invoke the actual Python base executable directly.
 
 This wires the existing libraries into one process. It owns no policy of its
 own. The launch owner, the lifecycle dispatcher, the control consumer, the
 recovery journal and the three pipe services are the production modules, and the
 host authority is the live one in host_authority.py.
 
-One iteration serves at most one launch RPC, one helper control proposal and one
-query RPC, each with a bounded deadline, reconciles every retained execution,
-and calls the control consumer's expiry sweep. Nothing here starts a thread or keeps a request queue of its own.
+One iteration serves at most one launch RPC, one typed helper control operation
+and one query RPC, each with a bounded deadline, and reconciles retained work.
+Lease checks precede RPC waits and follow reconciliation. The default accept
+deadline is 100ms; this is a bound, not a measured reaction-time claim. Nothing
+here starts a thread or keeps a request queue of its own.
 
 The default mode runs iterations until the process is stopped. The only stop
 condition that exists in this repository today is an interrupt delivered to the
@@ -17,7 +19,8 @@ does not invent one. A positive --iterations is the explicit bounded mode for
 tests and diagnostics.
 
 A stop never abandons custody. Once stopping, the host stops serving new launch
-requests and keeps reconciling and sweeping until no execution is retained. Only
+requests, refuses restrictive proposals, and continues restore/frame RPCs while
+reconciling and sweeping until no execution is retained. Only
 then does it close. Exiting with a retained execution would drop the Job handles
 and the only normal actuator, so it is never done voluntarily.
 
@@ -48,7 +51,7 @@ from .store import LifecycleError
 EXIT_OK = 0
 EXIT_REFUSED = 3
 EXIT_UNSETTLED = 4
-DEFAULT_RPC_TIMEOUT_MS = 1000
+DEFAULT_RPC_TIMEOUT_MS = 100
 DEFAULT_PROFILE = Path(__file__).resolve().parents[2] / "config" / "adaptive.example.json"
 # A stable code is a lowercase identifier. Anything else is free text.
 _STABLE_CODE = re.compile(r"[a-z][a-z0-9_]{0,63}")
@@ -89,12 +92,15 @@ class GuardianHost:
 
     def __init__(self, *, data_dir, journal_dir, guardian_epoch, profile_path=None,
                  rpc_timeout_ms=DEFAULT_RPC_TIMEOUT_MS, launch_instance_id=None,
-                 query_instance_id=None, control_instance_id=None, sleep=time.sleep):
+                 query_instance_id=None, control_instance_id=None, sleep=time.sleep,
+                 evidence_directory=None, evidence_sha256=None, control_purpose="isolated_canary"):
         self.data_dir = Path(data_dir)
         self.journal_dir = Path(journal_dir)
         self.guardian_epoch = guardian_epoch
         self.profile_path = Path(DEFAULT_PROFILE if profile_path is None else profile_path)
         self.rpc_timeout_ms = rpc_timeout_ms
+        self.evidence_directory, self.evidence_sha256 = evidence_directory, evidence_sha256
+        self.control_purpose = control_purpose
         # Paces the drain loop only. It is a test seam, never a timing claim.
         self._sleep = sleep
         self.launch_instance_id = str(uuid4()) if launch_instance_id is None else launch_instance_id
@@ -116,6 +122,8 @@ class GuardianHost:
         from .decision import parse_policy_profile
         from .guardian import GuardianLaunchOwner
         from .guardian_control import GuardianControl
+        from .guardian_floor import FloorPublisher
+        from .capability_evidence import NativeEvidenceAuthority
         from .identity import VerifiedProcess
         from .recovery_journal import RecoveryJournal
         from .store import LifecycleStore
@@ -145,8 +153,13 @@ class GuardianHost:
         self._register()
         self._endpoints()
         try:
+            capability_authority = NativeEvidenceAuthority(profile=profile,
+                bundle_directory=self.evidence_directory,
+                expected_bundle_sha256=self.evidence_sha256, purpose=self.control_purpose)
+            floor_publisher = FloorPublisher(self.owner)
             self.control = GuardianControl(self.owner, profile=profile,
-                                           exemptions=self.data_dir / "exemptions.sqlite3")
+                exemptions=self.data_dir / "exemptions.sqlite3",
+                capability_authority=capability_authority, floor_publisher=floor_publisher)
         except Exception as error:
             raise GuardianHostRefused("guardian_host_control_unavailable", _reason(error)) from None
         self._control_endpoint()
@@ -262,11 +275,9 @@ class GuardianHost:
     def run_once(self, *, serve_launch=True):
         """Serve at most one RPC of each kind, reconcile, then sweep leases.
 
-        ``serve_launch`` is false while draining. A stopping guardian must not
-        take on new custody or a new cap, so neither the launch pipe nor the
-        proposal pipe is served then. A renewal that is not served lets the
-        lease run out, and the sweep below restores it. The read only query
-        service keeps answering so callers can still observe what is finishing.
+        ``serve_launch`` is false while draining. The control consumer rejects
+        restrictions and renewals but still handles restore/frame requests.
+        Safety sweeps run before any bounded RPC wait and after reconciliation.
 
         The three pipes are served one after another, each with its own bounded
         deadline, so an idle iteration can take up to three of them. That is a
@@ -275,10 +286,15 @@ class GuardianHost:
         if not self._started:
             raise GuardianHostRefused("guardian_host_not_started")
         record = {"event": "guardian_host_iteration", "launch_rpc": None, "query_rpc": None,
-                  "control_rpc": None, "reconciled": [], "reconcile_errors": [], "restored": []}
+                  "control_rpc": None, "reconciled": [], "reconcile_errors": [], "restored": [],
+                  "barrier_clears": [], "barrier_clear_errors": []}
+        if not serve_launch:
+            self.control.begin_drain()
+        record["restored"] = [{"execution_id": execution_id, "reason": reason}
+                              for execution_id, reason, _ in self.control.tick(self.control.clock())]
         if serve_launch:
             record["launch_rpc"] = self._serve(self.launch_service, self.launch_listener)
-            record["control_rpc"] = self._control_rpc()
+        record["control_rpc"] = self._control_rpc()
         record["query_rpc"] = self._serve(self.query_service, self.query_listener)
         for execution_id in self.owner.lifecycle.retained_execution_ids:
             try:
@@ -289,8 +305,15 @@ class GuardianHost:
             except Exception as error:
                 record["reconcile_errors"].append({"execution_id": execution_id,
                                                    "reason": _reason(error)})
-        record["restored"] = [{"execution_id": execution_id, "reason": reason}
-                              for execution_id, reason, _ in self.control.tick(self.control.clock())]
+        record["restored"].extend({"execution_id": execution_id, "reason": reason}
+                                  for execution_id, reason, _ in self.control.tick(self.control.clock()))
+        for item in record["reconciled"]:
+            if item["terminal"]:
+                try:
+                    self.control.clear_finished_admission_barrier(item["execution_id"])
+                    record["barrier_clears"].append({"execution_id": item["execution_id"], "barrier_cleared": True})
+                except Exception as error:
+                    record["barrier_clear_errors"].append({"execution_id": item["execution_id"], "reason": _reason(error)})
         record["prelaunch_retirements"] = self.owner.retire_completed_pending()
         return record
 
@@ -342,12 +365,23 @@ class GuardianHost:
         return {"event": "guardian_host_drained", "settled": True, "iterations": iterations}
 
     def _control_rpc(self):
-        """Serve one proposal and record only the outcome fields of its ack."""
+        """Serve one authenticated operation, retaining only bounded outcomes."""
+        from .control_messages import ControlFrameAck, RestoreAck
         served = self._serve(self.control_service, self.control_listener)
         if served["served"]:
             ack = served["result"]
-            served["result"] = {"execution_id": ack.execution_id, "result": ack.result.value,
-                                "reason": ack.reason}
+            if isinstance(ack, ControlFrameAck):
+                served["result"] = {"sample_seq": ack.sample_seq, "results": [
+                    {"execution_id": item.execution_id, "observation": item.observation.value,
+                     "barrier_cleared": item.barrier_cleared, "reason": item.reason}
+                    for item in ack.results]}
+            else:
+                served["result"] = {"execution_id": ack.execution_id, "result": ack.result.value,
+                                    "reason": ack.reason}
+                if isinstance(ack, RestoreAck):
+                    served["result"].update(native_disabled=ack.native_disabled,
+                        bookkeeping_settled=ack.bookkeeping_settled,
+                        slot_released=ack.slot_released, barrier_cleared=ack.barrier_cleared)
         return served
 
     def _serve(self, service, listener):
@@ -404,6 +438,10 @@ def build_parser():
                         help="per RPC accept deadline in milliseconds")
     parser.add_argument("--launch-instance-id", default=None, help="launch pipe instance id")
     parser.add_argument("--query-instance-id", default=None, help="query pipe instance id")
+    parser.add_argument("--evidence-dir", default=None, help="isolated measured capability evidence bundle")
+    parser.add_argument("--evidence-sha256", default=None, help="pinned bundle manifest SHA-256")
+    parser.add_argument("--control-purpose", choices=("isolated_canary", "p6_trial", "limited"),
+                        default="isolated_canary", help="required evidence scope; never changes mode")
     return parser
 
 
@@ -416,7 +454,9 @@ def main(argv=None):
                         guardian_epoch=options.guardian_epoch, profile_path=options.profile,
                         rpc_timeout_ms=options.rpc_timeout_ms,
                         launch_instance_id=options.launch_instance_id,
-                        query_instance_id=options.query_instance_id)
+                        query_instance_id=options.query_instance_id,
+                        evidence_directory=options.evidence_dir, evidence_sha256=options.evidence_sha256,
+                        control_purpose=options.control_purpose)
     try:
         emit(host.start())
     except GuardianHostRefused as error:

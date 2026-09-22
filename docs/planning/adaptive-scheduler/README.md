@@ -22,11 +22,20 @@ custody、SQL 暫時故障丟失 guard、interrupt 隱藏 pending operation，�
 0 failures／errors／skips**；其前 120 個針對性 tests 亦全過（20.556 秒）。
 這是 source 與隔離 fixture 的驗證，不是 native P3–P6 通過。
 
+目標 3 的 [helper control 接線契約](P4-HELPER-CONTROL-INTEGRATION.md)已先以
+`e6f406d` 提交。Source 現已接上獨立 active sender、typed frame/restore transport、
+guardian 驗證、ACK 驅動階梯恢復與單調 demand floor。原 shadow helper 保持 query-only；
+沒有實測證據、啟動範圍證據或有效 receipt 時拒絕限速。外部 console 的 S1–S3、
+成本、恢復時間與 A/B 結果尚未產生，不能由 fixture 或 mode 字串取代。
+最後完整 adaptive 回歸 **91 個模組、2,298 tests 全過，305.309 秒，
+0 failures／errors／skips**，包含 launch-scope 缺證據拒絕。此前 114 個
+restore/floor、117 個 decision/helper 與 27 個 capability 針對性測試亦通過。
+
 | 目標項目 | 已驗證狀態／剩餘工作 |
 | --- | --- |
 | 1. 裁決 ② | 契約與 source 完成；完整 2,007 tests，最後 cleanup 修正後 102 tests 通過。 |
 | 2. 裁決 ④ | 契約與 source 完成；最後完整 adaptive 2,127 tests 通過。沒有舊 witness 的 cold adoption 仍不支援；native recovery 未驗證。 |
-| 3. helper sender | 尚缺 sender、ACK 驅動、uncapped frame／restore 傳輸與 capability 證據接線。 |
+| 3. helper sender | Source 接線、獨立 review 與完整 2,298 tests 通過。原生 capability bundle、actual launch/stdio scope producer 尚屬項目 4/6 的缺口，缺證據時不啟用控制。 |
 | 4. release／CLI | 已有 explicit named retirement API；wrapper host 自動失敗收尾、Coordinator 路徑、discovery／停止協定與 operational CLI 未完成。 |
 | 5. 全程容量覆蓋 | 尚缺能證明所有 live consumers 使用相同 lifetime accounting 的 provider；原日常 grace 前提仍不滿足，不能以測試 DB 假裝解鎖。 |
 | 6. console 驗收命令 | S1–S3／完整 §11.2／實測 A/B runner 尚未全部可執行；不能只包一層 CLI 就宣稱只剩使用者執行。 |
@@ -56,6 +65,19 @@ SQLite connection 未關閉導致 Windows temp cleanup 拒絕）；181 tests 有
 review 找到的恢復案例，最後完整 2,127 全過。沒有刪除 assertion、降低 gate 或以
 skip 取代實測。C4 的保守偏差：cold startup 連有效 terminal history 也 HOLD；
 保留 witness 的 rollover 才分頁驗證歷史。詳見 C4 契約的 implementation checkpoint。
+
+目標 3 的中間失敗與處理：首次 75 tests 有 3 failures／1 error，分別修正
+DB ACK-loss fixture 的注入位置、native restore 後的 floor journal 結算，以及
+orphan 的原 POLICY guard 重試。169 tests 的一個失敗來自不連續時間窗 fixture；
+110 tests 的一個失敗則把安全 disable 誤算為新增 restrictive Set，改為核對完整
+呼叫序列及保留 HOLD。Helper 42 tests 的一個 fixture 在 restore tick 未採樣後
+錯把兩秒視為有效窗口，修正為先驗證拒絕、下一正常窗口才恢復觀察。Capability
+首次 25 tests 有 19 failures，找到 Windows `lstat`／`fstat` 的 ctime 差異；
+現在以 opened file 的 volume/file ID/size/mtime 比對，並保留前後完整 path
+fingerprint 核對。另一次命令誤列不存在的 sampler test module，產生一個 loader
+error，後續以真正的完整 discovery 驗證。以上都已包含在最後 2,298 全過的版本。
+獨立 review 的 action-ID、cooldown、scope cleanup、current victim share 與
+第二次 native readback 問題亦已補回歸測試；沒有以 skip 或放寬 gate 換取通過。
 
 目前交接入口是 [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md)、
 [P0 對齊結果](BASELINE-RECONCILIATION.md)、[Windows capability 證據](CAPABILITY-RESULTS.md)

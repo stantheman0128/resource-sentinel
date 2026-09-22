@@ -39,6 +39,7 @@ class ProposalBuildError(ContractViolation):
 
 
 CONTROL_ACTIONS = frozenset({DecisionAction.PROPOSE_L1, DecisionAction.PROPOSE_L2,
+                             DecisionAction.PROPOSE_BASELINE,
                              DecisionAction.RENEW, DecisionAction.REQUEST_RESTORE})
 
 

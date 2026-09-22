@@ -78,9 +78,11 @@ CANDIDATES = (candidate(),)
 
 
 def tick(prof: PolicyProfile, snapshot: ControllerSnapshot, second: int, busy: float,
-         *, candidates=CANDIDATES, jobs=None, seq=None, now=None) -> Decision:
+         *, candidates=CANDIDATES, jobs=None, seq=None, now=None, window_start=None) -> Decision:
     moment = at(second)
     current = frame(second + 1 if seq is None else seq, moment, busy, jobs)
+    if window_start is not None:
+        current = replace(current, window_start_tick_100ns=at(window_start))
     return next_state(profile=prof, snapshot=snapshot, frame=current, candidates=candidates,
                       now_tick_100ns=moment if now is None else now)
 
@@ -136,6 +138,7 @@ class ConfigValidationTests(unittest.TestCase):
                         dict(recovery_cpu_pct=95), dict(retreat_l2_fraction=0.80),
                         dict(retreat_l1_fraction=1.0), dict(retreat_l2_fraction=0.0),
                         dict(lease_ms=3000), dict(lease_ms=2000),
+                        dict(normal_change_min_interval_ms=4999),
                         dict(normal_change_min_interval_ms=60000),
                         dict(intervention_max_ms=120000), dict(cap_floor_cpu_units=0.0),
                         dict(victim_min_cpu_units=-1.0), dict(schema_version=2),
@@ -571,11 +574,108 @@ class FailClosedTests(unittest.TestCase):
             self.assertIs(state.state, ControllerState.RESTORE_UNVERIFIED)
 
 
+class TemporalContinuityTests(unittest.TestCase):
+    def active_until(self, end, *, low_from=None):
+        state = ControllerSnapshot.initial()
+        for second in range(end + 1):
+            busy = LOW_BUSY if low_from is not None and second >= low_from else HIGH_BUSY
+            state = tick(ENFORCE, state, second, busy).next_snapshot
+        self.assertIsNotNone(state.active)
+        return state
+
+    def test_sequence_adjacent_high_window_gap_restores_instead_of_counting_silence(self):
+        state = self.active_until(10)
+        self.assertEqual(state.high_since_tick_100ns, at(4))
+        decision = tick(ENFORCE, state, 14, HIGH_BUSY, seq=12)
+        self.assertIs(decision.action, DecisionAction.REQUEST_RESTORE)
+        self.assertEqual(decision.reason, "sample_window_gap")
+        self.assertIsNone(decision.next_snapshot.active)
+        self.assertIsNone(decision.next_snapshot.high_since_tick_100ns)
+        self.assertEqual(decision.next_snapshot.uncapped_streak, 0)
+        self.assertEqual(decision.next_snapshot.last_window_end_tick_100ns, at(14))
+        resumed = tick(ENFORCE, decision.next_snapshot, 15, LOW_BUSY, seq=13)
+        self.assertEqual((resumed.reason, resumed.next_snapshot.uncapped_streak), ("warmup", 1))
+
+    def test_sequence_adjacent_low_window_gap_never_completes_normal_recovery_dwell(self):
+        state = self.active_until(10, low_from=5)
+        self.assertEqual(state.low_since_tick_100ns, at(5))
+        decision = tick(ENFORCE, state, 15, LOW_BUSY, seq=12)
+        self.assertIs(decision.action, DecisionAction.REQUEST_RESTORE)
+        self.assertEqual(decision.reason, "sample_window_gap")
+        self.assertIsNone(decision.next_snapshot.low_since_tick_100ns)
+        self.assertIsNone(decision.target)
+        self.assertIsNone(decision.lease_deadline_tick_100ns)
+
+    def test_overlapping_windows_restore_and_old_intervals_are_not_rebased(self):
+        state = self.active_until(8)
+        for end, adopt in ((8.5, True), (8, False)):
+            with self.subTest(end=end):
+                decision = tick(ENFORCE, state, end, HIGH_BUSY, seq=10, now=at(9))
+                self.assertIs(decision.action, DecisionAction.REQUEST_RESTORE)
+                self.assertEqual(decision.reason, "sample_window_overlap")
+                self.assertIsNone(decision.next_snapshot.high_since_tick_100ns)
+                self.assertEqual(decision.next_snapshot.last_sample_seq, 10 if adopt else 9)
+                self.assertEqual(decision.next_snapshot.last_window_end_tick_100ns,
+                                 at(end) if adopt else at(8))
+
+    def test_window_gap_rebases_warmup_without_erasing_existing_victim_cooldown(self):
+        state = replace(settle(ENFORCE), state=ControllerState.COOLDOWN,
+                        cooldown_execution_id=EXEC_A, cooldown_until_tick_100ns=at(50))
+        decision = tick(ENFORCE, state, 8, LOW_BUSY, seq=6)
+        self.assertIs(decision.action, DecisionAction.OBSERVE)
+        self.assertEqual(decision.reason, "sample_window_gap")
+        state = decision.next_snapshot
+        self.assertEqual((state.uncapped_streak, state.high_streak), (0, 0))
+        self.assertEqual((state.cooldown_execution_id, state.cooldown_until_tick_100ns), (EXEC_A, at(50)))
+        for second in range(9, 14):
+            state = tick(ENFORCE, state, second, LOW_BUSY, seq=second - 2).next_snapshot
+        self.assertIs(state.state, ControllerState.OBSERVING)
+        self.assertEqual(state.cooldown_until_tick_100ns, at(50))
+
+    def test_contiguous_windows_accept_250ms_and_one_second_processing_latency(self):
+        for latency in (0.25, 1.0):
+            with self.subTest(latency=latency):
+                state = ControllerSnapshot.initial()
+                for second in range(10):
+                    decision = tick(ENFORCE, state, second, LOW_BUSY, now=at(second + latency))
+                    state = decision.next_snapshot
+                    self.assertEqual(state.last_window_end_tick_100ns, at(second))
+                    self.assertEqual(state.last_tick_100ns, at(second + latency))
+                    self.assertNotIn(decision.reason,
+                        {"sample_window_gap", "sample_window_overlap", "sample_window_history_unknown"})
+                self.assertIs(state.state, ControllerState.OBSERVING)
+
+    def test_processing_latency_is_not_extra_high_dwell_time(self):
+        state = self.active_until(12)
+        delayed = tick(ENFORCE, state, 13, HIGH_BUSY, now=at(14))
+        self.assertIs(delayed.action, DecisionAction.RENEW)
+        self.assertEqual(delayed.next_snapshot.high_since_tick_100ns, at(4))
+        due = tick(ENFORCE, delayed.next_snapshot, 14, HIGH_BUSY, now=at(15))
+        self.assertIs(due.action, DecisionAction.PROPOSE_L2)
+        self.assertEqual(due.next_snapshot.active.deadline_tick_100ns, state.active.deadline_tick_100ns)
+
+    def test_processing_latency_is_not_extra_low_dwell_time(self):
+        state = self.active_until(13, low_from=5)
+        delayed = tick(ENFORCE, state, 14, LOW_BUSY, now=at(15))
+        self.assertIs(delayed.action, DecisionAction.RENEW)
+        due = tick(ENFORCE, delayed.next_snapshot, 15, LOW_BUSY, now=at(16))
+        self.assertIs(due.action, DecisionAction.PROPOSE_BASELINE)
+        self.assertEqual(due.next_snapshot.active.deadline_tick_100ns, state.active.deadline_tick_100ns)
+
+    def test_missing_previous_window_cannot_preserve_an_established_dwell(self):
+        state = replace(self.active_until(8), last_window_end_tick_100ns=None)
+        decision = tick(ENFORCE, state, 9, HIGH_BUSY)
+        self.assertIs(decision.action, DecisionAction.REQUEST_RESTORE)
+        self.assertEqual(decision.reason, "sample_window_history_unknown")
+        self.assertIsNone(decision.next_snapshot.high_since_tick_100ns)
+        self.assertEqual(decision.next_snapshot.last_window_end_tick_100ns, at(9))
+
+
 class TraceTests(unittest.TestCase):
     def test_escalation_recovery_and_cooldown(self):
         state = ControllerSnapshot.initial()
         actions = {}
-        for second in range(0, 90):
+        for second in range(0, 100):
             busy = HIGH_BUSY if 5 <= second <= 17 else LOW_BUSY
             decision = tick(ENFORCE, state, second, busy)
             actions[second] = decision
@@ -607,24 +707,205 @@ class TraceTests(unittest.TestCase):
 
         for second in range(18, 28):
             self.assertIs(actions[second].action, DecisionAction.RENEW, second)
+            self.assertIs(actions[second].next_snapshot.state, ControllerState.CAPPED_L2)
+        outward = actions[28]
+        self.assertIs(outward.action, DecisionAction.PROPOSE_L1)
+        self.assertEqual((outward.reason, outward.target.target_cpu_units), ("recovery_level_1", 4.5))
+        baseline = actions[33]
+        self.assertIs(baseline.action, DecisionAction.PROPOSE_BASELINE)
+        self.assertEqual((baseline.target.target_cpu_units, baseline.target.cpu_rate_bp), (6.0, 5000))
+        self.assertEqual(baseline.next_snapshot.active.level, 0)
+        for second in (*range(29, 33), *range(34, 38)):
+            self.assertIs(actions[second].action, DecisionAction.RENEW, second)
             self.assertIs(actions[second].next_snapshot.state, ControllerState.RECOVERING)
-        restored = actions[28]
+        restored = actions[38]
         self.assertIs(restored.action, DecisionAction.REQUEST_RESTORE)
         self.assertEqual(restored.reason, "pressure_cleared")
         self.assertIsNone(restored.target)
         self.assertIsNone(restored.next_snapshot.active)
         self.assertIs(restored.next_snapshot.state, ControllerState.COOLDOWN)
-        self.assertEqual(restored.next_snapshot.cooldown_until_tick_100ns, at(88))
+        self.assertEqual(restored.next_snapshot.cooldown_until_tick_100ns, at(98))
 
-        for second in range(29, 33):
+        for second in range(39, 43):
             self.assertEqual(actions[second].reason, "warmup", second)
-        for second in range(34, 89):
+        for second in range(44, 99):
             self.assertIs(actions[second].action, DecisionAction.OBSERVE, second)
 
         proposals = [d for d in actions.values() if d.action in
-                     (DecisionAction.PROPOSE_L1, DecisionAction.PROPOSE_L2)]
-        self.assertEqual(len(proposals), 2)
+                     (DecisionAction.PROPOSE_L1, DecisionAction.PROPOSE_L2, DecisionAction.PROPOSE_BASELINE)]
+        self.assertEqual(len(proposals), 4)
         self.assertEqual({d.victim_execution_id for d in proposals}, {EXEC_A})
+
+    def test_l1_recovers_via_original_baseline_before_disabling(self):
+        state = ControllerSnapshot.initial()
+        actions = {}
+        for second in range(21):
+            actions[second] = tick(ENFORCE, state, second, HIGH_BUSY if second <= 4 else LOW_BUSY)
+            state = actions[second].next_snapshot
+        self.assertIs(actions[4].action, DecisionAction.PROPOSE_L1)
+        self.assertIs(actions[14].action, DecisionAction.RENEW)
+        self.assertIs(actions[15].action, DecisionAction.PROPOSE_BASELINE)
+        self.assertEqual(actions[15].target.target_cpu_units, 6.0)
+        self.assertIs(actions[19].action, DecisionAction.RENEW)
+        self.assertIs(actions[20].action, DecisionAction.REQUEST_RESTORE)
+        self.assertIsNone(actions[20].target)
+
+    def test_l2_requires_ten_continuous_high_seconds_after_any_band_or_low_sample(self):
+        for interruption_pct in (79.0, 80.0, 85.0, 89.999):
+            with self.subTest(interruption_pct=interruption_pct):
+                state = ControllerSnapshot.initial()
+                actions = {}
+                for second in range(22):
+                    busy = 12 * interruption_pct / 100 if second == 10 else HIGH_BUSY
+                    actions[second] = tick(ENFORCE, state, second, busy)
+                    state = actions[second].next_snapshot
+                self.assertIs(actions[4].action, DecisionAction.PROPOSE_L1)
+                self.assertIsNone(actions[10].next_snapshot.high_since_tick_100ns)
+                self.assertEqual(actions[11].next_snapshot.high_since_tick_100ns, at(11))
+                for second in range(5, 21):
+                    self.assertIs(actions[second].action, DecisionAction.RENEW, second)
+                self.assertIs(actions[21].action, DecisionAction.PROPOSE_L2)
+                self.assertEqual(actions[21].next_snapshot.active.deadline_tick_100ns, at(64))
+
+    def test_persistent_band_pressure_does_not_escalate_or_start_normal_recovery(self):
+        state = ControllerSnapshot.initial()
+        for second in range(31):
+            busy = HIGH_BUSY if second <= 4 else 12 * 0.85
+            decision = tick(ENFORCE, state, second, busy)
+            state = decision.next_snapshot
+            if second > 4:
+                self.assertIs(decision.action, DecisionAction.RENEW)
+                self.assertEqual(state.active.level, 1)
+                self.assertIs(state.state, ControllerState.CAPPED_L1)
+                self.assertIsNone(state.high_since_tick_100ns)
+                self.assertIsNone(state.low_since_tick_100ns)
+
+    def test_exact_high_threshold_counts_elapsed_seconds_not_number_of_samples(self):
+        state = ControllerSnapshot.initial()
+        threshold = 12 * ENFORCE.high_cpu_pct / 100
+        for second in range(5):
+            state = tick(ENFORCE, state, second, threshold).next_snapshot
+        self.assertEqual(state.active.level, 1)
+        self.assertEqual(state.high_since_tick_100ns, at(4))
+        for index in range(1, 21):
+            moment = 4 + index / 2
+            decision = tick(ENFORCE, state, moment, threshold, seq=5 + index,
+                            window_start=moment - 0.5)
+            state = decision.next_snapshot
+            expected = DecisionAction.PROPOSE_L2 if index == 20 else DecisionAction.RENEW
+            self.assertIs(decision.action, expected, moment)
+        self.assertEqual(state.active.level_entered_tick_100ns, at(14))
+        self.assertEqual(state.active.deadline_tick_100ns, at(64))
+
+    def test_gap_restoration_discards_the_previous_high_dwell(self):
+        state = ControllerSnapshot.initial()
+        for second in range(10):
+            state = tick(ENFORCE, state, second, HIGH_BUSY).next_snapshot
+        self.assertEqual(state.high_since_tick_100ns, at(4))
+        gap = tick(ENFORCE, state, 10, HIGH_BUSY, seq=12)
+        self.assertIs(gap.action, DecisionAction.REQUEST_RESTORE)
+        self.assertIsNone(gap.next_snapshot.high_since_tick_100ns)
+        self.assertIsNone(gap.next_snapshot.active)
+
+    def recovery_snapshot(self, level=2, *, entered=15, deadline=60, baseline=6.0):
+        return ControllerSnapshot(state=ControllerState.RECOVERING,
+            sampler_epoch="sampler-a", clock_epoch="clock-a", last_sample_seq=20,
+            last_tick_100ns=at(19), low_since_tick_100ns=at(5), last_window_end_tick_100ns=at(19),
+            active=ActiveIntervention(EXEC_A, level, baseline, at(0), at(deadline), at(entered)))
+
+    def test_normal_recovery_observes_exact_five_second_boundary_at_every_level(self):
+        expected = {2: DecisionAction.PROPOSE_L1, 1: DecisionAction.PROPOSE_BASELINE,
+                    0: DecisionAction.REQUEST_RESTORE}
+        for level in (2, 1, 0):
+            with self.subTest(level=level):
+                snapshot = self.recovery_snapshot(level)
+                early = tick(ENFORCE, snapshot, 19.999, LOW_BUSY, seq=21, window_start=19)
+                self.assertIs(early.action, DecisionAction.RENEW)
+                self.assertEqual(early.next_snapshot.active, snapshot.active)
+                # Compare independently to avoid inventing a one-millisecond
+                # CPU window merely to probe the cooldown boundary.
+                due = tick(ENFORCE, snapshot, 20, LOW_BUSY, seq=21)
+                self.assertIs(due.action, expected[level])
+                self.assertEqual(snapshot.active.level, level)
+
+    def test_recovery_does_not_retighten_when_cpu_rises_and_does_not_relearn_baseline(self):
+        state = self.recovery_snapshot()
+        original = state.active
+        actions = {}
+        for second in range(20, 31):
+            actions[second] = tick(ENFORCE, state, second, HIGH_BUSY,
+                candidates=(candidate(uncapped_samples=(1.6,) * 5),),
+                jobs=(job(cpu_units=0.1, cpu_uncapped_high_water_units=0.1),))
+            state = actions[second].next_snapshot
+            if state.active is not None:
+                self.assertEqual((state.active.started_tick_100ns, state.active.deadline_tick_100ns,
+                                  state.active.baseline_cpu_units),
+                                 (original.started_tick_100ns, original.deadline_tick_100ns, 6.0))
+                self.assertLessEqual(actions[second].lease_deadline_tick_100ns, original.deadline_tick_100ns)
+                self.assertIs(state.state, ControllerState.RECOVERING)
+        self.assertEqual(actions[20].target.target_cpu_units, 4.5)
+        self.assertEqual(actions[25].target.target_cpu_units, 6.0)
+        self.assertIs(actions[30].action, DecisionAction.REQUEST_RESTORE)
+        self.assertNotIn(DecisionAction.PROPOSE_L2, [decision.action for decision in actions.values()])
+
+    def test_original_deadline_overrides_recovery_spacing_at_each_level(self):
+        for level in (2, 1, 0):
+            with self.subTest(level=level):
+                snapshot = replace(self.recovery_snapshot(level, entered=59),
+                                   last_tick_100ns=at(59), last_sample_seq=60,
+                                   last_window_end_tick_100ns=at(59))
+                decision = tick(ENFORCE, snapshot, 60, LOW_BUSY)
+                self.assertIs(decision.action, DecisionAction.REQUEST_RESTORE)
+                self.assertEqual(decision.reason, "intervention_deadline")
+                self.assertIsNone(decision.target)
+                self.assertIsNone(decision.lease_deadline_tick_100ns)
+
+    def test_unacknowledged_pure_decision_never_advances_the_previous_snapshot(self):
+        previous = self.recovery_snapshot()
+        first = tick(ENFORCE, previous, 20, LOW_BUSY)
+        self.assertIs(first.action, DecisionAction.PROPOSE_L1)
+        # A lost/rejected target ACK leaves the caller with its preceding
+        # applied snapshot. No global state lets this function skip a step.
+        retry = tick(ENFORCE, previous, 20, LOW_BUSY, seq=21, now=at(20.5))
+        self.assertIs(retry.action, DecisionAction.PROPOSE_L1)
+        self.assertEqual(retry.target, first.target)
+        self.assertEqual(previous.active.level, 2)
+        self.assertEqual(retry.next_snapshot.active.deadline_tick_100ns, previous.active.deadline_tick_100ns)
+        state = first.next_snapshot
+        for second in range(21, 26):
+            accepted = tick(ENFORCE, state, second, LOW_BUSY)
+            state = accepted.next_snapshot
+        self.assertIs(accepted.action, DecisionAction.PROPOSE_BASELINE)
+
+    def test_mode_off_invalid_evidence_and_lost_eligibility_restore_without_step_delay(self):
+        snapshot = self.recovery_snapshot(level=0, entered=19)
+        cases = (tick(EXAMPLE, snapshot, 20, LOW_BUSY),
+                 tick(ENFORCE, snapshot, 20, LOW_BUSY, now=at(24)),
+                 tick(ENFORCE, snapshot, 20, LOW_BUSY, candidates=(candidate(foreground=True),)))
+        for decision in cases:
+            self.assertIs(decision.action, DecisionAction.REQUEST_RESTORE)
+            self.assertTrue(decision.executable)
+            self.assertIsNone(decision.next_snapshot.active)
+
+    def test_baseline_at_machine_denominator_is_disabled_after_normal_spacing(self):
+        snapshot = self.recovery_snapshot(level=1, baseline=12.0)
+        early = tick(ENFORCE, snapshot, 19.5, LOW_BUSY, seq=21, window_start=19)
+        self.assertIs(early.action, DecisionAction.RENEW)
+        decision = tick(ENFORCE, snapshot, 20, LOW_BUSY, seq=21)
+        self.assertIs(decision.action, DecisionAction.REQUEST_RESTORE)
+        self.assertEqual(decision.reason, "recovery_target_exceeds_denominator")
+        self.assertIsNone(decision.target)
+
+    def test_recovery_targets_preserve_floor_and_shadow_never_executes_baseline_cap(self):
+        snapshot = self.recovery_snapshot(level=1, baseline=1.6)
+        raised_floor = replace(SHADOW, cap_floor_cpu_units=2.0)
+        baseline = tick(raised_floor, snapshot, 20, LOW_BUSY)
+        self.assertIs(baseline.action, DecisionAction.PROPOSE_BASELINE)
+        self.assertEqual(baseline.target.target_cpu_units, 2.0)
+        self.assertEqual(baseline.target.cpu_rate_bp, 1667)
+        self.assertTrue(baseline.would_apply)
+        self.assertFalse(baseline.executable)
+        self.assertEqual(baseline.next_snapshot.active.baseline_cpu_units, 1.6)
 
     def test_cooldown_blocks_the_same_victim_while_pressure_returns(self):
         cooled = ControllerSnapshot(state=ControllerState.COOLDOWN,
@@ -728,6 +1009,8 @@ class OutputShapeTests(unittest.TestCase):
             ControllerSnapshot(state="CAPPED_L1")
         with self.assertRaises(ContractViolation):
             ActiveIntervention(EXEC_A, 3, 6.0, at(0), at(60), at(0))
+        with self.assertRaises(ContractViolation):
+            ActiveIntervention(EXEC_A, True, 6.0, at(0), at(60), at(0))
         with self.assertRaises(ContractViolation):
             ActiveIntervention(EXEC_A, 1, 6.0, at(60), at(0), at(60))
         with self.assertRaises(ContractViolation):

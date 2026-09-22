@@ -155,6 +155,9 @@ class GuardianLifecycle:
         if terminal:
             self.store.assert_retained_terminal(row, record)
         else:
+            publisher = getattr(self, "_floor_publisher", None)
+            if publisher is not None:
+                record = publisher.reconcile_locked(entry, row, record)
             self.store.assert_retained_allocation(row, record)
         entry.manifest = record
         return record

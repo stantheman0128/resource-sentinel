@@ -321,6 +321,37 @@ class FrameResult:
     collection_cost_ms: float
 
 
+@dataclass(frozen=True)
+class FrameBinding:
+    """Pre-capture authority snapshot, not the local enrollment generation.
+
+    The active caller reads this from one bounded registry transaction and
+    verifies that transaction's facts again after capture. Construction alone
+    confers no control authority. Shadow callers omit it entirely.
+    """
+
+    registry_revision: int
+    config_revision: str
+    execution_ids: tuple[str, ...]
+
+    def __post_init__(self):
+        if not _uint(self.registry_revision):
+            raise ContractViolation("registry_revision: unsigned integer required")
+        if (type(self.config_revision) is not str or len(self.config_revision) != 64
+                or any(c not in '0123456789abcdef' for c in self.config_revision)):
+            raise ContractViolation("config_revision: profile digest required")
+        if (type(self.execution_ids) is not tuple or len(self.execution_ids) > MAX_ENROLLED_JOBS
+                or len(set(self.execution_ids)) != len(self.execution_ids)):
+            raise ContractViolation("execution_ids: bounded distinct identities required")
+        for value in self.execution_ids:
+            try:
+                valid = type(value) is str and str(UUID(value)) == value
+            except (ValueError, TypeError, AttributeError):
+                valid = False
+            if not valid:
+                raise ContractViolation("execution_ids: canonical UUID required")
+
+
 class FrameSampler:
     """One sample per call: machine endpoint, enrolled Jobs, then one FastFrame.
 
@@ -350,6 +381,11 @@ class FrameSampler:
     def sample_seq(self) -> int:
         return self._sample_seq
 
+    @property
+    def enrollment_generation(self) -> int:
+        """Local topology counter; never an authoritative registry revision."""
+        return self.registry_revision
+
     def enroll(self, execution_id: str) -> None:
         self._jobs.enroll(execution_id)
         self.registry_revision += 1
@@ -361,7 +397,13 @@ class FrameSampler:
     def invalidate_clock(self) -> None:
         self._jobs.invalidate_clock()
 
-    def sample(self) -> FrameResult:
+    def sample(self, *, binding: FrameBinding | None = None) -> FrameResult:
+        if binding is not None:
+            if (not isinstance(binding, FrameBinding)
+                    or binding.config_revision != self.config_revision
+                    or set(binding.execution_ids) != set(self.enrolled)):
+                raise ContractViolation("binding: current profile and exact enrollment required")
+        generation = self.enrollment_generation
         start = self._clock()
         observation = self._machine_source()
         if not isinstance(observation, MachineObservation):
@@ -369,6 +411,8 @@ class FrameSampler:
         jobs = self._jobs.sample()
         end = self._clock()
         cost_ms = max(0, end - start) / TICKS_PER_MS
+        if generation != self.enrollment_generation:
+            return FrameResult(None, "enrollment_changed_during_capture", (), True, cost_ms)
         errors = tuple(observation.errors) + jobs.errors
         reset = observation.reset_required or jobs.reset_required
 
@@ -392,7 +436,8 @@ class FrameSampler:
                 sample_seq=self._sample_seq + 1, window_start_tick_100ns=window_start,
                 window_end_tick_100ns=window_end, published_tick_100ns=published,
                 sampled_at_utc=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                config_revision=self.config_revision, registry_revision=self.registry_revision,
+                config_revision=self.config_revision,
+                registry_revision=self.registry_revision if binding is None else binding.registry_revision,
                 machine=observation.machine, jobs=jobs.jobs, validity=validity, errors=errors,
                 collection_cost_ms=cost_ms, collection_skew_ms=skew / TICKS_PER_MS)
         except ContractViolation:

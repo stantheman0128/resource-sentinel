@@ -28,7 +28,9 @@ from sentinel.adaptive.contracts import (
     ApplyAck, ApplyResult, IdentityObservation, IdentityStatus, MAX_MESSAGE_BYTES,
     ProcessIdentity, Validity,
 )
-from sentinel.adaptive.decision import ControllerSnapshot, DecisionAction
+from sentinel.adaptive.control_messages import (ControlFrameAck, ControlFrameRequest, ControlFrameResult,
+    ControlObservation, ControlRestoreRequest, RestoreAck, RestoreOutcome)
+from sentinel.adaptive.decision import ControllerSnapshot, DecisionAction, next_state
 from sentinel.adaptive.ipc import IpcError
 from sentinel.adaptive.legacy_writer import initialize_registry_locked, register_infrastructure_locked
 from sentinel.adaptive.pipe_windows import NativePipeEndpoint, NativePipeError
@@ -63,17 +65,44 @@ def refusal_ack(proposal, **changes):
     return ApplyAck(**(values | changes))
 
 
+def operation_ack(request):
+    """Explicit transport-owner fixture; its observations prove no native gate."""
+    if type(request) is ControlFrameRequest:
+        frame = request.frame
+        return ControlFrameAck(request.request_id, request.guardian_epoch, request.policy_epoch,
+            frame.sampler_epoch, frame.clock_epoch, frame.sample_seq, frame.registry_revision,
+            frame.config_revision, tuple(ControlFrameResult(job.execution_id,
+                ControlObservation.UNCAPPED, frame.published_tick_100ns, False, "fixture_uncapped")
+                for job in frame.jobs))
+    if type(request) is ControlRestoreRequest:
+        return RestoreAck(request.request_id, request.guardian_epoch, request.policy_epoch,
+            request.execution_id, RestoreOutcome.UNVERIFIED, None, None, None, None,
+            None, None, Validity.UNKNOWN, None, "fixture_restore_unverified", None)
+    return refusal_ack(request)
+
+
 class RecordingControl:
     """Explicit stand-in for GuardianControl. It applies nothing and counts."""
 
     def __init__(self):
         self.calls = []
+        self.helpers = []
         self.transform = None
 
-    def apply(self, proposal):
+    def apply(self, proposal, *, helper_identity):
         self.calls.append(proposal)
+        self.helpers.append(helper_identity)
         ack = refusal_ack(proposal)
         return ack if self.transform is None else self.transform(ack)
+
+    def observe_control_frame(self, request, *, helper_identity):
+        self.calls.append(request)
+        self.helpers.append(helper_identity)
+        ack = operation_ack(request)
+        return ack if self.transform is None else self.transform(ack)
+
+    def restore_control_request(self, request, *, helper_identity):
+        return self.observe_control_frame(request, helper_identity=helper_identity)
 
 
 class LoopbackEnd(Connection):
@@ -97,7 +126,7 @@ class LoopbackEnd(Connection):
 class ControlTransportTests(unittest.TestCase):
     # Reuse setup and helpers; never inherit another module's test methods.
     setUp = fixture.GuardianLifecycleTests.setUp
-    spec = fixture.GuardianLifecycleTests.spec
+    spec = control_fixture.GuardianControlTests.spec
     allocate = fixture.GuardianLifecycleTests.allocate
     connection = fixture.GuardianLifecycleTests.connection
     make_mutex = fixture.GuardianLifecycleTests.make_mutex
@@ -116,6 +145,7 @@ class ControlTransportTests(unittest.TestCase):
 
     def prepare(self, *, mode="canary", helpers=1, role="helper", registry=True, real_control=False):
         case = self.start(mode=mode)
+        self.helper_identity = HELPER
         self.clock = Clock()
         clock = patch("sentinel.adaptive.pipe_windows._backend", return_value=self.clock)
         clock.start()
@@ -133,7 +163,7 @@ class ControlTransportTests(unittest.TestCase):
         self.service = transport.ControlProposalService(self.db, self.endpoint, self.owner_under_test)
         return case
 
-    def built_proposal(self, case, *, seq=1, sample_seq=1, request_id=None, **changes):
+    def built_proposal(self, case, *, seq=1, sample_seq=8, request_id=None, **changes):
         """One proposal built by the production builder from a real decision.
 
         The enforce profile is constructed in memory. validate_policy_profile
@@ -142,26 +172,50 @@ class ControlTransportTests(unittest.TestCase):
         """
         execution = case.spec.execution_id
         profile = decisions.ENFORCE
-        candidates = (decisions.candidate(execution_id=execution),)
-        jobs = (decisions.job(execution_id=execution),)
+        baseline = 8 / 3
+        candidates = (decisions.candidate(execution_id=execution, uncapped_samples=(baseline,) * 5),)
+        jobs = (decisions.job(execution_id=execution, cpu_units=baseline,
+            private_working_set_bytes=case.spec.requested.physical_bytes,
+            private_commit_bytes=case.spec.requested.commit_bytes, active_processes=1),)
         state = ControllerSnapshot.initial()
-        for second in range(0, 7):
-            state = decisions.tick(profile, state, second,
-                                   decisions.LOW_BUSY if second < 5 else decisions.HIGH_BUSY,
-                                   candidates=candidates, jobs=jobs).next_snapshot
-        decision = decisions.tick(profile, state, 7, decisions.HIGH_BUSY,
-                                  candidates=candidates, jobs=jobs)
+        for second in range(8):
+            moment = BASE + (second - 7) * decisions.TICKS_PER_SECOND
+            frame = decisions.frame(sample_seq - 7 + second, moment, 6.0 if second < 5 else 7.6,
+                jobs=jobs, config_revision=self.control.config_revision,
+                registry_revision=self.runtime()["registry_revision"])
+            frame = replace(frame, machine=replace(frame.machine, logical_processors=8))
+            decision = next_state(profile=profile, snapshot=state, frame=frame, candidates=candidates,
+                now_tick_100ns=moment)
+            state = decision.next_snapshot
         self.assertIs(decision.action, DecisionAction.PROPOSE_L1)
         self.assertEqual(decision.victim_execution_id, execution)
         runtime = self.runtime()
         values = dict(request_id=str(uuid4()) if request_id is None else request_id,
                       guardian_epoch=EPOCH, policy_epoch=runtime["policy_instance_id"],
                       sampler_epoch="sampler-a", clock_epoch="clock-a",
-                      config_revision=CONFIG_REVISION,
+                      config_revision=self.control.config_revision,
                       registry_revision=runtime["registry_revision"], exemption_revision_seen=0,
                       decision_seq=seq, sample_seq=sample_seq,
                       sample_window_end_tick_100ns=BASE, decision_tick_100ns=BASE)
         return build_control_proposal(decision, **(values | changes))
+
+    def managed_frame_request(self, case, *, seq, window_end):
+        job = decisions.job(case.spec.execution_id, cpu_units=8 / 3,
+            private_working_set_bytes=case.spec.requested.physical_bytes,
+            private_commit_bytes=case.spec.requested.commit_bytes, active_processes=len(case.job.members))
+        frame = decisions.frame(seq, window_end, 7.6, jobs=(job,),
+            config_revision=self.control.config_revision, registry_revision=self.runtime()["registry_revision"])
+        frame = replace(frame, machine=replace(frame.machine, logical_processors=8))
+        return ControlFrameRequest(str(uuid4()), EPOCH, self.runtime()["policy_instance_id"], frame)
+
+    def warmup_via_transport(self, case, proposal):
+        saved = self.ticks
+        for index in range(5):
+            self.ticks = proposal.sample_window_end_tick_100ns - (4 - index) * decisions.TICKS_PER_SECOND
+            request = self.managed_frame_request(case, seq=proposal.sample_seq - 4 + index, window_end=self.ticks)
+            ack = self.loopback(request)
+            self.assertEqual(ack.results[0].observation, ControlObservation.UNCAPPED)
+        self.ticks = saved
 
     def service_pipe(self, proposal=None, *, peer=None, payload=None, on_write=None):
         if payload is None:
@@ -175,22 +229,25 @@ class ControlTransportTests(unittest.TestCase):
     def client_pipe(self, proposal, *, peer=None, challenge_change=None, ack_change=None,
                     ack=None, drop_ack=False):
         def respond(connection, outgoing):
-            if outgoing["kind"] != "ControlProposalRequest":
+            if outgoing["kind"] not in {"ControlProposalRequest", "ControlFrameRequest", "ControlRestoreRequest"}:
                 return
             challenge = {"version": 1, "kind": "ControlChallenge",
                          "request_id": outgoing["request_id"], "nonce": CHALLENGE_NONCE,
                          "endpoint_id": INSTANCE, "guardian_epoch": proposal.guardian_epoch,
+                         "policy_epoch": proposal.policy_epoch, "operation": outgoing["kind"],
                          "server": SERVER.to_dict(), "client": HELPER.to_dict()}
             if challenge_change is not None:
                 challenge = challenge_change(challenge)
             connection.enqueue(challenge)
             if drop_ack:
                 return
-            payload = (refusal_ack(proposal) if ack is None else ack).to_dict()
+            payload = (operation_ack(proposal) if ack is None else ack).to_dict()
             if ack_change is not None:
                 payload = ack_change(payload)
             connection.enqueue({"version": 1, "kind": "ControlAck",
                                 "request_id": outgoing["request_id"],
+                                "guardian_epoch": proposal.guardian_epoch, "policy_epoch": proposal.policy_epoch,
+                                "operation": outgoing["kind"],
                                 "nonce": challenge["nonce"], "ack": payload})
         self.pipe = Connection(SERVER if peer is None else peer, on_write=respond)
         return self.pipe
@@ -205,6 +262,13 @@ class ControlTransportTests(unittest.TestCase):
         client = transport.ControlProposalClient(
             self.endpoint, caller_process_or_identity=HELPER if caller is None else caller)
         with self.connected():
+            if type(proposal) is ControlFrameRequest:
+                return client.observe_uncapped(proposal.frame, request_id=proposal.request_id,
+                    guardian_epoch=proposal.guardian_epoch, policy_epoch=proposal.policy_epoch, timeout_ms=timeout_ms)
+            if type(proposal) is ControlRestoreRequest:
+                return client.request_restore(proposal.execution_id, request_id=proposal.request_id,
+                    guardian_epoch=proposal.guardian_epoch, policy_epoch=proposal.policy_epoch,
+                    reason=proposal.reason, timeout_ms=timeout_ms)
             return client.propose(proposal, timeout_ms=timeout_ms)
 
     def loopback(self, proposal, *, timeout_ms=1000):
@@ -381,6 +445,26 @@ class ControlTransportTests(unittest.TestCase):
         self.assertEqual(self.recorder.calls, [])
         self.assertEqual([value["kind"] for value in self.pipe.writes], ["ControlChallenge"])
 
+    def test_deadline_expiry_during_final_peer_check_prevents_every_owner_operation(self):
+        case = self.prepare()
+        original_live = transport._live
+
+        def slow_final_check(connection, retained, expected):
+            original_live(connection, retained, expected)
+            if connection.writes:
+                self.clock.now = 2000
+
+        for request in (self.proposal(case), self.frame_request(case), self.restore_request(case)):
+            with self.subTest(operation=type(request).__name__):
+                self.clock.now = 0
+                self.service_pipe(request)
+                with patch.object(transport, "_live", side_effect=slow_final_check) as peer_check:
+                    with self.assertRaisesRegex(IpcError, "ipc_deadline_exceeded"):
+                        self.serve()
+                self.assertEqual(peer_check.call_count, 3)
+                self.assertEqual(self.recorder.calls, [])
+                self.assertEqual([value["kind"] for value in self.pipe.writes], ["ControlChallenge"])
+
     def test_owner_is_called_once_and_the_service_caches_nothing(self):
         case = self.prepare()
         proposal = self.proposal(case)
@@ -436,6 +520,7 @@ class ControlTransportTests(unittest.TestCase):
         case = self.prepare()
         proposal = self.proposal(case)
         changes = ({"endpoint_id": str(uuid4())}, {"guardian_epoch": "another-epoch"},
+                   {"policy_epoch": "another-policy"}, {"operation": "ControlRestoreRequest"},
                    {"request_id": str(uuid4())},
                    {"server": replace(SERVER, pid=SERVER.pid + 2).to_dict()},
                    {"client": replace(HELPER, pid=HELPER.pid + 2).to_dict()})
@@ -476,9 +561,12 @@ class ControlTransportTests(unittest.TestCase):
                                     "request_id": proposal.request_id, "nonce": CHALLENGE_NONCE,
                                     "endpoint_id": INSTANCE,
                                     "guardian_epoch": proposal.guardian_epoch,
+                                    "policy_epoch": proposal.policy_epoch, "operation": "ControlProposalRequest",
                                     "server": SERVER.to_dict(), "client": HELPER.to_dict()})
                 connection.enqueue({"version": 1, "kind": "ControlAck",
                                     "request_id": proposal.request_id, "nonce": "d" * 64,
+                                    "guardian_epoch": proposal.guardian_epoch, "policy_epoch": proposal.policy_epoch,
+                                    "operation": "ControlProposalRequest",
                                     "ack": refusal_ack(proposal).to_dict()})
         self.pipe.on_write = tamper
         with self.assertRaisesRegex(transport.ControlTransportError,
@@ -546,6 +634,160 @@ class ControlTransportTests(unittest.TestCase):
                 client.propose({"request_id": str(uuid4())})
         connect.assert_not_called()
 
+    # --- typed frame/restore union ------------------------------------------
+
+    def frame_request(self, case, *, jobs=None):
+        frame = decisions.frame(11, BASE, 8.0,
+            jobs=(decisions.job(case.spec.execution_id),) if jobs is None else jobs,
+            registry_revision=self.runtime()["registry_revision"], config_revision=CONFIG_REVISION)
+        return ControlFrameRequest(str(uuid4()), EPOCH, self.runtime()["policy_instance_id"], frame)
+
+    def restore_request(self, case):
+        return ControlRestoreRequest(str(uuid4()), EPOCH, self.runtime()["policy_instance_id"],
+            case.spec.execution_id, "mode_off")
+
+    def test_new_operations_roundtrip_and_receive_authenticated_helper_identity(self):
+        case = self.prepare()
+        requests = (self.frame_request(case), self.restore_request(case), self.proposal(case))
+        for request in requests:
+            ack = self.loopback(request)
+            self.assertEqual(ack, operation_ack(request))
+            self.assertEqual(ack, self.served)
+        self.assertEqual(self.recorder.calls, list(requests))
+        self.assertEqual(self.recorder.helpers, [HELPER] * 3)
+        self.assertEqual(case.job.sets, 0)
+
+    def test_one_frame_rpc_carries_ten_unique_aggregates(self):
+        case = self.prepare()
+        jobs = tuple(decisions.job(str(uuid4())) for _ in range(10))
+        request = self.frame_request(case, jobs=jobs)
+        ack = self.loopback(request)
+        self.assertEqual(len(ack.results), 10)
+        self.assertEqual(self.recorder.calls, [request])
+        self.assertEqual([message["kind"] for message in self.pipe.writes], ["ControlFrameRequest"])
+
+    def test_new_operations_authenticate_before_reading_request(self):
+        case = self.prepare(helpers=0)
+        for request in (self.frame_request(case), self.restore_request(case)):
+            self.service_pipe(request)
+            with self.assertRaisesRegex(IpcError, "control_helper_unregistered"):
+                self.serve()
+            self.assertEqual(self.pipe.reads, [])
+            self.assertEqual(self.recorder.calls, [])
+
+    def test_new_operations_reject_injected_pid_command_and_force_fields(self):
+        case = self.prepare()
+        for request in (self.frame_request(case), self.restore_request(case)):
+            for extra in ({"pid": HELPER.pid}, {"command": "private"}, {"force": True}):
+                self.service_pipe(payload=wire_frame(transport.request_envelope(request) | extra))
+                with self.assertRaisesRegex(IpcError, "ipc_invalid_envelope"):
+                    self.serve()
+                self.assertEqual(self.recorder.calls, [])
+
+    def test_mixed_old_proposal_envelope_and_challenge_are_refused(self):
+        case = self.prepare()
+        request = self.proposal(case)
+        old = transport.request_envelope(request)
+        old.pop("policy_epoch")
+        self.service_pipe(payload=wire_frame(old))
+        with self.assertRaisesRegex(IpcError, "ipc_invalid_envelope"):
+            self.serve()
+        self.client_pipe(request, challenge_change=lambda value: {key: item for key, item in value.items() if key != "operation"})
+        with self.assertRaisesRegex(IpcError, "ipc_invalid_envelope") as caught:
+            self.call_client(request)
+        self.assertTrue(caught.exception.outcome_unknown)
+        self.assertEqual(self.recorder.calls, [])
+
+    def test_frame_and_restore_challenges_bind_kind_and_policy_epoch(self):
+        case = self.prepare()
+        for request in (self.frame_request(case), self.restore_request(case)):
+            for changed in ({"operation": "ControlProposalRequest"}, {"policy_epoch": "another-policy"}):
+                self.client_pipe(request, challenge_change=lambda value, c=changed: value | c)
+                with self.assertRaisesRegex(IpcError, "control_challenge_binding_mismatch") as caught:
+                    self.call_client(request)
+                self.assertTrue(caught.exception.outcome_unknown)
+                self.assertEqual(len(self.pipe.writes), 1)
+
+    def test_frame_ack_rejects_other_sampler_clock_sequence_or_unrequested_job(self):
+        case = self.prepare()
+        request = self.frame_request(case)
+        original = operation_ack(request)
+        variants = ({"sampler_epoch": "other-sampler"}, {"clock_epoch": "other-clock"},
+            {"sample_seq": request.frame.sample_seq + 1},
+            {"results": (replace(original.results[0], execution_id=str(uuid4())),)})
+        for change in variants:
+            self.client_pipe(request, ack=replace(original, **change))
+            with self.assertRaisesRegex(IpcError, "control_ack_binding_mismatch"):
+                self.call_client(request)
+
+    def test_frame_ack_can_report_new_authoritative_revision_and_missing_result(self):
+        case = self.prepare()
+        request = self.frame_request(case)
+        ack = replace(operation_ack(request), registry_revision=request.frame.registry_revision + 1,
+            config_revision="d" * 64, results=())
+        self.client_pipe(request, ack=ack)
+        self.assertEqual(self.call_client(request), ack)
+
+    def test_restore_ack_rejects_another_execution_and_inconsistent_restored_claim(self):
+        case = self.prepare()
+        request = self.restore_request(case)
+        self.client_pipe(request, ack=replace(operation_ack(request), execution_id=str(uuid4())))
+        with self.assertRaisesRegex(IpcError, "control_ack_binding_mismatch"):
+            self.call_client(request)
+        self.client_pipe(request, ack_change=lambda value: value | {"result": "RESTORED"})
+        with self.assertRaisesRegex(IpcError, "control_invalid_ack"):
+            self.call_client(request)
+
+    def test_owner_cannot_answer_frame_with_an_apply_or_restore_ack(self):
+        case = self.prepare()
+        frame_request = self.frame_request(case)
+        for wrong in (refusal_ack(self.proposal(case)), operation_ack(self.restore_request(case))):
+            self.recorder.transform = lambda ack, answer=wrong: answer
+            self.service_pipe(frame_request)
+            with self.assertRaisesRegex(IpcError, "control_invalid_ack"):
+                self.serve()
+            self.assertEqual([message["kind"] for message in self.pipe.writes], ["ControlChallenge"])
+
+    def test_new_operations_lost_ack_stays_unknown_and_does_not_retry(self):
+        case = self.prepare()
+        for request in (self.frame_request(case), self.restore_request(case)):
+            self.client_pipe(request, drop_ack=True)
+            with self.assertRaises(IpcError) as caught:
+                self.call_client(request)
+            self.assertTrue(caught.exception.outcome_unknown)
+            self.assertEqual(self.connect.call_count, 1)
+            self.assertEqual([message["request_id"] for message in self.pipe.writes], [request.request_id])
+
+    def test_new_operations_interrupt_preserves_unknown_outcome(self):
+        case = self.prepare()
+        request = self.restore_request(case)
+        self.client_pipe(request)
+        interruption = KeyboardInterrupt()
+        with patch.object(transport, "read_frame", side_effect=interruption):
+            with self.assertRaises(KeyboardInterrupt) as caught:
+                self.call_client(request)
+        self.assertIs(caught.exception, interruption)
+        self.assertTrue(interruption.control_outcome_unknown)
+        self.assertEqual(self.connect.call_count, 1)
+
+    def test_new_operations_deadline_after_challenge_prevents_owner_call(self):
+        case = self.prepare()
+        for request in (self.frame_request(case), self.restore_request(case)):
+            self.clock.now = 0
+            self.service_pipe(request, on_write=lambda *_: setattr(self.clock, "now", 2000))
+            with self.assertRaisesRegex(IpcError, "ipc_deadline_exceeded"):
+                self.serve()
+            self.assertEqual(self.recorder.calls, [])
+
+    def test_request_closed_union_refuses_nonstring_kind_and_cross_epoch(self):
+        case = self.prepare()
+        for changed in ({"kind": []}, {"kind": "ForceClear"}, {"guardian_epoch": "other"}, {"policy_epoch": "other"}):
+            value = transport.request_envelope(self.proposal(case)) | changed
+            self.service_pipe(payload=wire_frame(value))
+            with self.assertRaises(IpcError):
+                self.serve()
+        self.assertEqual(self.recorder.calls, [])
+
     # --- end to end against the production consumer --------------------------
 
     def test_ledger_mode_off_refuses_the_proposal_with_zero_native_set(self):
@@ -566,6 +808,7 @@ class ControlTransportTests(unittest.TestCase):
     def test_eligible_canary_applies_once_and_a_retried_request_repeats_the_ack(self):
         case = self.prepare(mode="canary", real_control=True)
         proposal = self.built_proposal(case)
+        self.warmup_via_transport(case, proposal)
         ack = self.loopback(proposal)
         self.assertEqual(ack.result, ApplyResult.APPLIED)
         self.assertEqual(ack.applied_rate_bp, proposal.target.cpu_rate_bp)
@@ -583,6 +826,41 @@ class ControlTransportTests(unittest.TestCase):
         self.assertEqual(again.action_id, ack.action_id)
         self.assertEqual(case.job.sets, 1)
         self.assertEqual([row["action_state"] for row in self.actions()], ["APPLIED"])
+
+    def test_full_frame_apply_restore_uncapped_barrier_path_preserves_allocation(self):
+        case = self.prepare(mode="canary", real_control=True)
+        proposal = self.built_proposal(case)
+        self.warmup_via_transport(case, proposal)
+        original = dict(self.connection().execute("SELECT * FROM reservations WHERE execution_id=?",
+                                                (case.spec.execution_id,)).fetchone())
+        applied = self.loopback(proposal)
+        self.assertEqual(applied.result, ApplyResult.APPLIED)
+        before = len(self.control._samples[case.spec.execution_id])
+        self.ticks = BASE + decisions.TICKS_PER_SECOND
+        capped = self.managed_frame_request(case, seq=proposal.sample_seq + 1, window_end=self.ticks)
+        observed = self.loopback(capped)
+        self.assertEqual(observed.results[0].observation, ControlObservation.CAPPED)
+        self.assertEqual(len(self.control._samples[case.spec.execution_id]), before)
+        restored = self.loopback(self.restore_request(case))
+        self.assertEqual(restored.result, RestoreOutcome.RESTORED)
+        self.assertTrue(restored.native_disabled and restored.bookkeeping_settled and restored.slot_released)
+        self.assertFalse(restored.barrier_cleared)
+        self.assertEqual(self.runtime()["admission_barrier"], "RECOVERY_HOLD")
+        for index in range(5):
+            self.ticks = BASE + (index + 2) * decisions.TICKS_PER_SECOND
+            fresh = self.managed_frame_request(case, seq=proposal.sample_seq + 2 + index, window_end=self.ticks)
+            observed = self.loopback(fresh)
+            self.assertEqual(observed.results[0].observation, ControlObservation.UNCAPPED)
+            if index < 4:
+                self.assertFalse(observed.results[0].barrier_cleared)
+        self.assertTrue(observed.results[0].barrier_cleared)
+        self.assertEqual(observed.registry_revision, self.runtime()["registry_revision"])
+        self.assertEqual(self.runtime()["admission_barrier"], "NONE")
+        retained = dict(self.connection().execute("SELECT * FROM reservations WHERE execution_id=?",
+                                                (case.spec.execution_id,)).fetchone())
+        for key in ("id", "execution_id", "cpu_units", "ram_gib", "physical_bytes", "commit_bytes"):
+            self.assertEqual(retained[key], original[key])
+        self.assertEqual([row["action_state"] for row in self.actions()], ["APPLIED", "RESTORED"])
 
     def test_unregistered_caller_never_reaches_guardian_control(self):
         case = self.prepare(mode="canary", helpers=0, real_control=True)

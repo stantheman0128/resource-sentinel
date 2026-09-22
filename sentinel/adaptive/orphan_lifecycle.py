@@ -27,9 +27,11 @@ import threading
 from uuid import uuid4
 
 from .contracts import CpuControl, CpuControlMode
-from .policy import PolicyError
+from .policy import PolicyBusy, PolicyError
 from .recovery_owner import RecoveryOwner
 from .store import LifecycleError, LifecycleEvidence
+from .supervisor_reconcile import RetainedPolicyOperation
+from .windows import NativePolicyMutexError
 
 
 _DISABLED = CpuControl(CpuControlMode.DISABLED, None)
@@ -67,6 +69,8 @@ class OrphanDrainOwner:
         self._lock = threading.RLock()
         self._scope_entry = self._scope_thread = None
         self._ledger_touched = False
+        self._policy_operation = RetainedPolicyOperation(store)
+        self._policy_execution_id = None
         if install_evidence_provider:
             self.store.evidence_provider = self.evidence_scope
 
@@ -96,8 +100,19 @@ class OrphanDrainOwner:
         return entry
 
     @contextmanager
-    def _policy(self):
-        """Take the store's POLICY guard between the instance and Job fences."""
+    def _policy(self, execution_id=None):
+        """Retain the same POLICY guard across a known interrupted drain.
+
+        The guard returned by prepare is the only nonce authority. Unknown
+        prepare/native cleanup is quarantined; a later read never reconstructs
+        custody from an existing nonce. A pending drain cannot lend its guard
+        to a different execution and accidentally clear that obligation.
+        """
+        operation = self._policy_operation
+        if operation._quarantine:
+            raise LifecycleError("orphan_policy_cleanup_unverified")
+        if operation.guard is not None and execution_id != self._policy_execution_id:
+            raise LifecycleError("orphan_policy_operation_pending")
         binding = self.recovery.binding
         with self.store._connection() as conn:
             runtime = self.store._policy._runtime(conn)
@@ -106,21 +121,61 @@ class OrphanDrainOwner:
             # Read before prepare: a changed namespace must not leave a
             # committed entry nonce behind for a scope that cannot run.
             raise LifecycleError("orphan_policy_binding_changed")
-        guard = self.store._policy.prepare(binding.logon_id)
-        with self.store._policy.hold(guard) as held:
-            self._ledger_touched = False
+        if operation.guard is not None:
             try:
+                nonce = operation._guard_nonce()
+                if nonce is None:
+                    # The preceding hold or clear committed and released its
+                    # own durable nonce. Retire only this retained authority;
+                    # never adopt a different nonce observed in the ledger.
+                    operation._guard = None
+                    self._policy_execution_id = None
+                elif nonce != operation.guard.nonce:
+                    operation._quarantine = "policy_entry_changed"
+                    raise PolicyError("policy_entry_changed")
+            except BaseException as error:
+                operation._failure(error)
+                raise
+        if operation.guard is None:
+            try:
+                operation._guard = self.store._policy.prepare(binding.logon_id)
+                self._policy_execution_id = execution_id
+            except PolicyBusy:
+                raise
+            except BaseException as error:
+                # prepare may have committed without returning the guard.
+                operation._error = error
+                operation._quarantine = "policy_prepare_ownership_unknown"
+                raise
+        guard = operation.guard
+        guard.clean_rejection = False
+        entered = False
+        try:
+            with self.store._policy.hold(guard) as held:
+                entered = True
+                operation._attempted = True
+                self._ledger_touched = False
                 if held.binding != binding:
                     raise LifecycleError("orphan_policy_binding_changed")
-                yield held
-            except LifecycleError:
-                # This owner refuses before it asks the ledger for anything, so
-                # the entry has no half finished work behind it. Releasing it
-                # keeps one opportunistic drain from blocking every other
-                # writer on the host. Any other failure stays uncertain.
-                if not self._ledger_touched:
-                    guard.clean_rejection = True
-                raise
+                try:
+                    yield held
+                except LifecycleError:
+                    # A read-only refusal can release its own entry. Any
+                    # started journal/ledger mutation keeps the retained guard.
+                    if not self._ledger_touched:
+                        guard.clean_rejection = True
+                    raise
+        except BaseException as error:
+            if not entered and not (isinstance(error, NativePolicyMutexError) and
+                    getattr(error, "reason", None) == "policy_mutex_timeout"):
+                operation._error = error
+                operation._quarantine = "orphan_policy_acquisition_unverified"
+            else:
+                operation._failure(error)
+            raise
+        else:
+            operation._guard = operation._error = None
+            self._policy_execution_id = None
 
     def _clear_barrier(self, record, row):
         """Ask the store to clear a finished Job's barrier, or leave it held.
@@ -164,7 +219,7 @@ class OrphanDrainOwner:
         """
         with self._lock:
             entry = self._entry(execution_id, creation_nonce)
-            with self.recovery._scope(entry, policy_scope=self._policy):
+            with self.recovery._scope(entry, policy_scope=lambda: self._policy(execution_id)):
                 record = self.recovery._read(entry)
                 if record.pending_intent is not None or record.last_applied not in (None, _DISABLED):
                     raise LifecycleError("orphan_restore_unsettled")
@@ -186,6 +241,12 @@ class OrphanDrainOwner:
                     return DrainResult(execution_id, "FINISHED", count, False, True, cleared, reason)
                 if count != 0:
                     return DrainResult(execution_id, row["state"], count, False, False)
+                from .guardian_floor import reconcile_orphan_floor_locked
+                # The DB may have acknowledged an increased demand floor just
+                # before guardian death. Repair only that monotone publication
+                # cut, after native withdrawal/empty proof, before finalization.
+                self._ledger_touched = True
+                record = reconcile_orphan_floor_locked(self.store, self.recovery, entry, row, record)
                 caller = record.wrapper_identity
                 # From here the ledger is asked to change. A failure past this
                 # line keeps the POLICY entry nonce, like any borrowed scope.

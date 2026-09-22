@@ -297,6 +297,12 @@ class GuardianRestorer:
                 # loss is reaffirmed at a new sequence on an explicit retry.
                 entry.manifest = record = following
                 entry.restore_previous = entry.restore_candidate = None
+            # Withdrawal must remain possible while accounting publication is
+            # unavailable. Settle a retained floor only after native disable,
+            # and before acknowledging bookkeeping or releasing the slot.
+            if getattr(self.owner, "_floor_publisher", None) is not None and row["state"] != "FINISHED":
+                fresh = self.owner.store.query(entry.execution_id, existing_path=True)
+                record = self.owner._manifest(entry, fresh)
             slot = self.owner.store.query_control_slot_locked()
             if slot is None or slot["execution_id"] != entry.execution_id:
                 if needs_slot:

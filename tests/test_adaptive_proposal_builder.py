@@ -87,6 +87,20 @@ class BuilderTests(unittest.TestCase):
         self.assertEqual(proposal.target, applied)
         self.assertEqual(proposal.decision_seq, 2)
 
+    def test_normal_recovery_baseline_action_is_executable_but_shadow_is_not(self):
+        state = cap_decision().next_snapshot
+        decision = None
+        for second in range(8, 40):
+            decision = decisions.tick(decisions.ENFORCE, state, second, decisions.LOW_BUSY)
+            state = decision.next_snapshot
+            if decision.action is DecisionAction.PROPOSE_BASELINE:
+                break
+        self.assertIs(decision.action, DecisionAction.PROPOSE_BASELINE)
+        proposal = build_control_proposal(decision, **bindings())
+        self.assertEqual(proposal.target, decision.target)
+        with self.assertRaises(ProposalBuildError):
+            build_control_proposal(replace(decision, executable=False, would_apply=True), **bindings())
+
     def test_restore_has_no_proposal_form_and_is_refused(self):
         capped = cap_decision().next_snapshot
         decision = decisions.tick(decisions.EXAMPLE, capped, 8, decisions.HIGH_BUSY)

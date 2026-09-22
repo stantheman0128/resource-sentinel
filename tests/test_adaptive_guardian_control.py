@@ -22,8 +22,10 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from sentinel.adaptive.contracts import (
-    ApplyResult, ControlProposal, CpuControl, CpuControlMode, CpuTarget, TICKS_PER_SECOND, Validity,
+    ApplyResult, ControlProposal, CpuControl, CpuControlMode, CpuTarget, ProcessIdentity,
+    ResourceDemand, TICKS_PER_SECOND, Validity,
 )
+from sentinel.adaptive.control_messages import ControlFrameRequest
 from sentinel.adaptive.control_slot import ControlSlotError, UncappedSample, clear_locked
 from sentinel.adaptive.decision import TICKS_PER_MS
 from sentinel.adaptive.exemption_sync import bind_policy_locked, commit_grant_locked
@@ -105,10 +107,39 @@ class Scope:
         return self.result
 
 
+class MeasuredCapabilityFixture:
+    """Explicit synthetic measured authority; no native gate claim."""
+    def assess(self):
+        return SimpleNamespace(eligible=True, reason="explicit_synthetic_capability")
+
+    def assert_control_eligible(self, *, profile_revision, logical_processors, **kwargs):
+        return SimpleNamespace(config_revision=profile_revision, logical_processors=logical_processors)
+
+
+class UnchangedFloorFixture:
+    """No publication needed only when the existing floor covers the frame.
+
+    Real floor growth and crash reconciliation have separate integration tests.
+    This seam refuses uncovered measurements rather than pretending to save.
+    """
+    def remember_uncapped_locked(self, entry, frame):
+        return None
+
+    def prepare_locked(self, entry, row, frame, *, uncapped):
+        job = next(item for item in frame.jobs if item.execution_id == entry.execution_id)
+        if (uncapped and job.cpu_units > row["floor_cpu_units"] or
+                job.private_working_set_bytes > row["floor_physical_bytes"] or
+                job.private_commit_bytes > row["floor_commit_bytes"]):
+            raise LifecycleError("fixture_floor_not_covered")
+        return row
+
+
 class GuardianControlTests(unittest.TestCase):
     # Reuse setup and helpers; never inherit another module's test methods.
     setUp = fixture.GuardianLifecycleTests.setUp
-    spec = fixture.GuardianLifecycleTests.spec
+    def spec(self, **kwargs):
+        kwargs.setdefault("demand", ResourceDemand(3.0, 1 << 30, 2 << 30, 1))
+        return fixture.GuardianLifecycleTests.spec(self, **kwargs)
     allocate = fixture.GuardianLifecycleTests.allocate
     connection = fixture.GuardianLifecycleTests.connection
     make_mutex = fixture.GuardianLifecycleTests.make_mutex
@@ -141,7 +172,11 @@ class GuardianControlTests(unittest.TestCase):
         # production code path can set a ledger mode, and none is added here.
         self.sql("UPDATE adaptive_runtime SET mode=?", (mode,))
         self.control = GuardianControl(self.launch_owner, profile=PROFILE,
-            exemptions=self.exemptions, scope=self.scope, clock=lambda: self.ticks)
+            exemptions=self.exemptions, scope=self.scope, clock=lambda: self.ticks,
+            capability_authority=MeasuredCapabilityFixture(), floor_publisher=UnchangedFloorFixture(),
+            native_capability_source=lambda: SimpleNamespace(logical_processors=8, processor_groups=1))
+        self.helper_identity = ProcessIdentity(9876, fixture.GUARDIAN.created_filetime_100ns + 99,
+                                                fixture.GUARDIAN.logon_id)
         return made[0] if cases == 1 else tuple(made)
 
     @contextmanager
@@ -200,13 +235,52 @@ class GuardianControlTests(unittest.TestCase):
         units = rate_bp * 8 / 10000
         values = dict(request_id=str(uuid4()), execution_id=case.spec.execution_id,
             guardian_epoch=EPOCH, policy_epoch=runtime["policy_instance_id"],
-            sampler_epoch="sampler-a", clock_epoch="clock-a", config_revision="c" * 64,
+            sampler_epoch="sampler-a", clock_epoch="clock-a", config_revision=self.control.config_revision,
             registry_revision=runtime["registry_revision"], exemption_revision_seen=0,
-            decision_seq=seq, sample_seq=sample_seq, sample_window_end_tick_100ns=window_end,
+            decision_seq=seq, sample_seq=sample_seq + 4, sample_window_end_tick_100ns=window_end,
             decision_tick_100ns=decision,
             target=CpuTarget("cpu_rate", CpuControlMode.HARD_CAP, units, rate_bp, 8),
             reason="cpu_pressure")
         return ControlProposal(**(values | changes))
+
+    def send_frame(self, case, *, seq, window_end, cpu_units=8 / 3, helper_identity=None, **changes):
+        jobs = tuple(decisions.job(item.spec.execution_id, cpu_units=cpu_units,
+            private_working_set_bytes=item.spec.requested.physical_bytes,
+            private_commit_bytes=item.spec.requested.commit_bytes,
+            active_processes=len(item.job.members)) for item in self.cases)
+        frame = decisions.frame(seq, window_end, 7.6, jobs=jobs,
+            config_revision=self.control.config_revision, registry_revision=self.runtime()["registry_revision"])
+        frame = replace(frame, machine=replace(frame.machine, logical_processors=8), **changes)
+        request = ControlFrameRequest(str(uuid4()), EPOCH, self.runtime()["policy_instance_id"], frame)
+        self.control.observe_control_frame(request,
+            helper_identity=self.helper_identity if helper_identity is None else helper_identity)
+        return frame
+
+    def apply(self, proposal, **kwargs):
+        # Populate real authenticated frame consumers before the direct
+        # proposal seam. Negative/replayed proposals retain their original
+        # mismatches; the fixture never edits their fields to make them pass.
+        previous = self.control._latest_frame
+        floor = self.control._seq_floor.get(proposal.execution_id, -1)
+        other_controlled = any(not episode.restored and execution != proposal.execution_id
+            for execution, episode in self.control._episodes.items())
+        episode = self.control._episodes.get(proposal.execution_id)
+        unverified_episode = episode is not None and not episode.restored and episode.applied is None
+        if (proposal.request_id not in self.control._proposal_payloads and proposal.decision_seq > floor
+                and not other_controlled and not unverified_episode
+                and proposal.config_revision == self.control.config_revision
+                and proposal.registry_revision == self.runtime()["registry_revision"]):
+            case = next(item for item in self.cases if item.spec.execution_id == proposal.execution_id)
+            saved = self.ticks
+            if previous is None:
+                for index in range(5):
+                    self.ticks = proposal.sample_window_end_tick_100ns - (4 - index) * TICKS_PER_SECOND
+                    self.send_frame(case, seq=proposal.sample_seq - 4 + index, window_end=self.ticks)
+            elif (previous.sample_seq != proposal.sample_seq or
+                  previous.registry_revision != proposal.registry_revision):
+                self.send_frame(case, seq=proposal.sample_seq, window_end=proposal.sample_window_end_tick_100ns)
+            self.ticks = saved
+        return self.control.apply(proposal, helper_identity=self.helper_identity, **kwargs)
 
     def grant(self, pid=4321, *, now=None, minutes=60):
         # The snapshot reads active leases against wall clock time, so this
@@ -236,7 +310,7 @@ class GuardianControlTests(unittest.TestCase):
         return rows[-1]["applied_tick_100ns"]
 
     def apply_cap(self, case, **changes):
-        ack = self.control.apply(self.proposal(case, **changes), now_tick_100ns=self.ticks)
+        ack = self.apply(self.proposal(case, **changes), now_tick_100ns=self.ticks)
         self.assertEqual(ack.result, ApplyResult.APPLIED)
         return ack
 
@@ -244,7 +318,7 @@ class GuardianControlTests(unittest.TestCase):
 
     def test_off_mode_refuses_every_proposal_with_zero_native_set(self):
         case = self.start(mode="off")
-        ack = self.control.apply(self.proposal(case), now_tick_100ns=self.ticks)
+        ack = self.apply(self.proposal(case), now_tick_100ns=self.ticks)
         self.assertEqual(ack.result, ApplyResult.REJECTED)
         self.assertEqual(ack.reason, "control_mode_unavailable")
         self.assertIsNone(ack.action_id)
@@ -257,7 +331,7 @@ class GuardianControlTests(unittest.TestCase):
     def test_shadow_mode_refuses_every_proposal_with_zero_native_set(self):
         case = self.start(mode="shadow")
         for seq in (1, 2, 3):
-            ack = self.control.apply(self.proposal(case, seq=seq), now_tick_100ns=self.ticks)
+            ack = self.apply(self.proposal(case, seq=seq), now_tick_100ns=self.ticks)
             self.assertEqual(ack.result, ApplyResult.REJECTED)
             self.assertEqual(ack.reason, "control_mode_unavailable")
         self.assertEqual(case.job.sets, 0)
@@ -270,7 +344,7 @@ class GuardianControlTests(unittest.TestCase):
         case = self.start()
         proposal = self.proposal(case)
         with self.recording_journal(case) as attempts:
-            ack = self.control.apply(proposal, now_tick_100ns=self.ticks)
+            ack = self.apply(proposal, now_tick_100ns=self.ticks)
         self.assertEqual(ack.result, ApplyResult.APPLIED)
         self.assertEqual((ack.applied_flags, ack.applied_rate_bp), (5, 2500))
         self.assertEqual(ack.applied_validity, Validity.VALID)
@@ -332,24 +406,26 @@ class GuardianControlTests(unittest.TestCase):
         case = self.start()
         first = self.apply_cap(case)
         intervention = first.intervention_deadline_tick_100ns
-        # Renew three seconds before the original deadline: the lease cannot
-        # reach beyond it even though six seconds of lease would fit.
-        self.ticks = intervention - 3 * TICKS_PER_SECOND
-        ack = self.control.apply(self.proposal(case, seq=2, sample_seq=2,
-            window_end=self.ticks - TICKS_PER_SECOND, decision=self.ticks), now_tick_100ns=self.ticks)
+        # Keep the actual short lease alive with distinct fresh frames. A
+        # fifty-second silent gap must never renew an expired episode.
+        for second in range(1, 58):
+            self.ticks = BASE + second * TICKS_PER_SECOND
+            ack = self.apply(self.proposal(case, seq=second + 1, sample_seq=second + 1,
+                window_end=self.ticks, decision=self.ticks), now_tick_100ns=self.ticks)
+            self.assertEqual(ack.result, ApplyResult.RENEWED, ack.reason)
         self.assertEqual(ack.result, ApplyResult.RENEWED)
         self.assertEqual(ack.lease_deadline_tick_100ns, intervention)
         self.assertEqual(ack.intervention_deadline_tick_100ns, intervention)
         self.assertEqual(case.job.sets, 1)
         rows = self.actions()
-        self.assertEqual([row["action_state"] for row in rows], ["APPLIED", "RENEWED"])
+        self.assertEqual([row["action_state"] for row in rows], ["APPLIED"] + ["RENEWED"] * 57)
 
     def test_same_sequence_retry_returns_the_original_ack_without_renewing(self):
         case = self.start()
         proposal = self.proposal(case)
-        first = self.control.apply(proposal, now_tick_100ns=self.ticks)
+        first = self.apply(proposal, now_tick_100ns=self.ticks)
         self.ticks += 2 * TICKS_PER_SECOND
-        again = self.control.apply(proposal, now_tick_100ns=self.ticks)
+        again = self.apply(proposal, now_tick_100ns=self.ticks)
         self.assertIs(again, first)
         self.assertEqual(again.lease_deadline_tick_100ns, first.lease_deadline_tick_100ns)
         self.assertEqual(case.job.sets, 1)
@@ -358,14 +434,14 @@ class GuardianControlTests(unittest.TestCase):
     def test_replayed_sequence_under_a_new_request_is_refused(self):
         case = self.start()
         self.apply_cap(case)
-        ack = self.control.apply(self.proposal(case, seq=1, sample_seq=2), now_tick_100ns=self.ticks)
+        ack = self.apply(self.proposal(case, seq=1, sample_seq=2), now_tick_100ns=self.ticks)
         self.assertEqual(ack.result, ApplyResult.REJECTED)
         self.assertEqual(ack.reason, "decision_seq_replayed")
 
     def test_older_sequence_is_refused(self):
         case = self.start()
         self.apply_cap(case, seq=5, sample_seq=5)
-        ack = self.control.apply(self.proposal(case, seq=4, sample_seq=6), now_tick_100ns=self.ticks)
+        ack = self.apply(self.proposal(case, seq=4, sample_seq=6), now_tick_100ns=self.ticks)
         self.assertEqual(ack.result, ApplyResult.REJECTED)
         self.assertEqual(ack.reason, "decision_seq_stale")
         self.assertEqual(case.job.sets, 1)
@@ -374,11 +450,11 @@ class GuardianControlTests(unittest.TestCase):
 
     def test_stale_guardian_epoch_and_registry_revision_are_refused(self):
         case = self.start()
-        stale_epoch = self.control.apply(self.proposal(case, guardian_epoch="other-epoch"),
+        stale_epoch = self.apply(self.proposal(case, guardian_epoch="other-epoch"),
                                          now_tick_100ns=self.ticks)
         self.assertEqual(stale_epoch.reason, "guardian_epoch_stale")
         revision = self.runtime()["registry_revision"]
-        stale_revision = self.control.apply(self.proposal(case, seq=2, registry_revision=revision + 1),
+        stale_revision = self.apply(self.proposal(case, seq=2, registry_revision=revision + 1),
                                             now_tick_100ns=self.ticks)
         self.assertEqual(stale_revision.reason, "registry_revision_stale")
         for ack in (stale_epoch, stale_revision):
@@ -388,7 +464,7 @@ class GuardianControlTests(unittest.TestCase):
 
     def test_stale_policy_epoch_is_refused(self):
         case = self.start()
-        ack = self.control.apply(self.proposal(case, policy_epoch=str(uuid4())),
+        ack = self.apply(self.proposal(case, policy_epoch=str(uuid4())),
                                  now_tick_100ns=self.ticks)
         self.assertEqual(ack.reason, "policy_epoch_stale")
         self.assertEqual(case.job.sets, 0)
@@ -396,7 +472,7 @@ class GuardianControlTests(unittest.TestCase):
     def test_expired_sample_window_is_refused(self):
         case = self.start()
         stale = self.ticks - (PROFILE.sample_max_age_ms * TICKS_PER_MS + 1)
-        ack = self.control.apply(self.proposal(case, window_end=stale, decision=stale),
+        ack = self.apply(self.proposal(case, window_end=stale, decision=stale),
                                  now_tick_100ns=self.ticks)
         self.assertEqual(ack.reason, "sample_window_expired")
         self.assertEqual(case.job.sets, 0)
@@ -404,7 +480,7 @@ class GuardianControlTests(unittest.TestCase):
     def test_second_victim_is_refused_while_the_slot_is_held(self):
         first, second = self.start(cases=2)
         self.apply_cap(first)
-        ack = self.control.apply(self.proposal(second, seq=1), now_tick_100ns=self.ticks)
+        ack = self.apply(self.proposal(second, seq=1), now_tick_100ns=self.ticks)
         self.assertEqual(ack.result, ApplyResult.REJECTED)
         self.assertEqual(ack.reason, "control_slot_occupied")
         self.assertEqual(second.job.sets, 0)
@@ -414,26 +490,26 @@ class GuardianControlTests(unittest.TestCase):
         case = self.start()
         self.grant()
         self.scope.result = GrantRelation.APPLICABLE
-        ack = self.control.apply(self.proposal(case), now_tick_100ns=self.ticks)
+        ack = self.apply(self.proposal(case), now_tick_100ns=self.ticks)
         self.assertEqual(ack.reason, "execution_exempt")
         self.assertEqual(case.job.sets, 0)
         self.assertIsNone(self.slot())
         self.scope.result = GrantRelation.UNKNOWN
-        unknown = self.control.apply(self.proposal(case, seq=2), now_tick_100ns=self.ticks)
+        unknown = self.apply(self.proposal(case, seq=2), now_tick_100ns=self.ticks)
         self.assertEqual(unknown.reason, "exemption_scope_unknown")
         self.assertEqual(case.job.sets, 0)
 
     def test_unreadable_exemption_authority_refuses(self):
         case = self.start()
         self.control.exemptions = None
-        ack = self.control.apply(self.proposal(case), now_tick_100ns=self.ticks)
+        ack = self.apply(self.proposal(case), now_tick_100ns=self.ticks)
         self.assertEqual(ack.reason, "exemption_authority_unavailable")
         self.assertEqual(case.job.sets, 0)
 
     def test_legacy_writer_exclusion_must_be_proven_by_the_host_authority(self):
         case = self.start()
         self.authority.excluded_error = LifecycleError("legacy_writer_handoff_unverified")
-        ack = self.control.apply(self.proposal(case), now_tick_100ns=self.ticks)
+        ack = self.apply(self.proposal(case), now_tick_100ns=self.ticks)
         self.assertEqual(ack.result, ApplyResult.REJECTED)
         self.assertEqual(ack.reason, "legacy_writer_handoff_unverified")
         self.assertGreater(self.authority.exclusion_calls, 0)
@@ -455,7 +531,7 @@ class GuardianControlTests(unittest.TestCase):
                 # Fixture write into this isolated database, to present the
                 # consumer with a row it must refuse.
                 self.sql(statement)
-                ack = self.control.apply(self.proposal(case), now_tick_100ns=self.ticks)
+                ack = self.apply(self.proposal(case), now_tick_100ns=self.ticks)
                 self.assertEqual(ack.result, ApplyResult.REJECTED)
                 self.assertEqual(ack.reason, reason)
                 self.assertEqual(case.job.sets, 0)
@@ -468,7 +544,7 @@ class GuardianControlTests(unittest.TestCase):
         failure = RecoveryJournalError("manifest_write_unavailable")
         with patch.object(self.journal, "publish", side_effect=failure):
             with self.assertRaises(RecoveryJournalError):
-                self.control.apply(self.proposal(case), now_tick_100ns=self.ticks)
+                self.apply(self.proposal(case), now_tick_100ns=self.ticks)
         self.assertEqual(case.job.sets, 0)
         self.assertEqual([call for call in case.job.calls if call[0] == "set"], [])
         # The publication may still have landed, so the slot is not handed back
@@ -490,7 +566,7 @@ class GuardianControlTests(unittest.TestCase):
     def test_query_mismatch_yields_no_applied_ack_and_attempts_restore(self):
         case = self.start()
         case.job.set_applies = False
-        ack = self.control.apply(self.proposal(case), now_tick_100ns=self.ticks)
+        ack = self.apply(self.proposal(case), now_tick_100ns=self.ticks)
         self.assertEqual(ack.result, ApplyResult.UNVERIFIED)
         self.assertEqual(ack.reason, "control_readback_mismatch")
         self.assertIsNone(ack.action_id)
@@ -508,7 +584,7 @@ class GuardianControlTests(unittest.TestCase):
     def test_settle_failure_after_a_good_set_withdraws_the_cap(self):
         case = self.start()
         with self.recording_journal(case, failures={2}) as attempts:
-            ack = self.control.apply(self.proposal(case), now_tick_100ns=self.ticks)
+            ack = self.apply(self.proposal(case), now_tick_100ns=self.ticks)
         self.assertEqual(ack.result, ApplyResult.UNVERIFIED)
         self.assertEqual(ack.reason, "control_settle_failed")
         self.assertIsNone(ack.action_id)
@@ -530,7 +606,7 @@ class GuardianControlTests(unittest.TestCase):
     def test_a_failed_settle_and_restore_is_never_renewed_and_the_sweep_retries(self):
         case = self.start()
         with self.recording_journal(case, failures={2, 3}) as attempts:
-            ack = self.control.apply(self.proposal(case), now_tick_100ns=self.ticks)
+            ack = self.apply(self.proposal(case), now_tick_100ns=self.ticks)
         self.assertEqual(ack.result, ApplyResult.UNVERIFIED)
         self.assertEqual(ack.reason, "control_settle_failed")
         self.assertEqual(attempts, ["intent", "settle", "restore"])
@@ -538,7 +614,7 @@ class GuardianControlTests(unittest.TestCase):
         # Nothing was verified and settled, so a later higher sequence is
         # refused outright instead of inheriting a fresh lease.
         self.ticks += TICKS_PER_SECOND
-        later = self.control.apply(self.proposal(case, seq=2, sample_seq=2,
+        later = self.apply(self.proposal(case, seq=2, sample_seq=2,
             window_end=self.ticks, decision=self.ticks), now_tick_100ns=self.ticks)
         self.assertEqual(later.result, ApplyResult.REJECTED)
         self.assertEqual(later.reason, "control_episode_unverified")

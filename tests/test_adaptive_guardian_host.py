@@ -20,7 +20,10 @@ import unittest
 from unittest.mock import patch
 
 from sentinel.adaptive import guardian_host as module
-from sentinel.adaptive.contracts import IdentityStatus, ProcessIdentity
+from sentinel.adaptive.contracts import ApplyAck, ApplyResult, IdentityStatus, ProcessIdentity, Validity
+from sentinel.adaptive.control_messages import (
+    ControlFrameAck, ControlFrameResult, ControlObservation, RestoreAck, RestoreOutcome,
+)
 from sentinel.adaptive.guardian_host import (
     EXIT_OK, EXIT_REFUSED, GuardianHost, GuardianHostRefused,
 )
@@ -28,7 +31,7 @@ from sentinel.adaptive.host_authority import HostCapabilityUnsupported
 from sentinel.adaptive.identity import IdentityUnavailable, VerifiedProcess
 from sentinel.adaptive.ipc import IpcError
 from sentinel.adaptive.pipe_windows import NativePipeError
-from sentinel.adaptive.store import LifecycleStore
+from sentinel.adaptive.store import LifecycleError, LifecycleStore
 from tests.fixtures.adaptive_evidence import FixturePolicyProvider
 from tests.test_adaptive_host_authority import SYNTHETIC, live_capability_refusal
 
@@ -37,6 +40,27 @@ EPOCH = "guardian-fixture-epoch"
 REPO_ROOT = Path(module.__file__).resolve().parents[2]
 LOGON = "S-1-5-5-1-2"
 GUARDIAN = ProcessIdentity(6001, 134343072000000005, LOGON)
+EXECUTION = "11111111-1111-4111-8111-111111111111"
+REQUEST = "22222222-2222-4222-8222-222222222222"
+
+
+def apply_ack():
+    return ApplyAck(request_id=REQUEST, action_id=None, execution_id=EXECUTION,
+        guardian_epoch=EPOCH, policy_epoch="fixture-policy", decision_seq=1,
+        result=ApplyResult.REJECTED, applied_flags=None, applied_rate_bp=None,
+        applied_validity=Validity.UNKNOWN, queried_tick_100ns=None,
+        lease_deadline_tick_100ns=None, intervention_deadline_tick_100ns=None,
+        reason="fixture_rejected", win32_error=None)
+
+
+def restore_ack(*, settled=True):
+    return RestoreAck(request_id=REQUEST, guardian_epoch=EPOCH,
+        policy_epoch="fixture-policy", execution_id=EXECUTION,
+        result=RestoreOutcome.RESTORED if settled else RestoreOutcome.UNVERIFIED,
+        native_disabled=True, bookkeeping_settled=settled, slot_released=settled,
+        barrier_cleared=False, applied_flags=0, applied_rate_bp=None,
+        applied_validity=Validity.VALID, queried_tick_100ns=1000,
+        reason="fixture_restored" if settled else "fixture_bookkeeping_pending", win32_error=None)
 
 
 class ProcessBackend:
@@ -68,9 +92,12 @@ class Service:
         self.name, self.events = name, events
         self.error = None
         self.result = "fixture-served"
+        self.before_serve = None
 
     def serve_once(self, listener, *, timeout_ms):
         self.events.append((self.name, timeout_ms, listener.name))
+        if self.before_serve is not None:
+            self.before_serve()
         if self.error is not None:
             raise self.error
         return self.result
@@ -94,6 +121,7 @@ class Lifecycle:
         self.events = events
         self.retained = []
         self.errors = {}
+        self.results = {}
 
     @property
     def retained_execution_ids(self):
@@ -103,8 +131,8 @@ class Lifecycle:
         self.events.append(("reconcile", execution_id))
         if execution_id in self.errors:
             raise self.errors[execution_id]
-        return SimpleNamespace(execution_id=execution_id, state="RUNNING",
-                               active_processes=1, terminal=False)
+        return self.results.get(execution_id, SimpleNamespace(
+            execution_id=execution_id, state="RUNNING", active_processes=1, terminal=False))
 
 
 class Owner:
@@ -120,19 +148,38 @@ class Owner:
 
 
 class Control:
-    """Records the sweep. Any other attribute access is a design violation."""
+    """Explicit host safety calls; direct apply/Set access remains a violation."""
 
     def __init__(self, events):
         object.__setattr__(self, "events", events)
         object.__setattr__(self, "restores", [])
         object.__setattr__(self, "now", 1000)
+        object.__setattr__(self, "tick_results", [])
+        object.__setattr__(self, "tick_error", None)
+        object.__setattr__(self, "draining", False)
+        object.__setattr__(self, "barrier_errors", {})
+        object.__setattr__(self, "barrier_results", {})
+
+    def begin_drain(self):
+        self.events.append(("begin_drain",))
+        self.draining = True
 
     def clock(self):
         return self.now
 
     def tick(self, now):
         self.events.append(("tick", now))
+        if self.tick_error is not None:
+            raise self.tick_error
+        if self.tick_results:
+            return self.tick_results.pop(0)
         return list(self.restores)
+
+    def clear_finished_admission_barrier(self, execution_id):
+        self.events.append(("clear_finished", execution_id))
+        if execution_id in self.barrier_errors:
+            raise self.barrier_errors[execution_id]
+        return self.barrier_results.get(execution_id, {"admission_barrier": "NONE"})
 
     def __getattr__(self, name):
         raise AssertionError("guardian host reached control." + name)
@@ -155,11 +202,9 @@ class GuardianHostTests(unittest.TestCase):
         host.launch_service = Service("launch", self.events)
         host.query_service = Service("query", self.events)
         host.control_service = Service("control", self.events)
-        # The proposal service returns the ApplyAck it sent. Only these three
-        # fields reach a host record.
-        host.control_service.result = SimpleNamespace(
-            execution_id="execution-a", result=SimpleNamespace(value="REJECTED"),
-            reason="fixture_rejected", request_id="private-request-marker")
+        # The transport returns its actual typed ack. Host records deliberately
+        # omit request bindings, native timestamps and the other protocol fields.
+        host.control_service.result = apply_ack()
         host.launch_listener = Listener("launch", self.events)
         host.query_listener = Listener("query", self.events)
         host.control_listener = Listener("control", self.events)
@@ -198,18 +243,68 @@ class GuardianHostTests(unittest.TestCase):
                 host.start()
         self.assertEqual(caught.exception.reason, "guardian_host_ledger_unavailable")
 
+    def test_default_rpc_deadline_is_bounded_to_one_hundred_milliseconds(self):
+        host = GuardianHost(data_dir=self.directory, journal_dir=self.directory,
+                            guardian_epoch=EPOCH)
+        options = module.build_parser().parse_args(self.arguments())
+        self.assertEqual(host.rpc_timeout_ms, 100)
+        self.assertEqual(options.rpc_timeout_ms, 100)
+        self.assertEqual(self.host.rpc_timeout_ms, 250)
+
+    def test_start_passes_evidence_authority_and_floor_publisher_to_control(self):
+        evidence_directory = self.directory / "isolated-evidence"
+        host = GuardianHost(data_dir=self.directory, journal_dir=self.directory / "recovery",
+            guardian_epoch=EPOCH, evidence_directory=evidence_directory,
+            evidence_sha256="c" * 64, control_purpose="isolated_canary")
+        host.launch_endpoint = SimpleNamespace(name="fixture-launch")
+        host.query_endpoint = SimpleNamespace(name="fixture-query")
+        host.control_endpoint = SimpleNamespace(name="fixture-control")
+        profile, evidence_authority, publisher = object(), object(), object()
+        owner, control = Owner(self.events), Control(self.events)
+        guardian = SimpleNamespace(identity=GUARDIAN)
+        store = SimpleNamespace(db_path=self.directory / "sentinel.db")
+        observed = []
+
+        def create_control(actual_owner, *, profile, exemptions, capability_authority, floor_publisher):
+            observed.append((actual_owner, profile, exemptions, capability_authority, floor_publisher))
+            return control
+
+        with patch.object(module, "read_host_capability", return_value=SYNTHETIC), \
+                patch.object(host, "_profile", return_value=profile), \
+                patch("sentinel.adaptive.store.LifecycleStore", return_value=store), \
+                patch("sentinel.adaptive.recovery_journal.RecoveryJournal", return_value=object()), \
+                patch.object(VerifiedProcess, "current", return_value=guardian), \
+                patch.object(module, "HostAuthority", return_value=object()), \
+                patch("sentinel.adaptive.guardian.GuardianLaunchOwner", return_value=owner), \
+                patch.object(host, "_register"), patch.object(host, "_endpoints"), \
+                patch.object(host, "_control_endpoint"), \
+                patch("sentinel.adaptive.capability_evidence.NativeEvidenceAuthority",
+                      return_value=evidence_authority) as evidence, \
+                patch("sentinel.adaptive.guardian_floor.FloorPublisher", return_value=publisher) as floor, \
+                patch("sentinel.adaptive.guardian_control.GuardianControl", side_effect=create_control):
+            record = host.start()
+        evidence.assert_called_once_with(profile=profile, bundle_directory=evidence_directory,
+                                         expected_bundle_sha256="c" * 64, purpose="isolated_canary")
+        floor.assert_called_once_with(owner)
+        self.assertEqual(observed, [(owner, profile, self.directory / "exemptions.sqlite3",
+                                     evidence_authority, publisher)])
+        self.assertIs(host.control, control)
+        self.assertTrue(host._started)
+        self.assertEqual(record["event"], "guardian_host_started")
+
     # --- one iteration ----------------------------------------------------
 
-    def test_one_iteration_serves_each_service_then_reconciles_then_sweeps(self):
+    def test_one_iteration_sweeps_before_rpc_then_reconciles_and_sweeps_again(self):
         self.host.owner.lifecycle.retained = ["execution-a", "execution-b"]
         record = self.host.run_once()
         self.assertEqual(self.events, [
+            ("tick", 1000),
             ("launch", 250, "launch"), ("control", 250, "control"), ("query", 250, "query"),
             ("reconcile", "execution-a"), ("reconcile", "execution-b"), ("tick", 1000)])
         self.assertTrue(record["launch_rpc"]["served"])
         self.assertTrue(record["query_rpc"]["served"])
         self.assertEqual(record["control_rpc"], {"served": True, "result": {
-            "execution_id": "execution-a", "result": "REJECTED", "reason": "fixture_rejected"}})
+            "execution_id": EXECUTION, "result": "REJECTED", "reason": "fixture_rejected"}})
         self.assertEqual([entry["execution_id"] for entry in record["reconciled"]],
                          ["execution-a", "execution-b"])
 
@@ -241,13 +336,126 @@ class GuardianHostTests(unittest.TestCase):
         self.assertEqual(caught.exception.reason, "guardian_host_not_started")
         self.assertEqual(self.events, [])
 
-    def test_the_host_never_asks_the_control_consumer_for_anything_but_a_sweep(self):
-        # Control raises on every other attribute, so a Set, an apply or a
-        # barrier clear from this loop fails the test rather than passing it.
+    def test_a_nonterminal_iteration_has_only_two_control_sweeps_and_no_barrier_clear(self):
+        # The host may request documented safety work, but Control still raises
+        # if this loop attempts to apply a proposal or manipulate native state.
+        self.host.owner.lifecycle.retained = [EXECUTION]
         self.host.run_once()
-        self.assertEqual([event for event in self.events if event[0] == "tick"], [("tick", 1000)])
+        self.assertEqual([event for event in self.events if event[0] == "tick"],
+                         [("tick", 1000), ("tick", 1000)])
+        self.assertFalse(any(event[0] == "clear_finished" for event in self.events))
+
+    def test_expiry_sweep_completes_before_first_rpc_wait_and_retains_both_outcomes(self):
+        self.host.control.tick_results = [
+            [("execution-expired", "lease_expired", None)],
+            [("execution-finished", "control_mode_unavailable", None)],
+        ]
+
+        def before_wait():
+            self.assertEqual(self.events[:2], [("tick", 1000), ("launch", 250, "launch")])
+            self.assertEqual(len(self.host.control.tick_results), 1)
+
+        self.host.launch_service.before_serve = before_wait
+        record = self.host.run_once()
+        self.assertEqual(record["restored"], [
+            {"execution_id": "execution-expired", "reason": "lease_expired"},
+            {"execution_id": "execution-finished", "reason": "control_mode_unavailable"},
+        ])
+
+    def test_failed_initial_safety_sweep_never_enters_a_blocking_rpc(self):
+        self.host.control.tick_error = LifecycleError("fixture_restore_unverified")
+        with self.assertRaisesRegex(LifecycleError, "fixture_restore_unverified"):
+            self.host.run_once()
+        self.assertEqual(self.events, [("tick", 1000)])
+
+    def test_finished_barrier_clear_follows_post_reconcile_sweep_and_retries_failure(self):
+        self.host.owner.lifecycle.retained = [EXECUTION]
+        self.host.owner.lifecycle.results[EXECUTION] = SimpleNamespace(
+            execution_id=EXECUTION, state="FINISHED", active_processes=0, terminal=True)
+        self.host.control.barrier_errors[EXECUTION] = LifecycleError("fixture_bookkeeping_pending")
+        first = self.host.run_once()
+        self.assertEqual(self.events[-3:], [
+            ("reconcile", EXECUTION), ("tick", 1000), ("clear_finished", EXECUTION)])
+        self.assertEqual(first["barrier_clears"], [])
+        self.assertEqual(first["barrier_clear_errors"], [
+            {"execution_id": EXECUTION, "reason": "fixture_bookkeeping_pending"}])
+        self.assertEqual(self.host.retained_execution_ids(), (EXECUTION,))
+        self.host.control.barrier_errors.clear()
+        second = self.host.run_once()
+        self.assertEqual(second["barrier_clear_errors"], [])
+        self.assertEqual(second["barrier_clears"], [
+            {"execution_id": EXECUTION, "barrier_cleared": True}])
+        self.assertEqual([event for event in self.events if event[0] == "clear_finished"],
+                         [("clear_finished", EXECUTION), ("clear_finished", EXECUTION)])
+
+    def test_reconcile_failure_does_not_claim_a_finished_barrier_clear(self):
+        self.host.owner.lifecycle.retained = [EXECUTION]
+        self.host.owner.lifecycle.errors[EXECUTION] = LifecycleError("fixture_reconcile_pending")
+        record = self.host.run_once()
+        self.assertEqual(record["barrier_clears"], [])
+        self.assertEqual(record["barrier_clear_errors"], [])
+        self.assertFalse(any(event[0] == "clear_finished" for event in self.events))
+
+    def test_control_frame_ack_summary_preserves_each_observation_without_wire_bindings(self):
+        second_execution = "33333333-3333-4333-8333-333333333333"
+        self.host.control_service.result = ControlFrameAck(
+            request_id=REQUEST, guardian_epoch=EPOCH, policy_epoch="fixture-policy",
+            sampler_epoch="fixture-sampler", clock_epoch="fixture-clock", sample_seq=7,
+            registry_revision=10, config_revision="a" * 64, results=(
+                ControlFrameResult(EXECUTION, ControlObservation.UNCAPPED, 1000, True, "fixture_clear"),
+                ControlFrameResult(second_execution, ControlObservation.UNVERIFIED, None, False,
+                                   "fixture_query_unknown"),
+            ))
+        result = self.host._control_rpc()
+        self.assertEqual(result, {"served": True, "result": {"sample_seq": 7, "results": [
+            {"execution_id": EXECUTION, "observation": "UNCAPPED", "barrier_cleared": True,
+             "reason": "fixture_clear"},
+            {"execution_id": second_execution, "observation": "UNVERIFIED", "barrier_cleared": False,
+             "reason": "fixture_query_unknown"},
+        ]}})
+        self.assertNotIn(REQUEST, json.dumps(result))
+
+    def test_restore_ack_summary_keeps_native_and_bookkeeping_outcomes_separate(self):
+        for settled in (False, True):
+            with self.subTest(settled=settled):
+                ack = restore_ack(settled=settled)
+                self.host.control_service.result = ack
+                result = self.host._control_rpc()
+                self.assertEqual(result, {"served": True, "result": {
+                    "execution_id": EXECUTION, "result": ack.result.value, "reason": ack.reason,
+                    "native_disabled": True, "bookkeeping_settled": settled,
+                    "slot_released": settled, "barrier_cleared": False,
+                }})
+                self.assertNotIn(REQUEST, json.dumps(result))
 
     # --- the drain --------------------------------------------------------
+
+    def test_drain_begins_before_sweep_and_still_serves_restore_rpc(self):
+        self.host.control_service.result = restore_ack(settled=False)
+
+        def serving_restore():
+            self.assertTrue(self.host.control.draining)
+            self.assertEqual(self.events[:2], [("begin_drain",), ("tick", 1000)])
+
+        self.host.control_service.before_serve = serving_restore
+        record = self.host.run_once(serve_launch=False)
+        self.assertIsNone(record["launch_rpc"])
+        self.assertTrue(record["control_rpc"]["served"])
+        self.assertFalse(record["control_rpc"]["result"]["bookkeeping_settled"])
+        self.assertTrue(record["query_rpc"]["served"])
+        self.assertEqual([event[0] for event in self.events],
+                         ["begin_drain", "tick", "control", "query", "tick"])
+
+    def test_drain_still_accepts_an_empty_frame_ack_without_launch_or_apply(self):
+        self.host.control_service.result = ControlFrameAck(
+            request_id=REQUEST, guardian_epoch=EPOCH, policy_epoch="fixture-policy",
+            sampler_epoch="fixture-sampler", clock_epoch="fixture-clock", sample_seq=8,
+            registry_revision=10, config_revision="b" * 64, results=())
+        record = self.host.run_once(serve_launch=False)
+        self.assertTrue(self.host.control.draining)
+        self.assertIsNone(record["launch_rpc"])
+        self.assertEqual(record["control_rpc"], {"served": True,
+                                                "result": {"sample_seq": 8, "results": []}})
 
     def test_a_bounded_drain_reports_retained_work_and_does_not_exit(self):
         self.host.owner.lifecycle.retained = ["execution-a"]
@@ -256,10 +464,11 @@ class GuardianHostTests(unittest.TestCase):
         self.assertEqual(record["exiting"], False)
         self.assertEqual(record["retained"], ["execution-a"])
         self.assertEqual(record["iterations"], 2)
-        # No launch RPC and no proposal is served while draining; the read
-        # only query is.
+        # New launches stop, while restore/frame RPCs and queries still reach
+        # their services. GuardianControl owns the restriction on new caps.
         self.assertEqual([event[0] for event in self.events
-                          if event[0] in {"launch", "control", "query"}], ["query", "query"])
+                          if event[0] in {"launch", "control", "query"}],
+                         ["control", "query", "control", "query"])
         self.assertFalse(self.host.launch_listener.closed)
 
     def test_the_drain_returns_only_once_custody_clears(self):

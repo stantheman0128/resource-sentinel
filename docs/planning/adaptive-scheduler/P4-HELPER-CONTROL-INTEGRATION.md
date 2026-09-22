@@ -223,3 +223,53 @@ old wording forbids all guardian communication must continue proving zero
 restrictive shadow behavior; do not delete safety coverage to enable a sender.
 Native effect, timing, overhead and A/B remain separately unverified until the
 required isolated measurements exist. This document reports no test passes.
+
+## Implementation checkpoint, 2026-09-22
+
+The contract above was committed before source as `e6f406d`. The implementation
+now separates the unchanged shadow host from `HelperControlHost`. The active
+driver pins a real bounded ledger snapshot and retained query-handle identity,
+captures a frame with the authoritative revision, then accepts only correlated
+native readback acknowledgements. A lost reply keeps its original operation;
+restoration and post-restore observations continue without promotion evidence.
+
+Guardian receives authenticated frame/restore operations through the existing
+control pipe. Consecutive sequence numbers alone no longer establish continuous
+pressure: actual measurement windows must also be adjacent. Processing delay
+does not count toward HIGH or low-pressure dwell. Same-native-target renewal
+retains the applied action ID; a changed native target gets a new journaled
+action. Verified restoration anchors victim cooldown, preserved across later
+sampling/registry faults. Uncertain fence cleanup cannot produce RESTORED.
+
+`FloorPublisher` keeps guardian-paired uncapped CPU observations and persists
+monotone demand before restriction. It does not trust the sampler's unqualified
+CPU high-water field. DB-ahead/journal-behind failures retain the original
+publication and POLICY owners; recovery disables native control before trying
+the accounting repair. Capped CPU never reduces the lifetime floor.
+
+`NativeEvidenceAuthority.assess()` / `refresh()` prepares evidence outside
+POLICY/Job fences; `assert_control_eligible()` performs a bounded cached check,
+and guardian reads interrupt time again before restriction. Immutable measured
+gate arithmetic is cached, while current bounded fingerprints and host context
+must still match. The production default has no evidence bundle or verified
+launch-scope source, so it cannot authorize a restrictive action.
+
+The typed `VerifiedLaunchScope` collaborator is deliberately an unfinished
+production integration for items 4/6, with the stable denial
+`capability_launch_scope_unverified` when absent. Its measured topology must
+come from the exact pinned S2 artifact and match retained original-wrapper
+launch/stdio provenance; independently selecting equal hashes is not proof.
+Shell binary hashes and console/RDP session protocol alone are insufficient.
+The native producer and original launch provenance consumer still need to be
+implemented; this gap is not described as something native tests alone fix.
+
+The new evidence-v1 schema requires raw counters/timestamps, exact identities,
+readbacks and cleanup measurements; older spike aggregate JSON cannot simply
+be relabelled as compatible evidence. LIMITED also retains the explicit
+`p6_promotion_policy_unresolved` refusal pending item 6's complete A/B contract.
+These are conservative refusals, not permission to skip S1-S3 or P4-P6 gates.
+
+The planning README is the current test/result index. All local fixtures are
+isolated and synthetic where native collaborators are substituted; they do not
+establish native effect, recovery latency, overhead or A/B success. Production
+configuration, Scheduled Tasks and global entrypoints remain unchanged.

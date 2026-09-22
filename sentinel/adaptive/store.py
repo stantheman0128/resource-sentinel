@@ -1388,7 +1388,7 @@ class LifecycleStore:
                 raise LifecycleError("coverage_allocation_binding_mismatch")
 
     @staticmethod
-    def _retained_inputs(expected_row: Mapping[str, Any], manifest: RecoveryManifest):
+    def _retained_inputs(expected_row: Mapping[str, Any], manifest: RecoveryManifest, *, floor_growth=False):
         """Validate retained data without treating it as native authority."""
         if type(manifest) is not RecoveryManifest:
             raise LifecycleError("retained_manifest_invalid")
@@ -1435,7 +1435,8 @@ class LifecycleStore:
                 expected["job_name"] != manifest.job_name or expected["job_nonce"] != manifest.creation_nonce or
                 expected["guardian_epoch"] != manifest.guardian_epoch or
                 wrapper != manifest.wrapper_identity or root != manifest.root_identity or
-                floor != manifest.allocated_floor):
+                (any(getattr(floor, key) < getattr(manifest.allocated_floor, key) for key in resource_keys)
+                 if floor_growth else floor != manifest.allocated_floor)):
             raise LifecycleError("retained_manifest_mismatch")
         return expected, manifest
 
@@ -1483,6 +1484,24 @@ class LifecycleStore:
         Missing/unknown storage is never recreated, repaired or treated as free.
         """
         expected, manifest = self._retained_inputs(expected_row, manifest)
+        try:
+            ledger_path = self._existing_ledger_path or Path(self.db_path).resolve()
+        except (OSError, TypeError, ValueError, RuntimeError):
+            raise LifecycleError("coverage_registry_unavailable") from None
+        with _coverage_read_transaction(ledger_path) as conn:
+            self._validate_retained_allocation(conn, expected, manifest)
+
+    def assert_retained_floor_growth(self, expected_row: Mapping[str, Any],
+                                     manifest: RecoveryManifest) -> None:
+        """Prove only the DB-ahead publication cut, never a control permit.
+
+        All allocation, identity, revision and uniqueness checks remain exact.
+        The sole permitted difference is a componentwise greater durable floor
+        in the DB. A retained native owner may copy that obligation into its
+        journal; the normal exact-equality proof is still required before Set.
+        Journal-ahead-DB, any decrease, terminal state or unknown storage fails.
+        """
+        expected, manifest = self._retained_inputs(expected_row, manifest, floor_growth=True)
         try:
             ledger_path = self._existing_ledger_path or Path(self.db_path).resolve()
         except (OSError, TypeError, ValueError, RuntimeError):

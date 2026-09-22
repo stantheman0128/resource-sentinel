@@ -16,7 +16,7 @@ returned decision is not an authorization: the guardian rereads exemptions,
 ownership, identity and API readback on its own.
 
 Fixed safety properties of this layer:
-  - the only outputs are maintain, cap at level 1, cap at level 2, and restore;
+  - outputs are maintain, two retreat levels, baseline recovery, and restore;
   - no kill, no suspend, no RAM cap, no GPU control, no worker resize;
   - at most one active cap, over at most ten enrolled Jobs;
   - only explicitly background, P2/P3, Job contained candidates may be victims;
@@ -65,11 +65,13 @@ class DecisionAction(str, Enum):
     OBSERVE = "OBSERVE"
     PROPOSE_L1 = "PROPOSE_L1"
     PROPOSE_L2 = "PROPOSE_L2"
+    PROPOSE_BASELINE = "PROPOSE_BASELINE"
     RENEW = "RENEW"
     REQUEST_RESTORE = "REQUEST_RESTORE"
 
 
 TIGHTENING_ACTIONS = frozenset({DecisionAction.PROPOSE_L1, DecisionAction.PROPOSE_L2})
+CONTROL_TARGET_ACTIONS = TIGHTENING_ACTIONS | {DecisionAction.PROPOSE_BASELINE}
 
 
 def _int(value, name, minimum=0, maximum=UINT64_MAX):
@@ -165,7 +167,7 @@ class PolicyProfile:
                                 ("high_samples", 1, 64),
                                 ("baseline_samples", 1, 64),
                                 ("retreat_l2_after_ms", 1, 60_000),
-                                ("normal_change_min_interval_ms", 1, 60_000),
+                                ("normal_change_min_interval_ms", 5_000, 60_000),
                                 ("recovery_continuous_ms", 1, 60_000),
                                 ("lease_ms", 1, 60_000),
                                 ("intervention_max_ms", 1, 60_000),
@@ -288,6 +290,9 @@ class ActiveIntervention:
     started_tick_100ns is when this module first proposed a cap, not when the
     guardian confirmed one. Starting the deadline clock at the earlier moment
     only shortens the intervention, which is the conservative direction.
+    Level zero is the baseline recovery cap, which still must be disabled.
+    A proposed snapshot is an intent; a live caller must retain the preceding
+    applied snapshot until the guardian has positively acknowledged the change.
     """
 
     execution_id: str
@@ -300,8 +305,7 @@ class ActiveIntervention:
     def __post_init__(self):
         if not isinstance(self.execution_id, str) or not self.execution_id:
             raise ContractViolation("execution_id: identifier required")
-        if self.level not in (1, 2):
-            raise ContractViolation("level: only two retreat levels exist")
+        _int(self.level, "level", 0, 2)
         _num(self.baseline_cpu_units, "baseline_cpu_units", 0.0, 4096.0, allow_minimum=False)
         for name in ("started_tick_100ns", "deadline_tick_100ns", "level_entered_tick_100ns"):
             _int(getattr(self, name), name)
@@ -326,6 +330,9 @@ class ControllerSnapshot:
     active: ActiveIntervention | None = None
     cooldown_execution_id: str | None = None
     cooldown_until_tick_100ns: int = 0
+    high_since_tick_100ns: int | None = None
+    # Processing time can lag by seconds; continuity belongs to measured windows.
+    last_window_end_tick_100ns: int | None = None
 
     def __post_init__(self):
         _typed(self.state, ControllerState, "state")
@@ -333,7 +340,8 @@ class ControllerSnapshot:
             value = getattr(self, name)
             if value is not None and (not isinstance(value, str) or not 1 <= len(value) <= 128):
                 raise ContractViolation(f"{name}: bounded identifier or null required")
-        for name in ("last_sample_seq", "last_tick_100ns", "low_since_tick_100ns"):
+        for name in ("last_sample_seq", "last_tick_100ns", "low_since_tick_100ns", "high_since_tick_100ns",
+                     "last_window_end_tick_100ns"):
             if getattr(self, name) is not None:
                 _int(getattr(self, name), name)
         _int(self.uncapped_streak, "uncapped_streak", 0, 4096)
@@ -575,10 +583,18 @@ def _evidence_problem(profile: PolicyProfile, snapshot: ControllerSnapshot,
     window_ms = (frame.window_end_tick_100ns - frame.window_start_tick_100ns) / TICKS_PER_MS
     if not profile.cpu_window_min_ms <= window_ms <= profile.cpu_window_max_ms:
         return "sample_window_invalid"
+    previous_end = snapshot.last_window_end_tick_100ns
+    if previous_end is None:
+        if snapshot.last_sample_seq is not None or snapshot.active is not None:
+            return "sample_window_history_unknown"
+    elif frame.window_start_tick_100ns != previous_end:
+        return ("sample_window_gap" if frame.window_start_tick_100ns > previous_end
+                else "sample_window_overlap")
     return None
 
 
-CONTINUITY_BREAKS = frozenset({"sample_gap", "sampler_epoch_changed", "clock_epoch_changed"})
+CONTINUITY_BREAKS = frozenset({"sample_gap", "sampler_epoch_changed", "clock_epoch_changed",
+                              "sample_window_gap", "sample_window_overlap", "sample_window_history_unknown"})
 
 
 def _rebase_frame(profile: PolicyProfile, snapshot: ControllerSnapshot, frame: FastFrame,
@@ -593,6 +609,10 @@ def _rebase_frame(profile: PolicyProfile, snapshot: ControllerSnapshot, frame: F
     """
     if problem not in CONTINUITY_BREAKS:
         return None
+    if (problem == "sample_window_overlap" and snapshot.last_window_end_tick_100ns is not None and
+            frame.window_end_tick_100ns <= snapshot.last_window_end_tick_100ns):
+        # An advancing sequence does not make an old interval new evidence.
+        return None
     # Ticks of a new clock epoch are not comparable with the old last tick.
     last_tick = None if problem == "clock_epoch_changed" else snapshot.last_tick_100ns
     fresh = ControllerSnapshot(state=ControllerState.WARMUP, last_tick_100ns=last_tick)
@@ -606,7 +626,9 @@ def _observed(snapshot: ControllerSnapshot, frame: FastFrame, now_tick_100ns: in
                   uncapped_streak=snapshot.uncapped_streak, high_streak=snapshot.high_streak,
                   low_since_tick_100ns=snapshot.low_since_tick_100ns, active=snapshot.active,
                   cooldown_execution_id=snapshot.cooldown_execution_id,
-                  cooldown_until_tick_100ns=snapshot.cooldown_until_tick_100ns)
+                  cooldown_until_tick_100ns=snapshot.cooldown_until_tick_100ns,
+                  high_since_tick_100ns=snapshot.high_since_tick_100ns,
+                  last_window_end_tick_100ns=frame.window_end_tick_100ns)
     values.update(changes)
     return ControllerSnapshot(**values)
 
@@ -614,11 +636,11 @@ def _observed(snapshot: ControllerSnapshot, frame: FastFrame, now_tick_100ns: in
 def _decide(action: DecisionAction, reason: str, snapshot: ControllerSnapshot, *,
             mode: Mode, victim: str | None = None, target: CpuTarget | None = None,
             lease: int | None = None, examined: int = 0) -> Decision:
-    # Restores are always executable. Tightening and renewal execute only in
+    # Restores are always executable. Target proposals and renewal execute only in
     # enforce mode; shadow records a would-apply and enforces nothing.
     if action is DecisionAction.REQUEST_RESTORE:
         executable, would_apply = True, False
-    elif action in TIGHTENING_ACTIONS or action is DecisionAction.RENEW:
+    elif action in CONTROL_TARGET_ACTIONS or action is DecisionAction.RENEW:
         executable = mode is Mode.ENFORCE
         would_apply = mode is Mode.SHADOW
     else:
@@ -651,7 +673,8 @@ def next_state(*, profile: PolicyProfile, snapshot: ControllerSnapshot, frame: F
     if snapshot.state is ControllerState.RESTORE_UNVERIFIED:
         return _decide(DecisionAction.REQUEST_RESTORE, "restore_unverified",
                        _observed(snapshot, frame, now_tick_100ns, state=ControllerState.RESTORE_UNVERIFIED,
-                                 uncapped_streak=0, high_streak=0, low_since_tick_100ns=None),
+                                 uncapped_streak=0, high_streak=0, low_since_tick_100ns=None,
+                                 high_since_tick_100ns=None),
                        mode=profile.mode, victim=snapshot.active.execution_id if snapshot.active else None)
 
     problem = _evidence_problem(profile, snapshot, frame, now_tick_100ns)
@@ -666,7 +689,7 @@ def next_state(*, profile: PolicyProfile, snapshot: ControllerSnapshot, frame: F
             return _decide(DecisionAction.OBSERVE, problem,
                            _observed(snapshot, rebase, now_tick_100ns,
                                      state=ControllerState.WARMUP, uncapped_streak=0,
-                                     high_streak=0, low_since_tick_100ns=None),
+                                     high_streak=0, low_since_tick_100ns=None, high_since_tick_100ns=None),
                            mode=profile.mode)
         return _decide(DecisionAction.OBSERVE, problem,
                        ControllerSnapshot(state=ControllerState.WARMUP,
@@ -674,6 +697,7 @@ def next_state(*, profile: PolicyProfile, snapshot: ControllerSnapshot, frame: F
                                           clock_epoch=snapshot.clock_epoch,
                                           last_sample_seq=snapshot.last_sample_seq,
                                           last_tick_100ns=snapshot.last_tick_100ns,
+                                          last_window_end_tick_100ns=snapshot.last_window_end_tick_100ns,
                                           cooldown_execution_id=snapshot.cooldown_execution_id,
                                           cooldown_until_tick_100ns=snapshot.cooldown_until_tick_100ns),
                        mode=profile.mode)
@@ -690,7 +714,7 @@ def _restore(profile: PolicyProfile, snapshot: ControllerSnapshot, now_tick_100n
     active = snapshot.active
     cooldown = now_tick_100ns + profile.victim_cooldown_ms * TICKS_PER_MS
     values = dict(state=ControllerState.COOLDOWN, uncapped_streak=0, high_streak=0,
-                  low_since_tick_100ns=None, active=None,
+                  low_since_tick_100ns=None, high_since_tick_100ns=None, active=None,
                   cooldown_execution_id=active.execution_id if active else None,
                   cooldown_until_tick_100ns=cooldown)
     if frame is not None:
@@ -699,7 +723,8 @@ def _restore(profile: PolicyProfile, snapshot: ControllerSnapshot, now_tick_100n
         next_snapshot = ControllerSnapshot(sampler_epoch=snapshot.sampler_epoch,
                                            clock_epoch=snapshot.clock_epoch,
                                            last_sample_seq=snapshot.last_sample_seq,
-                                           last_tick_100ns=snapshot.last_tick_100ns, **values)
+                                           last_tick_100ns=snapshot.last_tick_100ns,
+                                           last_window_end_tick_100ns=snapshot.last_window_end_tick_100ns, **values)
     return _decide(DecisionAction.REQUEST_RESTORE, reason, next_snapshot, mode=profile.mode,
                    victim=active.execution_id if active else None)
 
@@ -725,16 +750,31 @@ def _active_tick(profile: PolicyProfile, snapshot: ControllerSnapshot, frame: Fa
             or now_tick_100ns < still[0].ineligible_until_tick_100ns):
         return _restore(profile, snapshot, now_tick_100ns, "no_longer_eligible", frame=frame)
 
+    # Once the first outward change is proposed, recovery never turns back
+    # toward L2. Renewals and every step preserve the original deadline and b.
+    if snapshot.state is ControllerState.RECOVERING or active.level == 0:
+        return _recovery_step(profile, snapshot, frame, now_tick_100ns,
+                              snapshot.low_since_tick_100ns)
+
     if busy_pct < profile.recovery_cpu_pct:
         low_since = snapshot.low_since_tick_100ns
-        low_since = now_tick_100ns if low_since is None else low_since
-        if now_tick_100ns - low_since >= profile.recovery_continuous_ms * TICKS_PER_MS:
-            return _restore(profile, snapshot, now_tick_100ns, "pressure_cleared", frame=frame)
+        # Transport/processing delay is not extra evidence of low CPU usage.
+        low_since = frame.window_end_tick_100ns if low_since is None else low_since
+        if frame.window_end_tick_100ns - low_since >= profile.recovery_continuous_ms * TICKS_PER_MS:
+            return _recovery_step(profile, snapshot, frame, now_tick_100ns, low_since)
         return _renew(profile, snapshot, frame, now_tick_100ns, "recovery_pending",
                       low_since_tick_100ns=low_since)
 
     since_level = now_tick_100ns - active.level_entered_tick_100ns
-    if (active.level == 1 and since_level >= profile.retreat_l2_after_ms * TICKS_PER_MS
+    # The 80--90 percent hysteresis band is neither recovery nor HIGH. It
+    # breaks the high dwell; elapsed time under L1 alone cannot justify L2.
+    high_since = None
+    if busy_pct >= profile.high_cpu_pct:
+        high_since = max(active.level_entered_tick_100ns,
+                         frame.window_end_tick_100ns if snapshot.high_since_tick_100ns is None
+                         else snapshot.high_since_tick_100ns)
+    if (active.level == 1 and high_since is not None and
+            frame.window_end_tick_100ns - high_since >= profile.retreat_l2_after_ms * TICKS_PER_MS
             and since_level >= profile.normal_change_min_interval_ms * TICKS_PER_MS):
         target = target_rate(baseline_cpu_units=active.baseline_cpu_units,
                              fraction=profile.retreat_l2_fraction,
@@ -749,23 +789,74 @@ def _active_tick(profile: PolicyProfile, snapshot: ControllerSnapshot, frame: Fa
                                         intervention_deadline_tick_100ns=active.deadline_tick_100ns)
             return _decide(DecisionAction.PROPOSE_L2, "retreat_level_2",
                            _observed(snapshot, frame, now_tick_100ns, state=ControllerState.CAPPED_L2,
-                                     low_since_tick_100ns=None, active=escalated),
+                                     low_since_tick_100ns=None, high_since_tick_100ns=high_since,
+                                     active=escalated),
                            mode=profile.mode, victim=active.execution_id, target=target, lease=lease)
-    return _renew(profile, snapshot, frame, now_tick_100ns, "maintain", low_since_tick_100ns=None)
+    return _renew(profile, snapshot, frame, now_tick_100ns, "maintain",
+                  low_since_tick_100ns=None, high_since_tick_100ns=high_since)
+
+
+def _recovery_step(profile: PolicyProfile, snapshot: ControllerSnapshot, frame: FastFrame,
+                   now_tick_100ns: int, low_since_tick_100ns: int | None) -> Decision:
+    """L2 -> L1 -> original b -> disabled, with one ordinary step per interval.
+
+    No new baseline is learned under a cap. The caller ACK-gates each proposed
+    snapshot; replaying this pure function with the preceding snapshot cannot
+    advance through two unacknowledged steps. Safety and absolute deadline
+    restore are checked before reaching this function and never wait here.
+    """
+    active = snapshot.active
+    if (now_tick_100ns - active.level_entered_tick_100ns <
+            profile.normal_change_min_interval_ms * TICKS_PER_MS):
+        return _renew(profile, snapshot, frame, now_tick_100ns, "recovery_step_wait",
+                      low_since_tick_100ns=low_since_tick_100ns)
+    if active.level == 0:
+        return _restore(profile, snapshot, now_tick_100ns, "pressure_cleared", frame=frame)
+    if active.level == 2:
+        level, action, reason = 1, DecisionAction.PROPOSE_L1, "recovery_level_1"
+        target = target_rate(baseline_cpu_units=active.baseline_cpu_units,
+                             fraction=profile.retreat_l1_fraction,
+                             logical_processors=frame.machine.logical_processors,
+                             floor_cpu_units=profile.cap_floor_cpu_units)
+    else:
+        level, action, reason = 0, DecisionAction.PROPOSE_BASELINE, "recovery_baseline"
+        # target_rate deliberately accepts only retreat fractions. Baseline
+        # recovery is a distinct action, not a new retreat or admission signal.
+        units = max(profile.cap_floor_cpu_units, active.baseline_cpu_units)
+        denominator = frame.machine.logical_processors
+        target = (None if units >= denominator else
+                  CpuTarget("cpu_rate", CpuControlMode.HARD_CAP, units,
+                            math.ceil(10000 * units / denominator), denominator))
+    if target is None:
+        # There is no effective cap to express at/above the machine denominator.
+        return _restore(profile, snapshot, now_tick_100ns,
+                        "recovery_target_exceeds_denominator", frame=frame)
+    recovering = ActiveIntervention(active.execution_id, level, active.baseline_cpu_units,
+        active.started_tick_100ns, active.deadline_tick_100ns, now_tick_100ns)
+    lease = lease_deadline_tick(profile, now_tick_100ns=now_tick_100ns,
+        sample_window_end_tick_100ns=frame.window_end_tick_100ns,
+        intervention_deadline_tick_100ns=active.deadline_tick_100ns)
+    return _decide(action, reason,
+        _observed(snapshot, frame, now_tick_100ns, state=ControllerState.RECOVERING,
+                  high_streak=0, uncapped_streak=0, low_since_tick_100ns=low_since_tick_100ns,
+                  high_since_tick_100ns=None, active=recovering), mode=profile.mode,
+        victim=active.execution_id, target=target, lease=lease)
 
 
 def _renew(profile: PolicyProfile, snapshot: ControllerSnapshot, frame: FastFrame,
-           now_tick_100ns: int, reason: str, *, low_since_tick_100ns: int | None) -> Decision:
+           now_tick_100ns: int, reason: str, *, low_since_tick_100ns: int | None,
+           high_since_tick_100ns: int | None = None) -> Decision:
     active = snapshot.active
     lease = lease_deadline_tick(profile, now_tick_100ns=now_tick_100ns,
                                 sample_window_end_tick_100ns=frame.window_end_tick_100ns,
                                 intervention_deadline_tick_100ns=active.deadline_tick_100ns)
     state = ControllerState.CAPPED_L1 if active.level == 1 else ControllerState.CAPPED_L2
-    if reason == "recovery_pending":
+    if active.level == 0 or snapshot.state is ControllerState.RECOVERING:
         state = ControllerState.RECOVERING
     return _decide(DecisionAction.RENEW, reason,
                    _observed(snapshot, frame, now_tick_100ns, state=state,
-                             low_since_tick_100ns=low_since_tick_100ns),
+                             low_since_tick_100ns=low_since_tick_100ns,
+                             high_since_tick_100ns=high_since_tick_100ns),
                    mode=profile.mode, victim=active.execution_id, lease=lease)
 
 
@@ -778,7 +869,7 @@ def _idle_tick(profile: PolicyProfile, snapshot: ControllerSnapshot, frame: Fast
     observe = lambda state, reason, examined=0: _decide(  # noqa: E731 - local shorthand
         DecisionAction.OBSERVE, reason,
         _observed(snapshot, frame, now_tick_100ns, state=state, uncapped_streak=uncapped_streak,
-                  high_streak=high_streak, low_since_tick_100ns=None),
+                  high_streak=high_streak, low_since_tick_100ns=None, high_since_tick_100ns=None),
         mode=profile.mode, examined=examined)
 
     if uncapped_streak < profile.baseline_samples:
@@ -809,6 +900,7 @@ def _idle_tick(profile: PolicyProfile, snapshot: ControllerSnapshot, frame: Fast
     return _decide(DecisionAction.PROPOSE_L1, "retreat_level_1",
                    _observed(snapshot, frame, now_tick_100ns, state=ControllerState.CAPPED_L1,
                              uncapped_streak=0, high_streak=high_streak,
-                             low_since_tick_100ns=None, active=active),
+                             low_since_tick_100ns=None, high_since_tick_100ns=now_tick_100ns,
+                             active=active),
                    mode=profile.mode, victim=selection.execution_id, target=target, lease=lease,
                    examined=selection.examined)

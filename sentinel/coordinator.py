@@ -487,7 +487,10 @@ class Coordinator:
         if generated:
             try:
                 stamp = datetime.strptime(generated, "%Y-%m-%d %H:%M:%S").timestamp()
-                fresh = now - stamp <= float(config["admission_status_stale_sec"])
+                fresh = -30 <= now - stamp <= float(config["admission_status_stale_sec"])
+                if status.get("sampled_at"):
+                    sample = datetime.strptime(status["sampled_at"], "%Y-%m-%d %H:%M:%S").timestamp()
+                    fresh = fresh and -30 <= now - sample <= float(config["admission_status_stale_sec"])
             except (TypeError, ValueError):
                 pass
         ram = status.get("ram") or {}
@@ -507,20 +510,21 @@ class Coordinator:
     @staticmethod
     def _routed_local_pending(
         conn: sqlite3.Connection, config: dict[str, Any], now: float
-    ) -> tuple[float, float]:
+    ) -> tuple[float, float, int]:
         """Return fresh Maintainer reservations for this local execution pool."""
         table = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_reservations'"
         ).fetchone()
         if not table:
-            return 0.0, 0.0
+            return 0.0, 0.0, 0
         cutoff = now - float(config["reservation_grace_sec"])
         row = conn.execute(
-            """SELECT COALESCE(SUM(cpu_units),0) cpu,COALESCE(SUM(ram_gib),0) ram
-               FROM worker_reservations WHERE worker_id=? AND created_at>=?""",
-            (str(config["local_worker_id"]), cutoff),
+            """SELECT COALESCE(SUM(CASE WHEN created_at>=? THEN cpu_units ELSE 0 END),0) cpu,
+                      COALESCE(SUM(CASE WHEN created_at>=? THEN ram_gib ELSE 0 END),0) ram,COUNT(*) io
+               FROM worker_reservations WHERE worker_id=? AND expires_at>?""",
+            (cutoff, cutoff, str(config["local_worker_id"]), now),
         ).fetchone()
-        return float(row["cpu"]), float(row["ram"])
+        return float(row["cpu"]), float(row["ram"]), int(row["io"])
 
     def admit(
         self, request: ResourceRequest, status: dict[str, Any], *,
@@ -686,11 +690,11 @@ class Coordinator:
                 pending_ram = sum(float(r["ram_gib"]) for r in active if now - float(r["created_at"]) <= grace)
                 pending_commit = sum((r["commit_bytes"] / 2**30 if r["commit_bytes"] is not None else float(r["ram_gib"]))
                                      for r in active if now - float(r["created_at"]) <= grace)
-                routed_cpu, routed_ram = self._routed_local_pending(conn, cfg, now)
+                routed_cpu, routed_ram, routed_io = self._routed_local_pending(conn, cfg, now)
                 pending_cpu += routed_cpu
                 pending_ram += routed_ram
                 pending_commit += routed_ram
-                used_io = sum(int(r["io_slots"]) for r in active)
+                used_io = sum(int(r["io_slots"]) for r in active) + routed_io
                 if allowed and float(metrics["actual_cpu"]) + pending_cpu + float(req.cpu_units) > float(cfg["local_allocatable_cpu"]):
                     allowed, reason = False, "cpu_capacity"
                 if allowed and float(metrics["actual_ram"]) + pending_ram + float(req.ram_gib) > float(cfg["local_allocatable_ram_gib"]):
@@ -896,9 +900,15 @@ class Coordinator:
         return removed
 
     def record_sample(self, status: dict[str, Any], *, sampled_at: float | None = None) -> None:
-        sampled_at = time.time() if sampled_at is None else sampled_at
-        memory = _windows_memory()
-        disks = _disk_io()
+        if sampled_at is None:
+            try:
+                sampled_at = datetime.strptime(status['sampled_at'], '%Y-%m-%d %H:%M:%S').timestamp()
+            except (KeyError, TypeError, ValueError):
+                sampled_at = time.time()  # compatibility with callers predating sampled_at
+        # The collector has already sampled these counters. Re-reading here would
+        # associate later values with the original snapshot and add collection cost.
+        memory = status.get('memory') or {}
+        disks = status.get('disk_performance') or {}
         ram = status.get("ram") or {}
         with self._db() as conn:
             conn.execute(

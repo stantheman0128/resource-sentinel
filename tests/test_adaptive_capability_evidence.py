@@ -163,8 +163,14 @@ class CapabilityEvidenceTests(unittest.TestCase):
             LOGON, 1, 0, "3.12.9", 64, "d" * 64, False,
             sha(("powershell51\0" + "e" * 64 + "\n").encode()))
         self.now = 1000 * T
+        from sentinel.adaptive.launch_topology import LaunchTopology
+        self.topology = LaunchTopology(1, "powershell51", "e" * 64, "d" * 64, "f" * 64,
+            ("pipe", "pipe", "pipe"), (None, None, None), False, "", False,
+            None, None, 0x80000, 0x100, "job_list_handle_list")
+        launch_cases = [row | {"topology_sha256": None if row["case"] == "infra_exit_125"
+            else self.topology.sha256} for row in case_rows(False)]
         self.data = {"S1": s1_data(), "S2": {"hosts": [dict(name="powershell51",
-            executable_sha256="e" * 64, cases=case_rows(False))]},
+            executable_sha256="e" * 64, measured_topologies=[self.topology.to_dict()], cases=launch_cases)]},
             "S3": {"cases": case_rows(True)}, "P4": p4_data(), "P5": p5_data()}
         self.bundle = dict(schema_version=1, kind="native_capability_bundle", run_id=RUN,
             evidence_source="native", build=asdict(self.build), context=asdict(self.context),
@@ -222,6 +228,77 @@ class CapabilityEvidenceTests(unittest.TestCase):
         self.assertEqual(missing.reason, "capability_evidence_missing")
         self.assertEqual(self.authority(expected_bundle_sha256=None).assess().reason,
                          "capability_evidence_unpinned")
+
+    def test_helper_proposal_view_does_not_bypass_guardian_launch_gate(self):
+        authority = self.authority(launch_scope_source=None)
+        self.assertTrue(authority.assess().eligible)
+        self.assertEqual(self.assert_eligible(ce.HelperProposalEvidence(authority)).config_revision,
+                         profile_revision(self.profile))
+        with self.assertRaisesRegex(ce.CapabilityEvidenceError, "launch_scope_unverified"):
+            self.assert_eligible(authority)
+
+    def test_retained_scope_source_matches_actual_pinned_topology_without_hash_injection(self):
+        from types import SimpleNamespace
+        from sentinel.adaptive.launch_topology import OriginalLaunchProvenance
+        from sentinel.adaptive.launch_scope import RetainedLaunchProvenance, RetainedLaunchScopeSource
+        authority = self.authority(launch_scope_source=None)
+        proof = OriginalLaunchProvenance(ProcessIdentity(20, 200, LOGON),
+            ProcessIdentity(10, 100, LOGON), ProcessIdentity(30, 300, LOGON), self.topology)
+        retained = RetainedLaunchProvenance(EXECUTION, "a" * 32, proof)
+        source = RetainedLaunchScopeSource(owner=SimpleNamespace(launch_provenance_for=lambda _: retained),
+            authority=authority)
+        authority.launch_scope_source = source
+        self.assertTrue(authority.assess().eligible)
+        self.assert_eligible(authority)
+        retained = replace(retained, provenance=replace(proof,
+            topology=replace(self.topology, command_host_image_sha256="0" * 64)))
+        with self.assertRaisesRegex(ce.CapabilityEvidenceError, "launch_scope_unverified"):
+            self.assert_eligible(authority)
+        self.assertIsNone(authority._scope_failure)
+        retained = replace(retained, provenance=proof)
+        self.assert_eligible(authority)
+
+    def test_measured_topology_is_derived_from_validated_pinned_s2(self):
+        authority = self.authority()
+        with self.assertRaisesRegex(ce.CapabilityEvidenceError, "receipt_unprepared"):
+            authority.prepared_launch_topologies()
+        self.assertTrue(authority.assess().eligible)
+        prepared = authority.prepared_launch_topologies()
+        self.assertEqual(prepared.topologies, (self.topology,))
+        with patch.object(authority, "_load", side_effect=AssertionError("file I/O")), \
+             patch.object(authority, "context_source", side_effect=AssertionError("native probe")):
+            self.assertIs(authority.prepared_launch_topologies(), prepared)
+        self.now += 4 * T
+        with self.assertRaisesRegex(ce.CapabilityEvidenceError, "receipt_stale"):
+            authority.prepared_launch_topologies()
+
+    def test_missing_topology_reference_does_not_certify_execution_scope(self):
+        self.data["S2"]["hosts"][0]["cases"][0]["topology_sha256"] = "0" * 64
+        self.failed_gate("S2", "capability_launch_topology_unmeasured")
+
+    def test_partial_secondary_topology_does_not_borrow_full_case_matrix(self):
+        host = self.data["S2"]["hosts"][0]
+        secondary = replace(self.topology, stdio_types=("disk", "pipe", "pipe"))
+        host["measured_topologies"].append(secondary.to_dict())
+        host["cases"].append(deepcopy(host["cases"][0]) | {"topology_sha256": secondary.sha256})
+        authority = self.authority()
+        self.assertTrue(authority.assess().eligible)
+        self.assertEqual(authority.prepared_launch_topologies().topologies, (self.topology,))
+        host["cases"][0]["topology_sha256"] = secondary.sha256
+        host["cases"].pop()  # split one required case away from the original profile
+        self.failed_gate("S2", "capability_topology_case_matrix_incomplete")
+
+    def test_unlaunched_infrastructure_refusal_cannot_claim_topology(self):
+        row = next(row for row in self.data["S2"]["hosts"][0]["cases"] if row["case"] == "infra_exit_125")
+        row["topology_sha256"] = self.topology.sha256
+        self.failed_gate("S2", "capability_unlaunched_topology_claim")
+
+    def test_unobserved_topology_and_other_python_image_refuse(self):
+        host = self.data["S2"]["hosts"][0]
+        host["measured_topologies"].append(replace(self.topology, command_host_image_sha256="0" * 64).to_dict())
+        self.failed_gate("S2", "capability_launch_topology_unmeasured")
+        host["measured_topologies"] = [replace(self.topology, python_image_sha256="0" * 64).to_dict()]
+        self.failed_gate("S2", "capability_launch_topology_mismatch")
 
     def test_assert_never_refreshes_and_requires_prepared_receipt(self):
         authority = self.authority()
@@ -328,7 +405,7 @@ class CapabilityEvidenceTests(unittest.TestCase):
 
     def test_s2_hosts_and_child_survival_required(self):
         self.data["S2"]["hosts"][0]["executable_sha256"] = "f" * 64
-        self.failed_gate("S2", "capability_shell_scope_mismatch")
+        self.failed_gate("S2", "capability_launch_topology_mismatch")
         self.data["S2"]["hosts"][0]["executable_sha256"] = "e" * 64
         row = next(r for r in self.data["S2"]["hosts"][0]["cases"] if r["case"] == "root_child_survival")
         row["observations"]["live_child_count_after_root"] = 0

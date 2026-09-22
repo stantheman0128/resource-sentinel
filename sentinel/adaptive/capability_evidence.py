@@ -12,7 +12,12 @@ Producer contract v1 (item 6 must emit this, existing spike JSON is not v1):
 * S1 data is {prerequisites, rounds}. Prerequisites is the three numeric native
   observations described in _s1; rounds are ten unique 0..9 records, with raw
   CPU/window counters, cap/readback/restore and final cleanup observations.
-* S2 data is {hosts}, each {name, executable_sha256, cases}; S3 is {cases}.
+* S2 data is {hosts}, each {name, executable_sha256, measured_topologies,
+  cases}; S3 is {cases}. Each S2 case also has topology_sha256 referencing
+  its actual original-wrapper observation (null only for infra_exit_125,
+  which must not launch). A topology without an actual case is not measured;
+  only a topology with its own complete launched-case matrix is control-eligible.
+  Partial secondary observations do not inherit another topology's evidence.
   Each case has case, iteration, observations and cleanup.
   Their fixed matrices/observations are declared below; producers must keep the
   original detailed native logs whose fixed producer digest identifies their
@@ -524,7 +529,7 @@ def _zero_observations(observations, names):
             _reject("capability_safety_invariant_failed")
 
 
-def _cases(data, matrix, *, recovery):
+def _cases(data, matrix, *, recovery, require_complete=True):
     _object(data, ("cases",))
     seen = set()
     for row in _list(data["cases"], maximum=512):
@@ -578,23 +583,64 @@ def _cases(data, matrix, *, recovery):
                 _reject("capability_collector_isolation_unverified")
             _zero_observations(values, ("membership_mismatches",))
         _cleanup(row["cleanup"])
-    if seen != {(case, iteration) for case, count in matrix.items() for iteration in range(1, count + 1)}:
+    if require_complete and seen != {(case, iteration) for case, count in matrix.items() for iteration in range(1, count + 1)}:
         _reject("capability_case_matrix_incomplete")
 
 
 def _s2(data, context):
+    from .launch_topology import LaunchTopology
     _object(data, ("hosts",))
-    records, seen = [], set()
+    records, seen, eligible = [], set(), []
     for host in _list(data["hosts"], maximum=2):
-        _object(host, ("name", "executable_sha256", "cases"))
+        _object(host, ("name", "executable_sha256", "measured_topologies", "cases"))
         name = host["name"]
         if name not in {"powershell51", "pwsh"} or name in seen or not _digest(host["executable_sha256"]):
             _reject("capability_shell_scope_invalid")
         seen.add(name)
         records.append(name + "\0" + host["executable_sha256"] + "\n")
-        _cases({"cases": host["cases"]}, S2_CASES, recovery=False)
+        topologies = {}
+        for value in _list(host["measured_topologies"], maximum=16):
+            try:
+                topology = LaunchTopology.from_dict(value)
+            except Exception:
+                _reject("capability_launch_topology_invalid")
+            if (topology.shell_kind != name or topology.shell_image_sha256 != host["executable_sha256"] or
+                    topology.python_image_sha256 != context.python_sha256 or topology.sha256 in topologies):
+                _reject("capability_launch_topology_mismatch")
+            topologies[topology.sha256] = topology
+        referenced, groups, infrastructure = set(), {}, []
+        for row in _list(host["cases"], maximum=512):
+            _object(row, ("case", "iteration", "observations", "cleanup", "topology_sha256"))
+            if row["case"] == "infra_exit_125":
+                if row["topology_sha256"] is not None:
+                    _reject("capability_unlaunched_topology_claim")
+                infrastructure.append({key: value for key, value in row.items() if key != "topology_sha256"})
+            else:
+                digest = row["topology_sha256"]
+                if not _digest(digest) or digest not in topologies:
+                    _reject("capability_launch_topology_unmeasured")
+                referenced.add(digest)
+                groups.setdefault(digest, []).append({key: value for key, value in row.items() if key != "topology_sha256"})
+        if referenced != set(topologies):
+            _reject("capability_launch_topology_unmeasured")
+        complete = {(case, iteration) for case, count in S2_CASES.items()
+                    for iteration in range(1, count + 1)}
+        promoted = []
+        for digest, cases in groups.items():
+            matrix = cases + infrastructure
+            # Even an observed-only variant must contain valid observations,
+            # no duplicates, no unsafe outcomes, and valid cleanup. It cannot
+            # borrow missing launch cases from a different topology.
+            _cases({"cases": matrix}, S2_CASES, recovery=False, require_complete=False)
+            covered = {(row["case"], row["iteration"]) for row in matrix}
+            if covered == complete:
+                promoted.append(topologies[digest])
+        if not promoted:
+            _reject("capability_topology_case_matrix_incomplete")
+        eligible.extend(promoted)
     if "powershell51" not in seen or _sha("".join(sorted(records)).encode("utf-8")) != context.shell_hosts_sha256:
         _reject("capability_shell_scope_mismatch")
+    return tuple(eligible)
 
 
 def _p95(values):
@@ -821,7 +867,9 @@ class NativeEvidenceAuthority:
         self._files = {}
         self._failure = None
         self._gates = None
+        self._measured_launch_topologies = None
         self._prepared = None
+        self._prepared_launch = None
         self._prepared_tick = None
         self._clock_backend = None
         self.clock = self._tick if clock is None else clock
@@ -878,6 +926,7 @@ class NativeEvidenceAuthority:
 
     def assess(self):
         self._prepared, self._prepared_tick = None, None
+        self._prepared_launch = None
         missing, failed, notes = [], [], []
         try:
             self._load()
@@ -902,7 +951,7 @@ class NativeEvidenceAuthority:
                     if gate == "S1":
                         _s1(data, context)
                     elif gate == "S2":
-                        _s2(data, context)
+                        self._measured_launch_topologies = _s2(data, context)
                     elif gate == "S3":
                         _cases(data, S3_CASES, recovery=True)
                     elif gate == "P4":
@@ -923,6 +972,9 @@ class NativeEvidenceAuthority:
                 _reject("capability_refresh_stale")
             receipt = VerifiedCapability(context.logical_processors, self.config_revision,
                 self.expected_bundle_sha256, self.purpose, context.fingerprint)
+            from .launch_scope import MeasuredLaunchTopologies
+            self._prepared_launch = MeasuredLaunchTopologies(receipt.config_revision,
+                receipt.host_fingerprint, receipt.bundle_sha256, self._measured_launch_topologies)
             self._prepared_tick = start  # age covers the entire live refresh.
             self._prepared = CapabilityAssessment(True, "capability_evidence_verified", verified=receipt, scope_notes=notes)
             return self._prepared
@@ -937,7 +989,27 @@ class NativeEvidenceAuthority:
 
     refresh = assess
 
-    def assert_control_eligible(self, *, profile_revision, logical_processors, execution_row, guardian_identity):
+    def prepared_launch_topologies(self):
+        """Bounded immutable scope read; never load/probe inside a Job fence.
+
+        Each returned topology independently passed the full launched S2 matrix.
+        The infrastructure-refusal cases have no launch and are shared. Partial
+        secondary observations never acquire another topology's compatibility.
+        """
+        assessment = self._prepared
+        if assessment is None or self._prepared_tick is None or self._prepared_launch is None:
+            _reject("capability_receipt_unprepared")
+        now = _integer(self.clock())
+        if not 0 <= now - self._prepared_tick <= self.profile.sample_max_age_ms * 10_000:
+            _reject("capability_receipt_stale")
+        return self._prepared_launch
+
+    def assert_proposal_eligible(self, *, profile_revision, logical_processors, execution_row, guardian_identity):
+        """Prepared global evidence and row binding for a non-actuating helper.
+
+        This grants no native restriction. Only guardian assert_control_eligible
+        additionally proves its original retained launch scope before Set.
+        """
         assessment = self._prepared
         if assessment is None or self._prepared_tick is None:
             _reject("capability_receipt_unprepared")
@@ -963,6 +1035,12 @@ class NativeEvidenceAuthority:
                 _reject("capability_execution_ineligible")
         except KeyError:
             _reject("capability_execution_binding_invalid")
+        return receipt
+
+    def assert_control_eligible(self, *, profile_revision, logical_processors, execution_row, guardian_identity):
+        receipt = self.assert_proposal_eligible(profile_revision=profile_revision,
+            logical_processors=logical_processors, execution_row=execution_row,
+            guardian_identity=guardian_identity)
         if not callable(self.launch_scope_source) or self._scope_failure is not None:
             _reject("capability_launch_scope_unverified")
         binding = dict(execution_id=execution_row["execution_id"],
@@ -971,6 +1049,11 @@ class NativeEvidenceAuthority:
         try:
             scope = self.launch_scope_source(**binding)
         except Exception as error:
+            from .launch_scope import LaunchScopeUnavailable
+            if type(error) is LaunchScopeUnavailable:
+                # A known unsupported original topology rejects only this
+                # candidate. It does not quarantine other valid executions.
+                _reject("capability_launch_scope_unverified")
             # Preserve a collaborator's uncertain custody rather than retrying
             # it or replacing its exception to obtain a positive receipt.
             self._scope_failure = error
@@ -980,3 +1063,17 @@ class NativeEvidenceAuthority:
                 scope.measured_topology_sha256 != scope.actual_topology_sha256):
             _reject("capability_launch_scope_unverified")
         return receipt
+
+
+class HelperProposalEvidence:
+    """Helper-only adapter; the guardian always receives the full authority.
+
+    HelperControl's collaborator method predates separate original-launch
+    verification. Adapt only that helper callback; no scope receipt is forged
+    and the underlying guardian authority's exact control gate stays intact.
+    """
+    def __init__(self, authority):
+        self.authority = authority
+
+    def assert_control_eligible(self, **binding):
+        return self.authority.assert_proposal_eligible(**binding)

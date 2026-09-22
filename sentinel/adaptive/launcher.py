@@ -648,6 +648,7 @@ class ManagedLauncher:
         bound = self._rpc(self.client.bind_root, expected_revision=self._claim.state_revision,
             job_nonce=self._prepared.job_nonce, root_identity=self._root,
             root_handle_locator=self._root_locator,
+            launch_provenance=getattr(self.process, "launch_provenance", None),
             request_id=self._request_ids["bind"], timeout_ms=timeout_ms)
         self._bound_result = self._result(bound, states={"RUNNING", "DRAINING", "FINISHED"},
             minimum_revision=self._claim.state_revision + 1, scope=self._prepared)

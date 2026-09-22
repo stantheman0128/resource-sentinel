@@ -141,6 +141,7 @@ class GuardianHost:
         from .guardian_control import GuardianControl
         from .guardian_floor import FloorPublisher
         from .capability_evidence import NativeEvidenceAuthority
+        from .launch_scope import RetainedLaunchScopeSource
         from .identity import VerifiedProcess
         from .recovery_journal import RecoveryJournal
         from .store import LifecycleStore
@@ -181,6 +182,8 @@ class GuardianHost:
             capability_authority = NativeEvidenceAuthority(profile=profile,
                 bundle_directory=self.evidence_directory,
                 expected_bundle_sha256=self.evidence_sha256, purpose=self.control_purpose)
+            capability_authority.launch_scope_source = RetainedLaunchScopeSource(
+                owner=self.owner, authority=capability_authority)
             floor_publisher = FloorPublisher(self.owner)
             self.control = GuardianControl(self.owner, profile=profile,
                 exemptions=self.data_dir / "exemptions.sqlite3",

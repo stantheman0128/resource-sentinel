@@ -48,8 +48,9 @@ class HelperControlHost(HelperHost):
                 raise HelperHostRefused('helper_control_identity_changed')
             return ControlProposalClient(endpoint, caller_process_or_identity=self.process)
 
+        from .capability_evidence import HelperProposalEvidence
         self.control = HelperControl(profile=self.profile, sampler=self.sampler,
-            binding_source=source, evidence_authority=self.evidence_authority,
+            binding_source=source, evidence_authority=HelperProposalEvidence(self.evidence_authority),
             client_factory=client_factory, clock=self._clock)
         return {**record, 'event':'helper_control_host_started', 'mode':initial.mode,
                 'capability_verified':True}

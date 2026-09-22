@@ -69,7 +69,7 @@ loader error 或未跑的 native gate 算成 pass。
 | --- | --- |
 | 1. 裁決 ② | 契約與 source 完成；完整 2,007 tests，最後 cleanup 修正後 102 tests 通過。 |
 | 2. 裁決 ④ | 契約與 source 完成；最後完整 adaptive 2,127 tests 通過。沒有舊 witness 的 cold adoption 仍不支援；native recovery 未驗證。 |
-| 3. helper sender | Source 接線、獨立 review 與完整 2,298 tests 通過。原生 capability bundle、actual launch/stdio scope producer 尚屬項目 4/6 的缺口，缺證據時不啟用控制。 |
+| 3. helper sender | Source 接線、獨立 review 與完整 2,298 tests 通過。後續 original launch/stdio provenance、guardian scope 比對與 helper proposal adapter 已接線，344 targeted tests 通過（30.960 秒，含 30 個專用 scope tests）。實際 S2 topology producer／native bundle／新增採集成本仍未驗證，缺證據不啟用控制。 |
 | 4. release／CLI | Source 整合與完整 2,800 tests 通過；包含 exact discovery、typed operator transport、原子 off／audit、同 owner 收尾與三個 host 的 drain。Native 操作通訊、控制及恢復仍未驗證。 |
 | 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport 前置模組](P2-DAILY-ACTIVATION.md)已作為獨立 foundation 提交，通過 130 portable tests（5.026 秒）；既有 writer 接線、常駐 generation owner、真正 lifetime provider 與明確 source activation 仍待完成。日常 grace 前提未解鎖。 |
 | 6. console 驗收命令 | [P6 schedule／fixture／analyzer foundation](P6-RUNNER-CONTRACT.md)已獨立提交，與 P4 portable 模組合跑 184 tests 通過（0.610 秒）；S1/S2 producer、S3 real-host foundation、P4 cost 仍有本機候選程式。整體 orchestration、部分 fault cases、完整成本／A/B coverage 尚缺，不是只剩 console 執行。 |

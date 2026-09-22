@@ -326,7 +326,7 @@ class GuardianHostTests(unittest.TestCase):
         host.launch_endpoint = SimpleNamespace(name="fixture-launch")
         host.query_endpoint = SimpleNamespace(name="fixture-query")
         host.control_endpoint = SimpleNamespace(name="fixture-control")
-        profile, evidence_authority, publisher = object(), object(), object()
+        profile, evidence_authority, publisher = object(), SimpleNamespace(), object()
         owner, control = Owner(self.events), Control(self.events)
         guardian = SimpleNamespace(identity=GUARDIAN)
         store = SimpleNamespace(db_path=self.directory / "sentinel.db")
@@ -356,6 +356,10 @@ class GuardianHostTests(unittest.TestCase):
         floor.assert_called_once_with(owner)
         self.assertEqual(observed, [(owner, profile, self.directory / "exemptions.sqlite3",
                                      evidence_authority, publisher)])
+        from sentinel.adaptive.launch_scope import RetainedLaunchScopeSource
+        self.assertIsInstance(evidence_authority.launch_scope_source, RetainedLaunchScopeSource)
+        self.assertIs(evidence_authority.launch_scope_source.owner, owner)
+        self.assertIs(evidence_authority.launch_scope_source.authority, evidence_authority)
         self.assertIs(host.control, control)
         self.assertTrue(host._started)
         self.assertEqual(record["event"], "guardian_host_started")

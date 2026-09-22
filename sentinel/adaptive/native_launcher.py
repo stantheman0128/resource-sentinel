@@ -162,6 +162,9 @@ class CreatedProcess:
         self._creation_outcome = "not_attempted"
         self._unverified_process_info = _ProcessInfo()
         self._closed = False
+        self.launch_provenance = None
+        self._launch_capture = None
+        self._launch_capture_error = None
 
     @property
     def creation_definitely_absent(self):
@@ -295,6 +298,11 @@ class CreatedProcess:
                 self.handle = None
                 return
             errors = []
+            if self._launch_capture is not None and self._launch_capture.cleanup_pending:
+                try:
+                    self._launch_capture.retry_cleanup()
+                except BaseException as error:
+                    errors.append(error)
             try:
                 self._cleanup_transient()
             except BaseException as error:
@@ -336,7 +344,8 @@ def retry_launch_cleanup(error):
 
 
 def launch_in_job(job, application, command_line, *, cwd=None,
-                  stdin_handle=None, stdout_handle=None, stderr_handle=None, backend=None):
+                  stdin_handle=None, stdout_handle=None, stderr_handle=None, backend=None,
+                  capture_factory=None):
     """Perform one native attempt; caller holds the Job and launch authority.
 
     ``backend`` is an explicit in-process fixture seam. No serialized readiness,
@@ -357,6 +366,7 @@ def launch_in_job(job, application, command_line, *, cwd=None,
         raise ValueError("native_launch_encoding_invalid")
     if len(command_line.encode("utf-16-le")) // 2 + 1 > 32767:
         raise ValueError("native_command_line_too_large")
+    native_backend = backend is None
     backend = _WindowsBackend() if backend is None else backend
     owner = CreatedProcess(backend, logon_id)
     k, primary = backend.kernel, None
@@ -400,7 +410,26 @@ def launch_in_job(job, application, command_line, *, cwd=None,
         startup.StartupInfo.dwFlags = 0x00000100
         startup.StartupInfo.hStdInput, startup.StartupInfo.hStdOutput, startup.StartupInfo.hStdError = owner._stdio
         startup.lpAttributeList = C.cast(owner._attributes, C.c_void_p)
+        if native_backend or capture_factory is not None:
+            from .launch_topology import NativeLaunchCapture
+            owner._launch_capture = (capture_factory or NativeLaunchCapture)()
+            try:
+                owner._launch_capture.capture(application=application, stdio_handles=tuple(owner._stdio),
+                    creation_flags=0x00080000, startup_flags=int(startup.StartupInfo.dwFlags))
+            except Exception as error:
+                owner._launch_capture_error = error
+                # Unsupported topology still permits admission-only launch.
+                # Unsettled query-handle custody cannot be discarded to do so.
+                if owner._launch_capture.cleanup_pending:
+                    raise
         mutable_command = C.create_unicode_buffer(command_line)
+        if owner._launch_capture is not None and owner._launch_capture_error is None:
+            try:
+                owner._launch_capture.confirm_launch()
+            except Exception as error:
+                owner._launch_capture_error = error
+                if owner._launch_capture.cleanup_pending:
+                    raise
         owner._creation_outcome = "unknown"
         try:
             created = k.CreateProcessW(application, mutable_command, None, None, True,
@@ -427,6 +456,13 @@ def launch_in_job(job, application, command_line, *, cwd=None,
         backend.check(k.IsProcessInJob(owner.handle, job_handle, C.byref(member)), "created_process_membership_failed")
         if not member.value:
             raise NativeLaunchError("created_process_membership_mismatch")
+        if owner._launch_capture is not None and owner._launch_capture_error is None:
+            try:
+                owner.launch_provenance = owner._launch_capture.bind_created(owner)
+            except Exception as error:
+                owner._launch_capture_error = error
+                if owner._launch_capture.cleanup_pending:
+                    raise
     except BaseException as error:
         primary = error
     try:
@@ -441,7 +477,8 @@ def launch_in_job(job, application, command_line, *, cwd=None,
         if owner._creation_outcome in {"created", "unknown"}:
             raise LaunchOutcomeUnknown(owner, primary) from primary
         if (owner._thread is not None or owner._stdio or owner._attributes_initialized or
-                owner._attribute_initialization_uncertain or owner._duplicate_uncertainty):
+                owner._attribute_initialization_uncertain or owner._duplicate_uncertainty or
+                (owner._launch_capture is not None and owner._launch_capture.cleanup_pending)):
             primary.cleanup_owner = owner
         raise primary
     return owner

@@ -96,6 +96,7 @@ class GuardianLaunchOwner:
         self.guardian = self.lifecycle.guardian
         self._job_factory = NativeJob.create if job_factory is None else job_factory
         self._pending = {}
+        self._launch_provenance = {}
         self._failed_peers = {}
         self._uncertain = []
         self._lock = self.lifecycle._lock
@@ -111,6 +112,51 @@ class GuardianLaunchOwner:
     def retained_execution_ids(self):
         with self._lock:
             return tuple(self._pending) + self.lifecycle.retained_execution_ids + tuple(self._failed_peers)
+
+    def launch_provenance_for(self, execution_id):
+        """Read original, authenticated custody only; no probes or PID adoption.
+
+        Recovery/replacement cannot manufacture this record from a ledger or
+        a replay. Missing evidence denies new restriction, never restoration.
+        """
+        with self._lock:
+            retained = self._launch_provenance.get(execution_id)
+            entry = self._pending.get(execution_id) or self.lifecycle._entries.get(execution_id)
+            if (retained is None or entry is None or getattr(entry, "closed", False) or
+                    entry.job is None or getattr(entry.job, "closed", False) or entry.root is None):
+                return None
+            if (retained.job_nonce != entry.job.nonce or
+                    retained.provenance.wrapper_identity != entry.wrapper.identity or
+                    retained.provenance.root_identity != entry.root.identity):
+                return None
+            return retained
+
+    def _retain_launch_provenance(self, request, peer, entry):
+        """Only the original pending launch may acquire immutable provenance."""
+        from .launch_scope import RetainedLaunchProvenance
+        from .launch_topology import OriginalLaunchProvenance
+        proof = request.launch_provenance
+        if proof is None:
+            if request.execution_id in self._launch_provenance:
+                raise LifecycleError("guardian_launch_provenance_changed")
+            return
+        if (type(proof) is not OriginalLaunchProvenance or
+                proof.wrapper_identity != peer.identity or proof.wrapper_identity != entry.wrapper.identity or
+                proof.root_identity != request.root_identity or proof.root_identity != entry.root.identity):
+            raise LifecycleError("guardian_launch_provenance_mismatch")
+        retained = RetainedLaunchProvenance(request.execution_id, request.job_nonce, proof)
+        previous = self._launch_provenance.get(request.execution_id)
+        if previous is not None and previous != retained:
+            raise LifecycleError("guardian_launch_provenance_changed")
+        # Original scopes are already limited to ten Jobs. Retire metadata only
+        # after its corresponding native custody has left both retained maps.
+        live = set(self._pending) | set(self.lifecycle._entries)
+        for key in tuple(self._launch_provenance):
+            if key not in live:
+                del self._launch_provenance[key]
+        if previous is None and len(self._launch_provenance) >= 10:
+            raise LifecycleError("guardian_launch_provenance_inventory_full")
+        self._launch_provenance[request.execution_id] = retained
 
     def restore_owned_caps(self):
         """Restore the bounded adopted inventory without new admission/readiness.
@@ -624,6 +670,9 @@ class GuardianLaunchOwner:
     def bind_root(self, request, peer, auth_record, deadline):
         with self._lock:
             row = self._authenticate(request, peer, auth_record, deadline, terminal_bind=True)
+            if (request.launch_provenance is not None and
+                    request.launch_provenance.wrapper_identity != peer.identity):
+                raise LifecycleError("guardian_launch_provenance_mismatch")
             entry = self._pending.get(request.execution_id)
             if entry is None:
                 # A lost ACK after custody transfer can only observe the same
@@ -666,6 +715,7 @@ class GuardianLaunchOwner:
                 elif entry.root.identity != request.root_identity:
                     raise LifecycleError("guardian_root_binding_mismatch")
                 self._verify_root(entry)
+                self._retain_launch_provenance(request, peer, entry)
                 self._deadline(deadline)
                 # Read the old record without requiring its not-yet-bound root.
                 previous = self._read_record(entry)

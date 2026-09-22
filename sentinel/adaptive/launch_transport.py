@@ -154,6 +154,7 @@ class BindRootRequest(PrepareExecutionRequest):
     job_nonce: str
     root_identity: ProcessIdentity
     root_handle_locator: int = field(repr=False)
+    launch_provenance: object = None
     operation: ClassVar[str] = "BindRoot"
 
     def __post_init__(self):
@@ -162,11 +163,17 @@ class BindRootRequest(PrepareExecutionRequest):
         if type(self.root_identity) is not ProcessIdentity:
             raise IpcError("launch_invalid_root_identity")
         _locator(self.root_handle_locator)
+        if self.launch_provenance is not None:
+            from .launch_topology import OriginalLaunchProvenance
+            if (type(self.launch_provenance) is not OriginalLaunchProvenance or
+                    self.launch_provenance.root_identity != self.root_identity):
+                raise IpcError("launch_invalid_provenance")
 
     def to_dict(self):
         return {**super().to_dict(), "job_nonce": self.job_nonce,
                 "root_identity": self.root_identity.to_dict(),
-                "root_handle_locator": str(self.root_handle_locator)}
+                "root_handle_locator": str(self.root_handle_locator),
+                "launch_provenance": None if self.launch_provenance is None else self.launch_provenance.to_dict()}
 
 
 def decode_request(value):
@@ -174,7 +181,7 @@ def decode_request(value):
         raise IpcError("launch_invalid_request")
     operation = value["operation"]
     extra = {"PrepareExecution": set(), "ClaimLaunch": {"job_nonce", "claim_token", "launch_fence_version"},
-             "BindRoot": {"job_nonce", "root_identity", "root_handle_locator"},
+             "BindRoot": {"job_nonce", "root_identity", "root_handle_locator", "launch_provenance"},
              "CancelBeforeStart": {"job_nonce"}, "StartFailed": {"job_nonce"}}.get(operation)
     if extra is None:
         raise IpcError("launch_unsupported_operation")
@@ -189,8 +196,15 @@ def decode_request(value):
     if operation in {"CancelBeforeStart", "StartFailed"}:
         cls = CancelBeforeStartRequest if operation == "CancelBeforeStart" else StartFailedRequest
         return cls(**common, job_nonce=value["job_nonce"])
+    provenance = None
+    if value["launch_provenance"] is not None:
+        from .launch_topology import OriginalLaunchProvenance
+        try:
+            provenance = OriginalLaunchProvenance.from_dict(value["launch_provenance"])
+        except Exception:
+            raise IpcError("launch_invalid_provenance") from None
     return BindRootRequest(**common, job_nonce=value["job_nonce"], root_identity=_identity(value["root_identity"]),
-                           root_handle_locator=_read_locator(value["root_handle_locator"]))
+        root_handle_locator=_read_locator(value["root_handle_locator"]), launch_provenance=provenance)
 
 
 @dataclass(frozen=True)
@@ -386,9 +400,10 @@ class ManagedLaunchClient:
                              request_id=request_id, timeout_ms=timeout_ms, launch_fence_version=launch_fence_version)
 
     def bind_root(self, *, expected_revision, job_nonce, root_identity, root_handle_locator,
-                  request_id, timeout_ms=1000):
+                  request_id, timeout_ms=1000, launch_provenance=None):
         return self._request("BindRoot", expected_revision=expected_revision, job_nonce=job_nonce,
                              root_identity=root_identity, root_handle_locator=root_handle_locator,
+                             launch_provenance=launch_provenance,
                              request_id=request_id, timeout_ms=timeout_ms)
 
     def cancel_before_start(self, *, expected_revision, job_nonce, request_id, timeout_ms=1000):

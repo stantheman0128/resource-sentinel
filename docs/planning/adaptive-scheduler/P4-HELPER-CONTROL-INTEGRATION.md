@@ -254,14 +254,33 @@ gate arithmetic is cached, while current bounded fingerprints and host context
 must still match. The production default has no evidence bundle or verified
 launch-scope source, so it cannot authorize a restrictive action.
 
-The typed `VerifiedLaunchScope` collaborator is deliberately an unfinished
-production integration for items 4/6, with the stable denial
-`capability_launch_scope_unverified` when absent. Its measured topology must
-come from the exact pinned S2 artifact and match retained original-wrapper
-launch/stdio provenance; independently selecting equal hashes is not proof.
-Shell binary hashes and console/RDP session protocol alone are insufficient.
-The native producer and original launch provenance consumer still need to be
-implemented; this gap is not described as something native tests alone fix.
+The original launch provenance consumer is now wired. Before the sole Create,
+the wrapper captures exact original identities, duplicated stdio and console
+properties, native creation flags and executable bytes. It rechecks topology
+next to Create and after root-image verification; drift leaves the execution
+admission-only. Typed authenticated BindRoot provenance is retained immutably by
+the original guardian, scoped to the exact execution/Job nonce and custody.
+
+`RetainedLaunchScopeSource` matches that original evidence to prepared S2
+topologies without native/file probes under the control fence. Every qualifying
+topology must independently cover the full launched-case matrix. Partial
+secondary observations cannot borrow another topology's results, and selecting
+equal caller-supplied hashes does not create proof. Missing/recovered custody
+remains `capability_launch_scope_unverified`. Unknown collaborator or cleanup
+failures retain quarantine.
+
+The helper's separate `HelperProposalEvidence` checks global evidence only;
+the guardian alone checks exact retained execution provenance before Set.
+The source connection is tested, but the native S2 producer, actual qualified
+topology observations and measurement of the added hashing cost remain gates.
+No bundle has been fabricated and no production controller has been enabled.
+
+On 2026-09-22, 344 targeted portable tests passed in 30.960 seconds with zero
+failures/errors/skips, including 30 dedicated provenance/topology/scope tests
+and 21 tests for the separate uncommitted capability producer. Normal daily
+admission queued the command for Commit capacity, then admitted it unchanged.
+This validation uses the protected dirty baseline and adjacent uncommitted daily
+connection hooks; it does not establish clean-clone or native acceptance.
 
 The new evidence-v1 schema requires raw counters/timestamps, exact identities,
 readbacks and cleanup measurements; older spike aggregate JSON cannot simply

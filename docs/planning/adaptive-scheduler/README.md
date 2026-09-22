@@ -31,12 +31,22 @@ guardian 驗證、ACK 驅動階梯恢復與單調 demand floor。原 shadow help
 0 failures／errors／skips**，包含 launch-scope 缺證據拒絕。此前 114 個
 restore/floor、117 個 decision/helper 與 27 個 capability 針對性測試亦通過。
 
+目標 4 的 [operational lifecycle 契約](P3-OPERATIONAL-LIFECYCLE.md)先以
+`186178d` 入庫。第一個實作包完成 original-context queued／RESERVED cancellation、
+同 request 的 Prepare／Claim 對帳、retained native no-create 證據，以及 wrapper
+不丟棄 custody 的失敗收尾。直接 Prepare 先封住取消競態；取消交易核對 allocation
+唯一性及兩種 queue 關聯。335 個 admission／launcher／terminal／transport 針對性
+tests 全過（24.979 秒，0 failures／errors／skips）；此數包含尚在整合的 terminal
+與 transport 包，不是本提交單獨的乾淨 checkout 測試數。CLI／helper observer 另有
+110 tests 全過（14.175 秒），guardian operational host 57 tests 全過（1.009 秒）。
+Supervisor／helper host 與 off-recovery 整合仍在驗證，目標 4 尚未全部完成。
+
 | 目標項目 | 已驗證狀態／剩餘工作 |
 | --- | --- |
 | 1. 裁決 ② | 契約與 source 完成；完整 2,007 tests，最後 cleanup 修正後 102 tests 通過。 |
 | 2. 裁決 ④ | 契約與 source 完成；最後完整 adaptive 2,127 tests 通過。沒有舊 witness 的 cold adoption 仍不支援；native recovery 未驗證。 |
 | 3. helper sender | Source 接線、獨立 review 與完整 2,298 tests 通過。原生 capability bundle、actual launch/stdio scope producer 尚屬項目 4/6 的缺口，缺證據時不啟用控制。 |
-| 4. release／CLI | 已有 explicit named retirement API；wrapper host 自動失敗收尾、Coordinator 路徑、discovery／停止協定與 operational CLI 未完成。 |
+| 4. release／CLI | original-context cancellation、Prepare/Claim reconciliation、wrapper 收尾包已完成並通過上述 targeted tests；host/discovery/off-recovery/CLI 尚待完整整合回歸與提交。 |
 | 5. 全程容量覆蓋 | 尚缺能證明所有 live consumers 使用相同 lifetime accounting 的 provider；原日常 grace 前提仍不滿足，不能以測試 DB 假裝解鎖。 |
 | 6. console 驗收命令 | S1–S3／完整 §11.2／實測 A/B runner 尚未全部可執行；不能只包一層 CLI 就宣稱只剩使用者執行。 |
 

@@ -28,10 +28,11 @@ custody belongs to the guardian. A workload can return those same small
 integers, so a caller that needs certainty reads the JSON event record on
 stderr, which carries launch_state and command_started.
 
-Capacity is not released by a refusal. Once admit_once has allowed the request
-the reservation is bound to the execution, and the existing coordinator cleanup
-skips bound allocations while TTL expiry only marks a hold. See the module
-notes in the process host document.
+Failure cleanup stays with the original wrapper. Exact queued/unused RESERVED
+attempts may be abandoned through the original admission context; prepared
+scopes require the guardian's proof. Any unresolved launch or native cleanup
+keeps this host alive in owned recovery. Refusal, timeout and Ctrl+C are never
+evidence that workload descendants ended or that capacity was released.
 
 On a machine whose processes run inside a parent Job the capability preflight
 refuses with host_foreign_parent_job before anything is opened, and that is the
@@ -40,10 +41,12 @@ expected result there.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import json
 import math
 from pathlib import Path
 import re
+import signal
 import sys
 import time
 
@@ -172,6 +175,9 @@ class WrapperHost:
         self.logon_id = None
         self.coordinator = self.store = self.readiness = None
         self.endpoint = self.launcher = None
+        self._construction_unknown = None
+        self._recovery_errors = []
+        self._interrupt_requested = self._recovering = False
 
     # --- preflight --------------------------------------------------------
 
@@ -201,7 +207,12 @@ class WrapperHost:
         try:
             with VerifiedProcess.current() as current:
                 return current.identity.logon_id
-        except Exception as error:
+        except BaseException as error:
+            if (getattr(error, "_identity_handle_cleanup", ()) or
+                    getattr(error, "_policy_mutex_cleanup", ()) or getattr(error, "__notes__", ())):
+                self._construction_unknown = error
+            if not isinstance(error, Exception):
+                raise
             raise WrapperHostRefused("wrapper_host_identity_unavailable", _reason(error)) from None
 
     def _guardian_endpoint(self):
@@ -252,7 +263,17 @@ class WrapperHost:
         try:
             return factory(spec, coordinator=self.coordinator, endpoint=self.endpoint,
                            guardian_epoch=self.guardian_epoch, readiness=self.readiness)
-        except Exception as error:
+        except BaseException as error:
+            owner = getattr(error, "launcher_owner", None)
+            if owner is not None:
+                self.launcher = owner
+            elif (getattr(error, "_identity_handle_cleanup", ()) or
+                  getattr(error, "_policy_mutex_cleanup", ()) or
+                  getattr(error, "__notes__", ())):
+                # No fabricated launcher/context can inherit this authority.
+                self._construction_unknown = error
+            if not isinstance(error, Exception):
+                raise
             raise WrapperHostRefused("wrapper_host_launcher_unavailable", _reason(error)) from None
 
     # --- the managed run --------------------------------------------------
@@ -273,14 +294,22 @@ class WrapperHost:
         self.readiness = self._readiness()
         self.endpoint = self._guardian_endpoint()
         self.launcher = self._build_launcher(spec)
+        self._check_interrupt()
         emit({"event": "wrapper_host_attempt", "execution_id": self.launcher.execution_id,
               "guardian_epoch": self.guardian_epoch, "endpoint": self.endpoint.name,
               "capability": self.capability.to_dict()})
         self._admit(status, config)
+        self._check_interrupt()
         self._launch(handles)
+        self._check_interrupt()
         observation = self._wait()
         self._close()
         return observation.exit_code
+
+    def _check_interrupt(self):
+        if self._interrupt_requested and not self._recovering:
+            self._recovering = True
+            raise KeyboardInterrupt()
 
     def _admit(self, status, config):
         try:
@@ -299,9 +328,8 @@ class WrapperHost:
     def _launch(self, handles):
         """One create, then at most one exact bind replay.
 
-        A lost bind acknowledgement leaves custody with the guardian. This host
-        reports that and exits without closing anything, because a closed handle
-        is not proof that the Job is empty.
+        Lost acknowledgements pass to owned recovery. The host cannot infer a
+        guardian handoff or exit merely because the remote mutation may exist.
         """
         from . import native_launcher
         from .launcher import ManagedLaunchError
@@ -342,7 +370,7 @@ class WrapperHost:
         launcher = self.launcher
         if getattr(launcher, "_create_attempted", False) is not True:
             return NOT_ATTEMPTED
-        return LAUNCHED if getattr(launcher, "process", None) is not None else ATTEMPTED_UNKNOWN
+        return LAUNCHED if getattr(launcher, "_root", None) is not None else ATTEMPTED_UNKNOWN
 
     def _wait(self):
         """Wait for the exact retained root process.
@@ -353,6 +381,7 @@ class WrapperHost:
         deadline = None if self.max_wait_sec <= 0 else time.monotonic() + self.max_wait_sec
         interval = self.poll_interval_ms / 1000
         while True:
+            self._check_interrupt()
             try:
                 observation = self.launcher.poll_root()
             except Exception as error:
@@ -373,18 +402,61 @@ class WrapperHost:
             raise WrapperHostRefused("wrapper_host_close_unverified", _reason(error)) from None
 
     def release(self):
-        """Best effort local close after a refusal, reported and never forced.
-
-        close_local itself refuses while custody is unsettled. That refusal is
-        recorded and left alone; the guardian reconciles retained work.
-        """
+        """One bounded original-owner abandonment attempt, never an exit permit."""
+        if self._construction_unknown is not None:
+            return {"settled": False, "closed": False, "guardian_handoff": False,
+                    "state": "CONSTRUCTION_UNKNOWN", "reason": "wrapper_host_construction_cleanup_unknown"}
         if self.launcher is None:
             return None
         try:
-            self.launcher.close_local()
-            return {"closed": True}
-        except Exception as error:
-            return {"closed": False, "reason": _reason(error)}
+            return self.launcher.abandon_once(timeout_ms=self.rpc_timeout_ms)
+        except BaseException as error:
+            self._note_recovery_error(error)
+            return {"settled": False, "closed": False, "guardian_handoff": False,
+                    "state": "RECOVERY_PENDING", "reason": _reason(error)}
+
+    def _note_recovery_error(self, error):
+        # Repeated observation failures/interrupts must not grow memory while
+        # waiting. Native owners live on the launcher or construction hold.
+        if len(self._recovery_errors) < 32 and not any(
+                type(previous) is type(error) and _reason(previous) == _reason(error)
+                for previous in self._recovery_errors):
+            self._recovery_errors.append(error)
+
+    def settle_release(self, *, initial=None, max_iterations=None):
+        """Keep the original owner until positively settled.
+
+        The optional iteration bound is an in-process test/embedding seam. The
+        CLI has no bound and cannot use an observer timeout or a second Ctrl+C
+        to discard its only uncertain native owner. No work is relaunched here.
+        """
+        if max_iterations is not None and (type(max_iterations) is not int or max_iterations < 1):
+            raise ValueError("wrapper_host_settle_bound_invalid")
+        current = initial
+        previous = None
+        iterations = 0
+        while True:
+            if current is None:
+                current = self.release()
+            if current is None or (current.get("settled") is True and
+                                   (current.get("closed") is True or current.get("guardian_handoff") is True)):
+                return current
+            iterations += 1
+            if current != previous:
+                try:
+                    emit({"event": "wrapper_host_recovery_pending", "release": current})
+                except BaseException as error:
+                    self._note_recovery_error(error)
+                previous = dict(current)
+            if max_iterations is not None and iterations >= max_iterations:
+                return current
+            try:
+                time.sleep(self.poll_interval_ms / 1000)
+            except BaseException as error:
+                # Neither another console interrupt nor failed reporting is
+                # positive custody/release evidence. Keep the same owner.
+                self._note_recovery_error(error)
+            current = self.release()
 
 
 def parse_demand(options):
@@ -457,6 +529,32 @@ def build_parser():
     return parser
 
 
+@contextmanager
+def _owned_interrupts(host):
+    """Convert console SIGINT into a request at an owned safe boundary.
+
+    A Python signal exception can otherwise land between native ownership
+    publication statements, or inside an except suite performing recovery.
+    The handler only records intent; repeated signals cannot discard custody.
+    Embedded calls on a non-main thread keep the caller's signal handling.
+    """
+    previous = None
+    installed = False
+    def request_interrupt(signum, frame):
+        host._interrupt_requested = True
+    try:
+        try:
+            previous = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGINT, request_interrupt)
+            installed = True
+        except ValueError:
+            pass
+        yield
+    finally:
+        if installed:
+            signal.signal(signal.SIGINT, previous)
+
+
 def main(argv=None):
     options = build_parser().parse_args(argv)
     try:
@@ -475,10 +573,25 @@ def main(argv=None):
                            max_wait_sec=options.max_wait_sec)
     except WrapperHostRefused as error:
         return _refused(error, options.require_managed, None)
-    try:
-        exit_code = host.run()
-    except WrapperHostRefused as error:
-        return _refused(error, options.require_managed, host)
+    with _owned_interrupts(host):
+        try:
+            exit_code = host.run()
+        except BaseException as error:
+            host._recovering = True
+            host._note_recovery_error(error)
+            if isinstance(error, WrapperHostRefused):
+                refusal = error
+            else:
+                host.launch_state = host._state_after_failure()
+                reason = "wrapper_host_interrupted" if isinstance(error, KeyboardInterrupt) else "wrapper_host_unverified"
+                refusal = WrapperHostRefused(reason, _reason(error))
+            while True:
+                try:
+                    return _refused(refusal, options.require_managed, host)
+                except BaseException as recovery_error:
+                    # Also cover injected/non-signal interruptions at call or
+                    # publication boundaries, not only at sleep/emit sites.
+                    host._note_recovery_error(recovery_error)
     emit({"event": "wrapper_host_finished", "exit_code": exit_code})
     return exit_code
 
@@ -501,7 +614,14 @@ def _refused(error, require_managed, host):
               "launch_state": state, "command_started": None if state == ATTEMPTED_UNKNOWN
               else state == LAUNCHED}
     if host is not None:
-        record["release"] = host.release()
+        initial = host.release()
+        if initial is not None and not initial.get("settled"):
+            # Report before entering recovery, so a pending wrapper is visible.
+            try:
+                emit(dict(record, release=initial))
+            except BaseException as report_error:
+                host._note_recovery_error(report_error)
+        record["release"] = host.settle_release(initial=initial)
     emit(record)
     if post_launch:
         return EXIT_POST_LAUNCH

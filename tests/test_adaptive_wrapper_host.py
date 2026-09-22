@@ -33,6 +33,7 @@ from tests.test_adaptive_host_authority import SYNTHETIC, live_capability_refusa
 REPO_ROOT = Path(module.__file__).resolve().parents[2]
 GIB = 1 << 30
 STDIO = (101, 102, 103)
+REAL_LOGON = WrapperHost._logon
 
 
 class WrapperHostTests(unittest.TestCase):
@@ -166,7 +167,10 @@ class WrapperHostTests(unittest.TestCase):
             host.run()
         self.harness.process.wait_error = None
         record = host.release()
-        self.assertEqual(record, {"closed": False, "reason": "launcher_custody_unsettled"})
+        self.assertFalse(record["settled"])
+        self.assertFalse(record["closed"])
+        self.assertFalse(record["guardian_handoff"])
+        self.assertEqual(record["reason"], "launcher_root_still_running")
         self.assertEqual(self.harness.process.close_calls, 0)
 
     # --- what the host wires ----------------------------------------------
@@ -259,7 +263,15 @@ class WrapperHostTests(unittest.TestCase):
         self.harness.native_launch.assert_not_called()
 
     def test_a_post_launch_refusal_has_its_own_exit_code_and_event(self):
-        self.harness.process.wait_error = OSError("fixture_wait_failed")
+        # The first observation fails. Normal main exit is only possible after
+        # owned recovery observes this exact root's exit and closes locally.
+        waits = iter([OSError("fixture_wait_failed"), True, True])
+        def wait(timeout):
+            value = next(waits)
+            if isinstance(value, BaseException):
+                raise value
+            return value
+        self.harness.process.wait = wait
         host = self.build()
         records = []
         with patch.object(module, "emit", side_effect=records.append):
@@ -268,12 +280,162 @@ class WrapperHostTests(unittest.TestCase):
         self.assertEqual(records[-1]["event"], "wrapper_host_post_launch_refused")
         self.assertIs(records[-1]["command_started"], True)
         self.assertEqual(records[-1]["launch_state"], LAUNCHED)
+        self.assertTrue(records[-1]["release"]["settled"])
+        self.assertTrue(self.harness.coordinator.reservation_retained)
 
     def test_a_completed_run_returns_the_root_exit_code_from_main(self):
         self.harness.process.exited = True
         host = self.build()
         with patch.object(module, "emit"):
             self.assertEqual(self.run_main(host), 125)
+
+    def test_main_interrupt_during_admission_cancels_same_original_queued_attempt(self):
+        self.harness.coordinator.responses = [KeyboardInterrupt()]
+        host = self.build()
+        records = []
+        with patch.object(module, "emit", side_effect=records.append):
+            code = self.run_main(host, "--require-managed")
+        self.assertEqual(code, EXIT_REFUSED)
+        self.assertEqual(records[-1]["reason"], "wrapper_host_interrupted")
+        self.assertFalse(records[-1]["command_started"])
+        self.assertTrue(records[-1]["release"]["settled"])
+        self.assertEqual(len(self.harness.coordinator.calls), 1)
+        self.assertIs(self.harness.coordinator.cancel_calls[0][0], self.harness.admission)
+        self.harness.native_launch.assert_not_called()
+
+    def test_main_interrupt_after_prepare_is_reconciled_with_original_request_id(self):
+        client = self.harness.client
+        ordinary = client.prepare_execution
+        attempts = []
+        def prepare(**arguments):
+            attempts.append(arguments)
+            if len(attempts) == 1:
+                self.assertTrue(self.harness.admission.prepare_attempted)
+                raise KeyboardInterrupt()
+            return ordinary(**arguments)
+        client.prepare_execution = prepare
+        client.responses["cancel"] = harness.result("CANCELLED_BEFORE_START", 2)
+        self.harness.store.row.update(state="PREPARED", state_revision=1,
+                                      claim_consumed=0, launch_in_flight=0)
+        host = self.build()
+        records = []
+        with patch.object(module, "emit", side_effect=records.append):
+            self.assertEqual(self.run_main(host, "--require-managed"), EXIT_REFUSED)
+        self.assertEqual(attempts[0], attempts[1])
+        self.assertEqual(self.harness.coordinator.cancel_calls, [])
+        self.assertTrue(records[-1]["release"]["settled"])
+        self.harness.native_launch.assert_not_called()
+
+    def test_bounded_settlement_reports_unknown_create_without_normal_cli_exit(self):
+        self.harness.native_launch.side_effect = LaunchOutcomeUnknown(self.harness.process,
+                                                                      "fixture_unknown")
+        host = self.build()
+        with self.assertRaises(WrapperHostRefused):
+            host.run()
+        with patch.object(module.time, "sleep"):
+            record = host.settle_release(max_iterations=3)
+        self.assertFalse(record["settled"])
+        self.assertFalse(record["closed"])
+        self.assertFalse(record["guardian_handoff"])
+        self.assertIs(host.launcher.process, self.harness.process)
+        self.assertEqual(self.harness.native_launch.call_count, 1)
+        self.assertEqual(self.harness.process.close_calls, 0)
+        self.assertEqual(self.harness.admission.close_calls, 0)
+
+    def test_second_interrupt_during_settlement_does_not_drop_retained_running_root(self):
+        self.harness.process.wait_error = OSError("fixture_initial_observation_failed")
+        host = self.build()
+        with self.assertRaises(WrapperHostRefused):
+            host.run()
+        self.harness.process.wait_error = None
+        pauses = []
+        def pause(seconds):
+            pauses.append(seconds)
+            if len(pauses) == 1:
+                raise KeyboardInterrupt()
+            self.harness.process.exited = True
+        with patch.object(module.time, "sleep", side_effect=pause):
+            record = host.settle_release(max_iterations=4)
+        self.assertTrue(record["settled"])
+        self.assertEqual(len(pauses), 2)
+        self.assertTrue(any(isinstance(error, KeyboardInterrupt) for error in host._recovery_errors))
+        self.assertEqual(self.harness.native_launch.call_count, 1)
+        self.assertTrue(self.harness.coordinator.reservation_retained)
+
+    def test_failed_launcher_construction_keeps_exception_owned_context_in_host(self):
+        failure = OSError("fixture_client_initialization_failed")
+        self.harness.client_factory.side_effect = failure
+        self.harness.admission.close_error = KeyboardInterrupt()
+        host = self.build()
+        with self.assertRaises(WrapperHostRefused):
+            host.run()
+        self.assertIs(host.launcher, failure.launcher_owner)
+        with patch.object(module.time, "sleep"):
+            record = host.settle_release(max_iterations=2)
+        self.assertFalse(record["settled"])
+        self.assertEqual(self.harness.admission.close_calls, 1)
+        self.harness.native_launch.assert_not_called()
+
+    def test_preflight_identity_cleanup_failure_retains_owner_before_launcher_exists(self):
+        from sentinel.adaptive.identity import VerifiedProcess, IdentityUnavailable
+        native_owner = object()
+        error = IdentityUnavailable("process_handle_close_outcome_unknown")
+        error._identity_handle_cleanup = (native_owner,)
+        class Current:
+            identity = harness.WRAPPER
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                raise error
+        host = self.build()
+        host._logon = REAL_LOGON.__get__(host, WrapperHost)
+        with patch.object(VerifiedProcess, "current", return_value=Current()):
+            with self.assertRaises(WrapperHostRefused):
+                host.run()
+        self.assertIs(host._construction_unknown, error)
+        self.assertIsNone(host.launcher)
+        with patch.object(module.time, "sleep"):
+            outcome = host.settle_release(max_iterations=2)
+        self.assertFalse(outcome["settled"])
+        self.assertEqual(outcome["state"], "CONSTRUCTION_UNKNOWN")
+        self.assertEqual(self.harness.coordinator.calls, [])
+
+    def test_interrupt_at_recovery_call_boundary_cannot_escape_main(self):
+        self.harness.coordinator.responses = [dict(allowed=False, request_key=harness.REQUEST_KEY,
+                                                   reason="commit_capacity", position=1)]
+        host = self.build()
+        settle = host.settle_release
+        attempts = []
+        def interrupted_settle(**arguments):
+            attempts.append(arguments)
+            if len(attempts) == 1:
+                raise KeyboardInterrupt()
+            return settle(**arguments)
+        host.settle_release = interrupted_settle
+        self.assertEqual(self.run_main(host, "--require-managed"), EXIT_REFUSED)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(self.harness.admission.close_calls, 1)
+        self.assertTrue(host.launcher._closed)
+        self.harness.native_launch.assert_not_called()
+
+    def test_sigint_during_admission_is_deferred_until_original_result_is_owned(self):
+        host = self.build()
+        original = self.harness.coordinator.admit_managed
+        handlers = []
+        def install(signum, handler):
+            handlers.append(handler)
+        def interrupted_admission(*arguments, **keywords):
+            handlers[0](module.signal.SIGINT, None)
+            handlers[0](module.signal.SIGINT, None)
+            return original(*arguments, **keywords)
+        self.harness.coordinator.admit_managed = interrupted_admission
+        with patch.object(module.signal, "signal", side_effect=install):
+            self.assertEqual(self.run_main(host, "--require-managed"), EXIT_REFUSED)
+        self.assertEqual(len(handlers), 2)  # original signal handling restored
+        self.assertEqual(len(self.harness.coordinator.calls), 1)
+        self.assertEqual(self.harness.coordinator.cancel_calls[0][1],
+                         dict(reservation_id="fixture-reservation", expected_revision=0))
+        self.harness.native_launch.assert_not_called()
 
 
 class WrapperHostSubprocessTests(unittest.TestCase):

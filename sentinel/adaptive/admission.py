@@ -89,6 +89,78 @@ class ManagedAdmission:
         self._cancel_sealed = False
         self._cancel_target = None
         self._cancel_revision = None
+        self._prepare_attempted = False
+        self._submission_policy = None
+        self._submission_guard = None
+        self._submission_transaction = None
+        self._submission_policy_error = None
+        self._submission_policy_entered = False
+        self._submission_prepare_unknown = False
+        self._abandon_target = None
+        self._abandon_kind = None
+        self._abandon_commit_attempted = False
+        self._abandon_result = None
+        self._abandon_transaction = None
+        self._abandon_error = None
+
+    @contextmanager
+    def submission_scope(self):
+        """Serialize this original capability through admission completion.
+
+        begin_submission alone cannot fence a still running writer transaction.
+        The Coordinator keeps this same lock until policy and transaction
+        cleanup finish; cancellation cannot mistake its in-flight insert for
+        absence. This is an in-process owner fence, not native launch evidence.
+        """
+        with self._lock:
+            self.snapshot()
+            self._require_unsealed()
+            if self._prepare_attempted:
+                raise ManagedAdmissionUnavailable("prepare_already_attempted")
+            yield
+
+    def mark_prepare_attempted(self):
+        """Irreversibly record handoff before the first Prepare side effect.
+
+        Repeating the mark preserves the same original request's replay path.
+        A RESERVED row after this point cannot authorize local abandonment.
+        """
+        with self._lock:
+            self.snapshot()
+            self._require_unsealed()
+            self._require_settled_submission()
+            self._prepare_attempted = True
+
+    def _require_settled_submission(self):
+        if self._submission_guard is not None or self._submission_prepare_unknown:
+            raise ManagedAdmissionUnavailable("managed_submission_unsettled")
+
+    @staticmethod
+    def _validate_queued(row, snapshot):
+        request = snapshot.request
+        expected = {
+            "request_key": request.request_key, "owner_pid": request.owner_pid,
+            "owner_started": request.owner_started, "tool_use_id": request.tool_use_id,
+            "repo": request.repo, "command_signature": request.command_signature,
+            "command_text": "", "resource_class": request.resource_class,
+            "priority": request.priority, "priority_rank": int(request.priority[1:]),
+            "cpu_units": request.cpu_units, "ram_gib": request.ram_gib,
+            "io_slots": request.io_slots, "commit_bytes": request.commit_bytes,
+            "spec_hash": "managed-v1:" + snapshot.binding_hash,
+            "managed_execution_id": snapshot.execution_id,
+            "managed_binding_hash": snapshot.binding_hash,
+        }
+        if row is None or any(row[key] != value for key, value in expected.items()):
+            raise ManagedAdmissionUnavailable("queued_cancel_binding_mismatch")
+
+    def _seal_abandonment(self, path, snapshot, kind):
+        target = (path, snapshot.execution_id, snapshot.request.request_key)
+        if self._abandon_target is not None and (self._abandon_target != target or
+                                                 self._abandon_kind != kind):
+            raise ManagedAdmissionUnavailable("managed_abandon_target_mismatch")
+        self._abandon_target, self._abandon_kind = target, kind
+        self._cancel_sealed = True
+        self._claim_token = self._key = None
 
     @classmethod
     def current(cls, *, command: str, cwd: str, repo_identifier: str,
@@ -242,6 +314,7 @@ class ManagedAdmission:
         with self._lock:
             self.snapshot()
             self._require_unsealed()
+            self._require_settled_submission()
             # Once another trusted component can know the token, this context
             # cannot prove exclusive control of every possible launch path.
             self._claim_exported = True
@@ -293,6 +366,8 @@ class ManagedAdmission:
     def _require_unsealed(self):
         if self._cancel_sealed:
             raise ManagedAdmissionUnavailable("managed_admission_sealed")
+        if self._abandon_error is not None:
+            raise ManagedAdmissionUnavailable("managed_abandon_cleanup_unverified")
 
     @staticmethod
     def _validate_cancel_row(row, snapshot, reservation_id, *, terminal=False):
@@ -361,6 +436,8 @@ class ManagedAdmission:
             snapshot = self.snapshot()
             if self._claim_exported:
                 raise ManagedAdmissionUnavailable("launch_claim_already_exported")
+            if self._prepare_attempted:
+                raise ManagedAdmissionUnavailable("prepare_already_attempted")
             path = self._ledger_path(db_path)
             if self._admission_db_path is None or path != self._admission_db_path:
                 raise ManagedAdmissionUnavailable("managed_admission_ledger_mismatch")
@@ -407,12 +484,37 @@ class ManagedAdmission:
                 if expected_revision not in {self._cancel_revision, row["state_revision"]}:
                     raise ManagedAdmissionUnavailable("reserved_cancel_revision_mismatch")
                 with store._connection() as conn:
+                    conn.execute("BEGIN")
                     actual = conn.execute("SELECT claim_token_hash FROM managed_executions WHERE execution_id=?",
                                           (snapshot.execution_id,)).fetchone()
-                    remaining = conn.execute("SELECT 1 FROM reservations WHERE id=?", (reservation_id,)).fetchone()
-                    archived = conn.execute("SELECT count(*) FROM executions WHERE reservation_id=? AND outcome=?",
-                                            (reservation_id, "managed_cancelled_before_start")).fetchone()[0]
-                if actual is None or actual[0] != "" or remaining is not None or archived != 1:
+                    remaining = conn.execute("""SELECT 1 FROM reservations
+                        WHERE id=? OR execution_id=? OR request_key=? LIMIT 1""",
+                        (reservation_id, snapshot.execution_id, snapshot.request.request_key)).fetchone()
+                    routed = conn.execute("""SELECT 1 FROM worker_reservations
+                        WHERE execution_id=? OR task_id=? LIMIT 1""",
+                        (snapshot.execution_id, snapshot.task_id)).fetchone()
+                    queued = conn.execute("""SELECT 1 FROM queue
+                        WHERE managed_execution_id=? OR request_key=? LIMIT 1""",
+                        (snapshot.execution_id, snapshot.request.request_key)).fetchone()
+                    aliases = conn.execute("""SELECT count(*) FROM managed_executions
+                        WHERE execution_id=? OR (reservation_id=? AND allocation_kind='direct')""",
+                        (snapshot.execution_id, reservation_id)).fetchone()[0]
+                    archived = conn.execute("SELECT * FROM executions WHERE reservation_id=?",
+                                            (reservation_id,)).fetchall()
+                    conn.execute("COMMIT")
+                request = snapshot.request
+                archive_binding = {
+                    "reservation_id": reservation_id, "request_key": request.request_key,
+                    "owner_pid": request.owner_pid, "repo": request.repo,
+                    "command_signature": request.command_signature,
+                    "resource_class": request.resource_class, "priority": request.priority,
+                    "cpu_units": request.cpu_units, "ram_gib": request.ram_gib,
+                    "io_slots": request.io_slots, "started_at": row["created_at"],
+                    "ended_at": row["finished_at"], "outcome": "managed_cancelled_before_start",
+                }
+                if (actual is None or actual[0] != "" or remaining is not None or
+                        routed is not None or queued is not None or aliases != 1 or len(archived) != 1 or
+                        any(archived[0][key] != value for key, value in archive_binding.items())):
                     raise ManagedAdmissionUnavailable("reserved_cancel_replay_unverified")
                 return store.cancel_before_start(snapshot.execution_id, caller=snapshot.wrapper_identity,
                                                  expected_revision=row["state_revision"], now=now)

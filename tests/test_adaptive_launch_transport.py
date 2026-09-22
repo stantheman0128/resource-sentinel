@@ -16,6 +16,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from sentinel.adaptive import launch_transport as transport
+from sentinel.adaptive.admission import ManagedAdmissionUnavailable
 from sentinel.adaptive.contracts import IdentityObservation, IdentityStatus, ProcessIdentity
 from sentinel.adaptive.ipc import IpcError
 from sentinel.adaptive.pipe_windows import NativePipeEndpoint, NativePipeError
@@ -367,14 +368,43 @@ class LaunchTransportTests(unittest.TestCase):
             self.call_client("ClaimLaunch")
         self.assertEqual(exported.call_count, 1)
 
-    def test_prepare_mac_preserves_unexported_claim_and_actual_reserved_cancellation(self):
+    def test_prepare_preserves_unexported_claim_but_refuses_reserved_cancellation(self):
         self.client_connection()
         self.call_client()
         self.assertFalse(self.context_value._claim_exported)
         row = self.conn().execute("SELECT reservation_id FROM managed_executions").fetchone()
+        with self.assertRaisesRegex(ManagedAdmissionUnavailable, "prepare_already_attempted"):
+            self.context_value.cancel_reserved(self.coordinator.db_path,
+                reservation_id=row[0], expected_revision=0, now=NOW + 1)
+        self.assertEqual(self.counts(), (0, 1, 1))
+
+    def test_direct_prepare_fences_cancellation_before_connect_and_keeps_retry(self):
+        row = self.conn().execute("SELECT reservation_id FROM managed_executions").fetchone()
+        def connection_failure(*_):
+            with self.assertRaisesRegex(ManagedAdmissionUnavailable, "prepare_already_attempted"):
+                self.context_value.cancel_reserved(self.coordinator.db_path,
+                    reservation_id=row[0], expected_revision=0, now=NOW + 1)
+            raise OSError("fixture connection failed before write")
+        with patch.object(transport.NativePipeConnection, "connect", side_effect=connection_failure) as connect:
+            with self.assertRaises(transport.LaunchTransportError) as caught:
+                self.client.prepare_execution(expected_revision=0, request_id=REQUEST)
+        self.assertFalse(caught.exception.launch_outcome_unknown)
+        connect.assert_called_once()
+        self.assertEqual(self.counts(), (0, 1, 1))
+        self.client_connection()
+        result = self.call_client()
+        self.assertEqual(result.state, "PREPARED")
+        self.assertEqual(self.counts(), (0, 1, 1))
+
+    def test_sealed_cancellation_refuses_direct_prepare_before_connect(self):
+        row = self.conn().execute("SELECT reservation_id FROM managed_executions").fetchone()
         result = self.context_value.cancel_reserved(self.coordinator.db_path,
             reservation_id=row[0], expected_revision=0, now=NOW + 1)
         self.assertTrue(result["cancelled"])
+        with patch.object(transport.NativePipeConnection, "connect") as connect:
+            with self.assertRaisesRegex(ManagedAdmissionUnavailable, "managed_admission_sealed"):
+                self.client.prepare_execution(expected_revision=0, request_id=REQUEST)
+        connect.assert_not_called()
         self.assertEqual(self.counts(), (0, 0, 1))
 
     def test_stable_request_id_is_required_before_connection_for_exact_replay(self):

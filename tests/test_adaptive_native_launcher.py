@@ -206,6 +206,9 @@ class NativeLauncherTests(unittest.TestCase):
         self.assertEqual(self.identity.calls, [])
 
     def assert_original_retained(self, error):
+        self.assertIs(error.native_launch_owner, error.process)
+        self.assertIs(error.cause.native_launch_owner, error.process)
+        self.assertFalse(error.process.creation_definitely_absent)
         self.assertEqual(error.process.handle, PROCESS_HANDLE)
         self.assertEqual(error.process.pid, IDENTITY.pid)
         self.assertNotIn(("CloseHandle", PROCESS_HANDLE), self.kernel.calls)
@@ -363,12 +366,32 @@ class NativeLauncherTests(unittest.TestCase):
         self.assertTrue(original._native_cleanup_errors)
         self.assertEqual(self.calls("CloseHandle"), [("CloseHandle", value) for value in STDIO_COPIES])
         self.assertIsNotNone(original.cleanup_owner)
+        self.assertIs(original.native_launch_owner, original.cleanup_owner)
+        self.assertTrue(original.native_launch_owner.creation_definitely_absent)
         self.kernel.close_failures.clear()
         native.retry_launch_cleanup(original)
         self.assertEqual(self.calls("CloseHandle")[-1], ("CloseHandle", 201))
         count = len(self.kernel.calls)
         native.retry_launch_cleanup(original)
         self.assertEqual(len(self.kernel.calls), count)
+        self.assert_no_create()
+
+    def test_precreate_failure_retains_original_outcome_even_after_transient_cleanup(self):
+        original = self.kernel.update_exception = RuntimeError("fixture_precreate_failure")
+        with self.assertRaises(RuntimeError) as failed:
+            self.launch()
+        self.assertIs(failed.exception, original)
+        owner = original.native_launch_owner
+        self.assertIs(type(owner), native.CreatedProcess)
+        self.assertIsNone(owner.handle)
+        self.assertFalse(hasattr(original, "cleanup_owner"))
+        calls = list(self.kernel.calls)
+        self.assertTrue(owner.creation_definitely_absent)
+        with self.assertRaises(AttributeError):
+            owner.creation_definitely_absent = False
+        owner.close()
+        self.assertTrue(owner.creation_definitely_absent)
+        self.assertEqual(self.kernel.calls, calls)
         self.assert_no_create()
 
     def test_known_create_false_ignores_undefined_process_outputs(self):
@@ -378,10 +401,18 @@ class NativeLauncherTests(unittest.TestCase):
         with self.assertRaisesRegex(native.NativeLaunchError, "create_process_failed") as failed:
             self.launch()
         self.assertFalse(hasattr(failed.exception, "process"))
+        owner = failed.exception.native_launch_owner
+        self.assertIs(type(owner), native.CreatedProcess)
+        self.assertTrue(owner.creation_definitely_absent)
+        self.assertIsNone(owner.handle)
         self.assertEqual(len(self.calls("CreateProcessW")), 1)
         self.assertEqual(self.identity.calls, [])
         self.assertEqual(self.calls("IsProcessInJob"), [])
         self.assertEqual(self.calls("CloseHandle"), [("CloseHandle", value) for value in STDIO_COPIES])
+        calls = list(self.kernel.calls)
+        owner.close()
+        self.assertTrue(owner.creation_definitely_absent)
+        self.assertEqual(self.kernel.calls, calls)
 
     def test_exception_during_create_retains_raw_outputs_but_never_uses_them(self):
         original = self.kernel.create_exception = SystemExit("fixture_create_interruption")
@@ -391,6 +422,9 @@ class NativeLauncherTests(unittest.TestCase):
         error = failed.exception
         self.assertIs(error.cause, original)
         self.assertIs(error.__cause__, original)
+        self.assertIs(error.native_launch_owner, error.process)
+        self.assertIs(original.native_launch_owner, error.process)
+        self.assertFalse(error.process.creation_definitely_absent)
         self.assertIsNone(error.process.handle)
         self.assertEqual(error.process._unverified_process_info.hProcess, JOB_HANDLE)
         self.assertEqual(self.identity.calls, [])

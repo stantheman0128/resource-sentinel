@@ -233,6 +233,7 @@ class Coordinator:
             try:
                 conn.close()
             except BaseException:
+                primary._sentinel_connection_cleanup = conn
                 primary.add_note("coordinator_connection_cleanup_failed")
             raise
 
@@ -266,6 +267,70 @@ class Coordinator:
     @contextmanager
     def _admission_db(self, managed, context):
         if managed is None:
+            with self._admission_db_owned(managed, context) as value:
+                yield value
+            return
+        self._settle_managed_submission(context)
+        try:
+            with self._admission_db_owned(managed, context) as value:
+                yield value
+        except BaseException as error:
+            # Keep the original guard, transaction and exception owners. An
+            # uncertain native release is never permission to open a fresh
+            # mutex or to clear a nonce copied from the ledger.
+            context._submission_policy_error = error
+            raise
+        else:
+            context._submission_guard = None
+            context._submission_policy_error = None
+
+    def _settle_managed_submission(self, context):
+        """Settle only this original context's positively released publication."""
+        from sentinel.adaptive.admission import ManagedAdmissionUnavailable
+        from sentinel.adaptive.windows import NativePolicyMutexError
+        if context._submission_prepare_unknown:
+            raise ManagedAdmissionUnavailable("managed_policy_publication_unknown")
+        guard, policy = context._submission_guard, context._submission_policy
+        if guard is None:
+            return
+        if policy is not self._managed_lifecycle_store()._policy:
+            raise ManagedAdmissionUnavailable("managed_policy_owner_mismatch")
+        error = context._submission_policy_error
+        notes = tuple(getattr(error, "__notes__", ()))
+        if (str(error) == "managed_admission_connection_cleanup_failed" or
+                any(note != "policy_entry_cleanup_failed" for note in notes) or
+                (not context._submission_policy_entered and error is not None and
+                 not (isinstance(error, NativePolicyMutexError) and error.reason in
+                      {"policy_mutex_timeout", "policy_mutex_wait_failed"})) or
+                (isinstance(error, NativePolicyMutexError) and error.reason not in
+                 {"policy_mutex_timeout", "policy_mutex_wait_failed"})):
+            raise ManagedAdmissionUnavailable("managed_policy_cleanup_unverified")
+        with policy.store._connection() as conn:
+            runtime = policy._runtime(conn)
+            binding = policy._binding(runtime, guard.binding.logon_id)
+        if binding != guard.binding:
+            raise ManagedAdmissionUnavailable("managed_policy_binding_changed")
+        nonce = runtime["policy_entry_nonce"]
+        if nonce is not None:
+            if nonce != guard.nonce:
+                raise ManagedAdmissionUnavailable("managed_policy_entry_changed")
+            try:
+                # This guard was retained before the original native wait.
+                # hold revalidates it under the actual POLICY mutex; no new
+                # admission or capacity transaction is performed by this retry.
+                context._submission_policy_entered = False
+                with policy.hold(guard):
+                    context._submission_policy_entered = True
+                    pass
+            except BaseException as primary:
+                context._submission_policy_error = primary
+                raise
+        context._submission_guard = None
+        context._submission_policy_error = None
+
+    @contextmanager
+    def _admission_db_owned(self, managed, context):
+        if managed is None:
             with self._db() as conn:
                 conn.execute("BEGIN IMMEDIATE")
                 yield conn, None, True, None
@@ -280,14 +345,27 @@ class Coordinator:
         deadline = time.monotonic() + 1.0
         while True:
             try:
+                context._submission_prepare_unknown = True
                 guard = policy.prepare(logon)
+                context._submission_policy = policy
+                context._submission_guard = guard
+                context._submission_policy_error = None
+                context._submission_policy_entered = False
+                context._submission_prepare_unknown = False
                 break
             except PolicyBusy as error:
+                context._submission_prepare_unknown = bool(getattr(error, "__notes__", ()))
                 if getattr(error, "__notes__", ()) or time.monotonic() >= deadline:
                     raise
                 # No native scope or database connection survives this wait.
                 time.sleep(min(.01, max(0, deadline - time.monotonic())))
+            except BaseException:
+                # prepare may have committed its nonce before failing. Without
+                # a returned original guard its publication cannot be adopted.
+                context._submission_prepare_unknown = True
+                raise
         with policy.hold(guard):
+            context._submission_policy_entered = True
             # Native identity and canonical ledger checks remain outside the
             # capacity transaction. Contention has not consumed first submission.
             try:
@@ -301,7 +379,11 @@ class Coordinator:
             if snapshot is not managed:
                 guard.clean_rejection = True
                 raise LifecycleError("managed_admission_context_changed")
-            transaction = {"commit_attempted": False}
+            transaction = {"commit_attempted": False, "rolled_back": False,
+                           "first_submission": first_submission,
+                           "execution_id": managed.execution_id,
+                           "db_path": context._admission_db_path}
+            context._submission_transaction = transaction
             try:
                 conn = self._connect()
             except BaseException as primary:
@@ -310,6 +392,8 @@ class Coordinator:
                 if not getattr(primary, "__notes__", ()):
                     guard.clean_rejection = True
                 raise
+            transaction["connection"] = conn
+            transaction["connection_closed"] = False
             rolled_back = False
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -322,11 +406,14 @@ class Coordinator:
                 try:
                     conn.rollback()
                     rolled_back = not conn.in_transaction
+                    transaction["rolled_back"] = rolled_back
                 except BaseException:
                     primary.add_note("managed_admission_rollback_failed")
                 try:
                     conn.close()
+                    transaction["connection_closed"] = True
                 except BaseException:
+                    primary._sentinel_connection_cleanup = conn
                     primary.add_note("managed_admission_connection_cleanup_failed")
                 if (rolled_back and not transaction["commit_attempted"] and
                         not getattr(primary, "__notes__", ())):
@@ -335,8 +422,11 @@ class Coordinator:
             else:
                 try:
                     conn.close()
-                except BaseException:
-                    raise LifecycleError("managed_admission_connection_cleanup_failed") from None
+                    transaction["connection_closed"] = True
+                except BaseException as primary:
+                    primary._sentinel_connection_cleanup = conn
+                    primary.add_note("managed_admission_connection_cleanup_failed")
+                    raise
 
     def _init_db(self) -> None:
         with self._db() as conn:
@@ -545,9 +635,239 @@ class Coordinator:
         from sentinel.adaptive.admission import ManagedAdmission
         if type(context) is not ManagedAdmission:
             raise TypeError("managed_admission_context_required")
+        with context.submission_scope():
+            snapshot = context.snapshot()
+            return self._admit(snapshot.request, status, config=config, now=now,
+                               managed=snapshot, managed_context=context)
+
+    @staticmethod
+    def _managed_context_snapshot(context, db_path, *, pin=False):
+        from sentinel.adaptive.admission import ManagedAdmission, ManagedAdmissionUnavailable
+        if type(context) is not ManagedAdmission:
+            raise TypeError("managed_admission_context_required")
         snapshot = context.snapshot()
-        return self._admit(snapshot.request, status, config=config, now=now,
-                           managed=snapshot, managed_context=context)
+        path = context._ledger_path(db_path)
+        if context._admission_db_path is not None and path != context._admission_db_path:
+            raise ManagedAdmissionUnavailable("managed_admission_ledger_mismatch")
+        if context._submitted and context._admission_db_path is None:
+            raise ManagedAdmissionUnavailable("managed_admission_ledger_mismatch")
+        if pin:
+            context._admission_db_path = path
+        return snapshot, path
+
+    def _managed_reconciliation_locked(self, conn, context, snapshot):
+        """Read one original binding in the caller's coherent transaction."""
+        from sentinel.adaptive.admission import ManagedAdmissionUnavailable
+        request = snapshot.request
+        queues = conn.execute("""SELECT * FROM queue
+            WHERE request_key=? OR managed_execution_id=?""",
+            (request.request_key, snapshot.execution_id)).fetchall()
+        if queues:
+            if len(queues) != 1:
+                raise ManagedAdmissionUnavailable("managed_queue_binding_ambiguous")
+            context._validate_queued(queues[0], snapshot)
+        allocations = conn.execute("""SELECT * FROM reservations
+            WHERE request_key=? OR execution_id=?""",
+            (request.request_key, snapshot.execution_id)).fetchall()
+        if conn.execute("""SELECT 1 FROM worker_reservations
+            WHERE execution_id=? OR task_id=? LIMIT 1""",
+            (snapshot.execution_id, snapshot.task_id)).fetchone():
+            raise ManagedAdmissionUnavailable("managed_abandon_routed_obligation")
+        row = conn.execute("SELECT * FROM managed_executions WHERE execution_id=?",
+                           (snapshot.execution_id,)).fetchone()
+        result = {"execution_id": snapshot.execution_id, "request_key": request.request_key,
+                  "allowed": False, "launch_authorized": False}
+        if row is not None:
+            if queues or len(allocations) > 1:
+                raise ManagedAdmissionUnavailable("managed_admission_binding_mismatch")
+            if row["state"] in {"FINISHED", "CANCELLED_BEFORE_START", "START_FAILED"} and allocations:
+                raise ManagedAdmissionUnavailable("managed_abandon_allocation_unresolved")
+            if allocations:
+                context._validate_cancel_allocation(dict(allocations[0]), snapshot,
+                                                    row["reservation_id"])
+            replay = retry_managed_admission(conn, snapshot,
+                local_context=self._config({"admission_policy": "resource-v2"},
+                                           local_host_id=self.local_host_id))
+            return result | {key: replay[key] for key in
+                             ("state", "state_revision", "reservation_id")}
+        if allocations or conn.execute("SELECT 1 FROM executions WHERE request_key=? LIMIT 1",
+                                       (request.request_key,)).fetchone():
+            raise ManagedAdmissionUnavailable("managed_abandon_allocation_unresolved")
+        if queues:
+            return result | {"state": "QUEUED"}
+        state = "ABSENT_AFTER_SUBMISSION" if context._submitted else "NEVER_SUBMITTED"
+        transaction = context._submission_transaction
+        if (context._submitted and transaction is not None and
+                transaction.get("execution_id") == snapshot.execution_id and
+                transaction.get("db_path") == context._admission_db_path and
+                transaction.get("first_submission") is True and
+                transaction.get("commit_attempted") is False and
+                transaction.get("rolled_back") is True and
+                transaction.get("connection_closed") is True):
+            # Positive evidence from this exact first transaction, combined
+            # with the coherent absence check above. A later missing queue or
+            # lost COMMIT reply has none of this never-committed proof.
+            state = "SUBMISSION_REJECTED"
+        return result | {"state": state}
+
+    def reconcile_managed(self, context) -> dict[str, Any]:
+        """Inspect the original attempt without submitting, renewing or launching.
+
+        This is a read-only locator result, never unused-claim authority. In
+        particular ABSENT_AFTER_SUBMISSION does not authorize releasing owners.
+        """
+        from sentinel.adaptive.admission import ManagedAdmission
+        if type(context) is not ManagedAdmission:
+            raise TypeError("managed_admission_context_required")
+        with context._lock:
+            snapshot, path = self._managed_context_snapshot(context, self.db_path)
+            conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True,
+                                   timeout=1, isolation_level=None)
+            conn.row_factory = sqlite3.Row
+            try:
+                check_schema_version(conn)
+                conn.execute("BEGIN")
+                result = self._managed_reconciliation_locked(conn, context, snapshot)
+                conn.execute("COMMIT")
+            except BaseException as primary:
+                try:
+                    conn.close()
+                except BaseException:
+                    primary.add_note("managed_reconciliation_cleanup_failed")
+                raise
+            else:
+                conn.close()
+            result["submission_cleanup_pending"] = bool(
+                context._submission_guard is not None or context._submission_prepare_unknown)
+            return result
+
+    def cancel_managed(self, context, *, reservation_id: str | None = None,
+                       expected_revision: int | None = None,
+                       now: float | None = None) -> dict[str, Any]:
+        """Abandon exactly one original pre-handoff attempt, never another owner.
+
+        Explicit RESERVED cancellation delegates to the retained unused-claim
+        proof. A queued intent has no lifecycle allocation to archive; its
+        transaction proves full binding and absence of direct/routed obligations
+        before sealing and deleting exactly that key. Neither route uses a PID
+        as authority or interprets missing acknowledgement as a rejection.
+        """
+        from sentinel.adaptive.admission import ManagedAdmission, ManagedAdmissionUnavailable
+        if type(context) is not ManagedAdmission:
+            raise TypeError("managed_admission_context_required")
+        if (reservation_id is None) != (expected_revision is None):
+            raise ManagedAdmissionUnavailable("exact_reserved_cancel_arguments_required")
+        if now is not None and (type(now) not in {int, float} or not math.isfinite(now)):
+            raise ValueError("invalid_time")
+        with context._lock:
+            snapshot, path = self._managed_context_snapshot(context, self.db_path, pin=True)
+            if context._prepare_attempted:
+                raise ManagedAdmissionUnavailable("prepare_already_attempted")
+            if context._claim_exported:
+                raise ManagedAdmissionUnavailable("launch_claim_already_exported")
+            if context._abandon_error is not None:
+                raise ManagedAdmissionUnavailable("managed_abandon_cleanup_unverified")
+            self._settle_managed_submission(context)
+            if reservation_id is not None:
+                if context._abandon_target is not None:
+                    raise ManagedAdmissionUnavailable("managed_abandon_target_mismatch")
+                result = context.cancel_reserved(path, reservation_id=reservation_id,
+                    expected_revision=expected_revision, now=now)
+                # Keep the public adapter free of row internals and secrets.
+                result = {key: result[key] for key in
+                          ("execution_id", "reservation_id", "state", "state_revision", "cancelled")}
+                result.update(request_key=snapshot.request.request_key,
+                              allowed=False, launch_authorized=False)
+            else:
+                if context._cancel_target is not None:
+                    raise ManagedAdmissionUnavailable("exact_reserved_cancel_arguments_required")
+                result = self._cancel_managed_queue(context, snapshot, path)
+            # Mirrors follow an acknowledged authoritative outcome. Their
+            # best-effort failure cannot turn successful retirement into a
+            # retry of admission, nor into apparent allocation retention.
+            try:
+                self._mirror()
+            except (OSError, sqlite3.Error):
+                result["mirror_synced"] = False
+            else:
+                result["mirror_synced"] = True
+            return result
+
+    def _cancel_managed_queue(self, context, snapshot, path):
+        from sentinel.adaptive.admission import ManagedAdmissionUnavailable
+        if context._abandon_error is not None:
+            raise ManagedAdmissionUnavailable("managed_abandon_cleanup_unverified")
+        transaction = {"commit_attempted": False}
+        context._abandon_transaction = transaction
+        try:
+            conn = self._connect()
+        except BaseException as primary:
+            if getattr(primary, "__notes__", ()):
+                context._abandon_error = primary
+            raise
+        transaction.update(connection=conn, connection_closed=False)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            observed = self._managed_reconciliation_locked(conn, context, snapshot)
+            state = observed["state"]
+            target = (path, snapshot.execution_id, snapshot.request.request_key)
+            if context._abandon_target is not None:
+                if context._abandon_target != target:
+                    raise ManagedAdmissionUnavailable("managed_abandon_target_mismatch")
+                kind = context._abandon_kind
+                if state == "QUEUED" and kind != "QUEUED_CANCELLED":
+                    raise ManagedAdmissionUnavailable("managed_abandon_target_mismatch")
+                if state not in {"QUEUED", "NEVER_SUBMITTED", "ABSENT_AFTER_SUBMISSION", "SUBMISSION_REJECTED"}:
+                    raise ManagedAdmissionUnavailable("managed_abandon_obligation_changed")
+                if (state != "QUEUED" and kind == "QUEUED_CANCELLED" and
+                        not context._abandon_commit_attempted):
+                    raise ManagedAdmissionUnavailable("managed_abandon_absence_unverified")
+            elif state == "QUEUED":
+                kind = "QUEUED_CANCELLED"
+            elif state == "NEVER_SUBMITTED":
+                kind = "NOT_SUBMITTED"
+            elif state == "SUBMISSION_REJECTED":
+                kind = "SUBMISSION_REJECTED"
+            else:
+                raise ManagedAdmissionUnavailable("managed_abandon_requires_exact_evidence")
+            context._seal_abandonment(path, snapshot, kind)
+            result = {"cancelled": True, "state": kind, "execution_id": snapshot.execution_id,
+                      "request_key": snapshot.request.request_key, "allowed": False,
+                      "launch_authorized": False}
+            if state == "QUEUED":
+                changed = conn.execute("""DELETE FROM queue WHERE request_key=?
+                    AND managed_execution_id=? AND managed_binding_hash=?
+                    AND owner_pid=? AND owner_started=?""",
+                    (snapshot.request.request_key, snapshot.execution_id, snapshot.binding_hash,
+                     snapshot.wrapper_identity.pid, snapshot.request.owner_started)).rowcount
+                if changed != 1:
+                    raise ManagedAdmissionUnavailable("managed_queue_cancel_conflict")
+            # Publish the exact replay target before COMMIT can have any effect.
+            context._abandon_commit_attempted = True
+            self._commit_admission(conn, transaction)
+        except BaseException as primary:
+            try:
+                conn.rollback()
+            except BaseException:
+                primary.add_note("managed_abandon_rollback_failed")
+            try:
+                conn.close()
+                transaction["connection_closed"] = True
+            except BaseException:
+                primary._sentinel_connection_cleanup = conn
+                primary.add_note("managed_abandon_connection_cleanup_failed")
+            if getattr(primary, "__notes__", ()):
+                context._abandon_error = primary
+            raise
+        else:
+            try:
+                conn.close()
+                transaction["connection_closed"] = True
+            except BaseException as primary:
+                context._abandon_error = primary
+                raise
+        context._abandon_result = result.copy()
+        return result
 
     def _admit(
         self,

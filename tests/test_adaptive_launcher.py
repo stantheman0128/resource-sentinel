@@ -56,6 +56,7 @@ class Admission:
         self.payloads = []
         self.close_calls = 0
         self.close_error = None
+        self.prepare_attempted = False
 
     def snapshot(self):
         return self.value
@@ -63,6 +64,10 @@ class Admission:
     def snapshot_for_ledger(self, path):
         self.events.append(("snapshot_for_ledger", path))
         return self.value
+
+    def mark_prepare_attempted(self):
+        self.prepare_attempted = True
+        self.events.append(("prepare.boundary",))
 
     def verify_launch_payload(self, *, command, cwd):
         self.payloads.append((command, cwd))
@@ -87,6 +92,9 @@ class Coordinator:
             reservation_id="fixture-reservation", launch_authorized=False)]
         # The wrapper may observe root exit, but must never release this floor.
         self.reservation_retained = True
+        self.reconcile_calls = []
+        self.cancel_calls = []
+        self.reconciliation = self.cancellation = None
 
     def admit_managed(self, context, status, *, config):
         self.calls.append((context, status, config))
@@ -95,6 +103,28 @@ class Coordinator:
         if isinstance(value, BaseException):
             raise value
         return value
+
+    def reconcile_managed(self, context):
+        self.reconcile_calls.append(context)
+        if self.reconciliation is not None:
+            return dict(self.reconciliation)
+        return dict(execution_id=EXECUTION, request_key=REQUEST_KEY,
+                    state="QUEUED", allowed=False, launch_authorized=False)
+
+    def cancel_managed(self, context, **arguments):
+        self.cancel_calls.append((context, dict(arguments)))
+        if isinstance(self.cancellation, BaseException):
+            raise self.cancellation
+        if self.cancellation is not None:
+            return dict(self.cancellation)
+        result = dict(cancelled=True, execution_id=EXECUTION, request_key=REQUEST_KEY)
+        if arguments:
+            result.update(state="CANCELLED_BEFORE_START", reservation_id=arguments["reservation_id"],
+                          state_revision=arguments["expected_revision"] + 1)
+            self.reservation_retained = False
+        else:
+            result.update(state="QUEUED_CANCELLED")
+        return result
 
 
 class Client:
@@ -1062,6 +1092,224 @@ class ManagedLauncherTests(unittest.TestCase):
         h.admission_factory.assert_not_called()
         h.client_factory.assert_not_called()
         h.native_launch.assert_not_called()
+
+    def test_abandon_before_submission_only_closes_local_context(self):
+        h = Harness()
+        launcher = h.build()
+        outcome = launcher.abandon_once()
+        self.assertTrue(outcome["settled"])
+        self.assertTrue(outcome["closed"])
+        self.assertFalse(outcome["guardian_handoff"])
+        self.assertEqual(h.admission.close_calls, 1)
+        self.assertEqual(h.coordinator.cancel_calls, [])
+        self.assertEqual(h.coordinator.reconcile_calls, [])
+        self.assertEqual(h.client.calls, [])
+        h.native_launch.assert_not_called()
+
+    def test_queued_abandonment_uses_original_context_without_admission_replay(self):
+        h = Harness()
+        h.coordinator.responses = [dict(allowed=False, request_key=REQUEST_KEY, position=1)]
+        launcher = h.build()
+        launcher.admit_once({})
+        outcome = launcher.abandon_once()
+        self.assertTrue(outcome["settled"])
+        self.assertEqual(h.coordinator.reconcile_calls, [h.admission])
+        self.assertEqual(h.coordinator.cancel_calls, [(h.admission, {})])
+        self.assertEqual(len(h.coordinator.calls), 1)
+        self.assertEqual(h.client.calls, [])
+        h.native_launch.assert_not_called()
+
+    def test_lost_admission_ack_reconciles_exact_allocation_then_cancels_it(self):
+        h = Harness()
+        observed = dict(h.coordinator.responses[0], allowed=False)
+        h.coordinator.responses = [OSError("fixture_commit_ack_lost")]
+        h.coordinator.reconciliation = observed
+        launcher = h.build()
+        with self.assertRaises(OSError):
+            launcher.admit_once({})
+        outcome = launcher.abandon_once()
+        self.assertTrue(outcome["settled"])
+        self.assertEqual(h.coordinator.cancel_calls, [(h.admission, dict(
+            reservation_id="fixture-reservation", expected_revision=0))])
+        self.assertEqual(len(h.coordinator.calls), 1)
+        self.assertFalse(h.coordinator.reservation_retained)
+        self.assertEqual(h.client.calls, [])
+
+    def test_lost_reserved_cancellation_ack_keeps_original_target_and_context(self):
+        h = Harness()
+        launcher = h.admitted()
+        h.coordinator.cancellation = OSError("fixture_cancel_ack_lost")
+        first = launcher.abandon_once()
+        self.assertFalse(first["settled"])
+        self.assertEqual(h.admission.close_calls, 0)
+        with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_attempt_sealed"):
+            launcher.launch_once(**STDIO)
+        h.coordinator.cancellation = None
+        self.assertTrue(launcher.abandon_once()["settled"])
+        self.assertEqual(h.coordinator.cancel_calls[0], h.coordinator.cancel_calls[1])
+        self.assertEqual(len(h.coordinator.calls), 1)
+        h.native_launch.assert_not_called()
+
+    def test_cancellation_boolean_or_wrong_receipt_cannot_close_context(self):
+        cases = (dict(cancelled=True), dict(cancelled=True, execution_id=EXECUTION,
+            request_key=REQUEST_KEY, state="QUEUED_CANCELLED"),
+            dict(cancelled=True, execution_id=EXECUTION, request_key=REQUEST_KEY,
+                 state="CANCELLED_BEFORE_START", reservation_id="other", state_revision=1))
+        for reply in cases:
+            with self.subTest(reply=reply):
+                h = Harness()
+                launcher = h.admitted()
+                h.coordinator.cancellation = reply
+                self.assertFalse(launcher.abandon_once()["settled"])
+                self.assertEqual(h.admission.close_calls, 0)
+                h.native_launch.assert_not_called()
+
+    def test_unknown_prepare_replays_original_request_then_retires_without_claim(self):
+        h = Harness()
+        h.client.responses["prepare"] = KeyboardInterrupt("fixture_prepare_ack_lost")
+        launcher = h.admitted()
+        with self.assertRaises(KeyboardInterrupt):
+            launcher.launch_once(**STDIO)
+        self.assertTrue(launcher._prepare_attempted)
+        self.assertTrue(h.admission.prepare_attempted)
+        first = h.client.calls[0][1]
+        h.client.responses["prepare"] = result("PREPARED", 1, duplicate=True)
+        h.client.responses["cancel"] = result("CANCELLED_BEFORE_START", 2)
+        h.store.row.update(state="PREPARED", state_revision=1, claim_consumed=0, launch_in_flight=0)
+        self.assertTrue(launcher.abandon_once()["settled"])
+        self.assertEqual([call[0] for call in h.client.calls], ["prepare", "prepare", "cancel"])
+        self.assertEqual(h.client.calls[1][1], first)
+        self.assertEqual(h.coordinator.cancel_calls, [])
+        h.job_factory.assert_not_called()
+        h.native_launch.assert_not_called()
+
+    def test_prepared_job_open_failure_uses_cancel_without_exporting_claim(self):
+        h = Harness()
+        h.job_factory.side_effect = OSError("fixture_open_failed")
+        launcher = h.admitted()
+        with self.assertRaises(OSError):
+            launcher.launch_once(**STDIO)
+        h.client.responses["cancel"] = result("CANCELLED_BEFORE_START", 2)
+        h.store.row.update(state="PREPARED", state_revision=1, claim_consumed=0, launch_in_flight=0)
+        self.assertTrue(launcher.abandon_once()["settled"])
+        self.assertEqual([call[0] for call in h.client.calls], ["prepare", "cancel"])
+        self.assertFalse(launcher._claim_attempted)
+        h.native_launch.assert_not_called()
+
+    def test_unknown_claim_replays_same_request_for_retirement_only(self):
+        h = Harness()
+        h.client.responses["claim"] = OSError("fixture_claim_ack_lost")
+        launcher = h.admitted()
+        with self.assertRaises(OSError):
+            launcher.launch_once(**STDIO)
+        first = h.client.calls[1][1]
+        h.client.responses["claim"] = result("LAUNCHING", 2, duplicate=True)
+        h.client.responses["start_failed"] = result("START_FAILED", 3)
+        self.assertTrue(launcher.abandon_once()["settled"])
+        self.assertEqual([call[0] for call in h.client.calls], ["prepare", "claim", "claim", "start_failed"])
+        self.assertEqual(h.client.calls[2][1], first)
+        self.assertEqual(h.coordinator.cancel_calls, [])
+        h.native_launch.assert_not_called()
+
+    def test_unknown_create_and_unverified_retained_root_never_claim_start_failed(self):
+        for failure in (LaunchOutcomeUnknown(None, "fixture_unknown"), KeyboardInterrupt()):
+            with self.subTest(failure=type(failure).__name__):
+                h = Harness()
+                h.native_launch.side_effect = failure
+                launcher = h.admitted()
+                with self.assertRaises(type(failure)):
+                    launcher.launch_once(**STDIO)
+                original_calls = list(h.client.calls)
+                for _ in range(2):
+                    self.assertFalse(launcher.abandon_once()["settled"])
+                self.assertEqual(h.client.calls, original_calls)
+                self.assertEqual(h.coordinator.cancel_calls, [])
+                self.assertEqual(h.native_launch.call_count, 1)
+                self.assertEqual(h.job.close_calls, 0)
+                self.assertEqual(h.admission.close_calls, 0)
+                self.assertTrue(h.coordinator.reservation_retained)
+
+    def test_bind_ack_recovery_retains_root_until_exit_and_never_releases_children(self):
+        h = Harness()
+        h.client.responses["bind"] = OSError("fixture_bind_ack_lost")
+        launcher = h.admitted()
+        with self.assertRaises(OSError):
+            launcher.launch_once(**STDIO)
+        first = h.client.calls[-1][1]
+        h.client.responses["bind"] = result("RUNNING", 3, duplicate=True)
+        pending = launcher.abandon_once()
+        self.assertFalse(pending["settled"])
+        self.assertEqual(pending["state"], "ROOT_RUNNING")
+        self.assertEqual(h.client.calls[-1][1], first)
+        self.assertEqual(h.process.close_calls, 0)
+        h.process.exited = True
+        settled = launcher.abandon_once()
+        self.assertTrue(settled["settled"])
+        self.assertTrue(h.coordinator.reservation_retained)
+        self.assertEqual(h.coordinator.cancel_calls, [])
+        self.assertEqual(h.native_launch.call_count, 1)
+
+    def test_transport_cleanup_unknown_quarantines_further_rpc_and_local_close(self):
+        from sentinel.adaptive.launch_transport import LaunchTransportError
+        h = Harness()
+        cleanup = OSError("fixture_transport_close_effect_unknown")
+        cleanup.add_note("pipe_connection_cleanup_unverified")
+        h.client.responses["prepare"] = LaunchTransportError("launch_rpc_failed",
+            launch_outcome_unknown=True, cleanup_error=cleanup)
+        launcher = h.admitted()
+        with self.assertRaises(LaunchTransportError):
+            launcher.launch_once(**STDIO)
+        calls = list(h.client.calls)
+        h.client.responses["prepare"] = result("PREPARED", 1, duplicate=True)
+        h.client.responses["cancel"] = result("CANCELLED_BEFORE_START", 2)
+        h.store.row.update(state="PREPARED", state_revision=1, claim_consumed=0, launch_in_flight=0)
+        first = launcher.abandon_once()
+        self.assertFalse(first["settled"])
+        self.assertEqual(first["reason"], "launcher_transport_cleanup_unknown")
+        self.assertFalse(launcher.abandon_once()["settled"])
+        self.assertEqual(h.client.calls, calls)
+        self.assertEqual(h.admission.close_calls, 0)
+        self.assertTrue(launcher._operation_errors)
+
+    def test_original_native_positive_no_create_owner_can_retire_but_not_a_boolean(self):
+        for native_state in ("not_attempted", "not_created", "unknown", "created"):
+            with self.subTest(native_state=native_state):
+                h = Harness()
+                owner = module.native_launcher.CreatedProcess(SimpleNamespace(), LOGON)
+                owner._creation_outcome = native_state
+                failure = module.native_launcher.NativeLaunchError("fixture_native_failure")
+                failure.native_launch_owner = owner
+                h.native_launch.side_effect = failure
+                launcher = h.admitted()
+                with self.assertRaises(module.native_launcher.NativeLaunchError):
+                    launcher.launch_once(**STDIO)
+                h.client.responses["start_failed"] = result("START_FAILED", 3)
+                outcome = launcher.abandon_once()
+                positive = native_state in {"not_attempted", "not_created"}
+                self.assertEqual(outcome["settled"], positive)
+                self.assertEqual("start_failed" in [call[0] for call in h.client.calls], positive)
+                self.assertEqual(h.native_launch.call_count, 1)
+                self.assertEqual(h.admission.close_calls, int(positive))
+        h = Harness()
+        failure = module.native_launcher.NativeLaunchError("create_process_failed")
+        failure.native_launch_owner = SimpleNamespace(creation_definitely_absent=True)
+        h.native_launch.side_effect = failure
+        launcher = h.admitted()
+        with self.assertRaises(module.native_launcher.NativeLaunchError):
+            launcher.launch_once(**STDIO)
+        self.assertFalse(launcher.abandon_once()["settled"])
+        self.assertNotIn("start_failed", [call[0] for call in h.client.calls])
+
+    def test_repeated_pending_steps_keep_diagnostic_memory_bounded(self):
+        h = Harness()
+        h.native_launch.side_effect = KeyboardInterrupt()
+        launcher = h.admitted()
+        with self.assertRaises(KeyboardInterrupt):
+            launcher.launch_once(**STDIO)
+        for _ in range(100):
+            self.assertFalse(launcher.abandon_once()["settled"])
+        self.assertLessEqual(len(launcher._operation_errors), 3)
+        self.assertEqual(h.native_launch.call_count, 1)
 
 
 if __name__ == "__main__":

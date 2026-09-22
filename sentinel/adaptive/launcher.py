@@ -91,6 +91,20 @@ def resolve_system_cmd(cmd_path: str | None = None) -> str:
 
 def _remember(error, owner):
     error.launcher_owner = owner
+    # Keep prior failures too: a later ACK/retry must not drop the sole owner
+    # attached to an earlier native/transport cleanup failure.
+    if hasattr(owner, "_operation_errors"):
+        transport = getattr(error, "_transport_cleanup_error", None)
+        has_cleanup = bool(getattr(error, "__notes__", ()) or retained_owners(error) or
+            getattr(error, "_native_job_cleanup", ()) or getattr(error, "cleanup_owner", None) or
+            (transport is not None and (getattr(transport, "__notes__", ()) or retained_owners(transport) or
+                                       getattr(transport, "io_pending", False))) or
+            isinstance(error, native_launcher.LaunchOutcomeUnknown))
+        duplicate_reason = any(type(item) is type(error) and getattr(item, "reason", None) ==
+                               getattr(error, "reason", None) for item in owner._operation_errors)
+        if (not any(item is error for item in owner._operation_errors) and
+                (has_cleanup or (not duplicate_reason and len(owner._operation_errors) < 32))):
+            owner._operation_errors.append(error)
 
 
 class ManagedLauncher:
@@ -131,10 +145,16 @@ class ManagedLauncher:
         self._cleanup_records = {}
         self._mutex_construction_unknown = False
         self._submitted = self._sealed = self._create_attempted = self._bound = False
+        self._prepare_attempted = self._claim_attempted = False
+        self._abandoning = False
+        self._abandon_result = self._abandon_cancel_target = None
+        self._operation_errors = []
+        self._transport_cleanup_unknown = False
         self._closed = self._closing = self._admission_closed = False
         self._admission_close_unknown = False
         self._admitted = self._prepared = self._claim = self._bound_result = None
         self._root = self._root_locator = self._exit_code = self._native_failure = None
+        self._failed_native_owner = None
         self._retirement_requests = {}
         self._retired_result = None
         self.phase = "NEW"
@@ -301,6 +321,11 @@ class ManagedLauncher:
             except BaseException as error:
                 # Known failed creation can still own stdio/attribute cleanup.
                 # Positive guardian retirement does not close those resources.
+                native_owner = getattr(error, "native_launch_owner", None)
+                if isinstance(native_owner, native_launcher.CreatedProcess):
+                    self._failed_native_owner = native_owner
+                    self._extra_cleanup_owners.append(native_owner)
+                    self._track_cleanup(native_owner, guarded=False)
                 owner = getattr(error, "cleanup_owner", None)
                 if owner is not None:
                     self._extra_cleanup_owners.append(owner)
@@ -370,26 +395,24 @@ class ManagedLauncher:
             self._sealed = True
             self.phase = "PREPARING"
             try:
-                prepared = self.client.prepare_execution(expected_revision=self._admitted["state_revision"],
-                    request_id=self._request_ids["prepare"], timeout_ms=timeout_ms)
-                self._prepared = self._result(prepared, states={"PREPARED"},
-                    minimum_revision=self._admitted["state_revision"] + 1)
-                if prepared.launch_authorized:
-                    raise ManagedLaunchError("launcher_prepare_authorized_launch")
+                prepared = self._prepare_original(timeout_ms)
                 self.phase = "PREPARED"
-                self.job = self._open_job(prepared.job_name, prepared.job_nonce,
-                    self._snapshot.logon_id, access=JobAccess.LAUNCH)
+                try:
+                    self.job = self._open_job(prepared.job_name, prepared.job_nonce,
+                        self._snapshot.logon_id, access=JobAccess.LAUNCH)
+                except BaseException as error:
+                    for owner in getattr(error, "_native_job_cleanup", ()):
+                        self._extra_cleanup_owners.append(owner)
+                        self._track_cleanup(owner, guarded=not isinstance(owner, NativeJob),
+                                            unknown=not isinstance(owner, NativeJob))
+                    raise
                 if (self.job.name != prepared.job_name or self.job.nonce != prepared.job_nonce or
                         self.job.logon_sid != self._snapshot.logon_id or self.job.access is not JobAccess.LAUNCH or
                         self.job.query_cpu().flags != 0 or self.job.query_limits() != JobLimits(0, 0)):
                     raise ManagedLaunchError("launcher_job_binding_unverified")
                 self._ready(prepared.to_dict())
                 self.phase = "CLAIMING"
-                claimed = self.client.claim_launch(expected_revision=prepared.state_revision,
-                    job_nonce=prepared.job_nonce, request_id=self._request_ids["claim"],
-                    launch_fence_version=1, timeout_ms=timeout_ms)
-                self._claim = self._result(claimed, states={"LAUNCHING"},
-                    minimum_revision=prepared.state_revision + 1, scope=prepared)
+                claimed = self._claim_original(timeout_ms)
                 if claimed.launch_authorized is not True or claimed.duplicate is not False:
                     raise ManagedLaunchError("launcher_claim_not_authorized")
                 self.phase = "CLAIMED"
@@ -418,6 +441,147 @@ class ManagedLauncher:
                 self._native_failure = error
                 _remember(error, self)
                 raise
+
+    def _prepare_original(self, timeout_ms):
+        # Publish both boundaries before RPC. A RESERVED row cannot disprove
+        # an in-flight Prepare; only this original request may reconcile it.
+        self._prepare_attempted = True
+        self.admission.mark_prepare_attempted()
+        prepared = self._rpc(self.client.prepare_execution,
+            expected_revision=self._admitted["state_revision"],
+            request_id=self._request_ids["prepare"], timeout_ms=timeout_ms)
+        prepared = self._result(prepared, states={"PREPARED"},
+            minimum_revision=self._admitted["state_revision"] + 1)
+        if prepared.launch_authorized:
+            raise ManagedLaunchError("launcher_prepare_authorized_launch")
+        self._prepared = prepared
+        return prepared
+
+    def _claim_original(self, timeout_ms):
+        self._claim_attempted = True
+        prepared = self._prepared
+        claimed = self._rpc(self.client.claim_launch, expected_revision=prepared.state_revision,
+            job_nonce=prepared.job_nonce, request_id=self._request_ids["claim"],
+            launch_fence_version=1, timeout_ms=timeout_ms)
+        claimed = self._result(claimed, states={"LAUNCHING"},
+            minimum_revision=prepared.state_revision + 1, scope=prepared)
+        if not (claimed.launch_authorized or claimed.duplicate):
+            raise ManagedLaunchError("launcher_claim_not_authorized")
+        self._claim = claimed
+        return claimed
+
+    def _rpc(self, method, **arguments):
+        try:
+            return method(**arguments)
+        except BaseException as error:
+            _remember(error, self)
+            original = getattr(error, "_transport_cleanup_error", error)
+            if original is None:
+                original = error
+            # The pipe registry and the original exception retain native
+            # resources, but no contract transfers that cleanup to a guardian.
+            # Replaying an authenticated RPC cannot settle an uncertain close.
+            if (getattr(original, "__notes__", ()) or retained_owners(original) or
+                    getattr(original, "io_pending", False) or
+                    getattr(original, "_native_close_outcome_unknown", False)):
+                self._transport_cleanup_unknown = True
+            raise
+
+    def _abandon_admission(self):
+        """Cancel through the original context, never recreate its authority."""
+        if self._abandon_result is not None:
+            return
+        if self._admitted is None:
+            observation = self.coordinator.reconcile_managed(self.admission)
+            if (type(observation) is not dict or observation.get("execution_id") != self.execution_id or
+                    observation.get("request_key") != self._snapshot.request.request_key or
+                    observation.get("launch_authorized") is not False):
+                raise ManagedLaunchError("launcher_admission_reconciliation_invalid")
+            if observation.get("state") == "RESERVED":
+                if (type(observation.get("reservation_id")) is not str or not observation["reservation_id"] or
+                        type(observation.get("state_revision")) is not int or observation["state_revision"] < 0):
+                    raise ManagedLaunchError("launcher_admission_reconciliation_invalid")
+                self._admitted = dict(observation)
+        if self._admitted is not None and self._abandon_cancel_target is None:
+            self._abandon_cancel_target = dict(reservation_id=self._admitted["reservation_id"],
+                                              expected_revision=self._admitted["state_revision"])
+        reply = self.coordinator.cancel_managed(self.admission, **(self._abandon_cancel_target or {}))
+        if (type(reply) is not dict or reply.get("cancelled") is not True or
+                reply.get("execution_id") != self.execution_id or
+                reply.get("request_key") != self._snapshot.request.request_key or
+                reply.get("state") not in {"QUEUED_CANCELLED", "NOT_SUBMITTED", "SUBMISSION_REJECTED",
+                                           "CANCELLED_BEFORE_START"}):
+            raise ManagedLaunchError("launcher_admission_cancellation_invalid")
+        if self._abandon_cancel_target is not None:
+            if (reply["state"] != "CANCELLED_BEFORE_START" or
+                    reply.get("reservation_id") != self._abandon_cancel_target["reservation_id"] or
+                    type(reply.get("state_revision")) is not int or
+                    reply["state_revision"] <= self._abandon_cancel_target["expected_revision"]):
+                raise ManagedLaunchError("launcher_admission_cancellation_invalid")
+        elif reply["state"] == "CANCELLED_BEFORE_START":
+            # A surprise allocation must be pinned on a subsequent read, never
+            # accepted merely because a collaborator returned a boolean.
+            raise ManagedLaunchError("launcher_admission_cancellation_unbound")
+        self._abandon_result = dict(reply)
+
+    def abandon_once(self, *, timeout_ms=1000):
+        """One bounded original-owner settlement step; never rerun a command.
+
+        Pending is not permission for the owning process to exit. The host must
+        retain this launcher and retry eligible reconciliation/cleanup until a
+        positive terminal result, or an existing acknowledged custody handoff.
+        """
+        with self._lock:
+            if type(timeout_ms) is not int or not 1 <= timeout_ms <= 1000:
+                raise ManagedLaunchError("launcher_deadline_invalid")
+            self._abandoning = self._sealed = True
+            record = dict(execution_id=self.execution_id, settled=False, closed=False,
+                          guardian_handoff=False, state=self.phase, reason="launcher_abandon_pending")
+            try:
+                if self._transport_cleanup_unknown:
+                    raise ManagedLaunchError("launcher_transport_cleanup_unknown")
+                if not self._closed and not self._closing:
+                    if not self._submitted:
+                        pass
+                    elif self._retired_result is not None or self._abandon_result is not None:
+                        pass
+                    elif not self._prepare_attempted:
+                        self._abandon_admission()
+                    elif (self._create_attempted and self.process is None and self._root is None and
+                          self._failed_native_owner is not None and
+                          self._failed_native_owner.creation_definitely_absent):
+                        # The original native owner positively observed no
+                        # creation. The guardian still must prove lifetime
+                        # zero and atomically retire the claimed Job scope.
+                        self.retire_before_start(kind="start_failed", timeout_ms=timeout_ms)
+                    elif self._create_attempted or self.process is not None or self._root is not None:
+                        # An uncertain Create never turns into StartFailed from
+                        # a timeout or an empty observation. Bind replay needs
+                        # the original positively verified root/handle.
+                        if not self._bound:
+                            self.reconcile_bind(timeout_ms=timeout_ms)
+                        if not self.poll_root().exited:
+                            record.update(state="ROOT_RUNNING", reason="launcher_root_still_running")
+                            return record
+                    else:
+                        if self._prepared is None:
+                            self._prepare_original(timeout_ms)
+                        if self._claim_attempted and self._claim is None:
+                            self._claim_original(timeout_ms)
+                        # Do not advance an unclaimed request just to cancel.
+                        # After a claim, guardian native lifetime-zero proof
+                        # (not this local flag) must authorize StartFailed.
+                        kind = "start_failed" if self._claim_attempted else "cancel"
+                        self.retire_before_start(kind=kind, timeout_ms=timeout_ms)
+                self.close_local()
+                record.update(settled=True, closed=True, state="CLOSED", reason="launcher_abandon_settled")
+            except BaseException as error:
+                _remember(error, self)
+                reason = getattr(error, "reason", None)
+                if type(reason) is not str or not reason.replace("_", "").isalnum():
+                    reason = "launcher_abandon_interrupted" if isinstance(error, KeyboardInterrupt) else "launcher_abandon_unverified"
+                record.update(state=self.phase, reason=reason)
+            return record
 
     def retire_before_start(self, *, kind="cancel", timeout_ms=1000):
         """Explicit authenticated abandonment of this exact named scope only.
@@ -458,7 +622,7 @@ class ManagedLauncher:
                     self._retirement_requests[kind] = request
                 scope, arguments = request
                 method = self.client.cancel_before_start if kind == "cancel" else self.client.start_failed
-                reply = method(**arguments, timeout_ms=timeout_ms)
+                reply = self._rpc(method, **arguments, timeout_ms=timeout_ms)
                 states = ({"CANCELLED_BEFORE_START", "LAUNCHING", "RUNNING", "DRAINING",
                            "START_UNKNOWN", "UNCERTAIN_HOLD", "FINISHED"} if kind == "cancel" else {"START_FAILED"})
                 reply = self._result(reply, states=states,
@@ -479,7 +643,7 @@ class ManagedLauncher:
                 raise
 
     def _bind_verified_root(self, timeout_ms):
-        bound = self.client.bind_root(expected_revision=self._claim.state_revision,
+        bound = self._rpc(self.client.bind_root, expected_revision=self._claim.state_revision,
             job_nonce=self._prepared.job_nonce, root_identity=self._root,
             root_handle_locator=self._root_locator,
             request_id=self._request_ids["bind"], timeout_ms=timeout_ms)
@@ -555,8 +719,10 @@ class ManagedLauncher:
         with self._lock:
             if self._closed:
                 return
+            if self._transport_cleanup_unknown:
+                raise ManagedLaunchError("launcher_transport_cleanup_unknown")
             if not self._closing:
-                if self._submitted and self._retired_result is None:
+                if self._submitted and self._retired_result is None and self._abandon_result is None:
                     if not self._bound or not self.poll_root().exited:
                         raise ManagedLaunchError("launcher_custody_unsettled")
                 self._closing = True

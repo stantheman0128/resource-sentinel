@@ -2681,6 +2681,7 @@ class LifecycleStore:
                 self._require_revision(row, expected_revision)
                 self._caller(row, caller)
                 if proof.prelaunch_record_hash is not None:
+                    self._require_authenticated_allocation(conn, row)
                     try:
                         source = validate_active_allocation(
                             conn, execution_id, local_context=self._local_context)
@@ -2688,6 +2689,10 @@ class LifecycleStore:
                         raise LifecycleError(str(error)) from error
                     if source["allocation_kind"] != "direct":
                         raise LifecycleError("prelaunch_record_changed")
+                    if conn.execute("""SELECT 1 FROM queue
+                        WHERE managed_execution_id=? OR request_key=? LIMIT 1""",
+                        (execution_id, source["allocation"]["request_key"])).fetchone() is not None:
+                        raise LifecycleError("authenticated_allocation_not_unique")
                     actual_hash = prelaunch_record_hash(
                         row, claim_token_hash=row["claim_token_hash"],
                         allocation=source["allocation"])

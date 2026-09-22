@@ -373,6 +373,7 @@ class ManagedLaunchClient:
         self.context, self.endpoint, self.guardian_epoch = context, endpoint, guardian_epoch
 
     def prepare_execution(self, *, expected_revision, request_id, timeout_ms=1000):
+        self.context.mark_prepare_attempted()
         return self._request("PrepareExecution", expected_revision=expected_revision,
                              request_id=request_id, timeout_ms=timeout_ms)
 

@@ -44,6 +44,7 @@ class LaunchOutcomeUnknown(RuntimeError):
     """No retry: creation may have occurred; retain this exact process owner."""
     def __init__(self, process, cause):
         self.process, self.cause = process, cause
+        self.native_launch_owner = process
         super().__init__("native_launch_outcome_unknown")
 
 
@@ -161,6 +162,17 @@ class CreatedProcess:
         self._creation_outcome = "not_attempted"
         self._unverified_process_info = _ProcessInfo()
         self._closed = False
+
+    @property
+    def creation_definitely_absent(self):
+        """Observe this original attempt's positive never-created outcome.
+
+        The retained owner, not an exception reason or a missing handle, binds
+        this observation to one native invocation. It does not establish Job
+        emptiness, complete cleanup, or permission to release capacity.
+        """
+        with self._lock:
+            return self._creation_outcome in {"not_attempted", "not_created"}
 
     def _live_handle(self):
         if self.handle is None:
@@ -425,6 +437,7 @@ def launch_in_job(job, application, command_line, *, cwd=None,
         else:
             _remember(primary, cleanup)
     if primary is not None:
+        primary.native_launch_owner = owner
         if owner._creation_outcome in {"created", "unknown"}:
             raise LaunchOutcomeUnknown(owner, primary) from primary
         if (owner._thread is not None or owner._stdio or owner._attributes_initialized or

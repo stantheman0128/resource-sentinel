@@ -56,6 +56,14 @@ class NativePipeError(RuntimeError):
         super().__init__(reason)
 
 
+class _NativeCloseFailed(NativePipeError):
+    """Only the native BOOL-false boundary permits another close attempt."""
+
+
+class _NativeEventCreateFailed(NativePipeError):
+    """CreateEventW returned NULL; no event handle was acquired."""
+
+
 def _check(success, reason):
     if not success:
         raise NativePipeError(reason, C.get_last_error())
@@ -154,6 +162,10 @@ class _Operation:
         self.started = False
         self.completed = False
         self.error = None
+        self.event_acquisition_entered = False
+        self.event_acquisition_known = False
+        self.event_close_unknown = False
+        self.cancel_attempted = False
 
 
 class _WindowsPipeBackend:
@@ -182,11 +194,13 @@ class _WindowsPipeBackend:
         return int(self.kernel.GetTickCount64())
 
     def close(self, handle):
-        _check(self.kernel.CloseHandle(handle), "pipe_handle_close_failed")
+        if not self.kernel.CloseHandle(handle):
+            raise _NativeCloseFailed("pipe_handle_close_failed", C.get_last_error())
 
     def create_event(self):
         handle = self.kernel.CreateEventW(None, True, False, None)
-        _check(handle, "pipe_event_create_failed")
+        if not handle:
+            raise _NativeEventCreateFailed("pipe_event_create_failed", C.get_last_error())
         return handle
 
     def owner_sid(self):
@@ -368,6 +382,10 @@ class _PipeOwner:
         self._handle = self._operation = self._active = self._server_process = None
         self._self_process = self._peer_process = None
         self._busy, self._poisoned, self._proofs = True, False, 0
+        self._handle_close_unknown = False
+        self._accept_operation = self._accept_connection = None
+        self._accept_stopped = False
+        self._accept_disconnect_entered = self._accept_disconnected = False
         self._registry._retain(self)
 
     def _verify_current(self):
@@ -387,6 +405,8 @@ class _PipeOwner:
             raise NativePipeError("pipe_foreign_process")
         if self._handle is None:
             raise NativePipeError("pipe_closed")
+        if self._handle_close_unknown:
+            raise NativePipeError("pipe_handle_close_unknown")
         if self._poisoned:
             raise NativePipeError("pipe_quarantined", io_pending=self._operation is not None)
 
@@ -409,20 +429,49 @@ class _PipeOwner:
             return
         if not operation.completed:
             raise NativePipeError("pipe_io_pending", io_pending=True)
+        if (operation.event_acquisition_entered and not operation.event_acquisition_known
+                and operation.event is None):
+            raise NativePipeError("pipe_event_acquisition_unknown")
         if operation.event is not None:
-            self._api.close(operation.event)
-            operation.event = None
+            if operation.event_close_unknown:
+                raise NativePipeError("pipe_event_close_unknown")
+            operation.event_close_unknown = True
+            try:
+                self._api.close(operation.event)
+            except _NativeCloseFailed:
+                operation.event_close_unknown = False
+                raise
+            else:
+                operation.event = None
+                operation.event_close_unknown = False
         self._operation = None
 
+    def _create_operation_event(self, operation):
+        operation.event_acquisition_entered = True
+        try:
+            operation.event = self._api.create_event()
+        except _NativeEventCreateFailed:
+            operation.event_acquisition_known = True
+            raise
+        else:
+            operation.event_acquisition_known = True
+            operation.overlapped.event = operation.event
+
+    def _cancel_operation_once(self, operation):
+        if not operation.cancel_attempted:
+            operation.cancel_attempted = True
+            self._api.cancel(self._handle, operation)
+
     def _run(self, kind, deadline, size=0, payload=None):
+        if self._operation is not None or self._accept_operation is not None:
+            raise NativePipeError("pipe_busy", io_pending=self._operation is not None)
         deadline.require()
         operation = _Operation(kind, size, payload)
         # Registry already retains this owner. Attach every buffer before
         # event acquisition and before entering a call that can issue I/O.
         self._operation = operation
         try:
-            operation.event = self._api.create_event()
-            operation.overlapped.event = operation.event
+            self._create_operation_event(operation)
             self._api.start(self._handle, operation)
             while not operation.completed:
                 self._api.observe(self._handle, operation, min(_SLICE_MS, deadline.require()))
@@ -440,7 +489,7 @@ class _PipeOwner:
                 operation.completed = True
             if not operation.completed:
                 try:
-                    self._api.cancel(self._handle, operation)
+                    self._cancel_operation_once(operation)
                 except BaseException as cleanup:
                     _security._cleanup_note(primary, "pipe_cancel_failed", cleanup)
                 try:
@@ -467,8 +516,17 @@ class _PipeOwner:
         if self._operation is not None or self._proofs:
             raise NativePipeError("pipe_io_pending", io_pending=self._operation is not None)
         if self._handle is not None:
-            self._api.close(self._handle)
-            self._handle = None
+            if self._handle_close_unknown:
+                raise NativePipeError("pipe_handle_close_unknown")
+            self._handle_close_unknown = True
+            try:
+                self._api.close(self._handle)
+            except _NativeCloseFailed:
+                self._handle_close_unknown = False
+                raise
+            else:
+                self._handle = None
+                self._handle_close_unknown = False
         if self._server_process is not None:
             _close_identity(self._server_process)
             self._server_process = None
@@ -481,6 +539,10 @@ class _PipeOwner:
         if self._active is not None:
             self._active._closed = True
             self._active = None
+        if self._accept_connection is not None:
+            self._accept_connection._closed = True
+            self._accept_connection = None
+        self._accept_operation = None
         self._registry._forget(self)
 
     def _failed_initialization(self, primary):
@@ -493,12 +555,15 @@ class _PipeOwner:
 
     def _reap(self):
         with self._lock:
-            if self._pid != os.getpid() or self._busy or self._proofs or not self._poisoned:
+            if (self._pid != os.getpid() or self._busy or self._proofs or not self._poisoned
+                    or self._handle_close_unknown):
                 return
             self._busy = True
             try:
                 if self._operation is not None:
-                    if not self._api.observe(self._handle, self._operation, 0):
+                    if not self._operation.started:
+                        self._operation.completed = True
+                    elif not self._api.observe(self._handle, self._operation, 0):
                         return
                     self._retire_operation()
                 self._dispose()
@@ -533,8 +598,11 @@ class NativePipeListener:
         deadline = _deadline(deadline)
         owner = self._owner
         with owner._using():
-            if owner._active is not None:
-                raise NativePipeError("pipe_busy")
+            if owner._accept_stopped:
+                raise NativePipeError("pipe_accept_stopped")
+            if (owner._active is not None or owner._operation is not None
+                    or owner._accept_operation is not None):
+                raise NativePipeError("pipe_busy", io_pending=owner._operation is not None)
             try:
                 owner._run("connect", deadline)
                 connection = NativePipeConnection(owner)
@@ -548,6 +616,119 @@ class NativePipeListener:
                         owner._poisoned = True
                         _security._cleanup_note(primary, "pipe_disconnect_failed", cleanup)
                 raise
+
+    def poll_accept(self):
+        """Begin once, then inspect the same original accept without waiting.
+
+        None is a healthy pending accept. Registry reaping must leave it alone.
+        Only completed I/O and event retirement permit a borrowed connection;
+        an uncertain start or close keeps the original owner quarantined.
+        """
+        owner = self._owner
+        with owner._using():
+            if owner._accept_stopped:
+                raise NativePipeError("pipe_accept_stopped")
+            if owner._active is not None:
+                raise NativePipeError("pipe_busy")
+            operation = owner._accept_operation
+            if operation is None and owner._operation is not None:
+                raise NativePipeError("pipe_busy", io_pending=True)
+            settled_failure = False
+            try:
+                if operation is None:
+                    operation = _Operation("connect")
+                    # The registry retains owner before any event or Connect
+                    # call. Both references identify this same original op.
+                    owner._operation = operation
+                    owner._accept_operation = operation
+                    owner._create_operation_event(operation)
+                    owner._api.start(owner._handle, operation)
+                elif (owner._operation is not operation and not (
+                        owner._operation is None and operation.completed and operation.event is None)):
+                    raise NativePipeError("pipe_accept_operation_changed", io_pending=True)
+                if not operation.completed:
+                    owner._api.observe(owner._handle, operation, 0)
+                if not operation.completed:
+                    return None
+                failure = operation.error
+                owner._retire_operation()
+                if failure is not None:
+                    owner._api.disconnect(owner._handle)
+                    owner._accept_operation = None
+                    settled_failure = True
+                    raise NativePipeError("pipe_io_failed", failure)
+                # Retain the borrower before publishing it. An interrupted
+                # return leaves one exact connection reachable through owner.
+                with owner._lock:
+                    if owner._accept_stopped:
+                        return None  # terminal intent won publication race
+                    if owner._accept_connection is None:
+                        owner._accept_connection = NativePipeConnection(owner)
+                    connection = owner._accept_connection
+                    owner._active = connection
+                    owner._accept_operation = owner._accept_connection = None
+                    return connection
+            except BaseException as primary:
+                if not settled_failure:
+                    owner._poisoned = True
+                    primary._pipe_accept_owner = owner
+                raise
+
+    def stop_accept(self):
+        """Terminal intent: cancel at most once, observe at zero timeout.
+
+        False retains healthy cancellation still in progress. True proves only
+        that the accept operation/event and any connection race are retired;
+        callers must still explicitly close this original listener handle.
+        """
+        owner = self._owner
+        with owner._lock:
+            if owner._pid != os.getpid():
+                raise NativePipeError("pipe_foreign_process")
+            owner._accept_stopped = True
+            if owner._handle_close_unknown:
+                raise NativePipeError("pipe_handle_close_unknown")
+            if owner._busy or owner._proofs or owner._active is not None:
+                raise NativePipeError("pipe_busy", io_pending=owner._operation is not None)
+            if owner._handle is None:
+                return True
+            operation = owner._accept_operation
+            if operation is None:
+                if owner._operation is not None:
+                    raise NativePipeError("pipe_busy", io_pending=True)
+                return True
+            if owner._operation is not operation and not (
+                    owner._operation is None and operation.completed and operation.event is None):
+                raise NativePipeError("pipe_accept_operation_changed", io_pending=True)
+            owner._busy = True
+            try:
+                if not operation.started:
+                    # A known failed event acquisition issued no Connect;
+                    # _retire_operation separately checks unknown acquisition.
+                    operation.completed = True
+                elif not operation.completed:
+                    owner._cancel_operation_once(operation)
+                    owner._api.observe(owner._handle, operation, 0)
+                if not operation.completed:
+                    return False
+                owner._retire_operation()
+                if not owner._accept_disconnected:
+                    if owner._accept_disconnect_entered:
+                        raise NativePipeError("pipe_accept_disconnect_unknown")
+                    owner._accept_disconnect_entered = True
+                    owner._api.disconnect(owner._handle)
+                    owner._accept_disconnected = True
+                if owner._accept_connection is not None:
+                    owner._accept_connection._closed = True
+                    owner._accept_connection = None
+                owner._accept_operation = None
+                return True
+            except BaseException as primary:
+                owner._poisoned = True
+                primary._pipe_accept_owner = owner
+                raise
+            finally:
+                owner._busy = False
 
     def close(self):
         owner = self._owner

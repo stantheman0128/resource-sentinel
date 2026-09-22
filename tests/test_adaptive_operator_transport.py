@@ -95,6 +95,24 @@ class LoopbackEnd(Connection):
         return super().read_exact(size, deadline)
 
 
+class PollingListener:
+    """One accepted borrower or idle; a blocking accept is never permitted."""
+
+    def __init__(self, endpoint, connection=None, *, error=None):
+        self.endpoint, self.connection, self.error = endpoint, connection, error
+        self.polls = 0
+
+    def poll_accept(self):
+        self.polls += 1
+        if self.error is not None:
+            raise self.error
+        connection, self.connection = self.connection, None
+        return connection
+
+    def accept(self, *_args, **_kwargs):
+        raise AssertionError("poll_once attempted a blocking accept")
+
+
 class OperatorTransportTests(unittest.TestCase):
     def setUp(self):
         self.clock = Clock()
@@ -509,6 +527,208 @@ class OperatorTransportTests(unittest.TestCase):
         self.service_connection()
         self.serve()
         self.assertEqual(self.calls, [request(), request()])
+
+    def test_poll_idle_uses_no_deadline_clock_protocol_or_handler(self):
+        listener = PollingListener(self.endpoint)
+        initial_clock = self.clock.now
+        with patch.object(transport.NativeDeadline, "after_ms",
+                          side_effect=AssertionError("idle poll created a deadline")), \
+                patch.object(self.clock, "tick_ms",
+                             side_effect=AssertionError("idle poll read a clock")), \
+                patch.object(self.service, "_serve_connection",
+                             side_effect=AssertionError("idle poll entered protocol")):
+            self.assertIsNone(self.service.poll_once(listener))
+        self.assertEqual(listener.polls, 1)
+        self.assertEqual(self.clock.now, initial_clock)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.service._mutations, {})
+
+    def test_poll_ready_authenticates_with_one_shared_default_50ms_deadline(self):
+        stages = []
+        connection = self.service_connection(on_read=lambda conn, _size: stages.append(conn.peer_held))
+        listener = PollingListener(self.endpoint, connection)
+        factory = transport.NativeDeadline.after_ms
+        with patch.object(transport.NativeDeadline, "after_ms", wraps=factory) as create_deadline:
+            result = self.service.poll_once(listener)
+        create_deadline.assert_called_once_with(50)
+        self.assertEqual(listener.polls, 1)
+        self.assertEqual(result, reply_for(request()))
+        self.assertEqual(self.calls, [request()])
+        self.assertEqual(self.callers, [CALLER])
+        self.assertEqual(stages, [False, False, True, True])
+        self.assertEqual(connection.verified, [CALLER])
+        self.assertEqual([value["kind"] for value in connection.writes],
+                         ["OperatorChallenge", "OperatorReply"])
+        deadline = connection.deadlines[0]
+        self.assertTrue(all(value is deadline for value in connection.deadlines))
+        self.assertEqual(deadline._end - deadline._start, 50)
+        self.assertTrue(connection.closed)
+        self.assertFalse(connection.peer_held)
+
+    def test_poll_endpoint_mismatch_refuses_before_accept_or_deadline(self):
+        connection = self.service_connection()
+        listener = PollingListener(replace(self.endpoint, instance_id=str(uuid4())), connection)
+        with patch.object(transport.NativeDeadline, "after_ms",
+                          side_effect=AssertionError("wrong endpoint created a deadline")):
+            with self.assertRaisesRegex(transport.OperatorTransportError, "operator_endpoint_mismatch"):
+                self.service.poll_once(listener)
+        self.assertEqual(listener.polls, 0)
+        self.assertIs(listener.connection, connection)
+        self.assertEqual(connection.reads, [])
+        self.assertFalse(connection.closed)
+        self.assertEqual(self.calls, [])
+
+    def test_poll_invalid_timeout_refuses_before_accept_or_deadline(self):
+        for timeout in (0, -1, 5001, True, 1.5, None, "50"):
+            with self.subTest(timeout=timeout):
+                connection = self.service_connection()
+                listener = PollingListener(self.endpoint, connection)
+                with patch.object(transport.NativeDeadline, "after_ms",
+                                  side_effect=AssertionError("invalid timeout created a deadline")), \
+                        patch.object(self.clock, "tick_ms",
+                                     side_effect=AssertionError("invalid timeout read a clock")):
+                    with self.assertRaises((IpcError, NativePipeError)):
+                        self.service.poll_once(listener, timeout_ms=timeout)
+                self.assertEqual(listener.polls, 0)
+                self.assertIs(listener.connection, connection)
+                self.assertEqual(connection.reads, [])
+                self.assertFalse(connection.closed)
+        self.assertEqual(self.calls, [])
+
+    def test_poll_rejects_peer_mismatch_and_invalid_hello_before_request_or_handler(self):
+        cases = (
+            {"peer": replace(CALLER, pid=CALLER.pid + 1)},
+            {"peer": replace(CALLER, created_filetime_100ns=CALLER.created_filetime_100ns + 1)},
+            {"peer": replace(CALLER, logon_id="S-1-5-5-200-300")},
+            {"hello_change": lambda value: value | {"version": True}},
+        )
+        for index, changes in enumerate(cases):
+            with self.subTest(case=index):
+                connection = self.service_connection(**changes)
+                listener = PollingListener(self.endpoint, connection)
+                with self.assertRaises((IpcError, NativePipeError)):
+                    self.service.poll_once(listener)
+                self.assertEqual(listener.polls, 1)
+                self.assertEqual(len(connection.reads), 2)
+                self.assertEqual(connection.writes, [])
+                self.assertTrue(connection.closed)
+                self.assertFalse(connection.peer_held)
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.service._mutations, {})
+
+    def test_poll_deadline_creation_failure_closes_the_entered_exact_borrower(self):
+        connection = self.service_connection()
+        listener = PollingListener(self.endpoint, connection)
+        entered, exited = [], []
+        original_enter, original_exit = Connection.__enter__, Connection.__exit__
+        failure = OSError("fixture deadline unavailable")
+
+        def enter(owner):
+            entered.append(owner)
+            return original_enter(owner)
+
+        def leave(owner, *arguments):
+            exited.append(owner)
+            return original_exit(owner, *arguments)
+
+        def fail_deadline(timeout):
+            self.assertEqual(timeout, 50)
+            self.assertEqual(entered, [connection])
+            self.assertEqual(exited, [])
+            raise failure
+
+        with patch.object(Connection, "__enter__", enter), \
+                patch.object(Connection, "__exit__", leave), \
+                patch.object(transport.NativeDeadline, "after_ms", side_effect=fail_deadline) as create_deadline:
+            with self.assertRaises(OSError) as raised:
+                self.service.poll_once(listener)
+        self.assertIs(raised.exception, failure)
+        create_deadline.assert_called_once_with(50)
+        self.assertEqual(listener.polls, 1)
+        self.assertEqual(exited, [connection])
+        self.assertTrue(connection.closed)
+        self.assertEqual(connection.reads, [])
+        self.assertEqual(connection.writes, [])
+        self.assertEqual(self.calls, [])
+
+    def test_poll_expired_handler_keeps_mutation_binding_without_reply_or_retry(self):
+        original = request()
+        connection = self.service_connection(original)
+        listener = PollingListener(self.endpoint, connection)
+
+        def expire(result):
+            self.clock.now += 50
+            return result
+
+        self.handler_change = expire
+        with self.assertRaises(IpcError):
+            self.service.poll_once(listener)
+        self.assertEqual(listener.polls, 1)
+        self.assertEqual(self.calls, [original])
+        self.assertEqual([value["kind"] for value in connection.writes], ["OperatorChallenge"])
+        self.assertTrue(connection.closed)
+        self.handler_change = None
+        changed = self.service_connection(replace(original, expected_registry_revision=5))
+        with self.assertRaisesRegex(transport.OperatorTransportError, "operator_request_payload_changed"):
+            self.service.poll_once(PollingListener(self.endpoint, changed))
+        self.assertEqual(self.calls, [original])
+        retried = self.service_connection(original)
+        result = self.service.poll_once(PollingListener(self.endpoint, retried))
+        self.assertEqual(result, reply_for(original))
+        self.assertEqual(self.calls, [original, original])
+
+    def test_poll_unknown_accept_error_or_interrupt_propagates_without_protocol_or_retry(self):
+        for failure in (NativePipeError("pipe_completion_unavailable", 123, io_pending=True),
+                        KeyboardInterrupt()):
+            with self.subTest(error=type(failure).__name__):
+                connection = self.service_connection()
+                listener = PollingListener(self.endpoint, connection, error=failure)
+                with patch.object(transport.NativeDeadline, "after_ms",
+                                  side_effect=AssertionError("failed accept created a deadline")), \
+                        patch.object(self.service, "_serve_connection",
+                                     side_effect=AssertionError("failed accept entered protocol")):
+                    with self.assertRaises(type(failure)) as raised:
+                        self.service.poll_once(listener)
+                self.assertIs(raised.exception, failure)
+                self.assertEqual(listener.polls, 1)
+                self.assertIs(listener.connection, connection)
+                self.assertEqual(connection.reads, [])
+                self.assertFalse(connection.closed)
+        self.assertEqual(self.calls, [])
+
+    def test_poll_success_then_idle_does_not_reuse_borrower_or_repeat_protocol(self):
+        connection = self.service_connection()
+        listener = PollingListener(self.endpoint, connection)
+        self.assertEqual(self.service.poll_once(listener), reply_for(request()))
+        reads, writes = list(connection.reads), list(connection.writes)
+        with patch.object(transport.NativeDeadline, "after_ms",
+                          side_effect=AssertionError("next idle poll created a deadline")):
+            self.assertIsNone(self.service.poll_once(listener))
+        self.assertEqual(listener.polls, 2)
+        self.assertEqual(connection.reads, reads)
+        self.assertEqual(connection.writes, writes)
+        self.assertEqual(self.calls, [request()])
+        self.assertTrue(connection.closed)
+
+    def test_poll_final_deadline_check_includes_borrower_cleanup(self):
+        connection = self.service_connection()
+        listener = PollingListener(self.endpoint, connection)
+        original_exit = Connection.__exit__
+
+        def late_exit(owner, *arguments):
+            self.assertIs(owner, connection)
+            result = original_exit(owner, *arguments)
+            self.clock.now += 50
+            return result
+
+        with patch.object(Connection, "__exit__", late_exit):
+            with self.assertRaises(IpcError):
+                self.service.poll_once(listener)
+        self.assertEqual(listener.polls, 1)
+        self.assertEqual(self.calls, [request()])
+        self.assertTrue(connection.closed)
+        self.assertEqual([value["kind"] for value in connection.writes],
+                         ["OperatorChallenge", "OperatorReply"])
 
     def test_client_pins_server_before_sending_even_hello(self):
         for peer in (replace(SERVER, created_filetime_100ns=SERVER.created_filetime_100ns + 1),

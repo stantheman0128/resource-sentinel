@@ -75,7 +75,8 @@ class FixtureBackend:
     def close(self, handle):
         self.close_attempts.append(handle)
         if handle in self.close_failures:
-            raise native.NativePipeError("pipe_handle_close_failed", 6)
+            # Explicit fixture for a native BOOL-false result before closing.
+            raise native._NativeCloseFailed("pipe_handle_close_failed", 6)
         if handle in self.closed:
             raise AssertionError("fixture double close")
         self.closed.append(handle)

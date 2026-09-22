@@ -23,7 +23,7 @@ from .ipc import (IpcError, PROTOCOL_MAJOR, _hex, _identity, _live, _remaining,
                   _shape, _uuid, read_frame, write_frame)
 from .operator_messages import (MAX_OPERATOR_REQUESTS, OperatorOperation,
                                 OperatorReply, OperatorRequest)
-from .pipe_windows import NativeDeadline, NativePipeConnection, NativePipeEndpoint
+from .pipe_windows import NativeDeadline, NativePipeConnection, NativePipeEndpoint, NativePipeError
 
 
 MAX_HELLO_BYTES = 2048
@@ -200,6 +200,28 @@ class OperatorService:
             raise OperatorTransportError("operator_endpoint_mismatch")
         deadline = NativeDeadline.after_ms(timeout_ms)
         with listener.accept(deadline) as connection:
+            reply = self._serve_connection(connection, deadline)
+        _remaining(deadline)
+        return reply
+
+    def poll_once(self, listener, *, timeout_ms=50):
+        """Observe one retained accept without spending a request deadline idle.
+
+        A ready borrower enters the same authenticated protocol as serve_once.
+        Its one connected-request deadline begins only after that exact
+        connection is owned by the context, including deadline-factory failure.
+        """
+        if listener.endpoint != self.endpoint:
+            raise OperatorTransportError("operator_endpoint_mismatch")
+        # Match NativeDeadline's input bound without creating a deadline or
+        # touching its native clock for a listener that may simply be idle.
+        if type(timeout_ms) is not int or not 1 <= timeout_ms <= 5000:
+            raise NativePipeError("pipe_deadline_invalid")
+        connection = listener.poll_accept()
+        if connection is None:
+            return None
+        with connection:
+            deadline = NativeDeadline.after_ms(timeout_ms)
             reply = self._serve_connection(connection, deadline)
         _remaining(deadline)
         return reply

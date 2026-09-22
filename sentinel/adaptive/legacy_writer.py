@@ -182,6 +182,11 @@ def unregister_dead_infrastructure_locked(store, role, process):
 def _registry_locked(store, guard, deadline, clock):
     # No native query, second database or wait while this read transaction lives.
     with store._connection() as conn:
+        # A lifecycle connection may permit pending-install nonce cleanup;
+        # that limited exception never authorizes a legacy native mutation.
+        from .daily_generation import prepare_connection
+        prepare_connection(conn, role="legacy_writer", db_path=store.db_path)
+        # The original batch deadline is not renewed by readiness checks.
         conn.execute("PRAGMA busy_timeout=25")
         conn.set_progress_handler(lambda: int(clock() >= deadline), 1000)
         conn.execute("BEGIN")

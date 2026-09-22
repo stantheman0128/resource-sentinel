@@ -126,6 +126,15 @@ class DailyPrerequisiteTests(unittest.TestCase):
         with self.assertRaisesRegex(DailyGenerationUnavailable, "config_changed"):
             prerequisite.validate_prepared_baseline(private)
 
+    def test_replaced_ledger_stops_install_even_with_identical_bytes(self):
+        _, private = self.inspect()
+        ledger = self.data / "sentinel.db"
+        replacement = self.data / "replacement.db"
+        replacement.write_bytes(ledger.read_bytes())
+        replacement.replace(ledger)
+        with self.assertRaisesRegex(DailyGenerationUnavailable, "ledger_identity_changed"):
+            prerequisite.validate_prepared_baseline(private)
+
     def test_new_entrypoint_after_preparation_is_not_ignored(self):
         _, private = self.inspect()
         (self.daily / "scripts/late.py").write_text("pass\n")

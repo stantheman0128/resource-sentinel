@@ -177,11 +177,17 @@ class Maintainer:
         conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
         conn.row_factory = sqlite3.Row
         try:
+            from .adaptive.daily_generation import prepare_connection
+            prepare_connection(conn, role="maintainer", db_path=self.db_path)
             # An unknown adaptive schema must be rejected before legacy schema
             # initialization, cleanup or even changing its journal mode.
             check_schema_version(conn)
-        except BaseException:
-            conn.close()
+        except BaseException as primary:
+            try:
+                conn.close()
+            except BaseException:
+                primary._sentinel_connection_cleanup = conn
+                primary.add_note("maintainer_connection_cleanup_failed")
             raise
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("PRAGMA journal_mode=WAL")

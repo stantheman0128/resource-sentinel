@@ -121,9 +121,10 @@ entrypoints or source drift invalidate the prepared manifest.
 
 ## Rollback and evidence
 
-The prepared package has no automatic daily apply. Its default commands inspect
-and create local evidence only. Any later installation command must name the
-exact reviewed manifest digest and require a separate explicit activation action.
+The package has no automatic daily apply. Its default commands inspect and
+create local evidence only. The separate installation command names the exact
+reviewed manifest digest and requires an explicit activation action. Preparing,
+testing, or committing this code does not authorize running that command.
 
 Current preparation commands, using the base interpreter and implementation
 checkout, are:
@@ -139,8 +140,60 @@ for unchanged protected bytes with no additional unreviewed executable source;
 that result grants no activation. Configuration and preparation reads are bounded
 to 1 MiB. Private artifacts stay local and are not staged.
 
-A future installer must validate the original bytes before writing each file, retain backups,
-and report partially installed state honestly on failure.
+After the source integration is complete, generate a fresh preparation: a prior
+manifest will not match later source edits. Review the public digest and keep
+the private preparation and backups outside the repository. The executable
+review path performs no source or runtime mutation:
+
+```powershell
+C:\Python313\python.exe scripts/adaptive-activate.py --private-preparation <private-preparation.json> --preparation-sha256 <exact-private-file-sha256> --manifest-sha256 <exact-reviewed-source-sha256>
+```
+
+Only a separately authorized operator invocation may apply:
+
+```powershell
+C:\Python313\python.exe scripts/adaptive-activate.py --private-preparation <private-preparation.json> --preparation-sha256 <exact-private-file-sha256> --manifest-sha256 <exact-reviewed-source-sha256> --backup-directory <new-private-backup-directory> --apply-daily-accounting-handoff
+```
+
+This executable starts with standard-library imports only. It rejects a process
+that already imported Sentinel, validates canonical paths and exact source,
+configuration and ledger-file bindings, retains original Windows file handles
+denying concurrent writes/deletion, and captures exact backups before writing.
+The source closure includes unchanged files so another editor cannot change an
+already checked module while the operation holds its handles. Existing dirty
+bytes must match the reviewed private baseline. A new file uses `CREATE_NEW`.
+Parent creation must retain and verify each ancestor; no path-based recursive
+copy, delete, checkout, source reset, or broad rollback is performed.
+
+Source writes are in-place and are not a multi-file transaction. A write,
+flush, readback or close with unknown outcome retains its original owner and
+private operation evidence. The source stage cannot claim successful rollback
+from a closed handle or elapsed time. Known unchanged, pre-mutation refusals may
+release their handles and exit. Rollback through the retained source objects is
+limited to exact files written by that operation before runtime import; it
+never restores a pre-activation database. A created directory is not recursively
+removed, and deletion-pending for an owned new file is not reported as absence.
+
+After positive source settlement the same interpreter imports canonical daily
+Sentinel, captures its original native cohort and becomes `DailyActivationHost`.
+It explicitly migrates the real daily ledger, performs the fenced generation
+installation and acknowledgement, then owns the existing off-mode supervisor
+and one read-only readiness thread. The thread owns a separate, one-resource
+native pipe registry; it adds no accounting database or resident process.
+Actual native source-file locking, permissions, timing, cohort handoff and
+failure recovery still need their Windows evidence before this entrypoint can
+be promoted. The command has not been executed against daily state.
+
+The old cohort is first captured after source settlement, then refreshed under
+the original POLICY immediately before generation installation. This includes
+interpreters started during source replacement. Their exact original witnesses
+must be positively dead. Empty legacy allocations are checked under the same
+SQLite writer lock that installs generation triggers. A connection opened before
+the generation cannot write afterward without the generation function; no old
+reservation remains for a read-only reuse path. Reviewed native legacy setters
+hold the same POLICY through their exclusion checks and mutations. A renamed,
+embedded or otherwise unclassified relevant consumer remains an inventory gap;
+this argument does not certify such a consumer merely from its filename.
 
 Rollback first sets desired mode off and follows the operational drain/restore
 contract. Live allocations, unknown cleanup, outstanding caps or a retained
@@ -171,16 +224,29 @@ Prepared module APIs and remaining integration are deliberately distinct:
   primitives and retains source/config/ledger identity and original custody.
 - `DailyReadinessService` provides authenticated readiness of that exact owner;
   it neither allocates resources nor adopts a command or external test Job.
-- Entry hooks, supervisor ownership/service scheduling, genuine S1 provider
-  construction, S1 canonical naming/history reconciliation, and multi-process
-  experiment allocation adoption must be integrated and tested before claiming
-  that activation or native runners are ready. In particular, a global source
-  readiness response cannot stand in for `assert_spike_covered`.
+- The canonical package bootstrap and Coordinator, Maintainer, LifecycleStore
+  and legacy-writer connection hooks call the generation check before BEGIN.
+  With no installed generation, ordinary legacy behavior is preserved.
+- `DailyActivationHost` assembles the original owner, migration, readiness thread
+  and existing supervisor. Genuine S1 provider construction, S1 canonical
+  naming/history reconciliation, and multi-process experiment adoption remain
+  separate integration obligations. A global source readiness response cannot
+  stand in for `assert_spike_covered`.
 
 An activated generation retains a live owner dependency. Missing readiness
 refuses new capacity; stopping the owner or turning adaptive off does not remove
 the compatibility fence. Availability and monitoring cost must be measured in
 the required gates. No ordinary user work may be killed to satisfy the cohort.
+
+Generation retirement is a required promotion contract, not implemented by
+closing the supervisor: stop new admission while preserving cleanup authority,
+retain original Job/cap/ledger and pipe witnesses, positively settle every
+allocation and native restriction, publish the exact fenced terminal state,
+then close the readiness service and source owner. Until that sequence exists
+and passes native recovery gates, completed CPU-control drain leaves the source
+accounting keeper resident and reports `daily_generation_retirement_not_implemented`.
+It does not delete compatibility triggers, discard witnesses, or claim a clean
+process exit. Daily adaptive mode stays off.
 
 Python's official [audit-event table](https://docs.python.org/3/library/audit_events.html)
 documents the `exec` event's code-object argument.

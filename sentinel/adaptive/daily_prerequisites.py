@@ -13,7 +13,7 @@ import sqlite3
 
 from .daily_generation import (
     DailyGenerationUnavailable, SourceManifest, _existing_root, _read_source,
-    _source_paths, read_generation,
+    _source_paths, _ledger_identity, read_generation,
 )
 
 MAX_JSON = 1024 * 1024
@@ -91,10 +91,12 @@ def inspect_daily(*, candidate_root, daily_root=None, daily_data_dir=None):
     ledger = daily_data / "sentinel.db"
     counts = {}
     generation = None
+    ledger_identity = None
     conn = None
     try:
         if not ledger.is_file():
             raise FileNotFoundError
+        ledger_identity = _ledger_identity(ledger)
         conn = sqlite3.connect(ledger.as_uri() + "?mode=ro", uri=True, timeout=.25)
         conn.execute("PRAGMA query_only=ON")
         conn.execute("BEGIN")
@@ -130,6 +132,7 @@ def inspect_daily(*, candidate_root, daily_root=None, daily_data_dir=None):
         "schema_version": 1, "purpose": "review_only_not_activation_authority",
         "daily_root": str(root), "daily_data_dir": str(daily_data),
         "ledger_path": str(ledger), "config_sha256": config_hash,
+        "ledger_identity": None if ledger_identity is None else [str(value) for value in ledger_identity],
         "candidate": candidate.to_dict(), "baseline": originals,
         "unreviewed_daily_files": additional,
         "public": public,
@@ -153,6 +156,8 @@ def validate_prepared_baseline(prepared):
     _, config_hash = _read_json(data / "config.json")
     if config_hash != prepared["config_sha256"]:
         raise DailyGenerationUnavailable("daily_config_changed")
+    if prepared.get("ledger_identity") != [str(value) for value in _ledger_identity(data / "sentinel.db")]:
+        raise DailyGenerationUnavailable("daily_ledger_identity_changed")
     candidate = SourceManifest.from_dict(prepared["candidate"])
     if prepared.get("unreviewed_daily_files"):
         raise DailyGenerationUnavailable("daily_unreviewed_source_requires_review")

@@ -916,6 +916,11 @@ class LifecycleStore:
             raise
         try:
             conn.row_factory = sqlite3.Row
+            # Daily readiness precedes BEGIN; a refusal still follows this
+            # connection owner's existing cleanup path.
+            from .daily_generation import prepare_connection
+            prepare_connection(conn, role="lifecycle",
+                               db_path=self.db_path if pinned is None else pinned)
             conn.execute("PRAGMA foreign_keys=ON")
             yield conn
         except BaseException as primary:

@@ -100,6 +100,13 @@ C:\Python313\python.exe -m unittest tests.test_adaptive_guardian_retirement.Guar
 C:\Python313\python.exe -m unittest tests.test_adaptive_daily_generation tests.test_adaptive_daily_prerequisites tests.test_adaptive_daily_cohort tests.test_adaptive_daily_bootstrap tests.test_adaptive_daily_readiness_transport tests.test_adaptive_daily_connection_hooks tests.test_adaptive_daily_source_handles tests.test_adaptive_daily_source_install tests.test_adaptive_daily_activation_host tests.test_adaptive_launch_producer -q
 ```
 
+接線後另跑既有 admission／local worker／legacy writer 相容性測試，168 tests
+全過（16.577 秒，0 failures／errors／skips），命令為：
+
+```text
+C:\Python313\python.exe -m unittest tests.test_coordinator tests.test_maintainer tests.test_adaptive_coordinator tests.test_adaptive_maintainer tests.test_adaptive_legacy_writer tests.test_adaptive_legacy_writer_fence tests.test_adaptive_legacy_mode -q
+```
+
 項目 5 foundation 的檢驗命令（同樣透過日常 wrapper、隔離 fixture）為：
 
 ```text

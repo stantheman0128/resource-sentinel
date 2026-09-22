@@ -223,6 +223,8 @@ class Coordinator:
         conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
         try:
             conn.row_factory = sqlite3.Row
+            from .adaptive.daily_generation import prepare_connection
+            prepare_connection(conn, role="coordinator", db_path=self.db_path)
             check_schema_version(conn)
             conn.execute("PRAGMA busy_timeout=10000")
             conn.execute("PRAGMA journal_mode=WAL")

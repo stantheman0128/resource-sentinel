@@ -57,7 +57,7 @@ class ReactionLatencyError(ValueError):
 
 
 class _MemoryCountersEx(C.Structure):
-    _fields_ = [("cb", W.DWORD), ("PageFaultCount", W.DWORD),
+    _fields_ = [("cb", C.c_uint32), ("PageFaultCount", C.c_uint32),
                 ("PeakWorkingSetSize", C.c_size_t), ("WorkingSetSize", C.c_size_t),
                 ("QuotaPeakPagedPoolUsage", C.c_size_t), ("QuotaPagedPoolUsage", C.c_size_t),
                 ("QuotaPeakNonPagedPoolUsage", C.c_size_t), ("QuotaNonPagedPoolUsage", C.c_size_t),

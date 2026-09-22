@@ -1,0 +1,353 @@
+"""Synthetic reducer and fail-closed interface tests, never native P4 evidence."""
+from contextlib import closing
+import ctypes as C
+from pathlib import Path
+import sqlite3
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import Mock
+
+from sentinel.adaptive.contracts import ProcessIdentity
+from tests.windows import adaptive_cost_probe as cost
+from tests.windows import adaptive_overhead_native as native
+from tests.windows import adaptive_overhead_runner as runner
+
+
+LOGON = "S-1-5-5-10-20"
+
+
+def identity(pid):
+    return ProcessIdentity(pid, 100000 + pid, LOGON)
+
+
+def reading(pid, cpu=100, private=20, handles=3, peak=None):
+    return SimpleNamespace(identity=identity(pid), cpu_100ns=cpu,
+        private_bytes=private, handles=handles,
+        peak_private_bytes=private if peak is None else peak)
+
+
+def audit(**changes):
+    values = dict(identity=identity(2), scope_nonce="a" * 32, sequence=1,
+        observed_tick=100, installed_tick=1, calls=0, restrictive_calls=0)
+    values.update(changes)
+    return runner.NativeSetObservation(**values)
+
+
+class NativeCostLayoutTests(unittest.TestCase):
+    def test_documented_memory_layout_at_both_pointer_widths(self):
+        names = [name for name, _ in cost._MemoryCountersEx._fields_]
+        expected = ["cb", "PageFaultCount", "PeakWorkingSetSize", "WorkingSetSize",
+            "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage",
+            "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage", "PrivateUsage"]
+        self.assertEqual(names, expected)
+        for pointer, size, private_offset, peak_offset in (
+                (C.c_uint32, 44, 40, 36), (C.c_uint64, 80, 72, 64)):
+            with self.subTest(size=size):
+                class Layout(C.Structure):
+                    _fields_ = [(name, C.c_uint32 if i < 2 else pointer)
+                                for i, name in enumerate(names)]
+                self.assertEqual(C.sizeof(Layout), size)
+                self.assertEqual(Layout.PrivateUsage.offset, private_offset)
+                self.assertEqual(Layout.PeakPagefileUsage.offset, peak_offset)
+                for i, name in enumerate(names[2:]):
+                    self.assertEqual(getattr(Layout, name).offset, 8 + i * C.sizeof(pointer))
+
+    def test_native_struct_has_exact_host_abi(self):
+        width = C.sizeof(C.c_size_t)
+        self.assertEqual(C.sizeof(cost._MemoryCountersEx), 8 + 9 * width)
+        self.assertEqual(cost._MemoryCountersEx.PagefileUsage.offset, 8 + 6 * width)
+        self.assertEqual(cost._MemoryCountersEx.PeakPagefileUsage.offset, 8 + 7 * width)
+        self.assertEqual(cost._MemoryCountersEx.PrivateUsage.offset, 8 + 8 * width)
+
+
+class P4ReducerTests(unittest.TestCase):
+    def setUp(self):
+        self.roles = {identity(1): "helper", identity(2): "guardian",
+                      identity(3): "waiting_wrapper"}
+
+    def test_exact_identity_join_ignores_snapshot_order(self):
+        result = runner.process_endpoints(self.roles,
+            [reading(1), reading(2), reading(3)],
+            [reading(3, 120), reading(1, 130), reading(2, 150)])
+        self.assertEqual([row["cpu_end_100ns"] for row in result], [130, 150, 120])
+        self.assertEqual(result[0]["identity"], identity(1).to_dict())
+
+    def test_reused_pid_different_creation_time_refuses_cpu_splice(self):
+        last = [reading(1), reading(2), reading(3)]
+        last[0].identity = ProcessIdentity(1, 999999, LOGON)
+        with self.assertRaisesRegex(runner.NativeRunBlocked, "identity_changed"):
+            runner.process_endpoints(self.roles, [reading(1), reading(2), reading(3)], last)
+
+    def test_duplicate_reading_is_not_complete_coverage(self):
+        with self.assertRaisesRegex(runner.NativeRunBlocked, "identity_changed"):
+            runner.process_endpoints(self.roles, [reading(1), reading(2), reading(3)],
+                                     [reading(1), reading(1), reading(3)])
+
+    def test_reversed_cpu_endpoint_is_not_zero_cost(self):
+        with self.assertRaisesRegex(runner.NativeRunBlocked, "counter_reversed"):
+            runner.process_endpoints(self.roles, [reading(1), reading(2), reading(3)],
+                                     [reading(1, 99), reading(2), reading(3)])
+
+    def test_boolean_cpu_is_not_numeric_evidence(self):
+        with self.assertRaisesRegex(runner.NativeRunBlocked, "counter_invalid"):
+            runner.process_endpoints(self.roles, [reading(1, True), reading(2), reading(3)],
+                                     [reading(1), reading(2), reading(3)])
+
+    def test_private_totals_use_actual_lifetime_peak_without_baseline_discount(self):
+        self.assertEqual(runner.memory_totals(self.roles,
+            [reading(1, private=20, peak=80), reading(2, private=30, peak=50),
+             reading(3, private=40, peak=90)]), (130, 90))
+
+    def test_each_wrapper_limit_uses_max_not_sum(self):
+        roles = dict(self.roles)
+        roles[identity(4)] = "waiting_wrapper"
+        self.assertEqual(runner.memory_totals(roles,
+            [reading(1), reading(2), reading(3, private=30), reading(4, private=50)]), (40, 50))
+
+    def test_peak_below_current_refuses_inconsistent_sample(self):
+        with self.assertRaisesRegex(runner.NativeRunBlocked, "peak_inconsistent"):
+            runner.memory_totals(self.roles,
+                [reading(1, private=30, peak=20), reading(2), reading(3)])
+
+    def test_missing_monitor_is_not_zero_memory(self):
+        with self.assertRaisesRegex(runner.NativeRunBlocked, "coverage_incomplete"):
+            runner.memory_totals(self.roles, [reading(1), reading(2)])
+
+    def test_missing_cases_remain_unverified_zero(self):
+        values = dict.fromkeys(runner.CASE_KEYS, 0)
+        delta = dict(values, membership_added=3, subtraction_zero_samples=4)
+        runner.add_cases(values, delta)
+        self.assertEqual(values["membership_added"], 3)
+        self.assertEqual(values["inaccessible_identity"], 0)
+        self.assertEqual(values["member_scan_timeout"], 0)
+
+    def test_case_schema_cannot_omit_unverified_dimensions(self):
+        values = dict.fromkeys(runner.CASE_KEYS, 0)
+        with self.assertRaisesRegex(runner.NativeRunBlocked, "schema_invalid"):
+            runner.add_cases(values, {"membership_added": 1})
+
+    def test_case_boolean_is_not_observed_count(self):
+        values = dict.fromkeys(runner.CASE_KEYS, 0)
+        with self.assertRaisesRegex(runner.NativeRunBlocked, "case_invalid"):
+            runner.add_cases(values, dict(values, inaccessible_identity=True))
+
+
+class NativeAuditTests(unittest.TestCase):
+    def verify(self, value, previous=None, now=101):
+        return runner.validate_audit(value, previous, guardian=identity(2),
+            nonce="a" * 32, now=now, maximum_age=30)
+
+    def test_authenticated_actual_zero_counter_is_accepted(self):
+        self.assertEqual(self.verify(audit()).calls, 0)
+
+    def test_empty_list_or_boolean_is_not_zero_set_observation(self):
+        for value in ([], True, None, {"calls": 0}):
+            with self.subTest(value=value), self.assertRaises(runner.NativeRunBlocked):
+                self.verify(value)
+
+    def test_other_guardian_or_scope_cannot_attest_zero_set(self):
+        for value in (audit(identity=identity(5)), audit(scope_nonce="b" * 32)):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                    runner.NativeRunBlocked, "binding_invalid"):
+                self.verify(value)
+
+    def test_same_sequence_replay_is_rejected(self):
+        with self.assertRaisesRegex(runner.NativeRunBlocked, "replayed"):
+            self.verify(audit(), audit())
+
+    def test_reinstalled_or_rolled_back_counter_is_rejected(self):
+        for value in (audit(sequence=2, installed_tick=2),
+                      audit(sequence=2, calls=0)):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                    runner.NativeRunBlocked, "replayed"):
+                self.verify(value, audit(calls=1))
+
+    def test_stale_or_future_timestamp_cannot_prove_zero_writes(self):
+        for value in (audit(observed_tick=60), audit(observed_tick=102)):
+            with self.subTest(value=value), self.assertRaises(runner.NativeRunBlocked):
+                self.verify(value)
+
+    def test_recorded_set_count_is_not_silently_zeroed(self):
+        result = self.verify(audit(calls=3, restrictive_calls=2))
+        self.assertEqual((result.calls, result.restrictive_calls), (3, 2))
+
+
+class NativeSourceBoundaryTests(unittest.TestCase):
+    def test_real_boundary_interposer_counts_attempt_without_forwarding_set(self):
+        original = Mock(spec=[])
+        kernel = SimpleNamespace(SetInformationJobObject=original)
+        interposer = native._SetAudit(kernel)
+        interposer.install()
+        with self.assertRaisesRegex(native.NativeOverheadError, "set_attempted"):
+            kernel.SetInformationJobObject(10, 15, object(), 8)
+        self.assertEqual(interposer.calls, 1)
+        original.assert_not_called()
+        interposer.close()
+        self.assertIs(kernel.SetInformationJobObject, original)
+
+    def test_replaced_audit_is_unknown_and_does_not_overwrite_foreign_writer(self):
+        kernel = SimpleNamespace(SetInformationJobObject=Mock(spec=[]))
+        interposer = native._SetAudit(kernel)
+        interposer.install()
+        foreign = Mock()
+        kernel.SetInformationJobObject = foreign
+        with self.assertRaisesRegex(native.NativeOverheadError, "audit_changed"):
+            interposer.close()
+        self.assertIs(kernel.SetInformationJobObject, foreign)
+
+    def test_second_audit_install_is_not_silently_stacked(self):
+        kernel = SimpleNamespace(SetInformationJobObject=Mock(spec=[]))
+        original = native._SetAudit(kernel)
+        original.install()
+        with self.assertRaisesRegex(native.NativeOverheadError, "already_installed"):
+            native._SetAudit(kernel)
+        original.close()
+
+    def test_prepared_but_uninstalled_audit_cannot_verify_zero_sets(self):
+        original = Mock(spec=[])
+        kernel = SimpleNamespace(SetInformationJobObject=original)
+        interposer = native._SetAudit(kernel)
+        with self.assertRaisesRegex(native.NativeOverheadError, "audit_changed"):
+            interposer.verify()
+        interposer.close()
+        self.assertIs(kernel.SetInformationJobObject, original)
+
+    def test_retained_prepared_owner_cleans_interrupted_install_publication(self):
+        original = Mock(spec=[])
+        kernel = SimpleNamespace(SetInformationJobObject=original)
+        interposer = native._SetAudit(kernel)
+        # The real sampler retains this owner before install(). Model the cut
+        # after assignment and before the installed flag is published.
+        kernel.SetInformationJobObject = interposer.interposer
+        self.assertFalse(interposer.installed)
+        interposer.close()
+        self.assertIs(kernel.SetInformationJobObject, original)
+
+    def test_borrowed_probe_close_never_closes_process_owner(self):
+        probe = object.__new__(native.NativeCostProbe)
+        owner = SimpleNamespace(close=Mock())
+        probe._witnesses = [(owner, identity(1))]
+        probe.close()
+        owner.close.assert_not_called()
+
+    def test_native_reading_peak_does_not_accept_impossible_lower_number(self):
+        with self.assertRaisesRegex(native.NativeOverheadError, "reading_invalid"):
+            native.NativeProcessReading(identity(1), 100, 200, 3, 100)
+
+    def test_native_reading_rejects_boolean_measurements(self):
+        with self.assertRaisesRegex(native.NativeOverheadError, "reading_invalid"):
+            native.NativeProcessReading(identity(1), True, 20, 3, 30)
+
+
+class P4BoundaryTests(unittest.TestCase):
+    def test_missing_daily_bridge_refuses_before_native_setup_or_files(self):
+        coverage = SimpleNamespace()
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "absent"
+            with self.assertRaisesRegex(runner.NativeRunBlocked, "daily_cohort_unavailable"):
+                runner.produce_p4(coverage, target, None, None)
+            self.assertFalse(target.exists())
+
+    def test_no_duration_shortcut_is_exposed(self):
+        import inspect
+        self.assertEqual(runner.SCALE_SECONDS, 600)
+        self.assertEqual(runner.LEAK_SECONDS, 3600)
+        self.assertEqual(runner.SCALES, (1, 10, 50))
+        self.assertEqual(set(inspect.signature(runner.produce_p4).parameters),
+                         {"coverage", "evidence_directory", "context", "profile"})
+
+    def test_boolean_coverage_is_not_authority(self):
+        producer = object.__new__(runner.P4Producer)
+        with self.assertRaisesRegex(runner.NativeRunBlocked, "coverage_contract_invalid"):
+            producer._covered(SimpleNamespace(assert_daily_coverage=lambda: True))
+
+    def test_custody_retirement_does_not_close_originals_when_sampling_close_fails(self):
+        producer = object.__new__(runner.P4Producer)
+        session = SimpleNamespace(assert_daily_coverage=lambda: None, retire=Mock())
+        sampler = SimpleNamespace(close=Mock(side_effect=RuntimeError("uncertain")))
+        probe = SimpleNamespace(close=Mock())
+        with self.assertRaisesRegex(RuntimeError, "uncertain"):
+            producer._retire(session, probe, sampler)
+        session.retire.assert_not_called()
+        probe.close.assert_not_called()
+
+    def test_pending_open_failure_retains_exact_coverage(self):
+        producer = object.__new__(runner.P4Producer)
+        producer.active = None
+        producer.pending_open = True
+        producer.coverage = SimpleNamespace(pending_admissions=[])
+        producer.local_owners = [object()]
+        producer._scale = Mock(side_effect=RuntimeError("create acknowledgement lost"))
+        with self.assertRaises(runner.OverheadUnsettled) as caught:
+            producer.run()
+        self.assertIs(caught.exception.coverage, producer.coverage)
+        self.assertIs(caught.exception.local_owners[0], producer.local_owners[0])
+
+    def test_interrupt_retains_owner_without_swallowing_interrupt(self):
+        producer = object.__new__(runner.P4Producer)
+        producer.active = object()
+        producer.pending_open = False
+        producer.coverage = SimpleNamespace(pending_admissions=[])
+        producer.local_owners = []
+        interruption = KeyboardInterrupt()
+        producer._scale = Mock(side_effect=interruption)
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            producer.run()
+        self.assertIs(caught.exception, interruption)
+        self.assertIs(caught.exception.overhead_owner.session, producer.active)
+
+    def test_actual_runtime_footprint_is_read_only_and_excludes_evidence_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "state.db"
+            logs = root / "logs"
+            logs.mkdir()
+            # sqlite3's connection context commits/rolls back, but does not
+            # close the handle. Explicit closing prevents a Windows file lock
+            # from this setup connection surviving TemporaryDirectory cleanup.
+            with closing(sqlite3.connect(database)) as conn:
+                with conn:
+                    conn.execute("CREATE TABLE sample(id INTEGER)")
+                    conn.executemany("INSERT INTO sample VALUES (?)", [(1,), (2,)])
+            (logs / "runtime.log").write_bytes(b"12345")
+            (root / "large-producer-trace.jsonl").write_bytes(b"x" * 1000)
+            before = database.read_bytes()
+            self.assertEqual(runner.read_runtime_footprint(database, logs), (2, 5))
+            self.assertEqual(database.read_bytes(), before)
+
+    def test_trace_flush_failure_preserves_original_interrupt_and_cleanup_owner(self):
+        interruption = KeyboardInterrupt()
+        cleanup = OSError("flush failed")
+        trace = SimpleNamespace(close=Mock(side_effect=cleanup))
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            try:
+                raise interruption
+            finally:
+                runner.close_trace_preserving_primary(trace)
+        self.assertIs(caught.exception, interruption)
+        self.assertIs(interruption.overhead_trace, trace)
+        self.assertIs(interruption.overhead_trace_cleanup, cleanup)
+
+    def test_trace_flush_failure_without_primary_retains_stream_owner(self):
+        cleanup = OSError("fsync failed")
+        trace = SimpleNamespace(close=Mock(side_effect=cleanup))
+        with self.assertRaises(OSError) as caught:
+            runner.close_trace_preserving_primary(trace)
+        self.assertIs(caught.exception.overhead_trace, trace)
+
+    def test_interrupt_during_trace_cleanup_is_not_swallowed_by_ordinary_primary(self):
+        primary = RuntimeError("query failed")
+        interruption = KeyboardInterrupt()
+        trace = SimpleNamespace(close=Mock(side_effect=interruption))
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            try:
+                raise primary
+            finally:
+                runner.close_trace_preserving_primary(trace)
+        self.assertIs(caught.exception, interruption)
+        self.assertIs(interruption.overhead_primary, primary)
+
+
+if __name__ == "__main__":
+    unittest.main()

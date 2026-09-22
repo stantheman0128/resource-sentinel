@@ -83,6 +83,24 @@ class LaunchCodecTests(unittest.TestCase):
         with self.assertRaises(IpcError):
             transport.PrepareExecutionRequest.from_dict(claim)
 
+    def test_old_or_unrecognized_launch_fence_protocol_is_rejected(self):
+        request = self.requests()[1].to_dict()
+        unfenced = dict(request)
+        unfenced.pop("launch_fence_version")
+        with self.assertRaises(IpcError):
+            transport.decode_request(unfenced)
+        for version in (None, True, 0, 2, "1"):
+            with self.subTest(version=version), self.assertRaises(IpcError):
+                transport.decode_request(request | {"launch_fence_version": version})
+
+    def test_retirement_requests_contain_no_claim_or_asserted_native_evidence(self):
+        for cls in (transport.CancelBeforeStartRequest, transport.StartFailedRequest):
+            request = cls(**common(), job_nonce=NONCE)
+            self.assertEqual(transport.decode_request(request.to_dict()), request)
+            for extra in ({"launch_failed": True}, {"user_code_started": False}, {"claim_token": "t" * 43}):
+                with self.subTest(operation=request.operation, extra=extra), self.assertRaises(IpcError):
+                    transport.decode_request(request.to_dict() | extra)
+
     def test_wire_rejects_invalid_version_identifiers_epoch_revision_and_operation(self):
         base = self.requests()[0].to_dict()
         for change in ({"version": True}, {"version": 2}, {"kind": "Request"}, {"operation": "QueryExecution"},
@@ -164,6 +182,9 @@ class LedgerOwner:
     def bind_root(self, request, peer, *, auth_record, deadline):
         return self._call("BindRoot", request, peer, auth_record, deadline)
 
+    def retire_before_start(self, request, peer, *, auth_record, deadline):
+        return self._call(request.operation, request, peer, auth_record, deadline)
+
 
 class LaunchTransportTests(unittest.TestCase):
     context = admission_fixtures.ManagedAdmissionTests.context
@@ -197,10 +218,14 @@ class LaunchTransportTests(unittest.TestCase):
         if operation == "BindRoot":
             return transport.BindRootRequest(**values, job_nonce=NONCE,
                 root_identity=replace(ROOT, logon_id=self.snapshot.logon_id), root_handle_locator=440)
+        if operation in {"CancelBeforeStart", "StartFailed"}:
+            cls = transport.CancelBeforeStartRequest if operation == "CancelBeforeStart" else transport.StartFailedRequest
+            return cls(**values, job_nonce=NONCE)
         return transport.PrepareExecutionRequest(**values)
 
     def result_for(self, request):
-        state = {"PrepareExecution": "PREPARED", "ClaimLaunch": "LAUNCHING", "BindRoot": "RUNNING"}[request.operation]
+        state = {"PrepareExecution": "PREPARED", "ClaimLaunch": "LAUNCHING", "BindRoot": "RUNNING",
+                 "CancelBeforeStart": "CANCELLED_BEFORE_START", "StartFailed": "START_FAILED"}[request.operation]
         return transport.LaunchResult(request.execution_id, request.spec_hash, request.guardian_epoch, state,
             request.expected_revision + 1, f"Local\\ResourceSentinel.Job.{request.execution_id}.{NONCE}", NONCE,
             request.operation == "ClaimLaunch", False)
@@ -278,15 +303,19 @@ class LaunchTransportTests(unittest.TestCase):
                 result = self.client.prepare_execution(**arguments)
             elif operation == "ClaimLaunch":
                 result = self.client.claim_launch(**arguments, job_nonce=NONCE)
+            elif operation == "CancelBeforeStart":
+                result = self.client.cancel_before_start(**arguments, job_nonce=NONCE)
+            elif operation == "StartFailed":
+                result = self.client.start_failed(**arguments, job_nonce=NONCE)
             else:
                 result = self.client.bind_root(**arguments, job_nonce=NONCE,
                     root_identity=replace(ROOT, logon_id=self.snapshot.logon_id), root_handle_locator=440)
             self.assertEqual(connect.call_count, 1)
             return result
 
-    def test_service_uses_real_durable_credentials_for_all_three_fixed_methods_and_holds_peer(self):
+    def test_service_uses_real_durable_credentials_for_all_fixed_methods_and_holds_peer(self):
         before = tuple(self.conn().execute("SELECT state,state_revision,claim_consumed FROM managed_executions").fetchone())
-        for operation in ("PrepareExecution", "ClaimLaunch", "BindRoot"):
+        for operation in ("PrepareExecution", "ClaimLaunch", "BindRoot", "CancelBeforeStart", "StartFailed"):
             with self.subTest(operation=operation):
                 connection = self.service_connection(self.request(operation))
                 result = self.serve(connection)
@@ -296,11 +325,11 @@ class LaunchTransportTests(unittest.TestCase):
                 self.assertFalse(connection.peer_held)
                 self.assertTrue(connection.closed)
                 self.assertTrue(all(d is self.owner.calls[-1][2] for d in connection.deadlines))
-        self.assertEqual(len(self.owner.calls), 3)
+        self.assertEqual(len(self.owner.calls), 5)
         self.assertEqual(tuple(self.conn().execute("SELECT state,state_revision,claim_consumed FROM managed_executions").fetchone()), before)
 
     def test_client_uses_actual_managed_private_mac_and_never_exports_raw_command(self):
-        for operation in ("PrepareExecution", "BindRoot", "ClaimLaunch"):
+        for operation in ("PrepareExecution", "BindRoot", "ClaimLaunch", "CancelBeforeStart", "StartFailed"):
             with self.subTest(operation=operation):
                 self.client_connection()
                 result = self.call_client(operation)

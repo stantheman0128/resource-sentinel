@@ -92,7 +92,7 @@ class GuardianSupervisor:
         self._lock = threading.RLock()
         self._known = {}
         # Unretired terminal obligations inside _known, and the rowid below
-        # which every FINISHED scope is either proven retired or held there.
+        # which every terminal scope is either proven retired or held there.
         self._terminal = set()
         self._cursor = 0
         self._inventory_error = None
@@ -180,9 +180,10 @@ class GuardianSupervisor:
                 CASE WHEN typeof(guardian_epoch)='text' AND length(guardian_epoch)<=128 THEN guardian_epoch END AS guardian_epoch,
                 CASE WHEN typeof(logon_id)='text' AND length(logon_id)<=184 THEN logon_id END AS logon_id
                 FROM managed_executions WHERE job_name IS NOT NULL AND """
-            # Every named scope that is not FINISHED is live, including other
-            # terminal states: only finalization carries native proof.
-            rows = conn.execute("SELECT" + columns + """(typeof(state)!='text' OR state!='FINISHED')
+            # Terminal state only nominates a receipt/archive proof; it never
+            # releases an obligation by itself.
+            rows = conn.execute("SELECT" + columns + """(typeof(state)!='text' OR
+                state NOT IN ('FINISHED','CANCELLED_BEFORE_START','START_FAILED'))
                 ORDER BY execution_id LIMIT ?""", (_LIMIT + 1,)).fetchall()
             if len(rows) > _LIMIT:
                 raise LifecycleError("supervisor_inventory_bound_exceeded")
@@ -193,10 +194,11 @@ class GuardianSupervisor:
                     raise LifecycleError("supervisor_inventory_binding_changed")
                 execution, nonce = self._scope(row)
                 live[execution] = nonce
-            # FINISHED is permanent, so history is paged once in rowid order.
+            # Terminal history is permanent and paged once in rowid order.
             # The SQL state only nominates a scope for _prove_retired.
             page = [(row["position"], *self._scope(row)) for row in conn.execute(
-                "SELECT rowid AS position," + columns + """typeof(state)='text' AND state='FINISHED'
+                "SELECT rowid AS position," + columns + """typeof(state)='text'
+                AND state IN ('FINISHED','CANCELLED_BEFORE_START','START_FAILED')
                 AND rowid>? ORDER BY rowid LIMIT ?""", (self._cursor, _RETIRE_BATCH + 1)).fetchall()]
             slot = conn.execute("""SELECT CASE WHEN typeof(execution_id)='text'
                 AND length(execution_id)=36 THEN execution_id END AS execution_id,
@@ -217,7 +219,7 @@ class GuardianSupervisor:
             return live, page
 
     def _prove_retired(self, execution, nonce):
-        """True only for formal finalization evidence; False keeps the obligation.
+        """True only for formal terminal evidence; False keeps the obligation.
 
         FINISHED is committed solely by finalize_if_empty, under the guardian's
         POLICY and Job fences, with a native empty, sealed, CPU-disabled and
@@ -225,6 +227,8 @@ class GuardianSupervisor:
         is the existing retained-terminal reconciliation, and the journal half
         is the settled manifest that commit required. SQL state alone, an
         absent allocation or a missing native Job name is never accepted.
+        Unstarted terminal rows additionally require the guardian's atomic
+        prelaunch retirement receipt and rootless settled manifest.
         """
         try:
             row = self.store.query(execution)
@@ -232,7 +236,7 @@ class GuardianSupervisor:
             if _unavailable(error):
                 raise
             raise LifecycleError("supervisor_inventory_scope_changed") from None
-        if (row.get("state") != "FINISHED" or row.get("job_nonce") != nonce or
+        if (row.get("state") not in {"FINISHED", "CANCELLED_BEFORE_START", "START_FAILED"} or row.get("job_nonce") != nonce or
                 row.get("job_name") != f"Local\\ResourceSentinel.Job.{execution}.{nonce}"):
             raise LifecycleError("supervisor_inventory_scope_changed")
         try:

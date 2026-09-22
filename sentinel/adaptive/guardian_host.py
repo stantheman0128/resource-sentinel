@@ -276,6 +276,7 @@ class GuardianHost:
                                                    "reason": _reason(error)})
         record["restored"] = [{"execution_id": execution_id, "reason": reason}
                               for execution_id, reason, _ in self.control.tick(self.control.clock())]
+        record["prelaunch_retirements"] = self.owner.retire_completed_pending()
         return record
 
     def retained_execution_ids(self):

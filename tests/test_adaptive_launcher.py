@@ -5,6 +5,7 @@ These cases establish wrapper ordering/custody, not Windows capability or a
 production readiness authority. Native and transport behavior have separate tests.
 """
 import ctypes as C
+from contextlib import contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 import unittest
@@ -17,6 +18,7 @@ from sentinel.adaptive.launch_transport import LaunchResult
 from sentinel.adaptive.native_job import CpuState, JobAccess, JobLimits
 from sentinel.adaptive.native_launcher import LaunchOutcomeUnknown
 from sentinel.adaptive.pipe_windows import NativePipeEndpoint
+from sentinel.adaptive.windows import NativePolicyMutexError
 
 
 LOGON = "S-1-5-5-100-200"
@@ -101,7 +103,9 @@ class Client:
         self.calls = []
         self.responses = {"prepare": result("PREPARED", 1),
                           "claim": result("LAUNCHING", 2, authorized=True),
-                          "bind": result("RUNNING", 3)}
+                          "bind": result("RUNNING", 3),
+                          "cancel": result("LAUNCHING", 3),
+                          "start_failed": None}
 
     def _call(self, name, arguments):
         self.calls.append((name, arguments))
@@ -119,6 +123,12 @@ class Client:
 
     def bind_root(self, **arguments):
         return self._call("bind", arguments)
+
+    def cancel_before_start(self, **arguments):
+        return self._call("cancel", arguments)
+
+    def start_failed(self, **arguments):
+        return self._call("start_failed", arguments)
 
 
 class Readiness:
@@ -194,6 +204,66 @@ class Process:
         self.handle = None
 
 
+class Mutex:
+    def __init__(self, events):
+        self.events = events
+        self.held = False
+        self.abandoned = False
+        self.acquire_error = self.release_error = self.close_error = None
+        self.before_acquire = None
+        self.close_calls = 0
+
+    @contextmanager
+    def acquire(self, *, timeout_ms):
+        self.events.append(("fence.acquire", timeout_ms))
+        if self.acquire_error is not None:
+            raise self.acquire_error
+        if self.before_acquire is not None:
+            self.before_acquire()
+        self.held = True
+        try:
+            yield SimpleNamespace(abandoned=self.abandoned)
+        finally:
+            self.events.append(("fence.release",))
+            if self.release_error is not None:
+                raise self.release_error
+            self.held = False
+
+    def close(self):
+        self.close_calls += 1
+        if self.held or self.close_error is not None:
+            raise self.close_error or RuntimeError("fixture_mutex_still_owned")
+        self.events.append(("fence.close",))
+
+
+class Store:
+    def __init__(self, harness):
+        self.harness = harness
+        self.row = dict(execution_id=EXECUTION, spec_hash=SPEC_HASH, logon_id=LOGON,
+            wrapper_pid=WRAPPER.pid, wrapper_created_filetime_100ns=str(WRAPPER.created_filetime_100ns),
+            guardian_epoch=GUARDIAN, reservation_id="fixture-reservation",
+            allocation_kind="direct", parent_execution_id=None,
+            job_name=JOB_NAME, job_nonce=NONCE, state="LAUNCHING", state_revision=2,
+            claim_consumed=1, launch_in_flight=1, launch_sealed=0, cancel_requested_at=None,
+            root_pid=None, root_created_filetime_100ns=None, root_outcome=None,
+            hold_reason=None, finished_at=None)
+        self.coverage_error = self.fence_error = None
+
+    def query(self, execution_id, *, existing_path):
+        self.harness.events.append(("ledger.query", execution_id, existing_path, self.harness.mutex.held))
+        return dict(self.row)
+
+    def assert_admission_covered(self, admission, row):
+        self.harness.events.append(("ledger.coverage", self.harness.mutex.held))
+        if self.coverage_error is not None:
+            raise self.coverage_error
+
+    def assert_launch_fence(self, row, *, version):
+        self.harness.events.append(("ledger.fence", version, self.harness.mutex.held))
+        if self.fence_error is not None:
+            raise self.fence_error
+
+
 class Harness:
     def __init__(self):
         self.events = []
@@ -206,6 +276,9 @@ class Harness:
         self.job_factory = Mock(side_effect=self.open_job)
         self.native_launch = Mock(side_effect=self.launch)
         self.resolver = Mock(return_value=CMD)
+        self.mutex = Mutex(self.events)
+        self.mutex_factory = Mock(return_value=self.mutex)
+        self.store = Store(self)
 
     def open_job(self, *args, **kwargs):
         self.events.append(("open_job",))
@@ -219,9 +292,12 @@ class Harness:
         arguments = dict(coordinator=self.coordinator, endpoint=ENDPOINT, guardian_epoch=GUARDIAN,
             readiness=self.readiness, admission_factory=self.admission_factory,
             client_factory=self.client_factory, job_factory=self.job_factory,
-            launch=self.native_launch, cmd_resolver=self.resolver)
+            launch=self.native_launch, cmd_resolver=self.resolver, mutex_factory=self.mutex_factory)
         arguments.update(overrides)
-        return module.ManagedLauncher(SPEC, **arguments)
+        launcher = module.ManagedLauncher(SPEC, **arguments)
+        # Explicit portable ledger double; separate store tests use real SQLite.
+        launcher._store = self.store
+        return launcher
 
     def admitted(self, **overrides):
         launcher = self.build(**overrides)
@@ -336,6 +412,7 @@ class ManagedLauncherTests(unittest.TestCase):
         self.assertEqual(claim["expected_revision"], 1)
         self.assertEqual(bind["expected_revision"], 2)
         self.assertEqual(claim["job_nonce"], NONCE)
+        self.assertEqual(claim["launch_fence_version"], 1)
         self.assertEqual(bind["job_nonce"], NONCE)
         self.assertEqual(bind["root_identity"], ROOT)
         self.assertEqual(bind["root_handle_locator"], 700)
@@ -347,6 +424,205 @@ class ManagedLauncherTests(unittest.TestCase):
         with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_attempt_sealed"):
             launcher.launch_once(**STDIO)
         self.assertEqual(h.native_launch.call_count, 1)
+
+    def test_launch_fence_spans_fresh_coverage_and_exactly_one_create_but_no_ipc_or_readiness(self):
+        h = Harness()
+        launcher = h.admitted()
+        def create(*args, **kwargs):
+            self.assertTrue(h.mutex.held)
+            return h.process
+        h.native_launch.side_effect = create
+        client_call, ready = h.client._call, h.readiness.assert_launch_ready
+        def rpc(name, arguments):
+            self.assertFalse(h.mutex.held, "IPC inside Job fence inverts guardian lock ordering")
+            return client_call(name, arguments)
+        def readiness(*args):
+            self.assertFalse(h.mutex.held, "readiness can acquire POLICY and must precede Job")
+            return ready(*args)
+        h.client._call, h.readiness.assert_launch_ready = rpc, readiness
+        launcher.launch_once(**STDIO, timeout_ms=800)
+        h.mutex_factory.assert_called_once_with(LOGON, module.job_mutex_instance(EXECUTION, NONCE))
+        events = [event for event in h.events if event[0].startswith(("fence.", "ledger."))]
+        self.assertEqual(events, [("fence.acquire", 800), ("ledger.query", EXECUTION, True, True),
+            ("ledger.coverage", True), ("ledger.fence", 1, True), ("fence.release",)])
+        self.assertEqual(h.native_launch.call_count, 1)
+
+    def test_delayed_launch_rechecks_cancel_terminal_revision_identity_and_seal_after_acquiring_fence(self):
+        cases = ({"state": "START_FAILED"}, {"state_revision": 3}, {"cancel_requested_at": 123},
+                 {"launch_sealed": 1}, {"claim_consumed": 0}, {"launch_in_flight": 0},
+                 {"root_pid": ROOT.pid}, {"root_outcome": "exited"}, {"hold_reason": "held"},
+                 {"reservation_id": "other"}, {"wrapper_created_filetime_100ns": "1"},
+                 {"job_nonce": "b" * 32}, {"guardian_epoch": "other"}, {"spec_hash": "c" * 64})
+        for changes in cases:
+            with self.subTest(changes=changes):
+                h = Harness()
+                h.mutex.before_acquire = lambda: h.store.row.update(changes)
+                launcher = h.admitted()
+                with self.assertRaises(module.ManagedLaunchError):
+                    launcher.launch_once(**STDIO)
+                self.assertFalse(h.mutex.held)
+                self.assert_sealed(launcher, h, native_count=0)
+                self.assertFalse(any(event[0] == "ledger.fence" for event in h.events))
+
+    def test_fence_rejects_absent_state_fields_lost_capacity_and_unbound_protocol(self):
+        for failure in ("missing_cancel", "capacity", "protocol"):
+            with self.subTest(failure=failure):
+                h = Harness()
+                if failure == "missing_cancel":
+                    del h.store.row["cancel_requested_at"]
+                elif failure == "capacity":
+                    h.store.coverage_error = RuntimeError("fixture_capacity_lost")
+                else:
+                    h.store.fence_error = RuntimeError("fixture_protocol_unbound")
+                launcher = h.admitted()
+                with self.assertRaises(RuntimeError):
+                    launcher.launch_once(**STDIO)
+                self.assertFalse(h.mutex.held)
+                self.assert_sealed(launcher, h, native_count=0)
+
+    def test_abandoned_unknown_or_timed_out_mutex_never_creates_and_owner_stays_reachable(self):
+        for failure in (True, None, "timeout"):
+            with self.subTest(failure=failure):
+                h = Harness()
+                if failure == "timeout":
+                    h.mutex.acquire_error = RuntimeError("fixture_fence_timeout")
+                else:
+                    h.mutex.abandoned = failure
+                launcher = h.admitted()
+                with self.assertRaises(RuntimeError) as failed:
+                    launcher.launch_once(**STDIO)
+                self.assertIs(failed.exception.launcher_owner, launcher)
+                self.assertIs(launcher._launch_mutex, h.mutex)
+                self.assertEqual(h.mutex.close_calls, 0)
+                self.assert_sealed(launcher, h, native_count=0)
+
+    def test_uncertain_fence_release_after_creation_retains_process_and_refuses_failed_start(self):
+        h = Harness()
+        h.mutex.release_error = RuntimeError("fixture_fence_release_unknown")
+        launcher = h.admitted()
+        with self.assertRaisesRegex(RuntimeError, "fixture_fence_release_unknown"):
+            launcher.launch_once(**STDIO)
+        self.assertIs(launcher.process, h.process)
+        self.assertTrue(h.mutex.held)
+        self.assert_sealed(launcher, h, native_count=1)
+        with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_retirement_native_outcome_retained"):
+            launcher.retire_before_start(kind="start_failed")
+        self.assertEqual([call[0] for call in h.client.calls], ["prepare", "claim"])
+
+    def test_failed_create_ancillary_cleanup_is_retained_and_retried_only_after_terminal_ack(self):
+        h = Harness()
+        # Real launch failures retain a CreatedProcess, whose internal resource
+        # states already quarantine ambiguous closes and retry known failures.
+        ancillary = Mock(spec=module.native_launcher.CreatedProcess)
+        ancillary.close.side_effect = RuntimeError("fixture_ancillary_close_failed")
+        error = RuntimeError("fixture_known_create_failed")
+        error.cleanup_owner = ancillary
+        h.native_launch.side_effect = error
+        launcher = h.admitted()
+        with self.assertRaises(RuntimeError):
+            launcher.launch_once(**STDIO)
+        self.assertEqual(ancillary.close.call_count, 0)
+        h.client.responses["start_failed"] = result("START_FAILED", 3)
+        launcher.retire_before_start(kind="start_failed")
+        with self.assertRaisesRegex(RuntimeError, "fixture_ancillary_close_failed"):
+            launcher.close_local()
+        self.assertNotEqual(launcher.phase, "CLOSED")
+        self.assertEqual(ancillary.close.call_count, 1)
+        ancillary.close.side_effect = None
+        launcher.close_local()
+        self.assertEqual(ancillary.close.call_count, 2)
+        self.assertEqual(launcher.phase, "CLOSED")
+        self.assertEqual(h.native_launch.call_count, 1)
+
+    def test_preclaim_cancel_terminal_ack_allows_only_local_cleanup(self):
+        h = Harness()
+        h.readiness.fail_at = 2
+        launcher = h.admitted()
+        with self.assertRaises(RuntimeError):
+            launcher.launch_once(**STDIO)
+        h.store.row.update(state="PREPARED", state_revision=1, claim_consumed=0, launch_in_flight=0)
+        h.client.responses["cancel"] = result("CANCELLED_BEFORE_START", 2)
+        response = launcher.retire_before_start()
+        self.assertEqual(response.state, "CANCELLED_BEFORE_START")
+        self.assertEqual(launcher.phase, "RETIRED")
+        self.assertEqual(h.job.close_calls, 0)
+        launcher.close_local()
+        self.assertEqual(launcher.phase, "CLOSED")
+        self.assertEqual((h.job.close_calls, h.admission.close_calls), (1, 1))
+        self.assertEqual(h.process.close_calls, 0)
+        self.assertTrue(h.coordinator.reservation_retained)
+        h.native_launch.assert_not_called()
+
+    def test_failed_start_lost_ack_replays_original_revision_and_request_without_fresh_launch(self):
+        h = Harness()
+        h.readiness.fail_at = 3
+        launcher = h.admitted()
+        with self.assertRaises(RuntimeError):
+            launcher.launch_once(**STDIO)
+        h.client.responses["start_failed"] = OSError("fixture_terminal_ack_lost")
+        with self.assertRaises(OSError):
+            launcher.retire_before_start(kind="start_failed")
+        original = dict(h.client.calls[-1][1])
+        with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_custody_unsettled"):
+            launcher.close_local()
+        h.store.row.update(state="START_FAILED", state_revision=3, launch_sealed=1)
+        h.client.responses["start_failed"] = result("START_FAILED", 3, duplicate=True)
+        reply = launcher.retire_before_start(kind="start_failed")
+        self.assertEqual(h.client.calls[-1][1], original)
+        self.assertEqual(original["expected_revision"], 2)
+        self.assertIs(launcher.retire_before_start(kind="start_failed"), reply)
+        self.assertEqual(len([call for call in h.client.calls if call[0] == "start_failed"]), 2)
+        launcher.close_local()
+        h.native_launch.assert_not_called()
+
+    def test_postclaim_cancel_ack_stays_pending_and_cannot_release_local_custody(self):
+        h = Harness()
+        h.readiness.fail_at = 3
+        launcher = h.admitted()
+        with self.assertRaises(RuntimeError):
+            launcher.launch_once(**STDIO)
+        response = launcher.retire_before_start(kind="cancel")
+        self.assertEqual(response.state, "LAUNCHING")
+        self.assertEqual(launcher.phase, "CANCEL_PENDING")
+        with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_custody_unsettled"):
+            launcher.close_local()
+        with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_attempt_sealed"):
+            launcher.launch_once(**STDIO)
+        self.assertEqual(h.job.close_calls, 0)
+        self.assertTrue(h.coordinator.reservation_retained)
+
+    def test_retirement_rejects_wrong_scope_or_kind_ack_and_never_closes_on_uncertainty(self):
+        for reply in (result("START_FAILED", 3), result("LAUNCHING", 3, authorized=True),
+                      replace(result("CANCELLED_BEFORE_START", 3), guardian_epoch="other")):
+            with self.subTest(reply=reply):
+                h = Harness()
+                h.readiness.fail_at = 3
+                launcher = h.admitted()
+                with self.assertRaises(RuntimeError):
+                    launcher.launch_once(**STDIO)
+                h.client.responses["cancel"] = reply
+                with self.assertRaises(module.ManagedLaunchError):
+                    launcher.retire_before_start()
+                with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_custody_unsettled"):
+                    launcher.close_local()
+                h.native_launch.assert_not_called()
+
+    def test_retirement_never_treats_unknown_native_result_or_started_root_as_start_failed(self):
+        for unknown in (True, False):
+            with self.subTest(unknown=unknown):
+                h = Harness()
+                launcher = h.admitted()
+                if unknown:
+                    h.native_launch.side_effect = LaunchOutcomeUnknown(h.process, RuntimeError("fixture_unknown"))
+                    with self.assertRaises(LaunchOutcomeUnknown):
+                        launcher.launch_once(**STDIO)
+                else:
+                    launcher.launch_once(**STDIO)
+                calls = list(h.client.calls)
+                with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_retirement_native_outcome_retained"):
+                    launcher.retire_before_start(kind="start_failed")
+                self.assertEqual(h.client.calls, calls)
+                self.assertEqual(h.process.close_calls, 0)
 
     def test_each_readiness_failure_stops_the_next_mutation_and_only_initial_failure_can_retry(self):
         for index in (1, 2, 3):
@@ -636,6 +912,108 @@ class ManagedLauncherTests(unittest.TestCase):
         self.assertEqual(len(h.client.calls), 3)
         self.assertEqual(h.native_launch.call_count, 1)
         self.assertTrue(h.coordinator.reservation_retained)
+
+    def test_known_mutex_close_failure_retries_only_that_owner_and_tombstones_successes(self):
+        h = Harness()
+        launcher = h.bound()
+        h.process.exited = True
+        h.mutex.close_error = NativePolicyMutexError("policy_mutex_handle_close_failed", 6)
+        with self.assertRaises(NativePolicyMutexError):
+            launcher.close_local()
+        self.assertEqual((h.process.close_calls, h.job.close_calls, h.mutex.close_calls,
+                          h.admission.close_calls), (1, 1, 1, 1))
+        h.mutex.close_error = None
+        launcher.close_local()
+        self.assertEqual(launcher.phase, "CLOSED")
+        self.assertEqual((h.process.close_calls, h.job.close_calls, h.mutex.close_calls,
+                          h.admission.close_calls), (1, 1, 2, 1))
+
+    def test_ambiguous_mutex_close_after_native_effect_never_recloses_recycled_locator(self):
+        h = Harness()
+        launcher = h.bound()
+        h.process.exited = True
+        locator = {"owner": "launcher", "native_close_calls": 0}
+        def ambiguous_close():
+            h.mutex.close_calls += 1
+            locator["native_close_calls"] += 1
+            self.assertEqual(locator["owner"], "launcher")
+            locator["owner"] = "unrelated-reused-handle"
+            raise KeyboardInterrupt("fixture_close_effect_then_interrupt")
+        h.mutex.close = ambiguous_close
+        with self.assertRaises(KeyboardInterrupt):
+            launcher.close_local()
+        for _ in range(2):
+            with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_native_cleanup_outcome_unknown"):
+                launcher.close_local()
+        self.assertEqual(locator, {"owner": "unrelated-reused-handle", "native_close_calls": 1})
+        self.assertEqual((h.process.close_calls, h.job.close_calls, h.admission.close_calls), (1, 1, 1))
+        self.assertEqual(h.mutex_factory.call_count, 1)
+        with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_closed_or_closing"):
+            launcher.launch_once(**STDIO)
+
+    def test_mutex_close_error_with_cleanup_notes_is_not_known_retryable(self):
+        h = Harness()
+        launcher = h.bound()
+        h.process.exited = True
+        error = NativePolicyMutexError("policy_mutex_handle_close_failed", 6)
+        error.add_note("fixture_other_cleanup_outcome_unknown")
+        h.mutex.close_error = error
+        with self.assertRaises(NativePolicyMutexError):
+            launcher.close_local()
+        h.mutex.close_error = None
+        with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_native_cleanup_outcome_unknown"):
+            launcher.close_local()
+        self.assertEqual(h.mutex.close_calls, 1)
+
+    def test_constructor_retained_opaque_owner_is_quarantined_before_any_new_close(self):
+        h = Harness()
+        extra = Mutex(h.events)
+        error = RuntimeError("fixture_constructor_close_already_ambiguous")
+        error._policy_mutex_cleanup = (extra,)
+        h.mutex_factory.side_effect = error
+        launcher = h.admitted()
+        with self.assertRaises(RuntimeError):
+            launcher.launch_once(**STDIO)
+        h.client.responses["start_failed"] = result("START_FAILED", 3)
+        launcher.retire_before_start(kind="start_failed")
+        for _ in range(2):
+            with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_native_cleanup_outcome_unknown"):
+                launcher.close_local()
+        self.assertEqual(extra.close_calls, 0)
+        self.assertEqual((h.job.close_calls, h.admission.close_calls), (1, 1))
+        self.assertEqual(h.mutex_factory.call_count, 1)
+
+    def test_constructor_known_close_failure_owner_retries_but_each_success_closes_once(self):
+        h = Harness()
+        extra = Mutex(h.events)
+        error = NativePolicyMutexError("policy_mutex_handle_close_failed", 6)
+        # Duplicate ownership entries must not produce duplicate closes.
+        error._policy_mutex_cleanup = (extra, extra)
+        h.mutex_factory.side_effect = error
+        launcher = h.admitted()
+        with self.assertRaises(NativePolicyMutexError):
+            launcher.launch_once(**STDIO)
+        h.client.responses["start_failed"] = result("START_FAILED", 3)
+        launcher.retire_before_start(kind="start_failed")
+        launcher.close_local()
+        launcher.close_local()
+        self.assertEqual(extra.close_calls, 1)
+        self.assertEqual(launcher.phase, "CLOSED")
+
+    def test_opaque_failed_create_cleanup_owner_requires_its_own_positive_retryability(self):
+        h = Harness()
+        extra = Mutex(h.events)
+        error = RuntimeError("fixture_native_failure_with_opaque_cleanup")
+        error.cleanup_owner = extra
+        h.native_launch.side_effect = error
+        launcher = h.admitted()
+        with self.assertRaises(RuntimeError):
+            launcher.launch_once(**STDIO)
+        h.client.responses["start_failed"] = result("START_FAILED", 3)
+        launcher.retire_before_start(kind="start_failed")
+        with self.assertRaisesRegex(module.ManagedLaunchError, "launcher_native_cleanup_outcome_unknown"):
+            launcher.close_local()
+        self.assertEqual(extra.close_calls, 0)
 
     def test_admission_close_partial_failure_is_permanently_quarantined_without_second_call(self):
         h = Harness()

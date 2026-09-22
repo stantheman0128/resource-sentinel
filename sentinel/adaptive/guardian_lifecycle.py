@@ -327,7 +327,7 @@ class GuardianLifecycle:
 
     @contextmanager
     def evidence_scope(self, operation, row, caller):
-        if operation not in {"root_exited", "finalize", "heartbeat", "control_restore"}:
+        if operation not in {"root_exited", "finalize", "heartbeat", "control_restore", "cancel"}:
             raise LifecycleError("guardian_evidence_operation_unsupported")
         entry = self._entry(row["execution_id"])
         with self._scope(entry):

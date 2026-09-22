@@ -34,6 +34,9 @@ from .admission import ManagedAdmission
 from .contracts import ProcessIdentity, _identifier
 from .launch_spec import LaunchSpec, build_cmd_command_line, utf16_units
 from .native_job import JobAccess, JobLimits, NativeJob
+from .guardian_lifecycle import job_mutex_instance
+from .store import LifecycleStore
+from .windows import NativePolicyMutex, NativePolicyMutexError, retained_owners, unresolved_construction
 from . import native_launcher
 
 
@@ -101,7 +104,8 @@ class ManagedLauncher:
     """
     def __init__(self, spec: LaunchSpec, *, coordinator, endpoint, guardian_epoch: str,
                  cmd_path=None, readiness=None, client_factory=None,
-                 admission_factory=None, job_factory=None, launch=None, cmd_resolver=None):
+                 admission_factory=None, job_factory=None, launch=None, cmd_resolver=None,
+                 mutex_factory=None):
         if type(spec) is not LaunchSpec:
             raise ManagedLaunchError("launch_spec_required")
         spec.__post_init__()
@@ -115,18 +119,26 @@ class ManagedLauncher:
         self._readiness = _UnavailableReadiness() if readiness is None else readiness
         self._open_job = NativeJob.open if job_factory is None else job_factory
         self._launch = native_launcher.launch_in_job if launch is None else launch
+        self._make_mutex = NativePolicyMutex if mutex_factory is None else mutex_factory
         factory = ManagedAdmission.current if admission_factory is None else admission_factory
         self.admission = factory(command=spec.command, cwd=spec.cwd,
             repo_identifier=spec.repo_identifier, requested=spec.requested,
             role=spec.role, priority=spec.priority)
         self.job = self.process = None
+        self._launch_mutex = self._store = None
+        self._extra_cleanup_owners = []
+        # Keep the object alongside its state, so identity cannot be recycled.
+        self._cleanup_records = {}
+        self._mutex_construction_unknown = False
         self._submitted = self._sealed = self._create_attempted = self._bound = False
         self._closed = self._closing = self._admission_closed = False
         self._admission_close_unknown = False
         self._admitted = self._prepared = self._claim = self._bound_result = None
         self._root = self._root_locator = self._exit_code = self._native_failure = None
+        self._retirement_requests = {}
+        self._retired_result = None
         self.phase = "NEW"
-        self._request_ids = {name: str(uuid4()) for name in ("prepare", "claim", "bind")}
+        self._request_ids = {name: str(uuid4()) for name in ("prepare", "claim", "bind", "cancel", "start_failed")}
         try:
             self._snapshot = self.admission.snapshot()
             if (self._snapshot.requested != spec.requested or self._snapshot.role is not spec.role or
@@ -223,6 +235,117 @@ class ManagedLauncher:
             raise ManagedLaunchError("launcher_response_scope_changed")
         return result
 
+    def _ledger(self):
+        # Opening/migrating the existing ledger happens outside the Job mutex.
+        # All work inside that mutex is read-only until the single native create.
+        if self._store is None:
+            self._store = LifecycleStore(self.coordinator.db_path, existing_path=True)
+        return self._store
+
+    def _scope_row(self, store):
+        row = store.query(self.execution_id, existing_path=True)
+        expected = {
+            "execution_id": self.execution_id, "spec_hash": self._snapshot.spec_hash,
+            "logon_id": self._snapshot.logon_id,
+            "wrapper_pid": self._snapshot.wrapper_identity.pid,
+            "wrapper_created_filetime_100ns": str(self._snapshot.wrapper_identity.created_filetime_100ns),
+            "guardian_epoch": self.guardian_epoch,
+            "reservation_id": self._admitted["reservation_id"],
+            "allocation_kind": "direct", "parent_execution_id": None,
+        }
+        if any(row.get(key) != value for key, value in expected.items()):
+            raise ManagedLaunchError("launcher_ledger_binding_mismatch")
+        if self._prepared is not None and (row.get("job_name"), row.get("job_nonce")) != (
+                self._prepared.job_name, self._prepared.job_nonce):
+            raise ManagedLaunchError("launcher_ledger_scope_changed")
+        return row
+
+    def _create_fenced(self, command_line, *, timeout_ms, stdin_handle, stdout_handle, stderr_handle):
+        store = self._ledger()
+        try:
+            self._launch_mutex = self._make_mutex(self._snapshot.logon_id,
+                job_mutex_instance(self.execution_id, self._prepared.job_nonce))
+        except BaseException as error:
+            owners = retained_owners(error)
+            self._extra_cleanup_owners.extend(owners)
+            for owner in owners:
+                # These owners were already involved in failed construction
+                # cleanup. A retained locator alone cannot authorize another
+                # CloseHandle: its previous close might have taken effect.
+                self._track_cleanup(owner, guarded=True,
+                    unknown=not self._known_mutex_close_failure(error))
+            self._mutex_construction_unknown = unresolved_construction(error) and not owners
+            raise
+        with self._launch_mutex.acquire(timeout_ms=timeout_ms) as lease:
+            if lease.abandoned is not False:
+                raise ManagedLaunchError("launcher_launch_fence_abandoned")
+            row = self._scope_row(store)
+            expected = {"state": "LAUNCHING", "state_revision": self._claim.state_revision,
+                        "claim_consumed": 1, "launch_in_flight": 1, "launch_sealed": 0,
+                        "cancel_requested_at": None, "root_pid": None,
+                        "root_created_filetime_100ns": None, "root_outcome": None,
+                        "hold_reason": None, "finished_at": None}
+            if any(key not in row or row[key] != value for key, value in expected.items()):
+                raise ManagedLaunchError("launcher_launch_fence_state_changed")
+            store.assert_admission_covered(self.admission, row)
+            store.assert_launch_fence(row, version=1)
+            self._create_attempted = True
+            self.phase = "CREATING"
+            try:
+                self.process = self._launch(self.job, self._cmd_path, command_line,
+                    cwd=self._spec.cwd, stdin_handle=stdin_handle,
+                    stdout_handle=stdout_handle, stderr_handle=stderr_handle)
+            except native_launcher.LaunchOutcomeUnknown as error:
+                self.process = error.process
+                raise
+            except BaseException as error:
+                # Known failed creation can still own stdio/attribute cleanup.
+                # Positive guardian retirement does not close those resources.
+                owner = getattr(error, "cleanup_owner", None)
+                if owner is not None:
+                    self._extra_cleanup_owners.append(owner)
+                    protected = isinstance(owner, native_launcher.CreatedProcess)
+                    self._track_cleanup(owner, guarded=not protected, unknown=not protected)
+                raise
+
+    @staticmethod
+    def _known_mutex_close_failure(error):
+        return (isinstance(error, NativePolicyMutexError) and
+                error.reason == "policy_mutex_handle_close_failed" and
+                not getattr(error, "__notes__", ()) and
+                not getattr(error, "_native_close_outcome_unknown", False))
+
+    def _track_cleanup(self, owner, *, guarded, unknown=False):
+        key = id(owner)
+        record = self._cleanup_records.get(key)
+        if record is None:
+            record = self._cleanup_records[key] = dict(owner=owner, guarded=guarded,
+                state="unknown" if unknown else "pending")
+        elif unknown and record["state"] != "closed":
+            record["state"] = "unknown"
+        return record
+
+    def _close_owned(self, owner, *, guarded):
+        record = self._track_cleanup(owner, guarded=guarded)
+        if record["state"] == "closed":
+            return
+        if record["state"] == "unknown":
+            raise ManagedLaunchError("launcher_native_cleanup_outcome_unknown")
+        # NativeJob/CreatedProcess quarantine each of their raw resources
+        # internally. NativePolicyMutex and opaque construction owners do not.
+        # Guard those before entering close, including BaseException paths.
+        if record["guarded"]:
+            record["state"] = "unknown"
+        try:
+            owner.close()
+        except BaseException as error:
+            if record["guarded"] and self._known_mutex_close_failure(error):
+                record["state"] = "pending"
+            raise
+        # Tombstone success before any subsequent operation can fail. Never
+        # reacquire this object, and never close it twice after another error.
+        record["state"] = "closed"
+
     def launch_once(self, *, stdin_handle, stdout_handle, stderr_handle, timeout_ms=1000):
         """Prepare, consume one claim, Create once and bind the retained root.
 
@@ -263,7 +386,8 @@ class ManagedLauncher:
                 self._ready(prepared.to_dict())
                 self.phase = "CLAIMING"
                 claimed = self.client.claim_launch(expected_revision=prepared.state_revision,
-                    job_nonce=prepared.job_nonce, request_id=self._request_ids["claim"], timeout_ms=timeout_ms)
+                    job_nonce=prepared.job_nonce, request_id=self._request_ids["claim"],
+                    launch_fence_version=1, timeout_ms=timeout_ms)
                 self._claim = self._result(claimed, states={"LAUNCHING"},
                     minimum_revision=prepared.state_revision + 1, scope=prepared)
                 if claimed.launch_authorized is not True or claimed.duplicate is not False:
@@ -276,15 +400,8 @@ class ManagedLauncher:
                 self.admission.verify_launch_payload(command=self._spec.command, cwd=self._spec.cwd)
                 command_line = build_cmd_command_line(self._spec.command, cmd_path=self._cmd_path)
                 self._ready(claimed.to_dict())
-                self._create_attempted = True
-                self.phase = "CREATING"
-                try:
-                    self.process = self._launch(self.job, self._cmd_path, command_line,
-                        cwd=self._spec.cwd, stdin_handle=stdin_handle,
-                        stdout_handle=stdout_handle, stderr_handle=stderr_handle)
-                except native_launcher.LaunchOutcomeUnknown as error:
-                    self.process = error.process
-                    raise
+                self._create_fenced(command_line, timeout_ms=timeout_ms,
+                    stdin_handle=stdin_handle, stdout_handle=stdout_handle, stderr_handle=stderr_handle)
                 root = self.process.full_identity(expected_logon_id=self._snapshot.logon_id)
                 if (type(root) is not ProcessIdentity or root.pid != self.process.pid or
                         root.logon_id != self._snapshot.logon_id or
@@ -299,6 +416,65 @@ class ManagedLauncher:
             except BaseException as error:
                 self.phase = "UNCERTAIN"
                 self._native_failure = error
+                _remember(error, self)
+                raise
+
+    def retire_before_start(self, *, kind="cancel", timeout_ms=1000):
+        """Explicit authenticated abandonment of this exact named scope only.
+
+        A request never supplies native-failure facts. The original guardian
+        must prove never-created/never-associated and commit its sealed receipt.
+        Cancel after claim is only pending reconciliation. A lost ACK keeps the
+        same revision and request ID for explicit replay; it never creates again.
+        """
+        with self._lock:
+            self._assert_context()
+            if kind not in {"cancel", "start_failed"}:
+                raise ManagedLaunchError("launcher_retirement_kind_invalid")
+            if type(timeout_ms) is not int or not 1 <= timeout_ms <= 1000:
+                raise ManagedLaunchError("launcher_deadline_invalid")
+            if self._admitted is None:
+                raise ManagedLaunchError("launcher_not_admitted")
+            if kind == "start_failed" and (self.process is not None or self._root is not None or
+                    isinstance(self._native_failure, native_launcher.LaunchOutcomeUnknown)):
+                raise ManagedLaunchError("launcher_retirement_native_outcome_retained")
+            if self._retired_result is not None:
+                return self._retired_result
+            # Irrevocable local fence precedes even a failed query or RPC.
+            self._sealed = True
+            self.phase = "RETIRING"
+            try:
+                request = self._retirement_requests.get(kind)
+                if request is None:
+                    store = self._ledger()
+                    row = self._scope_row(store)
+                    from .launch_transport import LaunchResult
+                    scope = LaunchResult(self.execution_id, self._snapshot.spec_hash,
+                        self.guardian_epoch, row["state"], row["state_revision"],
+                        row["job_name"], row["job_nonce"], False, False)
+                    store.assert_admission_covered(self.admission, row)
+                    request = (scope, dict(expected_revision=scope.state_revision,
+                        job_nonce=scope.job_nonce, request_id=self._request_ids[kind]))
+                    self._retirement_requests[kind] = request
+                scope, arguments = request
+                method = self.client.cancel_before_start if kind == "cancel" else self.client.start_failed
+                reply = method(**arguments, timeout_ms=timeout_ms)
+                states = ({"CANCELLED_BEFORE_START", "LAUNCHING", "RUNNING", "DRAINING",
+                           "START_UNKNOWN", "UNCERTAIN_HOLD", "FINISHED"} if kind == "cancel" else {"START_FAILED"})
+                reply = self._result(reply, states=states,
+                    minimum_revision=scope.state_revision, scope=scope)
+                if reply.launch_authorized:
+                    raise ManagedLaunchError("launcher_retirement_authorized_launch")
+                if reply.state in {"CANCELLED_BEFORE_START", "START_FAILED"}:
+                    if self.process is not None or self._root is not None:
+                        raise ManagedLaunchError("launcher_retirement_native_outcome_retained")
+                    self._retired_result = reply
+                    self.phase = "RETIRED"
+                else:
+                    self.phase = "CANCEL_PENDING"
+                return reply
+            except BaseException as error:
+                self.phase = "UNCERTAIN"
                 _remember(error, self)
                 raise
 
@@ -380,15 +556,19 @@ class ManagedLauncher:
             if self._closed:
                 return
             if not self._closing:
-                if self._submitted:
+                if self._submitted and self._retired_result is None:
                     if not self._bound or not self.poll_root().exited:
                         raise ManagedLaunchError("launcher_custody_unsettled")
                 self._closing = True
-            primary = None
-            for owner in (self.process, self.job):
-                if owner is not None:
+            primary = (ManagedLaunchError("launcher_mutex_construction_cleanup_unknown")
+                       if self._mutex_construction_unknown else None)
+            attempted = set()
+            for owner in (self.process, self.job, self._launch_mutex, *self._extra_cleanup_owners):
+                if owner is not None and id(owner) not in attempted:
+                    attempted.add(id(owner))
                     try:
-                        owner.close()
+                        self._close_owned(owner, guarded=owner is self._launch_mutex or
+                            (owner is not self.process and owner is not self.job))
                     except BaseException as error:
                         if primary is None:
                             primary = error

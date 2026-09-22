@@ -108,6 +108,9 @@ class Lifecycle:
 
 
 class Owner:
+    def retire_completed_pending(self):
+        return []
+
     def __init__(self, events):
         self.lifecycle = Lifecycle(events)
 

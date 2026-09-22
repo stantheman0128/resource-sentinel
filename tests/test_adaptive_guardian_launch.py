@@ -116,6 +116,7 @@ class Job:
     def __init__(self, name, nonce, logon, handle, probe):
         self.name, self.nonce, self.logon_sid, self.handle = name, nonce, logon, handle
         self.members, self.writes = [], []
+        self.total_processes = 0
         self.closed = False
         self.probe = probe
         self.query_error = None
@@ -137,7 +138,8 @@ class Job:
 
     def accounting(self):
         self.check()
-        return SimpleNamespace(active_processes=len(self.members))
+        return SimpleNamespace(active_processes=len(self.members), total_processes=self.total_processes,
+                               user_100ns=0, kernel_100ns=0, total_terminated_processes=0)
 
     def active_pids(self):
         self.check()
@@ -306,6 +308,7 @@ class GuardianLaunchTests(unittest.TestCase):
         case.locator = 90000 + self.cases.index(case)
         self.processes.remote[(case.peer.identity, case.locator)] = self.processes.objects[identity]
         case.job.members[:] = [identity.pid]
+        case.job.total_processes += 1
         case.bind_request = BindRootRequest(request_id=str(uuid4()), execution_id=case.snapshot.execution_id,
             spec_hash=case.snapshot.spec_hash, guardian_epoch=EPOCH,
             expected_revision=case.claimed.state_revision, job_nonce=case.prepared.job_nonce,

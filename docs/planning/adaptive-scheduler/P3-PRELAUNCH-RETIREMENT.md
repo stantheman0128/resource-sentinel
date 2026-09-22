@@ -88,3 +88,43 @@ missing/tampered proof, partial cleanup and delayed-launch race. Prove the
 wrapper holds the shared fence around native creation and releases before IPC.
 No new test may stop, cap or crash a user's workload. Portable success is not
 native S1–S3, P3, P5 or P6 acceptance. Adaptive remains off.
+
+## Implementation checkpoint
+
+The production wrapper now fences native creation and the authenticated launch
+transport includes CancelBeforeStart/StartFailed plus an explicit ClaimLaunch
+protocol version. The original guardian emits the proof; SQLite archives it in
+the same transaction as release; the supervisor requires it before retirement.
+The guardian host retries terminal handle cleanup each tick. An exact running
+cancel replay can observe DRAINING or FINISHED without inventing prelaunch
+failure. The same original guardian can settle an initial manifest after a cut
+between scope registration and manifest construction, before any Create attempt.
+
+Targeted verification: 40 tests across `test_adaptive_guardian_retirement`,
+`test_adaptive_prelaunch_retirement_store` and `test_adaptive_p3_flow`, with
+0 failures/errors/skips. These run
+with isolated real SQLite/journals, explicit synthetic native handles, and a
+consistent fixture clock. Initial runs caught the SQLite Row/Mapping boundary,
+a missing pending-cancel scope binding and the fixture's mixed real/future
+clock; all were corrected without relaxing evidence requirements. Independent
+review identified the replay and pre-manifest cut points now covered above.
+The expanded tests also cover a NativeJob whose failed close has already made
+it non-queryable, known mutex-close retry, unknown-close quarantine and settled
+manifest validation on FINISHED replay. After cleanup begins, retries use the
+immutable terminal receipt and exact native owners; they do not reacquire or
+query a possibly closed Job/mutex. Each unsettled-manifest case has a separate
+fixture, preserving the intentional fail-closed POLICY entry in the first case.
+
+Full adaptive regression: 82 modules, 2,007 tests, zero failures/errors/skips in
+233.928 seconds. Independent review then found a wrapper mutex close retry
+that lacked unknown-outcome quarantine. The wrapper now tracks each exact
+owner, tombstones successful closes and quarantines uncertain native effects;
+only a positively known close failure permits retry. Six more regression
+cases were added. The final affected launcher/retirement/store/P3-flow/wrapper
+run passed 102 tests in 24.642 seconds, zero failures/errors/skips. The earlier
+2,007-test full run does not include those six later tests. Commands and dirty
+baseline dependencies are recorded in README.
+
+Wrapper-host
+automatic release/abandonment and operational CLI entrypoints remain item 4;
+these source methods do not enable production adaptive or certify native gates.

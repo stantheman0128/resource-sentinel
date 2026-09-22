@@ -115,16 +115,38 @@ class PrepareExecutionRequest:
 class ClaimLaunchRequest(PrepareExecutionRequest):
     job_nonce: str
     claim_token: str = field(repr=False)
+    launch_fence_version: int = 1
     operation: ClassVar[str] = "ClaimLaunch"
 
     def __post_init__(self):
         super().__post_init__()
         _nonce(self.job_nonce)
+        if type(self.launch_fence_version) is not int or self.launch_fence_version != 1:
+            raise IpcError("launch_fence_version_unsupported")
         if type(self.claim_token) is not str or _CLAIM.fullmatch(self.claim_token) is None:
             raise IpcError("launch_invalid_claim_token")
 
     def to_dict(self):
-        return {**super().to_dict(), "job_nonce": self.job_nonce, "claim_token": self.claim_token}
+        return {**super().to_dict(), "job_nonce": self.job_nonce, "claim_token": self.claim_token,
+                "launch_fence_version": self.launch_fence_version}
+
+
+@dataclass(frozen=True)
+class CancelBeforeStartRequest(PrepareExecutionRequest):
+    job_nonce: str
+    operation: ClassVar[str] = "CancelBeforeStart"
+
+    def __post_init__(self):
+        super().__post_init__()
+        _nonce(self.job_nonce)
+
+    def to_dict(self):
+        return {**super().to_dict(), "job_nonce": self.job_nonce}
+
+
+@dataclass(frozen=True)
+class StartFailedRequest(CancelBeforeStartRequest):
+    operation: ClassVar[str] = "StartFailed"
 
 
 @dataclass(frozen=True)
@@ -151,8 +173,9 @@ def decode_request(value):
     if type(value) is not dict or type(value.get("operation")) is not str:
         raise IpcError("launch_invalid_request")
     operation = value["operation"]
-    extra = {"PrepareExecution": set(), "ClaimLaunch": {"job_nonce", "claim_token"},
-             "BindRoot": {"job_nonce", "root_identity", "root_handle_locator"}}.get(operation)
+    extra = {"PrepareExecution": set(), "ClaimLaunch": {"job_nonce", "claim_token", "launch_fence_version"},
+             "BindRoot": {"job_nonce", "root_identity", "root_handle_locator"},
+             "CancelBeforeStart": {"job_nonce"}, "StartFailed": {"job_nonce"}}.get(operation)
     if extra is None:
         raise IpcError("launch_unsupported_operation")
     _shape(value, "LaunchRequest", _COMMON | extra)
@@ -161,7 +184,11 @@ def decode_request(value):
     if operation == "PrepareExecution":
         return PrepareExecutionRequest(**common)
     if operation == "ClaimLaunch":
-        return ClaimLaunchRequest(**common, job_nonce=value["job_nonce"], claim_token=value["claim_token"])
+        return ClaimLaunchRequest(**common, job_nonce=value["job_nonce"], claim_token=value["claim_token"],
+                                  launch_fence_version=value["launch_fence_version"])
+    if operation in {"CancelBeforeStart", "StartFailed"}:
+        cls = CancelBeforeStartRequest if operation == "CancelBeforeStart" else StartFailedRequest
+        return cls(**common, job_nonce=value["job_nonce"])
     return BindRootRequest(**common, job_nonce=value["job_nonce"], root_identity=_identity(value["root_identity"]),
                            root_handle_locator=_read_locator(value["root_handle_locator"]))
 
@@ -212,6 +239,11 @@ def _check_result(request, result):
         valid = result.state == "PREPARED" and not result.launch_authorized
     elif request.operation == "ClaimLaunch":
         valid = result.launch_authorized or result.duplicate
+    elif request.operation == "CancelBeforeStart":
+        valid = result.state in {"CANCELLED_BEFORE_START", "LAUNCHING", "START_UNKNOWN", "RUNNING",
+                                 "DRAINING", "UNCERTAIN_HOLD", "FINISHED"} and not result.launch_authorized
+    elif request.operation == "StartFailed":
+        valid = result.state == "START_FAILED" and not result.launch_authorized
     else:
         valid = result.state in {"RUNNING", "DRAINING", "FINISHED"} and not result.launch_authorized
     if not valid:
@@ -306,6 +338,8 @@ class LaunchService:
                 result = self.owner.prepare_execution(request, peer, auth_record=record, deadline=deadline)
             elif type(request) is ClaimLaunchRequest:
                 result = self.owner.claim_launch(request, peer, auth_record=record, deadline=deadline)
+            elif type(request) in {CancelBeforeStartRequest, StartFailedRequest}:
+                result = self.owner.retire_before_start(request, peer, auth_record=record, deadline=deadline)
             else:
                 result = self.owner.bind_root(request, peer, auth_record=record, deadline=deadline)
             _remaining(deadline)
@@ -342,14 +376,22 @@ class ManagedLaunchClient:
         return self._request("PrepareExecution", expected_revision=expected_revision,
                              request_id=request_id, timeout_ms=timeout_ms)
 
-    def claim_launch(self, *, expected_revision, job_nonce, request_id, timeout_ms=1000):
+    def claim_launch(self, *, expected_revision, job_nonce, request_id, timeout_ms=1000, launch_fence_version=1):
         return self._request("ClaimLaunch", expected_revision=expected_revision, job_nonce=job_nonce,
-                             request_id=request_id, timeout_ms=timeout_ms)
+                             request_id=request_id, timeout_ms=timeout_ms, launch_fence_version=launch_fence_version)
 
     def bind_root(self, *, expected_revision, job_nonce, root_identity, root_handle_locator,
                   request_id, timeout_ms=1000):
         return self._request("BindRoot", expected_revision=expected_revision, job_nonce=job_nonce,
                              root_identity=root_identity, root_handle_locator=root_handle_locator,
+                             request_id=request_id, timeout_ms=timeout_ms)
+
+    def cancel_before_start(self, *, expected_revision, job_nonce, request_id, timeout_ms=1000):
+        return self._request("CancelBeforeStart", expected_revision=expected_revision, job_nonce=job_nonce,
+                             request_id=request_id, timeout_ms=timeout_ms)
+
+    def start_failed(self, *, expected_revision, job_nonce, request_id, timeout_ms=1000):
+        return self._request("StartFailed", expected_revision=expected_revision, job_nonce=job_nonce,
                              request_id=request_id, timeout_ms=timeout_ms)
 
     def _request(self, operation, *, expected_revision, request_id, timeout_ms, **fields):
@@ -375,6 +417,9 @@ class ManagedLaunchClient:
                         request = BindRootRequest(**common, **fields)
                         if request.root_identity.logon_id != caller.logon_id:
                             raise IpcError("launch_root_logon_mismatch")
+                    elif operation in {"CancelBeforeStart", "StartFailed"}:
+                        cls = CancelBeforeStartRequest if operation == "CancelBeforeStart" else StartFailedRequest
+                        request = cls(**common, **fields)
                     else:
                         request = PrepareExecutionRequest(**common)
                     _live(connection, peer, self.endpoint.server_identity)

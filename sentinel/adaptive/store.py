@@ -41,6 +41,42 @@ _STATES = ("NEW", "QUEUED", "RESERVED", "PREPARED", "LAUNCHING", "RUNNING",
 # The withdrawn state a settled recovery manifest carries, as the supervisor's
 # own retirement proof defines it.
 _DISABLED_CONTROL = CpuControl(CpuControlMode.DISABLED, None)
+_PRELAUNCH_TERMINAL = frozenset({"CANCELLED_BEFORE_START", "START_FAILED"})
+_FENCE_FIELDS = ("execution_id", "spec_hash", "guardian_epoch", "job_nonce", "version")
+_RETIREMENT_FIELDS = ("execution_id", "state", "state_revision", "job_nonce", "manifest_hash",
+    "guardian_pid", "guardian_created_filetime_100ns", "guardian_logon_id", "guardian_epoch",
+    "evidence_kind", "total_process_count", "launch_fence_version")
+
+
+def _migrate_prelaunch_schema(conn):
+    """Add immutable protocol bindings and bounded retirement receipts."""
+    schemas = {
+        "adaptive_launch_fences": ("""execution_id TEXT PRIMARY KEY, spec_hash TEXT NOT NULL,
+            guardian_epoch TEXT NOT NULL, job_nonce TEXT NOT NULL,
+            version INTEGER NOT NULL CHECK(typeof(version)='integer' AND version=1),
+            FOREIGN KEY(execution_id) REFERENCES managed_executions(execution_id)""", _FENCE_FIELDS),
+        "adaptive_retirement_requests": ("""execution_id TEXT NOT NULL,
+            operation TEXT NOT NULL CHECK(operation IN ('CancelBeforeStart','StartFailed')),
+            request_id TEXT NOT NULL UNIQUE, payload_hash TEXT NOT NULL, spec_hash TEXT NOT NULL,
+            guardian_epoch TEXT NOT NULL, PRIMARY KEY(execution_id,operation),
+            FOREIGN KEY(execution_id) REFERENCES managed_executions(execution_id)""",
+            ("execution_id", "operation", "request_id", "payload_hash", "spec_hash", "guardian_epoch")),
+        "adaptive_prelaunch_retirements": ("""execution_id TEXT PRIMARY KEY,
+            state TEXT NOT NULL CHECK(state IN ('CANCELLED_BEFORE_START','START_FAILED')),
+            state_revision INTEGER NOT NULL, job_nonce TEXT NOT NULL, manifest_hash TEXT NOT NULL,
+            guardian_pid INTEGER NOT NULL, guardian_created_filetime_100ns TEXT NOT NULL,
+            guardian_logon_id TEXT NOT NULL, guardian_epoch TEXT NOT NULL,
+            evidence_kind TEXT NOT NULL CHECK(evidence_kind IN ('never-created','never-associated')),
+            total_process_count INTEGER, launch_fence_version INTEGER NOT NULL,
+            FOREIGN KEY(execution_id) REFERENCES managed_executions(execution_id)""", _RETIREMENT_FIELDS),
+    }
+    for name, (definition, fields) in schemas.items():
+        found = conn.execute("SELECT type FROM sqlite_master WHERE name=?", (name,)).fetchone()
+        if found is not None and found[0] != "table":
+            raise SchemaVersionError("prelaunch_schema_unsupported")
+        conn.execute(f"CREATE TABLE IF NOT EXISTS {name} ({definition})")
+        if tuple(row[1] for row in conn.execute(f"PRAGMA table_info({name})")) != fields:
+            raise SchemaVersionError("prelaunch_schema_unsupported")
 
 
 class LifecycleError(RuntimeError):
@@ -263,6 +299,7 @@ def migrate_schema(conn: sqlite3.Connection, *, in_transaction: bool = False) ->
             PRIMARY KEY(execution_id,operation),
             FOREIGN KEY(execution_id) REFERENCES managed_executions(execution_id)
         )""")
+        _migrate_prelaunch_schema(conn)
         from .control_slot import (
             ControlSlotError, migrate_control_actions_schema, migrate_control_slot_schema,
         )
@@ -396,6 +433,9 @@ class LifecycleEvidence:
     recovery_manifest_settled: bool = False
     job_nonce: str | None = None
     job_creation_never_attempted: bool = False
+    retirement_manifest: RecoveryManifest | None = None
+    total_process_count: int | None = None
+    launch_fence_version: int = 0
 
     def __post_init__(self):
         if self.operation not in {"register", "register_scope", "prepare", "claim", "bind_root", "root_exited", "finalize", "cancel", "start_failed",
@@ -417,6 +457,12 @@ class LifecycleEvidence:
             raise ValueError("invalid_evidence_job_nonce")
         if self.active_process_count is not None and (type(self.active_process_count) is not int or not 0 <= self.active_process_count < 1 << 32):
             raise ValueError("invalid_evidence_process_count")
+        if self.total_process_count is not None and (type(self.total_process_count) is not int or not 0 <= self.total_process_count < 1 << 32):
+            raise ValueError("invalid_evidence_total_process_count")
+        if type(self.launch_fence_version) is not int or self.launch_fence_version not in (0, 1):
+            raise ValueError("invalid_evidence_launch_fence_version")
+        if self.retirement_manifest is not None and type(self.retirement_manifest) is not RecoveryManifest:
+            raise ValueError("invalid_evidence_retirement_manifest")
         if self.process_ids is not None:
             if (type(self.process_ids) is not tuple or len(self.process_ids) > 4096 or
                     any(type(pid) is not int or not 0 < pid < 1 << 32 for pid in self.process_ids) or
@@ -1114,6 +1160,154 @@ class LifecycleStore:
         except PolicyError as error:
             raise LifecycleError(str(error)) from error
 
+    @staticmethod
+    def _assert_launch_fence(conn, row, *, version=1):
+        if type(version) is not int or version != 1:
+            raise LifecycleError("launch_fence_version_unsupported")
+        values = (row["execution_id"], row["spec_hash"], row["guardian_epoch"], row["job_nonce"], version)
+        if (not row["guardian_epoch"] or not re.fullmatch(r"[0-9a-f]{32}", row["job_nonce"] or "") or
+                row["job_name"] != f"Local\\ResourceSentinel.Job.{row['execution_id']}.{row['job_nonce']}"):
+            raise LifecycleError("launch_fence_unverified")
+        found = conn.execute("SELECT " + ",".join(_FENCE_FIELDS) +
+            " FROM adaptive_launch_fences WHERE execution_id=? LIMIT 2", (row["execution_id"],)).fetchall()
+        if len(found) != 1 or tuple(found[0]) != values:
+            raise LifecycleError("launch_fence_unverified")
+
+    def bind_launch_fence_locked(self, execution_id: str, *, caller: ProcessIdentity,
+                                  expected_auth: _IpcAuthRecord, guardian_epoch: str,
+                                  version: int = 1) -> bool:
+        """Bind the shared Job launch fence before claim; return exact replay.
+
+        POLICY and the original guardian's Job fence remain held by the caller.
+        This records a protocol obligation, never permission to create a process.
+        """
+        from .policy import PolicyError
+        if type(version) is not int or version != 1:
+            raise LifecycleError("launch_fence_version_unsupported")
+        try:
+            guard = self._policy.assert_held()
+            if guard.binding.logon_id != caller.logon_id:
+                raise LifecycleError("policy_logon_mismatch")
+            with self._transaction() as conn:
+                runtime = self._policy.revalidate(conn, guard)
+                _revalidate_launch_auth(conn, execution_id, caller, expected_auth)
+                row = self._get(conn, execution_id)
+                if (row["guardian_epoch"] != guardian_epoch or runtime["guardian_epoch"] != guardian_epoch):
+                    raise LifecycleError("guardian_identity_mismatch")
+                self._require_authenticated_allocation(conn, row)
+                found = conn.execute("SELECT 1 FROM adaptive_launch_fences WHERE execution_id=?", (execution_id,)).fetchone()
+                if found:
+                    self._assert_launch_fence(conn, row, version=version)
+                    return True
+                if (row["state"] != "PREPARED" or row["claim_consumed"] or
+                        row["launch_in_flight"] or row["launch_sealed"] or row["job_nonce"] is None):
+                    raise LifecycleError("invalid_lifecycle_transition")
+                conn.execute("INSERT INTO adaptive_launch_fences (" + ",".join(_FENCE_FIELDS) +
+                    ") VALUES(?,?,?,?,?)", (execution_id, row["spec_hash"], guardian_epoch, row["job_nonce"], version))
+                self._assert_launch_fence(conn, row, version=version)
+                return False
+        except PolicyError as error:
+            raise LifecycleError(str(error)) from error
+
+    def assert_launch_fence(self, row: Mapping[str, Any], *, version: int = 1) -> None:
+        """Read-only exact fence binding check; caller retains the Job mutex.
+
+        No POLICY acquisition, transaction write or launch authority is provided.
+        The caller additionally proves its claim revision and current allocation.
+        """
+        with _coverage_read_transaction(self._existing_ledger_path or Path(self.db_path).resolve()) as conn:
+            actual = self._get(conn, row["execution_id"])
+            self._require_revision(actual, row["state_revision"])
+            names = _FENCE_FIELDS[:-1] + ("job_name", "state", "launch_sealed", "launch_in_flight", "claim_consumed")
+            if any(actual[name] != row[name] for name in names):
+                raise LifecycleError("launch_fence_row_mismatch")
+            self._assert_launch_fence(conn, actual, version=version)
+
+    @staticmethod
+    def _retirement_request_arguments(operation, request_id, payload_hash, caller, guardian_epoch):
+        if (type(operation) is not str or operation not in {"CancelBeforeStart", "StartFailed"} or type(caller) is not ProcessIdentity or
+                type(payload_hash) is not str or not re.fullmatch(r"[0-9a-f]{64}", payload_hash) or
+                type(guardian_epoch) is not str or not re.fullmatch(r"[A-Za-z0-9_.:@-]{1,128}", guardian_epoch)):
+            raise LifecycleError("invalid_retirement_request")
+        try:
+            if type(request_id) is not str or UUID(request_id).int == 0 or str(UUID(request_id)) != request_id:
+                raise ValueError
+        except (ValueError, AttributeError):
+            raise LifecycleError("invalid_retirement_request") from None
+
+    def check_retirement_request_locked(self, execution_id: str, operation: str, request_id: str,
+                                         payload_hash: str, *, caller: ProcessIdentity,
+                                         expected_auth: _IpcAuthRecord, guardian_epoch: str) -> bool:
+        """Read-only exact replay precheck under the caller's retained POLICY.
+
+        True allows the original request to reconcile a later ledger revision.
+        False does not authorize anything: the guardian must still require the
+        request's original revision before first observation/publication. This
+        method neither inserts a request nor modifies the POLICY guard.
+        """
+        from .policy import PolicyError
+        self._retirement_request_arguments(operation, request_id, payload_hash, caller, guardian_epoch)
+        try:
+            guard = self._policy.assert_held()
+            if guard.binding.logon_id != caller.logon_id:
+                raise LifecycleError("policy_logon_mismatch")
+            with _coverage_read_transaction(self._existing_ledger_path or Path(self.db_path).resolve()) as conn:
+                runtime = self._policy.revalidate(conn, guard)
+                auth = _revalidate_launch_auth(conn, execution_id, caller, expected_auth)
+                row = self._get(conn, execution_id)
+                if row["guardian_epoch"] != guardian_epoch or runtime["guardian_epoch"] != guardian_epoch:
+                    raise LifecycleError("guardian_identity_mismatch")
+                values = (execution_id, operation, request_id, payload_hash, auth.spec_hash, guardian_epoch)
+                recorded = conn.execute("""SELECT execution_id,operation,request_id,payload_hash,spec_hash,guardian_epoch
+                    FROM adaptive_retirement_requests WHERE (execution_id=? AND operation=?) OR request_id=? LIMIT 2""",
+                    (execution_id, operation, request_id)).fetchall()
+                if recorded and (len(recorded) != 1 or tuple(recorded[0]) != values):
+                    raise LifecycleError("retirement_request_mismatch")
+                return bool(recorded)
+        except PolicyError as error:
+            raise LifecycleError(str(error)) from error
+
+    def record_retirement_request_locked(self, execution_id: str, operation: str, request_id: str,
+                                          payload_hash: str, *, caller: ProcessIdentity,
+                                          expected_auth: _IpcAuthRecord, guardian_epoch: str) -> bool:
+        """Record two bounded immutable retirement operation slots.
+
+        The trusted typed transport digest includes the original request revision.
+        Exact replay survives terminal CAS; a new ID, payload or revision cannot
+        replace the original. This receipt grants no native evidence or release.
+        """
+        from .policy import PolicyError
+        self._retirement_request_arguments(operation, request_id, payload_hash, caller, guardian_epoch)
+        try:
+            guard = self._policy.assert_held()
+            if guard.binding.logon_id != caller.logon_id:
+                raise LifecycleError("policy_logon_mismatch")
+            with self._transaction() as conn:
+                runtime = self._policy.revalidate(conn, guard)
+                auth = _revalidate_launch_auth(conn, execution_id, caller, expected_auth)
+                row = self._get(conn, execution_id)
+                if row["guardian_epoch"] != guardian_epoch or runtime["guardian_epoch"] != guardian_epoch:
+                    raise LifecycleError("guardian_identity_mismatch")
+                values = (execution_id, operation, request_id, payload_hash, auth.spec_hash, guardian_epoch)
+                recorded = conn.execute("""SELECT execution_id,operation,request_id,payload_hash,spec_hash,guardian_epoch
+                    FROM adaptive_retirement_requests WHERE (execution_id=? AND operation=?) OR request_id=? LIMIT 2""",
+                    (execution_id, operation, request_id)).fetchall()
+                if recorded:
+                    if len(recorded) != 1 or tuple(recorded[0]) != values:
+                        raise LifecycleError("retirement_request_mismatch")
+                    if row["state"] not in TERMINAL_STATES:
+                        self._require_authenticated_allocation(conn, row)
+                    return True
+                if row["state"] in TERMINAL_STATES:
+                    raise LifecycleError("invalid_lifecycle_transition")
+                self._require_authenticated_allocation(conn, row)
+                conn.execute("""INSERT INTO adaptive_retirement_requests
+                    (execution_id,operation,request_id,payload_hash,spec_hash,guardian_epoch)
+                    VALUES(?,?,?,?,?,?)""", values)
+                return False
+        except PolicyError as error:
+            raise LifecycleError(str(error)) from error
+
     def assert_admission_covered(self, admission, expected_row: Mapping[str, Any]) -> None:
         """Verify one direct admission's retained ledger custody, read-only.
 
@@ -1298,7 +1492,7 @@ class LifecycleStore:
 
     def assert_retained_terminal(self, expected_row: Mapping[str, Any],
                                  manifest: RecoveryManifest) -> None:
-        """Reconcile a committed FINISHED result after a lost finalization ACK.
+        """Reconcile a committed terminal result after a lost terminal ACK.
 
         This is a separate read-only ledger proof, never an active allocation
         fallback or another release. Native empty/disabled/settled verification
@@ -1326,9 +1520,11 @@ class LifecycleStore:
             if any(row[name] != value for name, value in expected.items()):
                 raise LifecycleError("retained_expected_row_mismatch")
             kind = row["allocation_kind"]
-            if (row["state"] != "FINISHED" or row["launch_sealed"] != 1 or row["launch_in_flight"] != 0 or
+            if (row["state"] not in TERMINAL_STATES or row["launch_sealed"] != 1 or row["launch_in_flight"] != 0 or
                     kind not in _TABLES or row["parent_execution_id"] is not None):
                 raise LifecycleError("retained_terminal_unverified")
+            if row["state"] in _PRELAUNCH_TERMINAL:
+                self._assert_prelaunch_receipt(conn, row, manifest)
             table = _TABLES[kind]
             other = _TABLES["routed" if kind == "direct" else "direct"]
             if (conn.execute(f"SELECT count(*) FROM {table} WHERE execution_id=? OR id=?",
@@ -1351,7 +1547,7 @@ class LifecycleStore:
             if len(archives) != 1:
                 raise LifecycleError("retained_terminal_unverified")
             archive = archives[0]
-            if (archive["outcome"] != "managed_finished" or archive["ended_at"] != finished or
+            if (archive["outcome"] != "managed_" + row["state"].lower() or archive["ended_at"] != finished or
                     archive["cpu_units"] != row["requested_cpu_units"] or
                     (kind == "direct" and archive["io_slots"] != row["requested_io_slots"]) or
                     (kind == "routed" and (archive["task_id"] != row["task_id"] or
@@ -1363,6 +1559,76 @@ class LifecycleStore:
                     raise LifecycleError("retained_terminal_unverified")
             if archive["started_at"] > finished:
                 raise LifecycleError("retained_terminal_unverified")
+
+    @staticmethod
+    def _retirement_manifest_settled(row, manifest):
+        if (manifest.root_identity is not None or manifest.original != _DISABLED_CONTROL or
+                manifest.last_applied is not None or manifest.pending_intent is not None or
+                row["root_pid"] is not None or row["root_created_filetime_100ns"] is not None or
+                row["root_outcome"] is not None):
+            raise LifecycleError("prelaunch_retirement_unverified")
+
+    def _record_prelaunch_receipt(self, conn, before, finished, proof):
+        manifest = proof.retirement_manifest
+        if manifest is None:
+            # Historical synthetic providers retain their old transition
+            # semantics, but cannot retire a native supervisor obligation.
+            return
+        expected, manifest = self._retained_inputs(dict(before), manifest)
+        self._retirement_manifest_settled(before, manifest)
+        if (before["state"] not in {"RESERVED", "PREPARED", "LAUNCHING", "START_UNKNOWN", "UNCERTAIN_HOLD"} or
+                finished["state"] not in _PRELAUNCH_TERMINAL or not proof.recovery_manifest_settled or
+                not proof.durable_manifest or not proof.original_cpu_disabled):
+            raise LifecycleError("prelaunch_retirement_unverified")
+        if proof.job_creation_never_attempted:
+            if proof.total_process_count is not None:
+                raise LifecycleError("prelaunch_retirement_unverified")
+            kind = "never-created"
+        else:
+            if (type(proof.total_process_count) is not int or proof.total_process_count != 0 or
+                    proof.active_process_count != 0 or proof.process_ids != () or not proof.current_cpu_disabled):
+                raise LifecycleError("prelaunch_retirement_unverified")
+            kind = "never-associated"
+        if before["claim_consumed"] or before["launch_in_flight"]:
+            if proof.launch_fence_version != 1:
+                raise LifecycleError("launch_fence_unverified")
+            self._assert_launch_fence(conn, before, version=1)
+        elif proof.launch_fence_version:
+            self._assert_launch_fence(conn, before, version=proof.launch_fence_version)
+        identity = manifest.guardian_identity
+        values = (finished["execution_id"], finished["state"], finished["state_revision"],
+            finished["job_nonce"], manifest.manifest_hash, identity.pid,
+            str(identity.created_filetime_100ns), identity.logon_id, manifest.guardian_epoch,
+            kind, proof.total_process_count, proof.launch_fence_version)
+        conn.execute("INSERT INTO adaptive_prelaunch_retirements (" + ",".join(_RETIREMENT_FIELDS) +
+            ") VALUES(" + ",".join("?" for _ in values) + ")", values)
+
+    def _assert_prelaunch_receipt(self, conn, row, manifest):
+        self._retirement_manifest_settled(row, manifest)
+        if row["claim_consumed"] != 1 or row["claim_token_hash"] != "":
+            raise LifecycleError("prelaunch_retirement_unverified")
+        records = conn.execute("SELECT " + ",".join(_RETIREMENT_FIELDS) +
+            " FROM adaptive_prelaunch_retirements WHERE execution_id=? LIMIT 2", (row["execution_id"],)).fetchall()
+        if len(records) != 1:
+            raise LifecycleError("prelaunch_retirement_unverified")
+        receipt = records[0]
+        identity = manifest.guardian_identity
+        expected = (row["execution_id"], row["state"], row["state_revision"], row["job_nonce"],
+            manifest.manifest_hash, identity.pid, str(identity.created_filetime_100ns),
+            identity.logon_id, manifest.guardian_epoch)
+        if tuple(receipt)[:9] != expected or type(receipt["launch_fence_version"]) is not int:
+            raise LifecycleError("prelaunch_retirement_unverified")
+        if receipt["launch_fence_version"] == 1:
+            self._assert_launch_fence(conn, row, version=1)
+        elif receipt["launch_fence_version"] != 0:
+            raise LifecycleError("prelaunch_retirement_unverified")
+        if receipt["evidence_kind"] == "never-created":
+            valid = receipt["total_process_count"] is None and receipt["launch_fence_version"] == 0
+        else:
+            valid = (receipt["evidence_kind"] == "never-associated" and
+                type(receipt["total_process_count"]) is int and receipt["total_process_count"] == 0)
+        if not valid:
+            raise LifecycleError("prelaunch_retirement_unverified")
 
     def heartbeat_retained_allocation(self, expected_row: Mapping[str, Any], manifest: RecoveryManifest,
                                       *, caller: ProcessIdentity, now: float | None = None) -> dict[str, Any]:
@@ -2196,6 +2462,8 @@ class LifecycleStore:
             snapshot = self.query(execution_id)
             self._require_revision(snapshot, expected_revision)
             self._caller(snapshot, caller)
+            if snapshot["state"] != "FINISHED":
+                raise LifecycleError("retained_terminal_unverified")
             if guard.binding.logon_id != caller.logon_id:
                 raise LifecycleError("policy_logon_mismatch")
             if (type(manifest) is not RecoveryManifest or manifest.original != _DISABLED_CONTROL or
@@ -2346,12 +2614,16 @@ class LifecycleStore:
             raise LifecycleError("live_descendants_unreconciled")
 
     def _finish_before_start(self, conn: sqlite3.Connection, row: Mapping[str, Any], *,
-                             expected_revision: int, state: str, now: float) -> dict[str, Any]:
+                             expected_revision: int, state: str, now: float,
+                             proof: LifecycleEvidence) -> dict[str, Any]:
         if row["job_name"] is not None:
             runtime = conn.execute("SELECT guardian_epoch,active_logon_id FROM adaptive_runtime WHERE singleton=1").fetchone()
             if runtime is None or runtime[0] != row["guardian_epoch"] or runtime[1] != row["logon_id"]:
                 raise LifecycleError("guardian_identity_mismatch")
         self._require_no_live_descendants(conn, row["execution_id"])
+        if proof.retirement_manifest is not None:
+            expected, manifest = self._retained_inputs(dict(row), proof.retirement_manifest)
+            self._validate_retained_allocation(conn, expected, manifest)
         updates = {"state": state, "finished_at": now, "launch_sealed": 1,
                    "launch_in_flight": 0, "claim_consumed": 1, "claim_token_hash": "", "hold_reason": None}
         if state == "CANCELLED_BEFORE_START":
@@ -2359,6 +2631,7 @@ class LifecycleStore:
         finished = self._cas(conn, row["execution_id"], expected_revision, updates)
         if row["allocation_kind"] != "parent":
             self._archive_allocation(conn, finished, now, outcome="managed_" + state.lower())
+        self._record_prelaunch_receipt(conn, row, finished, proof)
         return self._public(finished)
 
     def cancel_before_start(self, execution_id: str, *, caller: ProcessIdentity,
@@ -2407,7 +2680,7 @@ class LifecycleStore:
                     return {**self._public(row), "cancelled": False, "reason": "cancel_pending_reconciliation"}
                 self._require_never_started(row, proof)
                 done = self._finish_before_start(conn, row, expected_revision=expected_revision,
-                                                state="CANCELLED_BEFORE_START", now=now)
+                                                state="CANCELLED_BEFORE_START", now=now, proof=proof)
                 return {**done, "cancelled": True, "reason": "cancelled_before_start"}
 
     def mark_start_failed(self, execution_id: str, *, caller: ProcessIdentity,
@@ -2437,7 +2710,7 @@ class LifecycleStore:
                 self._caller(row, caller)
                 self._require_never_started(row, proof)
                 return self._finish_before_start(conn, row, expected_revision=expected_revision,
-                                                 state="START_FAILED", now=now)
+                                                 state="START_FAILED", now=now, proof=proof)
 
     def bind_root(self, execution_id: str, *, caller: ProcessIdentity, expected_revision: int,
                   expected_auth: _IpcAuthRecord | None = None) -> dict[str, Any]:

@@ -2,6 +2,43 @@
 
 日期：2026-09-19。狀態：**正式計畫已入庫，分階段實作進行中；production adaptive 維持 off。**
 
+## 2026-09-22 Codex 實作 checkpoint（目前狀態）
+
+接手時 Coordinator 的既存 freshness／共用計帳修正已獨立提交為 `6abadba`。
+裁決 ② 的[退場契約](P3-PRELAUNCH-RETIREMENT.md)先於程式提交為 `8cd06e7`。
+目前的 source 已接上 shared launch fence、guardian never-started 證據、原子退場
+receipt、supervisor 核對與 host 每輪 cleanup。完整 adaptive 回歸 82 個模組、
+2,007 個測試通過（233.928 秒）；之後獨立 review 找到 wrapper mutex 關閉結果
+不明時的重試風險，已修正並新增六個案例，最後重跑 102 個受影響測試全過
+（24.642 秒）。這兩次均為 0 failures／errors／skips；完整回歸的 2,007 不包含
+最後新增的六個測試。Native acceptance 仍未驗證。
+
+| 目標項目 | 已驗證狀態／剩餘工作 |
+| --- | --- |
+| 1. 裁決 ② | 契約與 source 完成；完整 2,007 tests，最後 cleanup 修正後 102 tests 通過。 |
+| 2. 裁決 ④ | 下一項：cold-start failsafe、保留 creation witness 的早期死亡接管、每輪 registry cleanup retry、barrier retry 與安全 epoch rollover。 |
+| 3. helper sender | 尚缺 sender、ACK 驅動、uncapped frame／restore 傳輸與 capability 證據接線。 |
+| 4. release／CLI | 已有 explicit named retirement API；wrapper host 自動失敗收尾、Coordinator 路徑、discovery／停止協定與 operational CLI 未完成。 |
+| 5. 全程容量覆蓋 | 尚缺能證明所有 live consumers 使用相同 lifetime accounting 的 provider；原日常 grace 前提仍不滿足，不能以測試 DB 假裝解鎖。 |
+| 6. console 驗收命令 | S1–S3／完整 §11.2／實測 A/B runner 尚未全部可執行；不能只包一層 CLI 就宣稱只剩使用者執行。 |
+
+以上是目前缺口；下列較早日期的段落保留其歷史測試範圍。Native S1–S3、完整
+P3–P6 都尚未通過。日常 config／Scheduled Task／啟動入口未修改。
+
+本次命令均由日常 `C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1`
+正常准入（P2、HEAVY、1 CPU、1 GiB RAM、0 I/O slots），在 implementation worktree 執行：
+
+```text
+C:\Python313\python.exe -m unittest discover -s tests -p test_adaptive*.py -q
+C:\Python313\python.exe -m unittest tests.test_adaptive_launcher tests.test_adaptive_guardian_retirement tests.test_adaptive_prelaunch_retirement_store tests.test_adaptive_p3_flow tests.test_adaptive_wrapper_host -q
+```
+
+第一次完整測試的七個錯誤來自 P3 flow 合成 fixture 缺少新要求的 lifetime process
+counter；修正 fixture 後全過，未放寬 production 證據。更早的 targeted 故障與修正
+見 C2 文件。測試仍依賴接手前 dirty tree 的 exemption／observability 整合內容；
+那些檔案未納入本次窄提交，這不是乾淨 clone 已重跑的聲明。沒有新建或限速真實
+test Job，沒有修改日常 runtime 或啟用 adaptive。
+
 目前交接入口是 [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md)、
 [P0 對齊結果](BASELINE-RECONCILIATION.md)、[Windows capability 證據](CAPABILITY-RESULTS.md)
 與 [P2 admission-only 實作紀錄](P2-ADMISSION-ONLY.md)。
@@ -130,7 +167,7 @@ P6 沒有任何 gate 通過，adaptive 維持 off。
    目錄都必填、沒有預設值，裡面沒有任何停止子行程的路徑。它只向 `py` 問直譯器的
    路徑，再直接啟動那個檔案，因為經 `py` 啟動的行程一定在 Job 內。
 
-已知缺口，都還沒有程式：
+已知整合缺口（以開頭 checkpoint 的最新狀態為準）：
 
 1. 沒有會送出 proposal 的 helper。shadow helper host 只觀察，enforce 模式依計畫要等
    P5 的 capability 核可，B 組因此仍然不能量測。不是由 supervisor 建立的 helper，
@@ -160,8 +197,10 @@ P6 沒有任何 gate 通過，adaptive 維持 off。
    orphan drain 在結案的同一輪清除，之後每一輪遇到已 `FINISHED` 的列會再試一次；
    原本的五筆樣本路徑沒有改。只有可攜測試證據。guardian 端的對應方法沒有 production
    caller。supervisor 在結案與清除之間結束的情況沒有人重試，併入第 4 項。
-2. `cancel` 與 `start_failed` 兩種狀態缺 guardian 證據，無法退場，細節在
-   retained supervisor 文件的 remaining gates。擁有者的答覆：交給 Codex 提方案。
+2. `cancel` 與 `start_failed` 的 guardian 證據採
+   [C2 正向退場契約](P3-PRELAUNCH-RETIREMENT.md)：共享啟動鎖、原始 retained Job
+   的 lifetime 零程序證據、原子 receipt／archive。Source 已實作，targeted tests
+   通過；wrapper host／CLI 接線仍屬目標項目 4，native race／cleanup gate 未驗證。
 3. 計畫 5.5 要求 caller 以 OS 可驗證身分和一次性 token 綁定。helper 沒有
    `ipc_auth_key`，registry 的欄位也是固定的，所以傳輸層只用 OS 驗證的 peer
    加上每次請求的 server nonce，沒有共享密鑰。擁有者的答覆：接受現況。
@@ -178,7 +217,7 @@ P6 沒有任何 gate 通過，adaptive 維持 off。
    guardian host 與 helper host 都在 hold 內第一個呼叫它。原函式不變，帳本被碰過之後
    才發生的拒絕仍然保留 nonce，有測試固定這個行為。細節在 process hosts 文件。
 
-整棵 adaptive 測試樹最後一次執行是 2026-09-22：80 個模組、1961 個測試、0 失敗、
+本段保留先前的歷史基準（最新結果見開頭 checkpoint）：2026-09-22，80 個模組、1961 個測試、0 失敗、
 0 錯誤、0 略過，經 `scripts/invoke-sentinel.ps1` 正常准入。0 略過只對 agent session
 成立，在通過 preflight 的主控台上，斷言拒絕代碼的測試會改走 `skipTest`。同一天較早的
 一次執行有 1 個錯誤：`test_adaptive_guardian_launch` 出現 `coverage_read_timeout`，

@@ -80,23 +80,21 @@ with a native proof that the Job is empty, sealed, CPU disabled and the manifest
 settled. `_prove_retired` rechecks the ledger half through
 `assert_retained_terminal`, which requires a sealed row, no active allocation,
 exactly one `managed_finished` archive and a row bound to the manifest. The
-journal half is the settled manifest. No new column or flag was added. SQL `FINISHED`
+journal half is the settled manifest. SQL `FINISHED`
 alone, a missing allocation or a missing Job name retires nothing: the scope
 stays an obligation, keeps its slot and is still restored after guardian death.
 A held obligation is asked again on every tick, at most ten proofs, so evidence
 that completes later still frees the slot and lets `close()` succeed.
 
 History is read once in `rowid` order, sixteen proofs per tick. While a
-remainder is unread the tick reports unverified inventory. A named scope in
-`CANCELLED_BEFORE_START` or `START_FAILED` still counts as live. The store would
-write either state only under a never-started proof, but no production path can
-reach that today. The one production cancel, in `admission.py`, accepts only a
-row with no Job name, and the supervisor never lists such a row.
-`mark_start_failed` has no caller, and neither guardian evidence provider
-answers `cancel` or `start_failed`. A retirement check for those two states
-would therefore verify evidence nothing can produce, so none was added. Enough
-unprovable history ends in `supervisor_inventory_bound_exceeded`, and the tick
-reports that as unverified inventory.
+remainder is unread the tick reports unverified inventory. As of C2 on
+2026-09-22, the page also nominates `CANCELLED_BEFORE_START` and `START_FAILED`.
+The [prelaunch retirement contract](P3-PRELAUNCH-RETIREMENT.md) adds a production
+guardian provider and a same-transaction native-evidence receipt. The supervisor
+requires that receipt, exact rootless settled manifest and unique matching
+archive before dropping an obligation. Historical state-only rows remain held.
+Enough unprovable history still ends in `supervisor_inventory_bound_exceeded`;
+no missing native name, TTL or handle close is a retirement proof.
 
 Unavailable and contradictory inventory are separated by the primary SQLite
 result code (`BUSY`, `LOCKED`, `IOERR` and similar), two journal read reasons
@@ -303,10 +301,9 @@ pass. Promotion remains stopped for this unresolved all-witness-loss contract.
 - Separate durable recovery ownership transfer for a scope that must keep
   running, followed by lifecycle adoption, child accounting and original lease
   handling. The drain finishes a scope; it does not adopt one.
-- Guardian evidence for `cancel` and `start_failed` on a named Job. Without it a
-  prepared Job whose launch positively failed before user code keeps its
-  allocation and its supervisor slot. Retirement of those two states follows
-  that evidence and is not built ahead of it.
+- Named-Job cancellation and failed-start evidence are implemented under C2.
+  Wrapper-host automatic failure/release handling and operational CLI wiring
+  remain goal item 4; native launch/race/cleanup acceptance is still unverified.
 - Real continuous host capacity and loaded legacy-writer authority, native
   S1-S3 recovery, P4 observer/shadow costs, P5 canary and P6 paired A/B evidence.
 

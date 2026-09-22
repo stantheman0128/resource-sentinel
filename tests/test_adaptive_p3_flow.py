@@ -132,7 +132,9 @@ class JobView:
 
     def accounting(self):
         self._live()
-        return SimpleNamespace(active_processes=len(self.state.members))
+        return SimpleNamespace(active_processes=len(self.state.members),
+                               total_processes=self.state.total_processes,
+                               user_100ns=0, kernel_100ns=0, total_terminated_processes=0)
 
     def active_pids(self):
         self._live()
@@ -141,6 +143,16 @@ class JobView:
     @property
     def members(self):
         return self.state.members
+
+    @property
+    def total_processes(self):
+        return self.state.total_processes
+
+    @total_processes.setter
+    def total_processes(self, value):
+        # Lifetime accounting belongs to the Job, not to an opened handle.
+        # Removing/exiting a member or reopening a view cannot reset it.
+        self.state.total_processes = value
 
     def set_cpu(self, *args, **kwargs):
         raise AssertionError("no production path may tighten in P3")
@@ -205,7 +217,7 @@ class P3FlowTests(unittest.TestCase):
     def make_job(self, name, nonce, logon, *, access):
         self.native_probe()
         self.assertIs(access, JobAccess.OWNER)
-        self.kernel.jobs[name] = SimpleNamespace(nonce=nonce, logon=logon, members=[], flags=0,
+        self.kernel.jobs[name] = SimpleNamespace(nonce=nonce, logon=logon, members=[], total_processes=0, flags=0,
                                                  rate_bp=0, views=0, disables=[])
         view = JobView(self.kernel, name, "guardian")
         self.jobs.append(view)
@@ -229,6 +241,7 @@ class P3FlowTests(unittest.TestCase):
         self.simulate_wrapper_launch(case)
         self.bind(case)
         case.job.members.append(CHILD_PID)
+        case.job.total_processes += 1
         return case
 
     def attach(self):

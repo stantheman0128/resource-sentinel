@@ -72,6 +72,73 @@ Status: source integration contract, **not** capability evidence. No daily
 configuration, database, Scheduled Task, or native control was changed to prepare
 this document. The producer remains blocked at `require_continuous_admission()`.
 
+## Next source slice: one original S1 native scope
+
+The implementation coordinator approved the next bounded slice on 2026-09-22.
+It is one explicitly test-only S1 scope, not a production control permit or a
+general adapter for the old `S1Runtime`. Its original guardian owns the native
+Job and is the only CPU actuator. A separately created, authenticated test
+wrapper owns its original command launch; guardian, wrapper and started root
+identities remain distinct. No workload is relabeled as infrastructure.
+
+The slice requires these concrete pieces together before the S1 producer can
+use it:
+
+1. An original `DailyExperimentDemand` remains the sole real capacity source.
+   The native scope pins the same reservation, generation/source/config and
+   ledger file identity. The isolated test ledger contains native scope,
+   intent, slot and cleanup records; it does not admit a second reservation or
+   supply machine capacity measurements. An expired or uncertain daily lease
+   closes new work/control but retains the full floor and restore obligation.
+2. A bounded daily experiment-exclusion registry records exact test actors and
+   the original retained Job name/nonce. Registration and source-generation
+   readiness must reach the loaded daily legacy writer. Its actual POLICY
+   registry read merges those actors/Jobs and its actual native membership
+   query excludes all descendants. A registry row alone grants no native
+   custody. A test Job must be originally created and successfully registered
+   before any contained command can start; an uncertain registration prevents
+   launch and retains the original Job. Query-only handles belong to the
+   legacy writer; they never borrow ownership of the guardian's numeric handle.
+3. Restrictive operations explicitly acquire **daily POLICY → isolated POLICY
+   → exact Job mutex** at their outer entry. No SQLite transaction spans a
+   native wait, query, Set, another ledger, or an RPC. Existing
+   `S1ControlAuthority.authorize_control` runs too late to acquire daily POLICY
+   and is not an integration shortcut. The final grant read uses the actual
+   daily `ExistingPolicyStore` and adjacent daily `exemptions.sqlite3` under
+   the retained daily guard, which remains held through Set/query/settlement.
+4. A grant committed before Set rejects the restriction. A grant committed
+   after Set is observed by the actual owning guardian and withdraws the cap
+   from the entire original Job. Unknown applicable scope is conservative.
+   Public grant authorization, original deadlines and the three-lease cap stay
+   unchanged; `restore_pending` is not an OS acknowledgement. Neither polling
+   cadence nor portable tests establish the two-second recovery target.
+5. Restore of the original owned cap can run under isolated POLICY → Job when
+   daily readiness, grant reads or daily locking fail. Such a path permits no
+   new restriction or renewal. Lower capped usage never reduces daily demand.
+6. Cleanup produces a distinct, original retained native-registry completion
+   capability only after launch is sealed, the correct test terminal state is
+   known, caps are queried disabled, Job membership is empty and every original
+   actor/Job/transport/lock owner is positively settled. Uncertain creation,
+   Set, publication, cleanup or ACK retains those same originals. JSON,
+   callbacks, PID reopen, TTL, missing rows or closed handles cannot mint that
+   capability. Its eventual daily retirement transaction may truthfully cancel
+   the **never-exported, never-consumed daily launch claim**, while separately
+   recording the completed experiment obligation. Ordinary production C2 and
+   its `last_applied=None` invariant remain unchanged. The schema and retirement
+   inventory must be coordinated before adding any `RETIRED` state.
+
+The actual guardian/fixture bootstrap and canonical production imports are part
+of this provider's implementation, not an assumed wrapper callback. Its source
+closure must be explicitly pinned and reviewed. A distinct daily activation or
+readiness keeper is not the test caller or isolated supervisor merely because
+their metadata has a role label. Any later aggregate observer must retain the
+actual native keeper witness before fixture creation, authenticate the pinned
+generation/readiness endpoint, and charge that process separately unless exact
+native identity proves a legitimate cohosted role.
+
+This approved contract is implementation scope. It is not a measured native
+result and does not unlock `require_continuous_admission()` by itself.
+
 ## Two independent authorities
 
 The original daily accounting owner obtains all capacity from the actual daily

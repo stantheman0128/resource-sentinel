@@ -82,6 +82,16 @@ generation 的正面退場契約。新增測試將繼續使用隔離帳本；任
 日常 source activation 都需要獨立授權，不因 commit/push 自動執行。項目 6
 尚未完成的內容不能以 mock、空 provider、另外一個 DB 或假量測取代。
 
+同帳本 experiment demand 的新增契約已先以 `ed0c2cf` 提交；
+[generation 正面退場契約](DAILY-GENERATION-RETIREMENT.md)為 `b281fd3`。
+兩者都不是已完成 native bridge 的聲明。退場之後的明確 fresh-generation
+restart 仍是 source 缺口；不能把關閉 keeper 說成恢復 admission-only。
+
+另修正 source keeper 在 stdout 失效時略過等待、持續忙轉的問題：診斷與 pacing
+分開，保持同一原始 operation，固定每個錯誤邊界只保留第一個錯誤。
+`C:\Python313\python.exe -m unittest tests.test_adaptive_daily_source_install -q`
+通過 30 tests（3.928 秒，0 failures／errors／skips）；没有實際安裝或 runtime 操作。
+
 最新 C2 回歸命令如下。首次 232 tests 用時 154.333 秒，有 1 failure：fixture
 直接期待底層 `LifecycleError` 文字，但該例外沒有 `.reason`，既有 guardian
 故意回固定的 `guardian_retirement_cleanup_unverified`。只修正該預期，原 owner

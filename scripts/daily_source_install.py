@@ -417,14 +417,26 @@ class SourceInstallation:
         host.run_forever()
 
 
+def _source_custody_tick(operation):
+    """One retained iteration; broken diagnostics cannot skip pacing."""
+    try:
+        print(json.dumps({"event": "daily_source_custody_retained", "source_complete": operation.source_complete,
+                          "written_files": len(operation.written), "activation_complete": False}), flush=True)
+    except BaseException as error:
+        # These fixed diagnostic boundaries retain only their first failure.
+        # Repeated broken stdout must neither grow an error list nor spin.
+        if getattr(operation, "keeper_reporting_error", None) is None:
+            operation.keeper_reporting_error = error
+    try:
+        time.sleep(30)
+    except BaseException as error:
+        if getattr(operation, "keeper_pacing_error", None) is None:
+            operation.keeper_pacing_error = error
+
+
 def remain_with_source_custody(operation):
     """Report an unresolved source owner without silently discarding handles."""
     while True:
-        try:
-            print(json.dumps({"event": "daily_source_custody_retained", "source_complete": operation.source_complete,
-                              "written_files": len(operation.written), "activation_complete": False}), flush=True)
-            time.sleep(30)
-        except BaseException:
-            # Explicit operator recovery must reconcile the exact operation;
-            # Ctrl+C is not positive write/close acknowledgement.
-            continue
+        # Explicit operator recovery must reconcile the exact operation;
+        # Ctrl+C is not positive write/close acknowledgement.
+        _source_custody_tick(operation)

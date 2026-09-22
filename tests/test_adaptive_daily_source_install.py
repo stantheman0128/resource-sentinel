@@ -355,5 +355,35 @@ class DailySourceInstallTests(unittest.TestCase):
         self._assert_cli_source_interruption_custody(BrokenPipeError("synthetic lost stdout"))
 
 
+class SourceCustodyPacingTests(unittest.TestCase):
+    def test_repeated_broken_stdout_still_paces_and_retains_first_error(self):
+        witness = object()
+        operation = SimpleNamespace(source_complete=False, written=["owned.py"],
+                                    owners={"owned.py": witness}, errors=[])
+        failures = [BrokenPipeError("synthetic stdout closed") for _ in range(5)]
+        with patch("builtins.print", side_effect=failures), patch.object(install.time, "sleep") as pace:
+            for _ in failures:
+                install._source_custody_tick(operation)
+        self.assertEqual(pace.call_args_list, [unittest.mock.call(30)] * 5)
+        self.assertIs(operation.keeper_reporting_error, failures[0])
+        self.assertIs(operation.owners["owned.py"], witness)
+        self.assertEqual(operation.errors, [])
+        self.assertEqual(operation.written, ["owned.py"])
+        self.assertFalse(operation.source_complete)
+
+    def test_interrupted_pacing_retains_operation_and_next_tick_waits(self):
+        witness = object()
+        operation = SimpleNamespace(source_complete=True, written=[], owners={"source": witness})
+        interrupted = KeyboardInterrupt()
+        with patch("builtins.print"), \
+                patch.object(install.time, "sleep", side_effect=[interrupted, None]) as pace:
+            install._source_custody_tick(operation)
+            install._source_custody_tick(operation)
+        self.assertEqual(pace.call_args_list, [unittest.mock.call(30)] * 2)
+        self.assertIs(operation.keeper_pacing_error, interrupted)
+        self.assertIs(operation.owners["source"], witness)
+        self.assertFalse(hasattr(operation, "keeper_reporting_error"))
+
+
 if __name__ == "__main__":
     unittest.main()

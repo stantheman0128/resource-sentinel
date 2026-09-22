@@ -144,6 +144,31 @@ Raw provider 仍被阻擋；此修補不代表 A0 qualification 或 native P6 �
 C:\Python313\python.exe -m unittest tests.test_adaptive_runner tests.test_adaptive_orchestrator -q
 ```
 
+後續 retirement／policy／guardian／transport 整合跑了 **653 tests，92.604 秒，
+1 failure／26 errors**，尚未當成通過。問題包含 nonce fixture 缺少 singleton、
+prelaunch fixture 的 current-wrapper 身分範圍、renewal fixture 未走到預期分支、
+host telemetry fixture 缺少 emit，以及 Windows journal inventory 的真正相容性
+錯誤：`DirEntry.stat()` 在 Windows 的 device／inode／link count 為零，不能拿來
+通過檔案身分檢查。本機唯讀比對已確認 `os.stat(..., follow_symlinks=False)`
+提供真實值；[Python 官方契約](https://docs.python.org/3.13/library/os.html#os.DirEntry.stat)
+亦如此規定。修正將保留原本的檔案／reparse 安全檢查，不能接受零身分來換取通過。
+
+原始 nonblocking pipe／operator core 則已獨立驗證：**205 tests 通過，16.096 秒，
+0 failures／errors／skips**，已提交為 `c0d4edd`。範圍包含 pipe Windows／async、
+operator、control、launch 與 daily-readiness transports。Helper 的實際 poll／
+telemetry 收尾接線仍待同批驗證，不宣稱 native idle cost 已通過。完整私人 log 為
+`.local-adaptive/pipe-core-regression-1.log`；等價的直接命令如下：
+
+```text
+C:\Python313\python.exe -m unittest tests.test_adaptive_pipe_windows tests.test_adaptive_pipe_async tests.test_adaptive_operator_transport tests.test_adaptive_control_transport tests.test_adaptive_launch_transport tests.test_adaptive_daily_readiness_transport -q
+```
+
+另一個已確認的 source 整合問題仍待修正：remote daily readiness 在
+`prepare_connection()` 中發送 RPC，但某些呼叫位於 POLICY 之內，與禁止鎖內 IPC
+的契約衝突。需要在鎖外取得原始 authenticated readiness authority，再於鎖內
+做 exact generation／ledger／native witness 核對；不能以 boolean、另外的 DB
+或任意快取取代。這是 source 缺口，不是必須等 Windows 實驗才知道的限制。
+
 另修正 source keeper 在 stdout 失效時略過等待、持續忙轉的問題：診斷與 pacing
 分開，保持同一原始 operation，固定每個錯誤邊界只保留第一個錯誤。
 `C:\Python313\python.exe -m unittest tests.test_adaptive_daily_source_install -q`

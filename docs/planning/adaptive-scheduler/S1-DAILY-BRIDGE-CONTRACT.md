@@ -1,5 +1,46 @@
 # S1 native producer: daily accounting bridge
 
+## Approved implementation deviation: explicit test demand lifetime
+
+The implementation coordinator accepted an explicit, narrowly test-only
+`DailyExperimentDemand` contract on 2026-09-22. It references the **same actual
+daily reservations row** and adds lifecycle metadata; it does not create a third
+capacity reservation store. This uses the allowance for additive lifecycle
+metadata in formal plan §7.2 and preserves the floors required by §§7.1 and 7.4.
+It is test-verification integration, not runtime deployment or promotion.
+
+This is an explicit addition to the formal plan's test plumbing. Two existing
+paths cannot supply it unchanged. A normal daily native umbrella Job places the
+spike host under a parent Job, contradicting S1's unrestricted-host preflight.
+An unnamed ManagedAdmission kept RESERVED does retain demand, but its replay
+never renews a lease; TTL changes it to UNCERTAIN_HOLD. Existing cancel_reserved
+permits only a genuinely unused launch with no Job, guardian, workload or
+handoff. It cannot silently become an isolated-work completion API.
+
+The new metadata must distinguish the unused daily launch credential from the
+isolated experiment that actually executes. Atomic admission and every retry
+bind the original native caller, source generation, actual ledger identity,
+reservation, declared demand, experiment identity and immutable isolated-scope
+description. It must not mint a second request after lost acknowledgement.
+Grace, TTL, wrapper death and missing responses retain the global demand floor.
+No API exports the daily launch credential for isolated execution.
+
+The first implementation slice is exact atomic admission metadata and its
+retained original operation. Subsequent native binding must retain the original
+sealed creation registry for **all** test infrastructure and workloads before
+side effects, plus original handles/transport operations after uncertainty.
+Retirement requires the genuine original completion capability: caps disabled,
+children empty, correct isolated terminal proof, native owner cleanup and fence
+cleanup. Serialized records, callback booleans or historical receipts alone
+cannot mint it. An expiry-only hold may be retired only by that new exact proof
+path; it must not reset RESERVED, extend the elapsed lease, fake FINISHED, or
+weaken the existing production C2 requirement last_applied=None.
+
+Ordinary admission and production CPU authority remain unchanged. The provider
+continues refusing native experiments until the entire lifetime, loaded-writer
+exclusion and cleanup bridge is wired and verified. Root owns integration of
+shared Coordinator/lifecycle/operator hunks and all test execution.
+
 Status: source integration contract, **not** capability evidence. No daily
 configuration, database, Scheduled Task, or native control was changed to prepare
 this document. The producer remains blocked at `require_continuous_admission()`.

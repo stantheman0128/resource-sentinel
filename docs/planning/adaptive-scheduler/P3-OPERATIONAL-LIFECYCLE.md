@@ -184,6 +184,38 @@ Do not erase recovery manifests, retirement receipts or history to make drain
 appear complete. Contradictory retained native observations override a proposed
 ledger-only success and preserve recovery HOLD.
 
+### 4.1 C2 post-close custody receipt
+
+`CANCELLED_BEFORE_START` and `START_FAILED` retain their original C2 terminal
+states. Their existing `adaptive_prelaunch_retirements` receipt proves sealed
+never-created or never-associated retirement and exact capacity archival; it
+does not prove that the original guardian's native handles subsequently closed.
+
+The original live guardian captures a separate retained receipt operation after
+the C2 proof scope exits successfully and before the first handle close. It pins
+the exact pending entry, original wrapper/Job/mutex objects, terminal row,
+manifest and policy binding. After eligible cleanup positively completes, its
+own retained POLICY operation acquires the publication fence. Publication
+retries use that same guard and original owners, without reacquiring or querying
+a possibly closed Job or Job mutex. Unknown close, guard or connection outcomes
+retain custody.
+
+Publish `adaptive_prelaunch_custody_receipts` only after every actually retained
+wrapper/Job/mutex owner positively closed. A never-created Job is recorded as
+never-created, not as a closed handle. Both C2 kinds have no workload root;
+`root_disposition=never-created` must follow the existing C2 proof, never a
+fabricated closed-root entry. Bind the exact C2 receipt, full terminal-row hash,
+archive hash, manifest hash/sequence, original guardian/epoch, Job nonce and
+policy instance/logon. Preserve `last_applied=None` and all C2 zero-lifetime
+requirements. This receipt grants no launch, native restore or capacity release.
+
+Remove the pending owner only after receipt commit, acknowledgement and POLICY
+cleanup complete. A lost commit acknowledgement reconciles the immutable body
+through the original operation. Historical audit dispatches by actual terminal
+state: FINISHED keeps its existing custody proof; C2 requires this post-close
+receipt plus its unchanged C2 retirement/archive/manifest proof. Missing or
+conflicting evidence remains unknown, including when no live owner remains.
+
 ## 5. Live discovery is a locator protocol
 
 The namespace is `<explicit-data-dir>/adaptive-host/`, using the project's

@@ -70,17 +70,35 @@ loader error 或未跑的 native gate 算成 pass。
 | 1. 裁決 ② | 契約與 source 完成；完整 2,007 tests，最後 cleanup 修正後 102 tests 通過。 |
 | 2. 裁決 ④ | 契約與 source 完成；最後完整 adaptive 2,127 tests 通過。沒有舊 witness 的 cold adoption 仍不支援；native recovery 未驗證。 |
 | 3. helper sender | Source 接線、獨立 review 與完整 2,298 tests 通過。後續 original launch/stdio provenance、guardian scope 比對與 helper proposal adapter 已接線，344 targeted tests 通過（30.960 秒，含 30 個專用 scope tests）。實際 S2 topology producer／native bundle／新增採集成本仍未驗證，缺證據不啟用控制。 |
-| 4. release／CLI | Source 整合與完整 2,800 tests 通過；包含 exact discovery、typed operator transport、原子 off／audit、同 owner 收尾與三個 host 的 drain。Native 操作通訊、控制及恢復仍未驗證。 |
-| 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport 前置模組](P2-DAILY-ACTIVATION.md)已作為獨立 foundation 提交，通過 130 portable tests（5.026 秒）；既有 writer 接線、常駐 generation owner、真正 lifetime provider 與明確 source activation 仍待完成。日常 grace 前提未解鎖。 |
-| 6. console 驗收命令 | [P6 schedule／fixture／analyzer foundation](P6-RUNNER-CONTRACT.md)已獨立提交，與 P4 portable 模組合跑 184 tests 通過（0.610 秒）；S1/S2 producer、S3 real-host foundation、P4 cost 仍有本機候選程式。整體 orchestration、部分 fault cases、完整成本／A/B coverage 尚缺，不是只剩 console 執行。 |
+| 4. release／CLI | Source 整合與完整 2,800 tests 通過；包含 exact discovery、typed operator transport、原子 off／audit、同 owner 收尾與三個 host 的 drain。後續 rootless C2 post-close receipt 已補上，保持原 terminal state，不偽造 FINISHED；新增 29 個案例。232 targeted tests 中 231 通過，唯一錯誤文字預期修正後單獨重跑通過，production 未因該失敗改動。沒有原始 close 證據的舊歷史仍 unknown。Native 操作通訊、控制及恢復仍未驗證。 |
+| 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport 與接線](P2-DAILY-ACTIVATION.md)已完成 source installer、原始 owner 常駐 host，以及 Coordinator／Maintainer／lifecycle／legacy writer 接線。252 個 portable tests 與 27 個 S2 tests 合跑全過（279，10.587 秒）。真正 experiment lifetime provider、generation 正式退場及 native source handoff 仍缺；日常 grace 前提未解鎖，未執行安裝。 |
+| 6. console 驗收命令 | [P6 schedule／fixture／analyzer foundation](P6-RUNNER-CONTRACT.md)已提交，與 P4 portable 模組合跑 184 tests 通過（0.610 秒）；[S1/S2 與 ledger bridge 契約](S1-DAILY-BRIDGE-CONTRACT.md)、[S3 foundation](S3-REAL-HOST-RECOVERY.md)、[P4 cost engine](P4-OVERHEAD-RUNNER.md)另有 161 tests 通過（41.676 秒）。S2 隨後補強原 shell／console cleanup custody，27 tests 在上述 279 合跑中通過。這些 foundation 分包提交；真正 daily bridge、完整 orchestration、部分 fault cases、完整成本／A/B coverage 尚缺，不是只剩 console 執行。 |
 
 以上是目前缺口；下列較早日期的段落保留其歷史測試範圍。Native S1–S3、完整
 P3–P6 都尚未通過。日常 config／Scheduled Task／啟動入口未修改。
 
-下一步是項目 5 的 actual writer／generation owner 接線，以及同一日常帳本的
-native evidence fixture 全程容量覆蓋。新增測試將繼續使用隔離帳本；任何實際
+下一步是項目 5 同一日常帳本的 native evidence fixture 全程容量覆蓋，以及
+generation 的正面退場契約。新增測試將繼續使用隔離帳本；任何實際
 日常 source activation 都需要獨立授權，不因 commit/push 自動執行。項目 6
 尚未完成的內容不能以 mock、空 provider、另外一個 DB 或假量測取代。
+
+最新 C2 回歸命令如下。首次 232 tests 用時 154.333 秒，有 1 failure：fixture
+直接期待底層 `LifecycleError` 文字，但該例外沒有 `.reason`，既有 guardian
+故意回固定的 `guardian_retirement_cleanup_unverified`。只修正該預期，原 owner
+保留與零 native close 斷言完整保留；該案例重跑通過（0.724 秒）。
+
+```text
+C:\Python313\python.exe -m unittest tests.test_adaptive_prelaunch_receipt tests.test_adaptive_guardian_retirement tests.test_adaptive_host_operations tests.test_adaptive_prelaunch_retirement_store tests.test_adaptive_terminal_receipt tests.test_adaptive_guardian_host tests.test_adaptive_supervisor_epoch tests.test_adaptive_supervisor_reconcile -q
+C:\Python313\python.exe -m unittest tests.test_adaptive_guardian_retirement.GuardianRetirementTests.test_receipt_capture_failure_never_starts_native_cleanup -q
+```
+
+日常接線首次 252 tests 有 9 errors，全部是 activation-host 的 cohort Mock
+缺少明確 `assert_retired` 介面；修正兩個 fixture，未放寬 production 檢查。
+以下 279 tests 全過（10.587 秒，0 failures／errors／skips）：
+
+```text
+C:\Python313\python.exe -m unittest tests.test_adaptive_daily_generation tests.test_adaptive_daily_prerequisites tests.test_adaptive_daily_cohort tests.test_adaptive_daily_bootstrap tests.test_adaptive_daily_readiness_transport tests.test_adaptive_daily_connection_hooks tests.test_adaptive_daily_source_handles tests.test_adaptive_daily_source_install tests.test_adaptive_daily_activation_host tests.test_adaptive_launch_producer -q
+```
 
 項目 5 foundation 的檢驗命令（同樣透過日常 wrapper、隔離 fixture）為：
 

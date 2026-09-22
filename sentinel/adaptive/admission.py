@@ -126,6 +126,8 @@ class ManagedAdmission:
         A RESERVED row after this point cannot authorize local abandonment.
         """
         with self._lock:
+            if getattr(self, "_experiment_demand", None) is not None:
+                raise ManagedAdmissionUnavailable("experiment_launch_credential_not_exportable")
             self.snapshot()
             self._require_unsealed()
             self._require_settled_submission()
@@ -312,6 +314,8 @@ class ManagedAdmission:
         authority, even if the receiving component does not actually launch.
         """
         with self._lock:
+            if getattr(self, "_experiment_demand", None) is not None:
+                raise ManagedAdmissionUnavailable("experiment_launch_credential_not_exportable")
             self.snapshot()
             self._require_unsealed()
             self._require_settled_submission()
@@ -331,6 +335,8 @@ class ManagedAdmission:
         consumes cancellation authority, so terminal readback remains possible.
         """
         with self._lock:
+            if getattr(self, "_experiment_demand", None) is not None:
+                raise ManagedAdmissionUnavailable("experiment_launch_credential_not_exportable")
             snapshot = self.snapshot()
             if type(transcript) is not bytes or not 1 <= len(transcript) <= MAX_MESSAGE_BYTES:
                 raise ManagedAdmissionUnavailable("invalid_ipc_transcript")
@@ -348,6 +354,8 @@ class ManagedAdmission:
         Raw payload text remains a call-local value and is never saved here.
         """
         with self._lock:
+            if getattr(self, "_experiment_demand", None) is not None:
+                raise ManagedAdmissionUnavailable("experiment_launch_credential_not_exportable")
             snapshot = self.snapshot()
             self._require_unsealed()
             try:
@@ -428,6 +436,9 @@ class ManagedAdmission:
         SQLite writer lock, and all DB binding is rechecked by the store there.
         """
         from .store import LifecycleEvidence, LifecycleStore, prelaunch_record_hash
+
+        if getattr(self, "_experiment_demand", None) is not None:
+            raise ManagedAdmissionUnavailable("experiment_native_cleanup_unverified")
 
         if (not isinstance(reservation_id, str) or not 1 <= len(reservation_id) <= 128 or
                 type(expected_revision) is not int or expected_revision < 0):
@@ -523,6 +534,8 @@ class ManagedAdmission:
                                              expected_revision=expected_revision, now=now)
 
     def close(self):
+        if getattr(self, "_experiment_demand", None) is not None:
+            raise ManagedAdmissionUnavailable("experiment_native_cleanup_unverified")
         with self._lock:
             if not self._closed:
                 self._closed = True

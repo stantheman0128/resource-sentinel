@@ -41,6 +41,33 @@ continues refusing native experiments until the entire lifetime, loaded-writer
 exclusion and cleanup bridge is wired and verified. Root owns integration of
 shared Coordinator/lifecycle/operator hunks and all test execution.
 
+The first source slice uses `DailyExperimentDemand.capture(declaration,
+isolated_directory)` and `Coordinator.admit_experiment(original_owner)`.
+Capture does not admit or launch work. Admission reads the canonical daily
+`config.json` and `status.json`; the public experiment route accepts no caller
+status, configuration override, clock, alternate ledger, or readiness callback.
+The exact current generation must positively prove readiness before the shared
+capacity transaction. SQLite publication creates the ordinary managed reservation
+and the immutable `adaptive_experiment_demands` binding atomically. This metadata
+has only `ADMITTED` revision zero in this slice; every row blocks retirement.
+Its canonical table and trigger definitions are checked even when it is empty.
+
+The durable triggers retain the reservation and its identity/resources and
+forbid consuming the unused daily claim. Normal TTL cleanup may still change
+`RESERVED` to `UNCERTAIN_HOLD`; it cannot lower requested or allocated floors,
+associate a Job/root, terminalize the row, or delete demand. Lost commit ACK
+keeps the same original managed owner and POLICY operation for exact readback
+and settlement. Failed readiness or uncertain connection/native cleanup
+quarantines the original objects; retry cannot replace them. Only an owner
+that never submitted demand and has positively settled preparation can close
+its unused native caller. There is no admitted-demand release API yet.
+
+These source APIs remain unusable as a native experiment provider until the
+creation/exclusion/exemption/floor-growth/cleanup bridge is complete. The
+`require_native_scope()` refusal is deliberate; admission alone is not launch
+or CPU control authority. The portable fixture tests model generation readiness
+explicitly and cannot establish an activated daily generation or a native gate.
+
 Status: source integration contract, **not** capability evidence. No daily
 configuration, database, Scheduled Task, or native control was changed to prepare
 this document. The producer remains blocked at `require_continuous_admission()`.
@@ -128,6 +155,7 @@ empty or capacity released. Unknown close results retain quarantined owners.
 | --- | --- | --- |
 | Original S1 scope | S1ExecutionOwner uses Test.Job, TestRecoveryJournal and the same caller for wrapper/guardian. | Separate authenticated guardian-owned fixture path; preserve identity invariants. |
 | Daily source readiness | Native source-generation readiness exists, without an enrolled S1 guardian/admission owner. | Assemble actual retained daily accounting and legacy-exclusion owners; no readiness boolean unlock. |
+| Native runner imports | Current runners under the implementation worktree put that worktree on `sys.path`; daily activation attests canonical production modules and does not copy `tests`. | Add a narrowly reviewed, pinned fixture-package/bootstrap source closure that imports canonical production code. Never copy the whole test tree or claim the current worktree command proves activated daily consumption. Keep A0 baseline source separately pinned and disclose any changed outer accounting behavior. |
 | Lifetime bridge | S1Runtime submits directly to one Coordinator/lifecycle store; no original owner spans daily demand and isolated cleanup. | Implement the ordered dual-authority bridge, including crash/lost-ACK retention and exactly-once daily release. |
 | Daily off | control_slot.begin_locked accepts only canary/limited. | Test mode/control state stays isolated. Preserve daily mode check and C2 invariants. |
 | Legacy exclusion | Daily HostAuthority.assert_excluded requires a canonical scope in its own registry; isolated test rows are not there. | Establish an authenticated exact test-scope handoff recognized by loaded daily writers. Expected rejection and source hashes alone prove no exclusion. |

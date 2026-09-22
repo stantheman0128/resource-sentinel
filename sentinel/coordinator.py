@@ -242,10 +242,21 @@ class Coordinator:
     @contextmanager
     def _db(self):
         conn = self._connect()
+        primary = None
         try:
             yield conn
+        except BaseException as error:
+            primary = error
+            raise
         finally:
-            conn.close()
+            try:
+                conn.close()
+            except BaseException as error:
+                target = error if primary is None else primary
+                target._sentinel_connection_cleanup = conn
+                if primary is None:
+                    raise
+                primary.add_note("coordinator_connection_cleanup_failed")
 
     def _managed_lifecycle_store(self):
         # Legacy admission does not initialize or acquire a native policy
@@ -637,10 +648,32 @@ class Coordinator:
         from sentinel.adaptive.admission import ManagedAdmission
         if type(context) is not ManagedAdmission:
             raise TypeError("managed_admission_context_required")
+        if getattr(context, "_experiment_demand", None) is not None:
+            raise TypeError("experiment_original_admission_route_required")
         with context.submission_scope():
             snapshot = context.snapshot()
             return self._admit(snapshot.request, status, config=config, now=now,
                                managed=snapshot, managed_context=context)
+
+    def admit_experiment(self, owner):
+        """Admit one original test demand through the actual daily provider.
+
+        This grants capacity only. The isolated native scope still needs its
+        separate original creation and cleanup authority before any work.
+        """
+        from sentinel.adaptive.experiment_demand import DailyExperimentDemand
+        if type(owner) is not DailyExperimentDemand:
+            raise TypeError("experiment_original_owner_required")
+        with owner._lock:
+            try:
+                context, status, config = owner._prepare_submission(self)
+                with context.submission_scope():
+                    snapshot = context.snapshot()
+                    return self._admit(snapshot.request, status, config=config,
+                        managed=snapshot, managed_context=context, experiment_context=owner)
+            except BaseException as error:
+                owner._retain_submission_error(error)
+                raise
 
     @staticmethod
     def _managed_context_snapshot(context, db_path, *, pin=False):
@@ -757,6 +790,8 @@ class Coordinator:
         from sentinel.adaptive.admission import ManagedAdmission, ManagedAdmissionUnavailable
         if type(context) is not ManagedAdmission:
             raise TypeError("managed_admission_context_required")
+        if getattr(context, "_experiment_demand", None) is not None:
+            raise ManagedAdmissionUnavailable("experiment_native_cleanup_unverified")
         if (reservation_id is None) != (expected_revision is None):
             raise ManagedAdmissionUnavailable("exact_reserved_cancel_arguments_required")
         if now is not None and (type(now) not in {int, float} or not math.isfinite(now)):
@@ -880,7 +915,16 @@ class Coordinator:
         now: float | None = None,
         managed=None,
         managed_context=None,
+        experiment_context=None,
     ) -> dict[str, Any]:
+        if getattr(managed_context, "_experiment_demand", None) is not experiment_context:
+            raise TypeError("experiment_original_admission_route_required")
+        if experiment_context is not None:
+            from sentinel.adaptive.experiment_demand import DailyExperimentDemand
+            if (type(experiment_context) is not DailyExperimentDemand or
+                    experiment_context._admission is not managed_context or
+                    experiment_context._snapshot is not managed):
+                raise TypeError("experiment_original_owner_required")
         req = request.normalized()
         cfg = self._config(config, local_host_id=self.local_host_id)
         now = time.time() if now is None else now
@@ -902,11 +946,15 @@ class Coordinator:
             pass  # unreadable exemption state never grants a bypass
         result: dict[str, Any]
         with self._admission_db(managed, managed_context) as (conn, policy, first_submission, transaction):
+            from sentinel.adaptive.daily_retirement_fence import assert_new_capacity_allowed
+            assert_new_capacity_allowed(conn)
             self._cleanup_locked(conn, now, cfg, observations)
             legacy_blocker = legacy_lifecycle_blocker(conn) if not v2 else None
             if managed is not None:
                 replay = retry_managed_admission(conn, managed, local_context=cfg)
                 if replay is not None:
+                    if experiment_context is not None:
+                        replay = experiment_context.publish_locked(conn, managed, policy, replay, replay=True)
                     self._commit_admission(conn, transaction)
                     return replay
             queued_existing = conn.execute("SELECT * FROM queue WHERE request_key=?", (req.request_key,)).fetchone()
@@ -1053,6 +1101,11 @@ class Coordinator:
             if exemption and not legacy_blocker and (not v2 or not details):
                 allowed = True
 
+            if experiment_context is not None:
+                experiment_blocker = experiment_context.admission_blocker_locked(conn, managed, policy)
+                if experiment_blocker is not None:
+                    allowed, reason = False, experiment_blocker
+
             if allowed:
                 lease_duration, lease_deadline = reservation_lease(cfg["reservation_ttl_min"], now)
                 reservation_id = uuid.uuid4().hex
@@ -1077,6 +1130,8 @@ class Coordinator:
                 result = {"allowed": True, "reservation_id": reservation_id, "reused": False, "request_key": req.request_key}
                 if managed is not None:
                     result = commit_managed_admission(conn, managed, reservation_id, now=now, local_context=cfg, policy_coordinator=policy)
+                    if experiment_context is not None:
+                        result = experiment_context.publish_locked(conn, managed, policy, result, replay=False)
                 if exemption:
                     result.update(reason="user_exemption", exemption_id=exemption["id"], exemption_expires_at=exemption["expires_at"])
             else:
@@ -1100,6 +1155,8 @@ class Coordinator:
         if row is None:
             with self._db() as conn:
                 conn.execute("BEGIN IMMEDIATE")
+                from sentinel.adaptive.daily_retirement_fence import assert_new_capacity_allowed
+                assert_new_capacity_allowed(conn)
                 active = conn.execute("SELECT id FROM reservations WHERE request_key=?", (request_key,)).fetchone()
                 bound = bool(active and allocation_is_bound(conn, "direct", active["id"]))
                 legacy_blocker = (legacy_lifecycle_blocker(conn)
@@ -1127,6 +1184,8 @@ class Coordinator:
         if result.get("allowed"):
             with self._db() as conn:
                 conn.execute("BEGIN IMMEDIATE")
+                from sentinel.adaptive.daily_retirement_fence import assert_new_capacity_allowed
+                assert_new_capacity_allowed(conn)
                 legacy_blocker = (legacy_lifecycle_blocker(conn)
                                   if (config or {}).get("admission_policy") != "resource-v2" else None)
                 if allocation_is_bound(conn, "direct", result["reservation_id"]):

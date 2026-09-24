@@ -27,6 +27,9 @@ import uuid
 
 OPT_IN = "SENTINEL_ADAPTIVE_WINDOWS_SPIKES"
 MAX_NS = 115_000_000_000
+MAX_SCOPE_NS = 120_000_000_000
+COOPERATIVE_GRACE_NS = 4_000_000_000
+MAX_TIMING_BYTES = 4096
 NONCE = re.compile(r"[0-9a-f]{32}\Z")
 HASH = re.compile(r"[0-9a-f]{64}\Z")
 JOB_PREFIX = "Local\\ResourceSentinel.Test.Job."
@@ -81,6 +84,8 @@ def parser():
     result.add_argument("--seconds", type=float, default=115)
     result.add_argument("--workers", type=int, default=1)
     result.add_argument("--leaf", action="store_true")
+    result.add_argument("--scope-id")
+    result.add_argument("--scope-bound-stdin", action="store_true")
     result.add_argument("--deadline-monotonic-ns", type=int)
     result.add_argument("--probe-foreign-host", action="store_true")
     return result
@@ -100,21 +105,83 @@ def validate(args, started_ns):
         raise FixtureError("fixture_duration_invalid")
     if type(args.workers) is not int or not 1 <= args.workers <= 64:
         raise FixtureError("fixture_workers_invalid")
-    if args.leaf and (args.workers != 1 or args.deadline_monotonic_ns is None or args.probe_foreign_host):
-        raise FixtureError("fixture_leaf_invalid")
+    if args.scope_id is not None:
+        canonical_uuid(args.scope_id)
+    if args.leaf:
+        if (args.workers != 1 or args.deadline_monotonic_ns is None or
+                args.probe_foreign_host or args.scope_bound_stdin):
+            raise FixtureError("fixture_leaf_invalid")
+    elif (not args.scope_bound_stdin or args.scope_id is None or
+          args.deadline_monotonic_ns is not None):
+        raise FixtureError("fixture_scope_timing_required")
     if args.probe_foreign_host and args.workers != 1:
         raise FixtureError("fixture_probe_must_not_spawn")
     deadline = started_ns + int(args.seconds * 1_000_000_000)
     if args.deadline_monotonic_ns is not None:
         supplied = args.deadline_monotonic_ns
-        if type(supplied) is not int or not 0 < supplied - started_ns <= MAX_NS:
+        if (type(supplied) is not int or
+                not 0 < supplied - started_ns <= int(args.seconds * 1_000_000_000)):
             raise FixtureError("fixture_deadline_invalid")
-        deadline = min(deadline, supplied)
+        deadline = supplied  # Leaves preserve the exact original tree cutoff.
     directory = safe_path(args.directory, directory=True)
     production = (Path.home() / ".resource-sentinel").resolve()
     if directory == production or production in directory.parents:
         raise FixtureError("fixture_directory_must_be_isolated")
     return directory, deadline
+
+
+def read_scope_timing(args, started_ns, *, fd=0):
+    """Read restrictive timing from original inherited regular stdin, never authority."""
+    if args.leaf or not args.scope_bound_stdin or args.scope_id is None:
+        raise FixtureError("fixture_scope_timing_required")
+    if type(started_ns) is not int or started_ns <= 0:
+        raise FixtureError("fixture_deadline_invalid")
+    before = os.fstat(fd)
+    if (not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= MAX_TIMING_BYTES):
+        raise FixtureError("fixture_timing_input_invalid")
+    if os.lseek(fd, 0, os.SEEK_CUR) != 0:
+        raise FixtureError("fixture_timing_input_invalid")
+    # No pipe/console read and no read-until-close loop. This descriptor remains
+    # the process's original stdio; do not duplicate, reopen or close it here.
+    raw = os.read(fd, MAX_TIMING_BYTES + 1)
+    extra = os.read(fd, 1)
+    after = os.fstat(fd)
+    fields = ("st_mode", "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if (any(getattr(before, name) != getattr(after, name) for name in fields) or
+            len(raw) != before.st_size or extra or os.lseek(fd, 0, os.SEEK_CUR) != len(raw)):
+        raise FixtureError("fixture_timing_input_changed")
+
+    def unique(items):
+        value = {}
+        for key, item in items:
+            if key in value:
+                raise FixtureError("fixture_timing_duplicate_key")
+            value[key] = item
+        return value
+
+    try:
+        text = raw.decode("utf-8")
+        if text != text.strip():
+            raise FixtureError("fixture_timing_json_invalid")
+        value = json.loads(text, object_pairs_hook=unique,
+            parse_constant=lambda _: (_ for _ in ()).throw(FixtureError("fixture_timing_json_invalid")))
+    except (UnicodeError, ValueError):
+        raise FixtureError("fixture_timing_json_invalid") from None
+    expected = dict(schema_version=1, kind="S1ScopeTiming", scope_id=args.scope_id,
+        job_nonce=args.nonce, source_generation=args.source_generation,
+        source_digest=args.source_digest, fixture_sha256=args.fixture_sha256)
+    if (type(value) is not dict or set(value) != {*expected, "scope_deadline_monotonic_ns"} or
+            any(type(value[key]) is not type(item) or value[key] != item for key, item in expected.items())):
+        raise FixtureError("fixture_timing_binding_changed")
+    scope_deadline = value["scope_deadline_monotonic_ns"]
+    if type(scope_deadline) is not int or not 0 < scope_deadline - started_ns <= MAX_SCOPE_NS:
+        raise FixtureError("fixture_deadline_invalid")
+    deadline = min(started_ns + int(args.seconds * 1_000_000_000),
+                   scope_deadline - COOPERATIVE_GRACE_NS)
+    observed_ns = time.monotonic_ns()
+    if observed_ns < started_ns or observed_ns >= deadline:
+        raise FixtureError("fixture_deadline_expired")
+    return deadline
 
 
 def bootstrap(args):
@@ -167,12 +234,15 @@ def child_command(args, deadline):
     executable = safe_path(Path(getattr(sys, "_base_executable", None) or sys.executable))
     if executable != Path(sys.executable).resolve(strict=True) or executable.name.lower() in {"py.exe", "pyw.exe"}:
         raise FixtureError("fixture_direct_base_python_required")
-    return [str(executable), "-I", str(Path(__file__).resolve(strict=True)),
+    command = [str(executable), "-I", str(Path(__file__).resolve(strict=True)),
             "--canonical-root", str(args.canonical_root), "--source-generation", args.source_generation,
             "--source-digest", args.source_digest, "--fixture-sha256", args.fixture_sha256,
             "--nonce", args.nonce, "--job-name", args.job_name, "--directory", str(args.directory),
             "--seconds", str(args.seconds), "--workers", "1", "--leaf",
             "--deadline-monotonic-ns", str(deadline)]
+    if args.scope_id is not None:
+        command.extend(("--scope-id", args.scope_id))
+    return command
 
 
 class NativeChildren:
@@ -353,6 +423,8 @@ def verify_ready(record, *, identity, args, deadline):
                 "source_generation": args.source_generation, "source_digest": args.source_digest,
                 "fixture_sha256": args.fixture_sha256, "deadline_monotonic_ns": deadline,
                 "in_expected_job": True, "role": "leaf", "status": "ready", "schema_version": 1}
+    if args.scope_id is not None:
+        expected["scope_id"] = args.scope_id
     if not isinstance(record, dict) or any(type(record.get(key)) is not type(value) or record.get(key) != value
                                           for key, value in expected.items()):
         raise FixtureError("fixture_child_ready_mismatch")
@@ -390,6 +462,8 @@ def run(args, directory, deadline, modules):
                   "fixture_sha256": args.fixture_sha256, "deadline_monotonic_ns": deadline,
                   "deadline_monotonic": deadline / 1_000_000_000,
                   "maximum_cpu_work_seconds": args.seconds, "cooperative_cleanup_grace_seconds": 4}
+        if args.scope_id is not None:
+            record["scope_id"] = args.scope_id
         owner.record = record
         if args.probe_foreign_host:
             try:
@@ -440,7 +514,7 @@ def run(args, directory, deadline, modules):
             except BaseException as error:
                 owner.errors.append(error)
                 primary = primary or error
-        until = deadline + 4_000_000_000
+        until = deadline + COOPERATIVE_GRACE_NS
         while not owner.settle() and not owner.quarantined and time.monotonic_ns() < until:
             time.sleep(.01)
         if owner in _RETAINED:
@@ -457,7 +531,11 @@ def main(argv=None):
     started = time.monotonic_ns()
     args = parser().parse_args(argv)
     directory, deadline = validate(args, started)
+    if not args.leaf:
+        deadline = read_scope_timing(args, started)
     modules = bootstrap(args)
+    if time.monotonic_ns() >= deadline:
+        raise FixtureError("fixture_deadline_expired")
     try:
         return run(args, directory, deadline, modules)
     except RetainedOwnerError as error:

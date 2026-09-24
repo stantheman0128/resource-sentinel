@@ -3,6 +3,9 @@ from pathlib import Path
 from contextlib import ExitStack
 import ctypes
 import hashlib
+import json
+import os
+import stat
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -12,6 +15,7 @@ from tests.fixtures import adaptive_scope_cpu_worker as worker
 
 
 GENERATION = "12345678-1234-4234-9234-123456789abc"
+SCOPE_ID = "22345678-1234-4234-9234-123456789abc"
 NONCE = "a" * 32
 NOW = 100_000_000_000
 IDENTITY = {"pid": 1234, "created_filetime_100ns": "130000000000000001", "logon_id": "S-1-5-5-123-456"}
@@ -26,7 +30,8 @@ class WorkloadTests(unittest.TestCase):
             "--canonical-root", str(self.directory), "--source-generation", GENERATION,
             "--source-digest", "b" * 64, "--fixture-sha256", "c" * 64,
             "--nonce", NONCE, "--job-name", worker.JOB_PREFIX + NONCE,
-            "--directory", str(self.directory), "--seconds", "10"])
+            "--directory", str(self.directory), "--seconds", "10",
+            "--scope-id", SCOPE_ID, "--scope-bound-stdin"])
         self.owners = []
         self.addCleanup(self.clear_owners)
 
@@ -56,6 +61,7 @@ class WorkloadTests(unittest.TestCase):
 
     def ready(self):
         return {"identity": dict(IDENTITY), "nonce": NONCE, "job_name": worker.JOB_PREFIX + NONCE,
+                "scope_id": SCOPE_ID,
                 "source_generation": GENERATION, "source_digest": "b" * 64, "fixture_sha256": "c" * 64,
                 "deadline_monotonic_ns": NOW + 10_000_000_000, "in_expected_job": True,
                 "role": "leaf", "status": "ready", "schema_version": 1}
@@ -65,6 +71,7 @@ class WorkloadTests(unittest.TestCase):
 
     def test_shared_deadline_is_never_extended_by_child(self):
         self.args.leaf, self.args.deadline_monotonic_ns = True, NOW + 5_000_000_000
+        self.args.scope_bound_stdin = False
         self.assertEqual(worker.validate(self.args, NOW)[1], NOW + 5_000_000_000)
         self.assertEqual(worker.validate(self.args, NOW + 1_000_000_000)[1], NOW + 5_000_000_000)
 
@@ -104,6 +111,7 @@ class WorkloadTests(unittest.TestCase):
 
     def test_leaf_requires_original_deadline_and_cannot_spawn(self):
         self.args.leaf = True
+        self.args.scope_bound_stdin = False
         with self.assertRaisesRegex(worker.FixtureError, "fixture_leaf_invalid"):
             worker.validate(self.args, NOW)
         self.args.deadline_monotonic_ns = NOW + 5_000_000_000
@@ -112,6 +120,7 @@ class WorkloadTests(unittest.TestCase):
             worker.validate(self.args, NOW)
 
     def test_expired_and_overlong_deadlines_refused(self):
+        self.args.leaf, self.args.scope_bound_stdin = True, False
         for deadline in (NOW, NOW - 1, NOW + worker.MAX_NS + 1, True):
             self.args.deadline_monotonic_ns = deadline
             with self.subTest(deadline=deadline), self.assertRaisesRegex(worker.FixtureError, "fixture_deadline_invalid"):
@@ -138,7 +147,246 @@ class WorkloadTests(unittest.TestCase):
             self.assertEqual(getattr(leaf, name), getattr(self.args, name))
         self.assertEqual(leaf.deadline_monotonic_ns, NOW + 5_000_000_000)
         self.assertTrue(leaf.leaf)
+        self.assertEqual(leaf.scope_id, SCOPE_ID)
+        self.assertFalse(leaf.scope_bound_stdin)
         self.assertEqual(leaf.workers, 1)
+
+    def timing_record(self, **changes):
+        return dict(schema_version=1, kind="S1ScopeTiming", scope_id=SCOPE_ID,
+                    job_nonce=NONCE, source_generation=GENERATION, source_digest="b" * 64,
+                    fixture_sha256="c" * 64,
+                    scope_deadline_monotonic_ns=NOW + worker.MAX_SCOPE_NS) | changes
+
+    def timing_file(self, *, record=None, raw=None):
+        stream = tempfile.TemporaryFile(mode="w+b")
+        self.addCleanup(stream.close)
+        if raw is None:
+            raw = json.dumps(self.timing_record() if record is None else record,
+                             separators=(",", ":")).encode("utf-8")
+        stream.write(raw)
+        stream.flush()
+        stream.seek(0)
+        return stream
+
+    def read_timing(self, stream, *, now=NOW):
+        with patch.object(worker.time, "monotonic_ns", return_value=now):
+            return worker.read_scope_timing(self.args, NOW, fd=stream.fileno())
+
+    def test_root_requires_scope_uuid_and_stdin_mode_without_clock_argument(self):
+        for name, value in (("scope_id", None), ("scope_bound_stdin", False),
+                            ("deadline_monotonic_ns", NOW + 5_000_000_000)):
+            original = getattr(self.args, name)
+            setattr(self.args, name, value)
+            with self.subTest(name=name), self.assertRaisesRegex(worker.FixtureError, "fixture_scope_timing_required"):
+                worker.validate(self.args, NOW)
+            setattr(self.args, name, original)
+        self.args.scope_id = "0" * 32
+        with self.assertRaisesRegex(worker.FixtureError, "fixture_uuid_invalid"):
+            worker.validate(self.args, NOW)
+
+    def test_leaf_refuses_root_stdin_mode_and_keeps_exact_cutoff(self):
+        self.args.leaf, self.args.deadline_monotonic_ns = True, NOW + 5_000_000_000
+        with patch.object(worker.os, "read") as read:
+            with self.assertRaisesRegex(worker.FixtureError, "fixture_leaf_invalid"):
+                worker.validate(self.args, NOW)
+            with self.assertRaisesRegex(worker.FixtureError, "fixture_scope_timing_required"):
+                worker.read_scope_timing(self.args, NOW)
+        read.assert_not_called()
+        self.args.scope_bound_stdin = False
+        self.assertEqual(worker.validate(self.args, NOW)[1], self.args.deadline_monotonic_ns)
+        self.args.seconds = 2
+        with self.assertRaisesRegex(worker.FixtureError, "fixture_deadline_invalid"):
+            worker.validate(self.args, NOW)
+
+    def test_timing_uses_real_regular_stdin_and_leaves_original_descriptor_open(self):
+        stream = self.timing_file()
+        self.assertTrue(stat.S_ISREG(os.fstat(stream.fileno()).st_mode))
+        self.assertEqual(self.read_timing(stream), NOW + 10_000_000_000)
+        self.assertFalse(stream.closed)
+        self.assertEqual(os.lseek(stream.fileno(), 0, os.SEEK_CUR), os.fstat(stream.fileno()).st_size)
+        self.assertEqual(os.read(stream.fileno(), 1), b"")
+
+    def test_timing_scope_minus_grace_bounds_root_and_same_leaf_deadline(self):
+        self.args.seconds = 115
+        stream = self.timing_file(record=self.timing_record(scope_deadline_monotonic_ns=NOW + 100_000_000_000))
+        deadline = self.read_timing(stream)
+        self.assertEqual(deadline, NOW + 96_000_000_000)
+        leaf = worker.parser().parse_args(worker.child_command(self.args, deadline)[3:])
+        self.assertEqual(worker.validate(leaf, NOW + 7_000_000_000)[1], deadline)
+        self.assertEqual(deadline + worker.COOPERATIVE_GRACE_NS, NOW + 100_000_000_000)
+
+    def test_exact_4096_byte_regular_timing_record_is_within_bound(self):
+        raw = json.dumps(self.timing_record(), separators=(",", ":")).encode()
+        padded = raw[:1] + b" " * (worker.MAX_TIMING_BYTES - len(raw)) + raw[1:]
+        self.assertEqual(len(padded), worker.MAX_TIMING_BYTES)
+        self.assertEqual(self.read_timing(self.timing_file(raw=padded)), NOW + 10_000_000_000)
+
+    def test_two_second_prerequisite_remains_two_seconds(self):
+        self.args.seconds = 2
+        self.assertEqual(self.read_timing(self.timing_file()), NOW + 2_000_000_000)
+
+    def test_nonregular_stdin_is_rejected_before_any_read_or_seek(self):
+        with open(os.devnull, "rb") as stream, patch.object(worker.os, "read") as read, \
+                patch.object(worker.os, "lseek") as seek:
+            with self.assertRaisesRegex(worker.FixtureError, "fixture_timing_input_invalid"):
+                worker.read_scope_timing(self.args, NOW, fd=stream.fileno())
+        read.assert_not_called()
+        seek.assert_not_called()
+
+    def test_empty_oversized_and_nonzero_offset_inputs_refuse_before_read(self):
+        for raw in (b"", b"x" * (worker.MAX_TIMING_BYTES + 1)):
+            stream = self.timing_file(raw=raw)
+            with self.subTest(size=len(raw)), patch.object(worker.os, "read") as read:
+                with self.assertRaisesRegex(worker.FixtureError, "fixture_timing_input_invalid"):
+                    worker.read_scope_timing(self.args, NOW, fd=stream.fileno())
+                read.assert_not_called()
+        stream = self.timing_file()
+        stream.seek(1)
+        with patch.object(worker.os, "read") as read:
+            with self.assertRaisesRegex(worker.FixtureError, "fixture_timing_input_invalid"):
+                worker.read_scope_timing(self.args, NOW, fd=stream.fileno())
+        read.assert_not_called()
+
+    def test_each_timing_binding_and_exact_field_set_is_required(self):
+        changes = (("schema_version", True), ("kind", "Other"),
+                   ("scope_id", GENERATION), ("job_nonce", "d" * 32),
+                   ("source_generation", SCOPE_ID), ("source_digest", "d" * 64),
+                   ("fixture_sha256", "d" * 64))
+        for key, value in changes:
+            with self.subTest(key=key), self.assertRaisesRegex(worker.FixtureError, "fixture_timing_binding_changed"):
+                self.read_timing(self.timing_file(record=self.timing_record(**{key: value})))
+        for key in self.timing_record():
+            value = self.timing_record()
+            del value[key]
+            with self.subTest(missing=key), self.assertRaisesRegex(worker.FixtureError, "fixture_timing_binding_changed"):
+                self.read_timing(self.timing_file(record=value))
+        with self.assertRaisesRegex(worker.FixtureError, "fixture_timing_binding_changed"):
+            self.read_timing(self.timing_file(record=self.timing_record(command_sha256="f" * 64)))
+
+    def test_duplicate_nonfinite_invalid_utf8_and_trailing_json_are_rejected(self):
+        raw = json.dumps(self.timing_record(), separators=(",", ":")).encode()
+        payloads = (b'{"kind":"S1ScopeTiming",' + raw[1:], raw[:-1] + b',"x":NaN}',
+                    raw + b"{}", raw + b"\n", b"\xff", b"[1]")
+        for payload in payloads:
+            with self.subTest(payload=payload[:32]), self.assertRaises(worker.FixtureError):
+                self.read_timing(self.timing_file(raw=payload))
+
+    def test_scope_deadline_type_maximum_and_expiry_are_strict(self):
+        for value in (True, float(NOW + 10_000_000_000), NOW, NOW - 1,
+                      NOW + worker.MAX_SCOPE_NS + 1):
+            with self.subTest(value=value), self.assertRaisesRegex(worker.FixtureError, "fixture_deadline_invalid"):
+                self.read_timing(self.timing_file(record=self.timing_record(scope_deadline_monotonic_ns=value)))
+        for value in (NOW + 1, NOW + worker.COOPERATIVE_GRACE_NS):
+            with self.subTest(value=value), self.assertRaisesRegex(worker.FixtureError, "fixture_deadline_expired"):
+                self.read_timing(self.timing_file(record=self.timing_record(scope_deadline_monotonic_ns=value)))
+
+    def test_file_growth_during_real_read_is_rejected(self):
+        stream = self.timing_file()
+        original_read = os.read
+        changed = False
+
+        def grow_after_read(fd, count):
+            nonlocal changed
+            result = original_read(fd, count)
+            if not changed:
+                changed = True
+                os.write(fd, b"x")
+            return result
+
+        with patch.object(worker.os, "read", side_effect=grow_after_read):
+            with self.assertRaisesRegex(worker.FixtureError, "fixture_timing_input_changed"):
+                self.read_timing(stream)
+
+    def test_descriptor_identity_change_after_read_is_rejected(self):
+        stream = self.timing_file()
+        original_stat = os.fstat
+        calls = 0
+
+        def changed_identity(fd):
+            nonlocal calls
+            calls += 1
+            value = original_stat(fd)
+            if calls == 1:
+                return value
+            fields = ("st_mode", "st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+            return SimpleNamespace(**{key: getattr(value, key) + (key == "st_ino") for key in fields})
+
+        with patch.object(worker.os, "fstat", side_effect=changed_identity):
+            with self.assertRaisesRegex(worker.FixtureError, "fixture_timing_input_changed"):
+                self.read_timing(stream)
+
+    def test_short_regular_read_is_rejected_as_truncated(self):
+        stream = self.timing_file()
+        original_read = os.read
+        with patch.object(worker.os, "read", side_effect=lambda fd, count: original_read(fd, min(count, 3))):
+            with self.assertRaisesRegex(worker.FixtureError, "fixture_timing_input_changed"):
+                self.read_timing(stream)
+
+    def test_regular_read_delay_consumes_original_deadline(self):
+        stream = self.timing_file()
+        original_read = os.read
+        clock = {"now": NOW}
+
+        def delayed_read(fd, count):
+            result = original_read(fd, count)
+            clock["now"] = NOW + 10_000_000_000
+            return result
+
+        with patch.object(worker.os, "read", side_effect=delayed_read), \
+                patch.object(worker.time, "monotonic_ns", side_effect=lambda: clock["now"]):
+            with self.assertRaisesRegex(worker.FixtureError, "fixture_deadline_expired"):
+                worker.read_scope_timing(self.args, NOW, fd=stream.fileno())
+
+    def test_main_captures_start_before_parse_and_preserves_cutoff_through_bootstrap(self):
+        stream = self.timing_file()
+        actual_reader = worker.read_scope_timing
+        clock = {"now": NOW}
+        modules = object()
+
+        def parse(_):
+            clock["now"] += 2_000_000_000
+            return self.args
+
+        def bootstrap(_):
+            clock["now"] += 3_000_000_000
+            return modules
+
+        with patch.object(worker.time, "monotonic_ns", side_effect=lambda: clock["now"]), \
+                patch.object(worker, "parser", return_value=SimpleNamespace(parse_args=parse)), \
+                patch.object(worker, "read_scope_timing", side_effect=lambda args, start: actual_reader(args, start, fd=stream.fileno())) as read, \
+                patch.object(worker, "bootstrap", side_effect=bootstrap), patch.object(worker, "run", return_value=0) as run:
+            self.assertEqual(worker.main([]), 0)
+        read.assert_called_once_with(self.args, NOW)
+        run.assert_called_once_with(self.args, self.directory, NOW + 10_000_000_000, modules)
+
+    def test_bootstrap_expiry_refuses_before_workload_native_setup(self):
+        stream = self.timing_file()
+        actual_reader = worker.read_scope_timing
+        clock = {"now": NOW}
+
+        def bootstrap(_):
+            clock["now"] = NOW + 10_000_000_000
+            return object()
+
+        with patch.object(worker.time, "monotonic_ns", side_effect=lambda: clock["now"]), \
+                patch.object(worker, "parser", return_value=SimpleNamespace(parse_args=lambda _: self.args)), \
+                patch.object(worker, "read_scope_timing", side_effect=lambda args, start: actual_reader(args, start, fd=stream.fileno())), \
+                patch.object(worker, "bootstrap", side_effect=bootstrap), patch.object(worker, "run") as run:
+            with self.assertRaisesRegex(worker.FixtureError, "fixture_deadline_expired"):
+                worker.main([])
+        run.assert_not_called()
+
+    def test_leaf_main_never_reads_stdin_and_uses_parent_deadline(self):
+        self.args.leaf, self.args.scope_bound_stdin = True, False
+        self.args.deadline_monotonic_ns = NOW + 5_000_000_000
+        modules = object()
+        with patch.object(worker.time, "monotonic_ns", return_value=NOW), \
+                patch.object(worker, "parser", return_value=SimpleNamespace(parse_args=lambda _: self.args)), \
+                patch.object(worker, "read_scope_timing") as read, \
+                patch.object(worker, "bootstrap", return_value=modules), patch.object(worker, "run", return_value=0) as run:
+            self.assertEqual(worker.main([]), 0)
+        read.assert_not_called()
+        run.assert_called_once_with(self.args, self.directory, self.args.deadline_monotonic_ns, modules)
 
     def test_bootstrap_refuses_nonisolated_interpreter_before_import(self):
         with patch.object(worker.sys, "flags", SimpleNamespace(isolated=0)), patch.object(worker.importlib, "import_module") as load:
@@ -207,6 +455,7 @@ class WorkloadTests(unittest.TestCase):
     def test_child_ready_uses_exact_native_birth_logon_and_source_pins(self):
         self.verify(self.ready())
         for key, changed in (("identity", {**IDENTITY, "created_filetime_100ns": "130000000000000002"}),
+                             ("scope_id", GENERATION),
                              ("source_generation", "22345678-1234-4234-9234-123456789abc"),
                              ("source_digest", "d" * 64), ("fixture_sha256", "d" * 64),
                              ("deadline_monotonic_ns", NOW + 11_000_000_000),
@@ -330,7 +579,7 @@ class WorkloadTests(unittest.TestCase):
 
     def test_successful_leaf_records_only_after_membership_then_handle_cleanup(self):
         modules, process, job = self.modules()
-        self.args.leaf = True
+        self.args.leaf, self.args.scope_bound_stdin = True, False
         result, burn = self.run_synthetic(modules)
         self.assertEqual(result, 0)
         self.assertEqual(worker.read_ready(self.directory / "ready-1234.json")["identity"], IDENTITY)

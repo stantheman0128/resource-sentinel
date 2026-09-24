@@ -346,26 +346,38 @@ def retry_launch_cleanup(error):
 
 def launch_in_job(job, application, command_line, *, cwd=None,
                   stdin_handle=None, stdout_handle=None, stderr_handle=None, backend=None,
-                  capture_factory=None, native_deadline=None, scope_deadline_monotonic=None):
+                  capture_factory=None, native_deadline=None, scope_deadline_monotonic=None,
+                  readiness_deadline=None, lease_deadline_monotonic_ns=None, lease_expires_at=None):
     """Perform one native attempt; caller holds the Job and launch authority.
 
     ``backend`` is an explicit in-process fixture seam. No serialized readiness,
     environment switch or status file can construct authorization here. All
     post-create errors retain process custody, including failed cleanup after
     successful identity/membership checks. Uncertain creation is never retried.
-    An optional original NativeDeadline only bounds entering Create after native
-    preparation. The optional original absolute scope deadline is checked at
-    the same boundary; a fresh RPC deadline cannot extend it. Neither grants
-    launch authority nor limits safe cleanup after expiry.
+    Original exchange/readiness NativeDeadlines and optional scope/allocation
+    restrictions only bound entering Create after native preparation. Every
+    supplied original is checked at the same final boundary; none grants launch
+    authority or limits safe cleanup after expiry.
     """
     if native_deadline is not None:
         from .pipe_windows import NativeDeadline
         if type(native_deadline) is not NativeDeadline:
             raise ValueError("native_launch_deadline_invalid")
+    if readiness_deadline is not None:
+        from .pipe_windows import NativeDeadline
+        if type(readiness_deadline) is not NativeDeadline:
+            raise ValueError("native_readiness_deadline_invalid")
     if scope_deadline_monotonic is not None and (
             type(scope_deadline_monotonic) not in (int, float) or
             not math.isfinite(scope_deadline_monotonic) or scope_deadline_monotonic <= 0):
         raise ValueError("native_scope_deadline_invalid")
+    if (lease_deadline_monotonic_ns is None) != (lease_expires_at is None):
+        raise ValueError("native_lease_deadline_invalid")
+    if lease_deadline_monotonic_ns is not None and (
+            type(lease_deadline_monotonic_ns) is not int or lease_deadline_monotonic_ns <= 0 or
+            type(lease_expires_at) not in (int, float) or
+            not math.isfinite(lease_expires_at) or lease_expires_at <= 0):
+        raise ValueError("native_lease_deadline_invalid")
     job_handle, logon_id = _handle(job.handle), _logon(job.logon_sid)
     if type(application) is not str or not os.path.isabs(application) or "\x00" in application:
         raise ValueError("native_application_invalid")
@@ -445,8 +457,13 @@ def launch_in_job(job, application, command_line, *, cwd=None,
                     raise
         if native_deadline is not None:
             native_deadline.require()
+        if readiness_deadline is not None:
+            readiness_deadline.require()
         if scope_deadline_monotonic is not None and time.monotonic() >= scope_deadline_monotonic:
             raise NativeLaunchError("native_scope_deadline_expired")
+        if lease_deadline_monotonic_ns is not None and (
+                time.monotonic_ns() >= lease_deadline_monotonic_ns or time.time() >= lease_expires_at):
+            raise NativeLaunchError("native_lease_deadline_expired")
         owner._creation_outcome = "unknown"
         try:
             created = k.CreateProcessW(application, mutable_command, None, None, True,

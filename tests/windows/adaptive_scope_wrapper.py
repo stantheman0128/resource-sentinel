@@ -16,10 +16,20 @@ import os
 from pathlib import Path
 import stat
 import sys
+import tempfile
 import time
 
 
 _RETAINED = []
+
+
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("scope_duplicate_json_key")
+        result[key] = value
+    return result
 
 
 def _read(path, limit):
@@ -45,12 +55,14 @@ def load_bootstrap(path, sha256):
     data = _read(path, 2 * 1024 * 1024)
     if hashlib.sha256(data).hexdigest() != sha256:
         raise ValueError("scope_bootstrap_changed")
-    payload = json.loads(data, parse_constant=lambda unused: (_ for _ in ()).throw(ValueError("nonfinite")))
+    payload = json.loads(data, object_pairs_hook=_unique_object,
+        parse_constant=lambda unused: (_ for _ in ()).throw(ValueError("nonfinite")))
     fields = {"schema_version", "scope_id", "job_nonce", "job_name", "guardian_identity",
               "endpoint_instance", "deadline_monotonic", "command", "command_sha256",
-              "canonical_source", "source_manifest", "source_digest", "fixture_sources", "python_sha256",
-              "request_marker"}
-    if type(payload) is not dict or set(payload) != fields or payload["schema_version"] != 1:
+              "canonical_source", "generation", "reservation_id", "binding_sha256",
+              "fixture_sources", "python_sha256", "request_marker"}
+    if (type(payload) is not dict or set(payload) != fields or
+            type(payload["schema_version"]) is not int or payload["schema_version"] != 2):
         raise ValueError("scope_bootstrap_invalid")
     sources = payload["fixture_sources"]
     paths = {str(Path(__file__).resolve()), str(Path(__file__).with_name("adaptive_scope_launch.py").resolve())}
@@ -94,9 +106,13 @@ def load_bootstrap(path, sha256):
     # completed execution before it acquires the first native self handle.
     for name in ("sentinel.adaptive.contracts", "sentinel.adaptive.identity", "sentinel.adaptive.pipe_windows"):
         importlib.import_module(name)
-    manifest = generation.SourceManifest.from_dict(payload["source_manifest"])
-    if manifest.digest != payload["source_digest"]:
+    row = module.validate_generation(payload["generation"])
+    manifest = generation.SourceManifest.from_dict(json.loads(row["source_manifest_json"],
+        object_pairs_hook=_unique_object))
+    if manifest.digest != row["source_digest"] or row["source_root"] != str(canonical):
         raise ValueError("scope_source_digest_changed")
+    module.validate_launch_bounds(dict(reservation_id=payload["reservation_id"],
+        binding_sha256=payload["binding_sha256"], expires_at=1, lease_deadline_monotonic_ns=1))
     generation.verify_import_provenance(manifest, canonical)
     command = module.ScopeCommand.from_dict(payload["command"])
     command.verify()
@@ -115,6 +131,40 @@ def load_bootstrap(path, sha256):
     return payload, module, command, manifest
 
 
+def timing_record(command, payload):
+    """Only independently pinned argv fields, never a self-referential hash."""
+    arguments = command.arguments[2:]
+    if (arguments.count("--scope-bound-stdin") != 1 or "--leaf" in arguments or
+            "--deadline-monotonic-ns" in arguments):
+        raise ValueError("scope_timing_command_invalid")
+    def argument(flag):
+        if arguments.count(flag) != 1:
+            raise ValueError("scope_timing_command_invalid")
+        index = arguments.index(flag) + 1
+        if index >= len(arguments):
+            raise ValueError("scope_timing_command_invalid")
+        return arguments[index]
+    fixture = next(source for source in command.fixture_sources if source.path == command.arguments[1])
+    expected = {"--scope-id": payload["scope_id"], "--nonce": payload["job_nonce"],
+        "--job-name": payload["job_name"], "--canonical-root": payload["canonical_source"],
+        "--source-generation": payload["generation"]["generation"],
+        "--source-digest": payload["generation"]["source_digest"], "--fixture-sha256": fixture.sha256,
+        "--directory": str(Path(payload["request_marker"]).parent)}
+    if any(argument(key) != value for key, value in expected.items()):
+        raise ValueError("scope_timing_binding_changed")
+    deadline = payload["deadline_monotonic"]
+    if type(deadline) not in (int, float) or not math.isfinite(deadline) or deadline <= 0:
+        raise ValueError("scope_timing_deadline_invalid")
+    value = dict(schema_version=1, kind="S1ScopeTiming", scope_id=payload["scope_id"],
+        job_nonce=payload["job_nonce"], source_generation=payload["generation"]["generation"],
+        source_digest=payload["generation"]["source_digest"], fixture_sha256=fixture.sha256,
+        scope_deadline_monotonic_ns=math.floor(deadline * 1_000_000_000))
+    raw = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    if not 0 < len(raw) <= 4096:
+        raise ValueError("scope_timing_oversized")
+    return raw
+
+
 class WrapperOwner:
     """No public success branch until local and transport custody both close."""
     def __init__(self, payload, module, command, manifest):
@@ -130,6 +180,8 @@ class WrapperOwner:
         self._launch_failed = False
         self._provenance = None
         self._marker_nonce = None
+        self._readiness_context = self._readiness_scope = self._readiness_error = None
+        self._readiness_pending = False
         self.state = module.OnceLaunchState(command.sha256)
         _RETAINED.append(self)  # Own partial native constructors before calls.
 
@@ -166,21 +218,27 @@ class WrapperOwner:
 
     def _launch(self, incoming, deadline):
         from sentinel.adaptive import native_launcher
-        from sentinel.adaptive.daily_generation import verify_import_provenance
+        from sentinel.adaptive import daily_generation
         from sentinel.adaptive.native_job import NativeJob, JobAccess
+        from sentinel.adaptive.pipe_windows import NativeDeadline
         from sentinel.adaptive.windows import NativePolicyMutex
         from sentinel.adaptive.guardian_lifecycle import job_mutex_instance
         import msvcrt
-        if self.state.attempted:
-            self.state.begin(incoming["request_id"], incoming["command_sha256"])
+        bounds = self.api.validate_launch_bounds(incoming.get("launch_bounds"))
+        if not self.state.begin(incoming["request_id"], incoming["command_sha256"], launch_bounds=bounds):
             return
-        if time.monotonic() >= self.payload["deadline_monotonic"]:
+        if (bounds["reservation_id"] != self.payload["reservation_id"] or
+                bounds["binding_sha256"] != self.payload["binding_sha256"] or
+                bounds["lease_deadline_monotonic_ns"] > math.floor(self.payload["deadline_monotonic"] * 1e9)):
+            raise self.api.ScopeLaunchError("scope_launch_binding_changed")
+        if (time.monotonic() >= self.payload["deadline_monotonic"] or
+                time.monotonic_ns() >= bounds["lease_deadline_monotonic_ns"] or
+                time.time() >= bounds["expires_at"]):
             raise self.api.ScopeLaunchError("scope_deadline_expired")
         deadline.require()
         self.command.verify()
-        verify_import_provenance(self.manifest, self.payload["canonical_source"])
-        if not self.state.begin(incoming["request_id"], incoming["command_sha256"]):
-            return
+        daily_generation.verify_import_provenance(self.manifest, self.payload["canonical_source"])
+        timing = timing_record(self.command, self.payload)
         self._acquisition_pending = True
         self.job = NativeJob.open(self.payload["job_name"], self.payload["job_nonce"],
                                   self.guardian.logon_id, access=JobAccess.LAUNCH)
@@ -191,33 +249,89 @@ class WrapperOwner:
         self._acquisition_pending = False
         # These handles are genuinely owned by THIS wrapper. Parent handle
         # numbers are never accepted or reinterpreted in this process.
-        for mode in ("rb", "wb", "wb"):
+        self._acquisition_pending = True
+        self.files.append(tempfile.TemporaryFile(mode="w+b", dir=Path(self.payload["request_marker"]).parent))
+        self._acquisition_pending = False
+        if self.files[0].write(timing) != len(timing):
+            raise self.api.ScopeLaunchError("scope_timing_write_incomplete")
+        self.files[0].flush()
+        self.files[0].seek(0)
+        for mode in ("wb", "wb"):
             self._acquisition_pending = True
             self.files.append(open(os.devnull, mode))
             self._acquisition_pending = False
-        with self.mutex.acquire(timeout_ms=250) as lease:
-            if lease.abandoned or self.state.sealed or time.monotonic() >= self.payload["deadline_monotonic"]:
-                raise self.api.ScopeLaunchError("scope_launch_fence_unavailable")
-            if self.job.accounting().total_processes != 0 or self.job.active_pids() != ():
-                raise self.api.ScopeLaunchError("scope_job_previously_used")
-            deadline.require()
-            self._creation_outcome = "unknown"
-            try:
-                self.process = native_launcher.launch_in_job(self.job, self.command.application,
-                    self.command.command_line, cwd=self.command.cwd,
-                    stdin_handle=msvcrt.get_osfhandle(self.files[0].fileno()),
-                    stdout_handle=msvcrt.get_osfhandle(self.files[1].fileno()),
-                    stderr_handle=msvcrt.get_osfhandle(self.files[2].fileno()), native_deadline=deadline,
-                    scope_deadline_monotonic=self.payload["deadline_monotonic"])
-            except BaseException as error:
-                original = getattr(error, "native_launch_owner", None)
-                if type(original) is native_launcher.CreatedProcess:
-                    self.process = original
-                    self._creation_outcome = original._creation_outcome
-                raise
-            self._creation_outcome = self.process._creation_outcome
-            if self.process.launch_provenance is not None:
-                self._provenance = self.process.launch_provenance.to_dict()
+        failure = None
+        self._readiness_pending = True
+        try:
+            self._readiness_context = daily_generation.readiness_scope(self.payload["generation"]["ledger_path"])
+            with self._readiness_context as original:
+                self._readiness_scope = original
+                with self.mutex.acquire(timeout_ms=250) as lease:
+                    if lease.abandoned or self.state.sealed or time.monotonic() >= self.payload["deadline_monotonic"]:
+                        raise self.api.ScopeLaunchError("scope_launch_fence_unavailable")
+                    ready_deadline = daily_generation.revalidate_scoped_readiness(
+                        self.payload["generation"]["ledger_path"], expected_generation=self.payload["generation"])
+                    if type(ready_deadline) is not NativeDeadline:
+                        raise self.api.ScopeLaunchError("scope_remote_readiness_required")
+                    if self.job.accounting().total_processes != 0 or self.job.active_pids() != ():
+                        raise self.api.ScopeLaunchError("scope_job_previously_used")
+                    deadline.require()
+                    self._creation_outcome = "unknown"
+                    try:
+                        self.process = native_launcher.launch_in_job(self.job, self.command.application,
+                            self.command.command_line, cwd=self.command.cwd,
+                            stdin_handle=msvcrt.get_osfhandle(self.files[0].fileno()),
+                            stdout_handle=msvcrt.get_osfhandle(self.files[1].fileno()),
+                            stderr_handle=msvcrt.get_osfhandle(self.files[2].fileno()), native_deadline=deadline,
+                            readiness_deadline=ready_deadline, scope_deadline_monotonic=self.payload["deadline_monotonic"],
+                            lease_deadline_monotonic_ns=bounds["lease_deadline_monotonic_ns"],
+                            lease_expires_at=bounds["expires_at"])
+                    except BaseException as error:
+                        failure = error
+                        self.errors.append(error)
+                        retained = getattr(error, "native_launch_owner", None)
+                        if type(retained) is native_launcher.CreatedProcess:
+                            self.process = retained
+                    if self.process is not None:
+                        self._creation_outcome = self.process._creation_outcome
+                        if self.process.launch_provenance is not None:
+                            self._provenance = self.process.launch_provenance.to_dict()
+        except BaseException as error:
+            self._readiness_error = error
+            # Every actual owner/error stays retained. Clear only the acquisition
+            # marker when the readiness API positively settled its own resources.
+            self._readiness_pending = False
+            if self._readiness_unsettled():
+                self._readiness_pending = True
+            raise
+        self._readiness_pending = False
+        if failure is not None:
+            raise failure
+
+    def _readiness_unsettled(self):
+        from sentinel.adaptive.daily_generation import _readiness_cleanup_unknown
+        if self._readiness_pending or (self._readiness_scope is not None and
+                self._readiness_scope.closed is not True):
+            return True
+        if self._readiness_error is None:
+            return False
+        if _readiness_cleanup_unknown(self._readiness_error):
+            return True
+        pending, seen = [self._readiness_error], set()
+        while pending:
+            error = pending.pop()
+            if id(error) in seen:
+                continue
+            seen.add(id(error))
+            if len(seen) > 32:
+                return True
+            scopes = (*getattr(error, "_daily_readiness_scopes", ()), getattr(error, "daily_readiness_scope", None))
+            if any(value is not None and getattr(value, "closed", None) is not True for value in scopes):
+                return True
+            pending.extend(value for value in (getattr(error, "__cause__", None),
+                getattr(error, "__context__", None), getattr(error, "_daily_readiness_cause", None),
+                getattr(error, "_daily_readiness_authority_cleanup", None)) if isinstance(value, BaseException))
+        return False
 
     def _drain(self):
         if not self.state.sealed:
@@ -226,7 +340,7 @@ class WrapperOwner:
             return
         # Diagnostics are not custody. Pure source/deadline refusals may drain;
         # interrupted constructors and ambiguous closes retain their originals.
-        if self._close_unknown or self._acquisition_pending:
+        if self._close_unknown or self._acquisition_pending or self._readiness_unsettled():
             raise self.api.ScopeLaunchError("scope_wrapper_custody_quarantined")
         if not self._closing:
             if (self.process is not None and not self.process.creation_definitely_absent and

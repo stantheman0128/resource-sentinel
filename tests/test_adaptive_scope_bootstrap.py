@@ -106,13 +106,19 @@ class ScopeBootstrapTests(unittest.TestCase):
     def payload(self):
         manifest = SourceManifest.capture(self.root)
         nonce = uuid4().hex
-        return dict(schema_version=1, scope_id=self.scope_id, job_nonce=nonce,
+        generation = dict(singleton=1, schema_version=1, generation=str(uuid4()), state="ACTIVE",
+            source_digest=manifest.digest, config_digest="a" * 64,
+            source_manifest_json=json.dumps(manifest.to_dict()), source_root=str(self.root),
+            ledger_path=str(self.home / "fixture-ledger.sqlite3"),
+            owner_identity_json=json.dumps(dict(pid=101, created_filetime_100ns=123456, logon_id="S-1-5-5-1-2")),
+            ledger_identity_json=json.dumps(["1", "2"]), readiness_instance_id=str(uuid4()))
+        return dict(schema_version=2, scope_id=self.scope_id, job_nonce=nonce,
             job_name="Local\\ResourceSentinel.Test.Job." + nonce,
             guardian_identity=dict(pid=101, created_filetime_100ns=123456, logon_id="S-1-5-5-1-2"),
             endpoint_instance=str(uuid4()), deadline_monotonic=time.monotonic() + 120,
             command=self.command.to_dict(), command_sha256=self.command.sha256,
-            canonical_source=str(self.root), source_manifest=manifest.to_dict(),
-            source_digest=manifest.digest,
+            canonical_source=str(self.root), generation=generation,
+            reservation_id="r" * 32, binding_sha256="b" * 64,
             request_marker=str(self.home / ("scope-request-" + self.scope_id + ".json")),
             fixture_sources=[scope.FixtureSource.capture(path).to_dict()
                              for path in (self.launch_path, self.wrapper_path)],
@@ -193,8 +199,27 @@ class ScopeBootstrapTests(unittest.TestCase):
         self.assertEqual(outcome["reason"], "daily_source_generation_mismatch")
 
     def test_changed_manifest_digest_refused(self):
-        outcome = self.bootstrap(self.payload() | {"source_digest": "0" * 64})
+        payload = self.payload()
+        payload["generation"]["source_digest"] = "0" * 64
+        outcome = self.bootstrap(payload)
         self.assertEqual(outcome["reason"], "scope_source_digest_changed")
+
+    def test_bootstrap_requires_v2_and_full_original_generation(self):
+        for change in ("version", "missing", "type", "extra"):
+            payload = self.payload()
+            if change == "version":
+                payload["schema_version"] = 1
+            elif change == "missing":
+                del payload["generation"]["config_digest"]
+            elif change == "type":
+                payload["generation"]["singleton"] = True
+            else:
+                payload["generation"]["authorized"] = True
+            with self.subTest(change=change):
+                outcome = self.bootstrap(payload)
+                self.assertFalse(outcome["accepted"])
+                self.assertEqual(outcome["reason"], "scope_bootstrap_invalid" if change == "version"
+                    else "scope_source_generation_changed")
 
     def test_preloaded_sentinel_cannot_replace_original_import_attestation(self):
         outcome = self.bootstrap(mode="preloaded")

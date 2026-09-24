@@ -13,6 +13,10 @@ from tests.windows import adaptive_scope_launch as scope
 from tests.windows import adaptive_scope_wrapper as wrapper_module
 
 
+LAUNCH_BOUNDS = dict(reservation_id="r" * 32, binding_sha256="b" * 64,
+    expires_at=2000000000.0, lease_deadline_monotonic_ns=9000000000000000000)
+
+
 class ScopeCommandTests(unittest.TestCase):
     def setUp(self):
         self.temp = TemporaryDirectory()
@@ -98,7 +102,7 @@ class OnceLaunchTests(unittest.TestCase):
 
     def test_protocol_exact_scope_and_schema(self):
         sid, rid = str(uuid4()), str(uuid4())
-        value = scope.request("launch", sid, rid, "a" * 64)
+        value = scope.request("launch", sid, rid, "a" * 64, launch_bounds=LAUNCH_BOUNDS)
         self.assertEqual(scope.validate_request(value, sid, "a" * 64), value)
         for changed in (value | {"scope_id": str(uuid4())}, value | {"schema_version": True},
                         value | {"control_allowed": True}):
@@ -119,6 +123,8 @@ class SyntheticTransferTests(unittest.TestCase):
         self.owner.deadline = float("inf")
         self.owner.guardian_identity = self.guardian
         self.owner.command = SimpleNamespace(sha256="a" * 64)
+        self.owner._launch_bounds = dict(LAUNCH_BOUNDS)
+        self.owner._original_launch_bounds = scope.canonical(LAUNCH_BOUNDS)
         self.owner._request_marker = Path(self.temp.name) / "marker.json"
         self.owner.wrapper_witness = SimpleNamespace(identity=self.wrapper,
             observe=lambda: SimpleNamespace(status=IdentityStatus.ALIVE))
@@ -278,7 +284,8 @@ class SyntheticTransferTests(unittest.TestCase):
                        self.result(root=None)):
             with self.assertRaises(scope.ScopeLaunchError):
                 self.owner._validate_result(result,
-                    scope.request("launch", self.owner.scope_id, result["request_id"], "a" * 64))
+                    scope.request("launch", self.owner.scope_id, result["request_id"], "a" * 64,
+                                  launch_bounds=LAUNCH_BOUNDS))
 
 
 class SyntheticCleanupTests(unittest.TestCase):

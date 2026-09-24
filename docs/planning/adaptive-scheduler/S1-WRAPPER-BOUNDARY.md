@@ -1,7 +1,8 @@
 # S1 root timing and wrapper readiness boundary
 
-Contract before implementation, 2026-09-24. This is not an implementation or
-native acceptance result. It follows the original scope/readiness contracts and
+Source implemented, 2026-09-24; verification is recorded in the planning README.
+The prior contract was committed as `c64708c`. This is not a native acceptance
+result. It follows the original scope/readiness contracts and
 the child Create cutoff committed as `c2877da`. Production adaptive stays off.
 The actual serial provider remains unavailable until its complete integration is
 implemented and verified. This contract grants no activation or gate promotion.
@@ -160,6 +161,11 @@ lease_deadline_ns = min(original_scope_deadline_ns,
                        monotonic_sample_ns + floor(remaining * 1e9))
 ```
 
+The current experiment allocation is immutable: its SQL update guard rejects
+expiry renewal, including ordinary heartbeat-style updates. Tests select TTL
+before original capture/admission and verify that refusal; local earlier-bound
+fixtures only strengthen the restriction. This protocol grants no renewal API.
+
 Require positive finite remaining time. Capture once for the original launch
 attempt; SQL close, journal work, lock exit, IPC and wrapper setup consume it.
 Never recompute it on receipt, observation, replay or cleanup. A backwards wall
@@ -243,6 +249,13 @@ Its current `_close_unknown`/`_acquisition_pending` checks alone are insufficien
 for new `_daily_readiness_*` owners. Preserve every original owner attachment;
 do not replace it with a boolean or safe-text diagnostic.
 
+Before entering the context manager, retain the context and acquisition marker.
+The readiness API itself owns its scope before it can yield; the wrapper retains
+the exact yielded scope, or the original pre-yield error graph when entry fails.
+Do not introspect a generator or fabricate an earlier scope. A retained error
+attachment can name an already-closed connection; inspect original cleanup
+state rather than interpreting every non-null attachment as unknown.
+
 A clean readiness timeout/rejection whose original acquisitions all positively
 settled may drain a never-created root. Readiness close uncertainty after a
 successful Create must still preserve the root offer/transfer and original
@@ -282,4 +295,3 @@ their full original graph; never defer them as ordinary launch diagnostics.
 Portable tests establish these source invariants only. Actual serial S1 native
 execution, canonical aggregate-provider bootstrap and all gate evidence remain
 separate, unverified work.
-

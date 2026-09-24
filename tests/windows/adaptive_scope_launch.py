@@ -177,40 +177,79 @@ class OnceLaunchState:
         self.command_sha256 = command_sha256
         self.attempted = self.sealed = False
         self.request_id = None
+        self._bounds = None
 
-    def begin(self, request_id, command_sha256):
+    def begin(self, request_id, command_sha256, *, launch_bounds=None):
         if not _uuid(request_id) or command_sha256 != self.command_sha256:
             raise ScopeLaunchError("scope_request_changed")
+        bounds = None if launch_bounds is None else canonical(validate_launch_bounds(launch_bounds))
         if self.attempted:
-            if request_id != self.request_id:
+            if request_id != self.request_id or bounds != self._bounds:
                 raise ScopeLaunchError("scope_second_launch_refused")
             return False
         if self.sealed:
             raise ScopeLaunchError("scope_launch_sealed")
         # Retain the attempt BEFORE any open/lock/Create side effect.
         self.request_id, self.attempted = request_id, True
+        self._bounds = bounds
         return True
 
     def seal(self):
         self.sealed = True
 
 
-def request(operation, scope_id, request_id, command_sha256):
+def validate_launch_bounds(value):
+    if (type(value) is not dict or set(value) != {
+            "reservation_id", "binding_sha256", "expires_at", "lease_deadline_monotonic_ns"} or
+            type(value["reservation_id"]) is not str or not 1 <= len(value["reservation_id"]) <= 128 or
+            "\x00" in value["reservation_id"] or type(value["binding_sha256"]) is not str or
+            re.fullmatch(r"[0-9a-f]{64}", value["binding_sha256"]) is None or
+            type(value["expires_at"]) not in (int, float) or not math.isfinite(value["expires_at"]) or
+            value["expires_at"] <= 0 or type(value["lease_deadline_monotonic_ns"]) is not int or
+            value["lease_deadline_monotonic_ns"] <= 0):
+        raise ScopeLaunchError("scope_launch_bounds_invalid")
+    return dict(value)
+
+
+def validate_generation(value):
+    from sentinel.adaptive.daily_generation import _GENERATION_FIELDS
+    if (type(value) is not dict or set(value) != _GENERATION_FIELDS or
+            any(type(value[key]) is not int or value[key] != 1 for key in ("singleton", "schema_version")) or
+            any(type(value[key]) is not str for key in _GENERATION_FIELDS - {"singleton", "schema_version"}) or
+            value["state"] != "ACTIVE" or not _uuid(value["generation"]) or
+            not _uuid(value["readiness_instance_id"]) or
+            any(re.fullmatch(r"[0-9a-f]{64}", value[key]) is None for key in ("source_digest", "config_digest"))):
+        raise ScopeLaunchError("scope_source_generation_changed")
+    _absolute(value["source_root"])
+    _absolute(value["ledger_path"])
+    return dict(value)
+
+
+def request(operation, scope_id, request_id, command_sha256, *, launch_bounds=None):
     if operation not in {"launch", "observe", "seal", "drain"} or not _uuid(scope_id) or not _uuid(request_id):
         raise ScopeLaunchError("scope_request_invalid")
     if type(command_sha256) is not str or re.fullmatch(r"[0-9a-f]{64}", command_sha256) is None:
         raise ScopeLaunchError("scope_request_invalid")
-    return dict(schema_version=_SCHEMA, kind="S1ScopeRequest", operation=operation,
-                scope_id=scope_id, request_id=request_id, command_sha256=command_sha256)
+    value = dict(schema_version=2 if operation == "launch" else _SCHEMA,
+        kind="S1ScopeRequest", operation=operation, scope_id=scope_id,
+        request_id=request_id, command_sha256=command_sha256)
+    if operation == "launch":
+        value["launch_bounds"] = validate_launch_bounds(launch_bounds)
+    elif launch_bounds is not None:
+        raise ScopeLaunchError("scope_launch_bounds_invalid")
+    return value
 
 
 def validate_request(value, scope_id, command_sha256):
-    if type(value) is not dict or set(value) != {
-            "schema_version", "kind", "operation", "scope_id", "request_id", "command_sha256"}:
+    if type(value) is not dict:
+        raise ScopeLaunchError("scope_request_invalid")
+    fields = {"schema_version", "kind", "operation", "scope_id", "request_id", "command_sha256"}
+    if set(value) != fields | ({"launch_bounds"} if value.get("operation") == "launch" else set()):
         raise ScopeLaunchError("scope_request_invalid")
     if type(value["schema_version"]) is not int:
         raise ScopeLaunchError("scope_request_invalid")
-    expected = request(value["operation"], scope_id, value["request_id"], command_sha256)
+    expected = request(value["operation"], scope_id, value["request_id"], command_sha256,
+        launch_bounds=value.get("launch_bounds"))
     if value != expected:
         raise ScopeLaunchError("scope_request_changed")
     return value
@@ -273,6 +312,7 @@ class ScopeLaunch:
         self._root_offer = None
         self._root_membership_verified = False
         self._root_membership_binding = None
+        self._launch_bounds = self._original_launch_bounds = None
         self._request_marker = None
         self._request_ids = {name: str(uuid4()) for name in ("launch", "observe", "seal", "drain")}
 
@@ -311,25 +351,31 @@ class ScopeLaunch:
             connection = owner._source_connection = sqlite3.connect(demand.ledger_path.as_uri() + "?mode=ro",
                 uri=True, timeout=.25, isolation_level=None)
             connection.row_factory = sqlite3.Row
+            connection.execute("BEGIN")
             generation = read_generation(connection)
+            original_generation = validate_generation(demand._original_generation_binding())
+            metadata = connection.execute("SELECT * FROM adaptive_experiment_demands WHERE experiment_id=?",
+                (demand.declaration.experiment_id,)).fetchone()
+            if (generation != original_generation or metadata is None or
+                    dict(metadata) != demand._binding(metadata["reservation_id"])):
+                raise ScopeLaunchError("scope_source_generation_changed")
+            owner.reservation_id, owner.binding_sha256 = metadata["reservation_id"], metadata["binding_sha256"]
+            connection.rollback()
             owner._source_close_unknown = True
             connection.close()
             owner._source_connection = None
             owner._source_close_unknown = False
-            if (generation is None or demand._prepared is None or generation["state"] != "ACTIVE" or
-                    any(generation[key] != value for key, value in demand._prepared[0].items())):
-                raise ScopeLaunchError("scope_source_generation_changed")
             manifest = SourceManifest.from_dict(json.loads(generation["source_manifest_json"]))
             verify_import_provenance(manifest, demand._source_root)
             owner.endpoint = NativePipeEndpoint(owner.guardian_identity.logon_id, str(uuid4()), owner.guardian_identity)
             owner.registry = NativePipeRegistry(max_resources=4)
             owner.listener = NativePipeListener(owner.endpoint, registry=owner.registry)
-            payload = dict(schema_version=1, scope_id=scope_id, job_nonce=job_nonce,
+            payload = dict(schema_version=2, scope_id=scope_id, job_nonce=job_nonce,
                 job_name=owner.job_name, guardian_identity=owner.guardian_identity.to_dict(),
                 endpoint_instance=owner.endpoint.instance_id, deadline_monotonic=deadline,
                 command=command.to_dict(), command_sha256=command.sha256,
-                canonical_source=str(demand._source_root), source_manifest=manifest.to_dict(),
-                source_digest=manifest.digest,
+                canonical_source=str(demand._source_root), generation=original_generation,
+                reservation_id=owner.reservation_id, binding_sha256=owner.binding_sha256,
                 request_marker=str(demand.directory / ("scope-request-" + scope_id + ".json")),
                 fixture_sources=[source.to_dict() for source in owner.fixture_sources],
                 python_sha256=hashlib.sha256(base.read_bytes()).hexdigest())
@@ -411,7 +457,11 @@ class ScopeLaunch:
                 raise ScopeLaunchError("scope_launch_authority_required", self)
             self._launch_attempted = True
             try:
-                registration._authorize_launch(self, job)
+                self._launch_bounds = validate_launch_bounds(registration._authorize_launch(self, job))
+                if (self._launch_bounds["reservation_id"] != self.reservation_id or
+                        self._launch_bounds["binding_sha256"] != self.binding_sha256):
+                    raise ScopeLaunchError("scope_launch_binding_changed")
+                self._original_launch_bounds = canonical(self._launch_bounds)
                 self._authorized = True
                 result = self._exchange("launch")
                 if self.root_witness is None:
@@ -481,7 +531,13 @@ class ScopeLaunch:
                     wrapper_identity=self.wrapper_witness.identity.to_dict(), command_sha256=self.command.sha256)
                 if hello != expected or peer.identity != self.wrapper_witness.identity:
                     raise ScopeLaunchError("scope_wrapper_auth_failed")
-                outgoing = request(operation, self.scope_id, self._request_ids[operation], self.command.sha256)
+                bounds = None
+                if operation == "launch":
+                    bounds = validate_launch_bounds(self._launch_bounds)
+                    if canonical(bounds) != self._original_launch_bounds:
+                        raise ScopeLaunchError("scope_launch_binding_changed")
+                outgoing = request(operation, self.scope_id, self._request_ids[operation], self.command.sha256,
+                    launch_bounds=bounds)
                 if operation == "launch":
                     self._command_dispatched = True  # unknown delivery still forbids another attempt
                 write_frame(connection, outgoing, deadline)

@@ -15,6 +15,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import sqlite3
@@ -189,6 +190,8 @@ class ExperimentNativeScope:
         self._mutex_construction_error = None
         self._probe_attempts, self._original_probe_attempts = [], ()
         self._probe_attempt_count = 0
+        self._launch_authorization_attempted = False
+        self._launch_bounds = None
 
     @classmethod
     def prepare(cls, demand, command, *, scope_id=None, creation_nonce=None):
@@ -629,19 +632,45 @@ class ExperimentNativeScope:
                 self._coverage_locked(conn, restrictive=True)
 
     def _authorize_launch(self, launcher, job):
-        if (launcher is not self.launch or job is not self.job or not self._registered or
-                self._launch_authorized or self._close_started):
-            _fail("launch_binding_changed", self)
-        with self._scope(daily=True):
-            with self.daily_store._transaction() as conn:
-                self._coverage_locked(conn, restrictive=True)
-            self._verify_job(empty=True)
-            with self.store._transaction() as conn:
-                self.journal.begin_launch_locked(conn)
-            self._ready()
-            self._launch_authorized = True
-        # The actual launcher performs authenticated IPC only after every lock
-        # above has positively settled. This return is not a serialized permit.
+        with self._lock:
+            if (launcher is not self.launch or job is not self.job or not self._registered or
+                    self._launch_authorized or self._launch_authorization_attempted or
+                    self._launch_bounds is not None or self._close_started or launcher._sealed):
+                _fail("launch_binding_changed", self)
+            self._launch_authorization_attempted = True
+            with self._scope(daily=True):
+                with self.daily_store._transaction() as conn:
+                    # Coverage refreshes its current restriction. Preserve the
+                    # earlier original expiry before validating that same row.
+                    prior_expiry = getattr(self, "_restriction_lease_deadline", None)
+                    self._coverage_locked(conn, restrictive=True)
+                    current_expiry = self._restriction_lease_deadline
+                    expiries = (current_expiry,) if prior_expiry is None else (prior_expiry, current_expiry)
+                    if any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+                           for value in expiries):
+                        _fail("launch_lease_invalid", self)
+                    expires_at = min(expiries)
+                    monotonic_ns = time.monotonic_ns()
+                    remaining = expires_at - time.time()
+                    if not math.isfinite(remaining) or remaining <= 0:
+                        _fail("launch_lease_expired", self)
+                    scope_ns = int(self.deadline * 1_000_000_000)
+                    numerator, denominator = remaining.as_integer_ratio()
+                    lease_ns = min(scope_ns, monotonic_ns + numerator * 1_000_000_000 // denominator)
+                    if lease_ns <= monotonic_ns:
+                        _fail("launch_lease_expired", self)
+                    self._restriction_lease_deadline = expires_at
+                    self._launch_bounds = dict(reservation_id=self.reservation_id,
+                        binding_sha256=self._daily_binding_sha256, expires_at=expires_at,
+                        lease_deadline_monotonic_ns=lease_ns)
+                self._verify_job(empty=True)
+                with self.store._transaction() as conn:
+                    self.journal.begin_launch_locked(conn)
+                self._ready()
+                self._launch_authorized = True
+            # SQL close, lock exit and all following IPC consume these original
+            # restrictions. The returned copy cannot alter this retained pin.
+            return dict(self._launch_bounds)
 
     def launch_once(self):
         try:

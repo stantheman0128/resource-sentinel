@@ -146,6 +146,8 @@ class ExperimentNativeReleaseTests(unittest.TestCase):
         owner.demand, owner.command, owner.scope_id = demand, command, scope_id
         owner.job_nonce, owner.deadline = nonce, deadline
         owner.guardian, owner.guardian_identity = self.guardian, self.guardian.identity
+        binding = self.rows(demand_module.TABLE)[0]
+        owner.reservation_id, owner.binding_sha256 = binding["reservation_id"], binding["binding_sha256"]
         owner.job_name = "Local\\ResourceSentinel.Test.Job." + nonce
         owner.fixture_sources = ()
         owner.wrapper_command_line = "synthetic-wrapper"

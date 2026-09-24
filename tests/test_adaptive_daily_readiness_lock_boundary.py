@@ -248,12 +248,15 @@ class DailyReadinessLockBoundaryTests(unittest.TestCase):
                                    "AND name='adaptive_daily_generation'").fetchone()[0]
         self.conn.execute("CREATE TEMP TABLE original_generation AS SELECT * FROM adaptive_daily_generation")
         self.conn.execute("DROP TABLE adaptive_daily_generation")
+        for name in generation._trigger_definitions():
+            self.conn.execute("DROP TRIGGER " + name)
         self.conn.commit()
         with patch.dict(generation._LOCAL_GENERATIONS, {self.owner.generation: self.owner}):
             with generation.readiness_scope(self.db) as original:
                 self.assertIsNone(original.row)
                 self.conn.execute(schema)
                 self.conn.execute("INSERT INTO adaptive_daily_generation SELECT * FROM original_generation")
+                generation._install_triggers(self.conn)
                 self.conn.commit()
                 with self.assertRaisesRegex(generation.DailyGenerationUnavailable, "scope_binding_changed"):
                     self.bind(self.conn)
@@ -305,6 +308,8 @@ class DailyReadinessLockBoundaryTests(unittest.TestCase):
     def test_generation_disappearance_is_not_absent_generation_fallback(self):
         with generation.readiness_scope(self.db):
             self.conn.execute("DROP TABLE adaptive_daily_generation")
+            for name in generation._trigger_definitions():
+                self.conn.execute("DROP TRIGGER " + name)
             self.conn.commit()
             with self.assertRaisesRegex(generation.DailyGenerationUnavailable, "generation_changed"):
                 self.bind(self.conn)
@@ -543,6 +548,12 @@ class DailyReadinessLockBoundaryTests(unittest.TestCase):
             with isolated._connection() as conn:
                 conn.execute("ATTACH DATABASE ? AS fixture_daily", (str(self.db),))
                 conn.execute("CREATE TABLE adaptive_daily_generation AS SELECT * FROM fixture_daily.adaptive_daily_generation")
+                # Model a complete new generation, so this test reaches the
+                # retained absence check instead of the earlier schema fence.
+                for table in generation.CAPACITY_TABLES:
+                    key = "request_key" if table == "queue" else "id"
+                    conn.execute("CREATE TABLE IF NOT EXISTS " + table + "(" + key + " TEXT)")
+                generation._install_triggers(conn)
                 conn.execute("BEGIN IMMEDIATE")
                 with self.assertRaisesRegex(generation.DailyGenerationUnavailable, "absence_required"):
                     generation.revalidate_transaction(conn, db_path=isolated.db_path)

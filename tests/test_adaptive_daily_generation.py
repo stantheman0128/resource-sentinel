@@ -39,7 +39,7 @@ class DailyGenerationTests(unittest.TestCase):
             CREATE TABLE reservations(id TEXT);
             CREATE TABLE worker_reservations(id TEXT);
             CREATE TABLE workers(id TEXT);
-            CREATE TABLE queue(id TEXT);
+            CREATE TABLE queue(request_key TEXT);
             CREATE TABLE managed_executions(execution_id TEXT);
         """)
         self.identity = ProcessIdentity(123, 123456, "S-1-5-5-1-2")

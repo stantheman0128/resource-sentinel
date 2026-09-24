@@ -146,6 +146,11 @@ class PolicyCoordinator:
         return binding
 
     def prepare(self, logon_id):
+        from .experiment_cleanup import current_operation
+        operation = current_operation()
+        if operation is not None:
+            current_operation(self.store.db_path)
+            return operation.prepare_policy(self, logon_id)
         # Randomness and identity collection happen before the short DB lock.
         candidate, nonce = str(uuid4()), str(uuid4())
         with self.store._transaction() as conn:

@@ -154,6 +154,12 @@ class _ReadinessScope:
 @contextmanager
 def readiness_scope(db_path):
     """Acquire before any lock; nested exact-ledger users borrow, never refresh."""
+    from .experiment_cleanup import current_operation
+    operation = current_operation(db_path)
+    if operation is not None:
+        with operation.connection_scope(db_path) as original:
+            yield original
+        return
     path = Path(db_path).resolve()
     borrowed = getattr(_READINESS_LOCAL, "scope", None)
     group = getattr(_READINESS_LOCAL, "group", None)
@@ -305,6 +311,13 @@ def _revalidate_absent(conn, scope, db_path):
 @contextmanager
 def readiness_nonce_cleanup(policy, guard):
     """Only _clear after positive original native release may enter this seam."""
+    from .experiment_cleanup import current_operation
+    operation = current_operation()
+    if operation is not None:
+        current_operation(policy.store.db_path)
+        with operation.nonce_cleanup(policy, guard):
+            yield
+        return
     scope = getattr(_READINESS_LOCAL, "scope", None)
     if scope is None:
         yield
@@ -702,7 +715,11 @@ def verify_import_provenance(manifest, root):
 def read_generation(conn):
     present = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (_TABLE,)).fetchone()
     if present is None:
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                        "AND name GLOB 'adaptive_daily_*' LIMIT 1").fetchone() is not None:
+            _reject("daily_generation_guards_unverified")
         return None
+    validate_triggers(conn)
     bounds = {"generation": 36, "state": 16, "source_digest": 64, "config_digest": 64,
               "source_manifest_json": 1024 * 1024, "source_root": 32768,
               "ledger_path": 32768, "owner_identity_json": 1024,
@@ -751,6 +768,11 @@ def prepare_connection(conn, *, role, db_path):
     """Validate outside BEGIN and bind this connection, without installing schema."""
     if role not in ROLES or conn.in_transaction:
         _reject("daily_connection_scope_invalid")
+    from .experiment_cleanup import current_operation
+    operation = current_operation(db_path)
+    if operation is not None:
+        operation.bind_connection(conn, role=role, db_path=db_path)
+        return None
     row = read_generation(conn)
     if row is None:
         scope = getattr(_READINESS_LOCAL, "scope", None)
@@ -832,6 +854,14 @@ def prepare_connection(conn, *, role, db_path):
             _revalidate_local(local, row)
         return row["generation"]
     conn.create_function("sentinel_daily_generation", 0, current_generation)
+    def delete_authority(table, key):
+        if table not in {"reservations", "queue"} or type(key) is not str or not key:
+            _reject("daily_delete_scope_invalid")
+        generation = current_generation()
+        if row["state"] != "ACTIVE" or generation != row["generation"]:
+            _reject("daily_generation_draining")
+        return 1
+    conn.create_function("sentinel_daily_delete_authority", 2, delete_authority)
     return row["generation"]
 
 
@@ -852,6 +882,11 @@ def revalidate_transaction(conn, *, db_path):
     """Recheck on the actual acquired SQL snapshot, without acquiring authority."""
     if not conn.in_transaction:
         _reject("daily_connection_scope_invalid")
+    from .experiment_cleanup import current_operation
+    operation = current_operation(db_path)
+    if operation is not None:
+        operation.revalidate_connection(conn, db_path=db_path)
+        return
     row = read_generation(conn)
     scope = getattr(_READINESS_LOCAL, "scope", None)
     if row is None:
@@ -924,14 +959,42 @@ def _prove_retained_owner_ready(row):
     return authority
 
 
-def _install_triggers(conn):
+def _trigger_definitions():
+    result = {}
     for table in CAPACITY_TABLES:
         for event in ("INSERT", "UPDATE", "DELETE"):
             name = f"adaptive_daily_{table}_{event.lower()}"
-            conn.execute(f"CREATE TRIGGER {name} BEFORE {event} ON {table} WHEN "
-                f"(SELECT state FROM {_TABLE} WHERE singleton=1) IS NOT 'ACTIVE' OR "
-                f"sentinel_daily_generation() IS NOT (SELECT generation FROM {_TABLE} WHERE singleton=1) "
+            if event == "DELETE" and table in {"reservations", "queue"}:
+                key = "id" if table == "reservations" else "request_key"
+                predicate = f"sentinel_daily_delete_authority('{table}',OLD.{key}) IS NOT 1"
+            else:
+                predicate = (f"(SELECT state FROM {_TABLE} WHERE singleton=1) IS NOT 'ACTIVE' OR "
+                    f"sentinel_daily_generation() IS NOT (SELECT generation FROM {_TABLE} WHERE singleton=1)")
+            result[name] = (f"CREATE TRIGGER {name} BEFORE {event} ON {table} WHEN {predicate} "
                 "BEGIN SELECT RAISE(ABORT,'daily_generation_required'); END")
+    return result
+
+
+def validate_triggers(conn):
+    """Require the complete canonical generation guards without repairing them."""
+    expected = _trigger_definitions()
+    rows = conn.execute("""SELECT
+        CASE WHEN length(CAST(name AS BLOB))<=256 THEN name END,
+        CASE WHEN length(CAST(sql AS BLOB))<=65536 THEN sql END
+        FROM sqlite_master WHERE type='trigger' AND name GLOB 'adaptive_daily_*'
+        LIMIT ?""", (len(expected) + 1,)).fetchall()
+    if len(rows) != len(expected) or any(name is None or sql is None for name, sql in rows):
+        _reject("daily_generation_guards_unverified")
+    actual = dict(rows)
+    normalize = lambda sql: " ".join(sql.split()).rstrip(";")
+    if set(actual) != set(expected) or any(normalize(actual[name]) != normalize(sql)
+                                          for name, sql in expected.items()):
+        _reject("daily_generation_guards_unverified")
+
+
+def _install_triggers(conn):
+    for statement in _trigger_definitions().values():
+        conn.execute(statement)
 
 
 class DailyGenerationOwner:

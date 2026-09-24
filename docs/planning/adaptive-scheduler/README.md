@@ -4,12 +4,30 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
+Cleanup 的原始 operation／read／nonce 接線已完成，**15 模組、351 tests 全過，
+45.886 秒，0 failures／errors／skips**。`DailyExperimentDemand.prepare_release`
+現在保留同一原始 completion、admission POLICY binding 與 generation；read／nonce
+階段可在同 generation 的 ACTIVE／DRAINING 重驗，不取得新 readiness 或一般容量
+UDF。未知 SQL close、native wait／constructor close 的原始 owner 會保留並拒絕
+重新取得；lost nonce COMMIT ACK 則核對同一原始 candidate。完整私人日誌為
+`.local-adaptive/experiment-release-custody-20260924-4.log`。
+這批含 13 個原始 custody 與 11 個 hook／trigger 案例，原生 API 以明確 synthetic
+backend 驗證控制流程，沒有實際 Job 控制。第一次 282 tests 有 2 failures／2 errors，
+原因為更早的 canonical guard 拒絕及舊 queue fixture 缺少 request_key；修正 fixture
+保留原本拒絕斷言後 283 tests 全過。後續 350 tests 的 10 errors 是新 release
+lookup 對非 release 的 SQL-only POLICY fixture 不必要地讀取 db_path；改為先確認
+有原始 release scope 才取路徑，最終 351 tests 全過。獨立 review 找到的 native
+不確定持有者與 timeout-clear 例外覆蓋問題已修正並納入最終測試。
+**Receipt publication、精確取消／archive／exclusion／history reuse 與 retirement
+整合仍未完成；沒有 `Coordinator.release_experiment` 或容量釋放成功的宣稱。**
+
 原始 experiment generation binding 已補上：同一 authenticated SQL reader 在
 `BEGIN` 後重驗完整 generation row，正面 close 後才固定原始 pin；後續 admission
 與 writer snapshot 比較所有欄位，completion 只回傳原始資料的副本。缺少原始
 pin 的舊物件拒絕補建，不從 cleanup 時的新 row 推回來源。五個相關模組
 **179 tests 全過，19.063 秒，0 failures／errors／skips**；包含 10 個新增案例，
-私人日誌為 `.local-adaptive/experiment-generation-pin-20260924-1.log`。
+私人日誌為 `.local-adaptive/experiment-generation-pin-20260924-1.log`，已提交並 push
+為 `d78916a`。
 測試經正常日常 wrapper 准入，依賴受保護的 dirty baseline；未執行 native 控制。
 這是 typed release 的前置 binding；精確 cleanup-only SQL、receipt／history
 交易、remote scope 與 native provider 仍待完成，尚未授予容量釋放權限。

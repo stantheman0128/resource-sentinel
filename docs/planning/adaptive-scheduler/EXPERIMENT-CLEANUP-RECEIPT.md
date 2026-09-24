@@ -6,6 +6,15 @@ following `ebd936c`. Names below marked **proposed** are not implemented APIs or
 permission to release a reservation. This document changes no source, database,
 runtime setting, policy or capability gate. Daily adaptive remains off.
 
+Implementation checkpoint (2026-09-24): original preparation/completion and the
+full generation pin are implemented. `prepare_release` now retains the exact
+completion plus the POLICY binding captured during original admission. The
+read/nonce connection phases are implemented and verified by 351 tests across
+15 modules (45.886 seconds; no failures, errors or skips). This does not yet
+implement receipt publication, `Coordinator.release_experiment`, reservation
+release, closed-history reuse or mixed retirement. The original self witness
+remains retained. No native gate or runtime activation is claimed.
+
 The required result is one truthful daily cancellation after the original
 isolated experiment has positively completed native cleanup. The daily claim
 never launched anything: its reservation covered a separately executed test.
@@ -380,3 +389,33 @@ binding, missing original admission pin, attempted new POLICY binding,
 unrelated row deletion, wrong phase or retained connection after lexical exit,
 and lost ACK/unknown cleanup. No new native experiment or runtime activation
 is authorized by this amendment.
+
+### Canonical DELETE guards and nonce custody
+
+SQLite resolves trigger function names before executing their conditions, so a
+cleanup connection cannot merely skip a branch that mentions the unavailable
+capacity UDF. The canonical reservation/queue DELETE guards now call the fixed
+`sentinel_daily_delete_authority(table, exact_key)` instead. Normal consumers
+implement it by the existing full current-generation ACTIVE validation. The
+unactivated installer and release read/nonce phases receive no delete authority.
+The future receipt publication phase must bind that function to the exact
+original operation, same connection/guard and receipt-bound OLD row; no general
+DELETE exception is permitted. The other ten capacity triggers are unchanged.
+All twelve canonical definitions are checked together; missing, altered, extra
+or dangling guards refuse without repair. This source change does not migrate
+an installed generation or allow an older generation's guard set to be adopted.
+
+The original nonce candidate is retained before the first SQL attempt. Unknown
+native entry/close and SQL cleanup retain their original owner graph, including
+bounded nested cause/context, and prevent reopening. A later timeout cannot
+overwrite an earlier failed nonce-clear connection owner. A lost COMMIT ACK
+with positive SQL cleanup may reconcile only that original candidate; it never
+reads a nonce from the ledger and turns it into new ownership.
+
+The durable envelope distinguishes `cleanup_digest` (domain-separated original
+completion/demand/operation binding) from `receipt_sha256` (the entire canonical
+pre/postimage record). CLOSED exclusion rows reference the former, avoiding a
+digest cycle without omitting the exclusion postimage from the latter. A full
+original source manifest may require a bounded 2 MiB receipt_json cell; the
+future retirement reader may allow that exact canonical column while preserving
+its 64 KiB default cell bound and shared 16 MiB aggregate inventory limit.

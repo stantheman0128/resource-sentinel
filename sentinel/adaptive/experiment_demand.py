@@ -208,6 +208,8 @@ class DailyExperimentDemand:
         self._lock = threading.RLock()
         self._admission = self._prepared = None
         self._generation_original = None
+        self._policy_original = None
+        self._release_operation = None
         self._original_admission = None
         self._errors = []
         self._quarantine = None
@@ -610,6 +612,11 @@ class DailyExperimentDemand:
 
     def publish_locked(self, conn, snapshot, policy, result, *, replay):
         self._locked(conn, snapshot, policy)
+        binding = policy.assert_held().binding
+        if self._policy_original is None:
+            self._policy_original = binding
+        elif self._policy_original != binding:
+            _deny("original_policy_changed", self)
         expected = self._binding(result["reservation_id"])
         rows = conn.execute("SELECT * FROM " + TABLE + " WHERE experiment_id=? OR execution_id=? OR reservation_id=?",
             (self.declaration.experiment_id, snapshot.execution_id, result["reservation_id"])).fetchall()
@@ -626,6 +633,10 @@ class DailyExperimentDemand:
 
     def require_native_scope(self):
         _deny("scope_binding_unavailable", self)
+
+    def prepare_release(self, completion):
+        from .experiment_cleanup import prepare_release
+        return prepare_release(self, completion)
 
     def close_unsubmitted(self):
         """Close only an original context that never submitted any demand."""

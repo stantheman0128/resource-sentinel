@@ -939,6 +939,8 @@ class LifecycleStore:
         pinned = self._existing_ledger_path if existing_path is None else existing_path
         if self._existing_ledger_path is not None and pinned != self._existing_ledger_path:
             raise LifecycleError("coverage_registry_unavailable")
+        from .experiment_cleanup import current_operation
+        operation = current_operation(self.db_path if pinned is None else pinned)
         target = self.db_path if pinned is None else pinned.as_uri() + "?mode=rw"
         try:
             conn = sqlite3.connect(target, uri=pinned is not None, timeout=5, isolation_level=None)
@@ -961,6 +963,14 @@ class LifecycleStore:
             except BaseException:
                 primary._sentinel_connection_cleanup = conn
                 primary.add_note("lifecycle_connection_cleanup_failed")
+            else:
+                if operation is not None:
+                    try:
+                        operation.connection_closed(conn)
+                    except BaseException as error:
+                        primary._experiment_release_operation = operation
+                        primary._experiment_release_connection_closed_error = error
+                        primary.add_note("experiment_release_connection_accounting_failed")
             raise
         else:
             try:
@@ -971,6 +981,8 @@ class LifecycleStore:
                 failure._sentinel_connection_cleanup_error = cause
                 failure.add_note("lifecycle_connection_cleanup_failed")
                 raise failure from None
+            if operation is not None:
+                operation.connection_closed(conn)
 
     @contextmanager
     def _transaction(self, *, existing_path: Path | None = None):

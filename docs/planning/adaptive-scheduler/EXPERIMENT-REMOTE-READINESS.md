@@ -98,3 +98,21 @@ daily readiness loss and retained uncertainty after failed original close.
 Run shared preparation/scope/release, readiness and native primitive regressions
 through normal daily admission. Synthetic tests prove source contracts only;
 S1-S3, recovery, monitoring overhead and A/B gates remain unverified.
+
+## Primitive implementation checkpoint
+
+The three optional exact NativeDeadline entry points are implemented. Their
+checks occur after descriptor setup, wrapper source/buffer verification, or
+setter lock/handle preparation, before the corresponding kernel call. Invalid
+deadline objects fail before setup. Expired Job creation retains its original
+initialization owner and descriptor cleanup outcome; expired wrapper creation
+keeps its original not-attempted CreatedProcess. Disable and None callers stay
+unchanged. No deadline is reconstructed or renewed.
+
+Four related modules passed 135 tests with zero failures/errors/skips (0.315
+seconds runner), including 15 new deadline cases. The planning README records
+the equivalent command and private log location. These tests use actual deadline
+and ownership implementations with explicit synthetic time/Win32 APIs. Independent
+review found no actionable issue. Actual remote scope integration remains work
+in progress; this primitive checkpoint does not enable any native gate or daily
+activation. Tests use the protected dirty baseline through normal daily admission.

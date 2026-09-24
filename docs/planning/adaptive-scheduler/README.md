@@ -4,6 +4,22 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
+Remote readiness 的原始 deadline 底層接線已完成：`NativeJob.create`、
+`ScopeLaunch.create_inert` 與 `set_cpu_rate_unverified` 可接收 exact
+`NativeDeadline`，在 security／fixture／command buffer／internal lock 準備後、
+實際 Win32 Create／Set 前檢查同一原期限。預設 None 不改既有呼叫；disable／
+restore 不被過期期限攔截。原始 setup owner 與未進入 Create 的證據繼續保留。
+先行契約為 [EXPERIMENT-REMOTE-READINESS.md](EXPERIMENT-REMOTE-READINESS.md)。
+四模組 **135 tests 全過，0 failures／errors／skips**（runner 0.315 秒），
+包括 15 個新 deadline 案例，私人日誌為
+`.local-adaptive/native-deadline-20260924-1.log`。獨立 review 無 actionable finding。
+這是底層 source 邊界驗證；scope 的實際 remote authority 接線仍在實作，不能
+因 optional 參數或這批 synthetic Win32 fixtures 宣稱 native gate 通過。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command 'C:\Python313\python.exe -m unittest tests.test_adaptive_experiment_native_deadlines tests.test_adaptive_native_job tests.test_adaptive_native_launcher tests.test_adaptive_scope_launch -q' -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
 原始 unadmitted experiment 收尾已實作，先行契約為
 [`55adc56`](EXPERIMENT-UNADMITTED-CLEANUP.md)。
 `Coordinator.abandon_experiment(demand)` 保留同一原始 demand、submission guard、

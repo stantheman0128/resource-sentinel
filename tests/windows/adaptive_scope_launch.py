@@ -350,10 +350,13 @@ class ScopeLaunch:
         except BaseException as error:
             raise _retain(error, owner)
 
-    def create_inert(self):
+    def create_inert(self, *, native_deadline=None):
         """Native creation only; no pipe/readiness RPC under parent locks."""
         from sentinel.adaptive import native_launcher as native
         from sentinel.adaptive.identity import VerifiedProcess
+        from sentinel.adaptive.pipe_windows import NativeDeadline
+        if native_deadline is not None and type(native_deadline) is not NativeDeadline:
+            raise ValueError("scope_wrapper_deadline_invalid")
         with self._lock:
             if self._created or self._closed or self._sealed:
                 raise ScopeLaunchError("scope_wrapper_creation_repeated", self)
@@ -370,6 +373,8 @@ class ScopeLaunch:
                 command_buffer = C.create_unicode_buffer(self.wrapper_command_line)
                 if time.monotonic() >= self.deadline:
                     raise ScopeLaunchError("scope_deadline_expired")
+                if native_deadline is not None:
+                    native_deadline.require()
                 owner._creation_outcome = "unknown"
                 self._wrapper_create_entered = True
                 created = owner._backend.kernel.CreateProcessW(self.command.application,

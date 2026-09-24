@@ -158,6 +158,14 @@ def _valid_handle(value):
     return value
 
 
+def _native_deadline(value):
+    if value is not None:
+        from .pipe_windows import NativeDeadline
+        if type(value) is not NativeDeadline:
+            raise ValueError("native_job_deadline_invalid")
+    return value
+
+
 def _security_call(function, *args, **kwargs):
     try:
         return function(*args, **kwargs)
@@ -259,11 +267,12 @@ class NativeJob:
 
     @classmethod
     def create(cls, name: str, nonce: str, logon_id: str, *,
-               access: JobAccess = JobAccess.LAUNCH, backend=None) -> NativeJob:
+               access: JobAccess = JobAccess.LAUNCH, backend=None, native_deadline=None) -> NativeJob:
         _validate(name, nonce, logon_id, access)
+        _native_deadline(native_deadline)
         owner = cls(name, nonce, logon_id, access, backend or _WindowsBackend())
         try:
-            owner._create()
+            owner._create(native_deadline=native_deadline)
             return owner
         except BaseException as primary:
             owner._failed_initialization(primary)
@@ -289,7 +298,7 @@ class NativeJob:
             owner._failed_initialization(primary)
             raise
 
-    def _create(self):
+    def _create(self, *, native_deadline=None):
         k, a = self._backend.kernel, self._backend.advapi
         owner_sid = _security_call(self._backend.security.current_owner_sid)
         # The helper validates real owner SIDs; injected fixtures must do so too.
@@ -308,6 +317,10 @@ class NativeJob:
         self._descriptor.state = "owned"
         self._uncertain_outputs.remove(descriptor)
         attributes = _SecurityAttributes(C.sizeof(_SecurityAttributes), descriptor.value, False)
+        # The original remote-readiness clock includes backend/security setup.
+        # An expired clock leaves only our descriptor, with no entered Create.
+        if native_deadline is not None:
+            native_deadline.require()
         C.set_last_error(0)
         self._creation.state = "allocation_unknown"
         self._creation.value = k.CreateJobObjectW(C.byref(attributes), self.name)
@@ -425,23 +438,27 @@ class NativeJob:
                     break
             raise NativeJobError("native_job_membership_unstable")
 
-    def _set(self, flags, rate_bp):
+    def _set(self, flags, rate_bp, *, native_deadline=None):
         if self.access not in (JobAccess.CONTROL, JobAccess.OWNER):
             raise NativeJobError("native_job_control_access_required")
         info = _CpuInfo(flags, rate_bp)
         try:
+            handle = self.handle
+            if native_deadline is not None:
+                native_deadline.require()
             _check(self._backend.kernel.SetInformationJobObject(
-                self.handle, 15, C.byref(info), C.sizeof(info)), "native_job_cpu_set_failed")
+                handle, 15, C.byref(info), C.sizeof(info)), "native_job_cpu_set_failed")
         except BaseException as error:
             _retain(error, self)
             raise
 
-    def set_cpu_rate_unverified(self, rate_bp: int) -> None:
+    def set_cpu_rate_unverified(self, rate_bp: int, *, native_deadline=None) -> None:
         """Native Set boundary only; caller must query before acknowledging it."""
         if type(rate_bp) is not int or not 1 <= rate_bp <= 10000:
             raise ValueError("native_job_cpu_rate_invalid")
+        _native_deadline(native_deadline)
         with self._lock:
-            self._set(ENABLE | HARD_CAP, rate_bp)
+            self._set(ENABLE | HARD_CAP, rate_bp, native_deadline=native_deadline)
 
     def set_cpu_rate(self, rate_bp: int) -> CpuState:
         with self._lock:

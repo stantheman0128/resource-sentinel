@@ -498,6 +498,17 @@ def run(args, directory, deadline, modules):
                     if not path.exists():
                         raise FixtureError("fixture_child_ready_missing")
                     verify_ready(read_ready(path), identity=child["identity"], args=args, deadline=deadline)
+                if time.monotonic_ns() >= deadline or os.path.lexists(stop):
+                    raise FixtureError("fixture_stopped_before_tree_ready")
+                # This root has now matched every leaf to its own retained
+                # Create witness. The guardian must still match this bounded
+                # observation to its original root and the actual Job PID set.
+                publish(directory / "tree-ready.json", {
+                    "schema_version": 1, "status": "tree_ready", "root_identity": dict(identity),
+                    "child_identities": [dict(child["identity"]) for child in owner.children],
+                    "nonce": args.nonce, "scope_id": args.scope_id, "job_name": args.job_name,
+                    "source_generation": args.source_generation, "source_digest": args.source_digest,
+                    "fixture_sha256": args.fixture_sha256, "deadline_monotonic_ns": deadline})
             chunks, reason = cpu_work(deadline, stop)
         if owner.process.is_in_job(owner.job.handle) is not True:
             raise FixtureError("fixture_exit_membership_unverified")

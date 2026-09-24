@@ -4,6 +4,29 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
+S1 workload root 的整棵程序樹就緒紀錄已補上。只有全部 child ready 與原始
+Create witness 相符後才發布 bounded `tree-ready.json`，保留原始建立順序、
+source pins 與共同截止時間；單 worker 的 child list 為空，leaf／foreign-parent
+probe 不發布。缺檔、錯誤 birth、部分建立失敗或停止時不發布部分成功紀錄。
+契約見 [S1-SERIAL-PROVIDER.md](S1-SERIAL-PROVIDER.md)。這是 root 的觀測紀錄，
+consumer 接線尚未完成；不能當作 guardian 已持有 child handles 或已證明退場。
+
+本次 **4 模組、124 PASS，0 failures／errors／skips，runner 3.413 秒**，
+包含六個新增案例。使用原始 spawn／readiness 流程、隔離檔案及明確 synthetic
+native calls，沒有執行 CPU workload 或改變任何實際 Job 限制。私人日誌
+`.local-adaptive/tree-ready-commit-20260924-1.log`。可重現的正常准入命令：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command 'C:\Python313\python.exe -m unittest tests.test_adaptive_scope_cpu_worker tests.test_adaptive_scope_bootstrap tests.test_adaptive_scope_launch tests.test_adaptive_scope_wrapper_boundary -q' -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
+這一批是獨立可提交的 fixture 改善，不代表 S1 或 P3–P6 native gate 通過。
+Items 5/6 仍有下述 source 缺口；日常 runtime、config、Scheduled Task 與啟動入口
+維持原狀，adaptive off。受保護 dirty baseline 仍未提交，測試依賴於 commit
+message 揭露；未宣稱 clean-checkout 或 full-suite 通過。
+
+### Serial provider checkpoint（歷史驗證）
+
 Serial S1 provider 的原始 case／daily demand／admission／cleanup 接線已實作。
 `tests/windows/adaptive_s1_provider.py` 保留同一個原始 case 與 command，排隊期間
 不建立 native scope；准入後只準備一次 scope，部分失敗沿原始 owner 收尾，前一個

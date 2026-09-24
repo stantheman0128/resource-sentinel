@@ -553,6 +553,7 @@ class WorkloadTests(unittest.TestCase):
         burn.assert_not_called()
         native.spawn.assert_not_called()
         self.assertFalse(list(self.directory.glob("ready-*.json")))
+        self.assertFalse((self.directory / "tree-ready.json").exists())
         self.assertEqual(worker.read_ready(self.directory / "foreign-probe.json")["foreign_gate"]["reason"],
                          "host_foreign_parent_job")
         self.assertTrue(worker.read_ready(self.directory / "exit-1234.json")["owned_handles_closed"])
@@ -586,6 +587,7 @@ class WorkloadTests(unittest.TestCase):
         exit_record = worker.read_ready(self.directory / "exit-1234.json")
         self.assertEqual(exit_record["children_still_alive"], 0)
         self.assertEqual(exit_record["status"], "work_complete")
+        self.assertFalse((self.directory / "tree-ready.json").exists())
         self.assertFalse((self.directory / "stop").exists())
         process.close.assert_called_once()
         job.close.assert_called_once()
@@ -617,6 +619,137 @@ class WorkloadTests(unittest.TestCase):
             return 1
         native.create.side_effect = created
         return native, owner, verified
+
+    def tree_native(self, *, missing_ready_at=None, mismatched_ready_at=None, failed_create_at=None):
+        """Real retained Create/duplicate/ready path, using explicit fake calls."""
+        native, fixture_owner, _ = self.raw_native()
+        self.args.workers = 3
+        identities = [dict(IDENTITY, pid=3234, created_filetime_100ns="130000000000000003"),
+                      dict(IDENTITY, pid=2234, created_filetime_100ns="130000000000000002")]
+        created, witnesses = [], []
+
+        def create(*args):
+            index = len(created)
+            created.append(index)
+            if index == failed_create_at:
+                return 0  # Documented FALSE, with the original zeroed output cells.
+            info = args[-1]._obj
+            info.hProcess, info.hThread = 81 + 10 * index, 82 + 10 * index
+            info.dwProcessId, info.dwThreadId = identities[index]["pid"], 6000 + index
+            return 1
+
+        def duplicate(handle, *, expected_pid, expected_logon_id):
+            index = (handle - 81) // 10
+            original = identities[index]
+            self.assertEqual(expected_pid, original["pid"])
+            self.assertEqual(expected_logon_id, original["logon_id"])
+            witness = Mock()
+            witness.identity = SimpleNamespace(to_dict=lambda: dict(original))
+            witness.is_in_job.return_value = True
+            witnesses.append(witness)
+            if index != missing_ready_at:
+                record = self.ready()
+                record["identity"] = dict(original)
+                if index == mismatched_ready_at:
+                    record["identity"]["created_filetime_100ns"] = "130000000000000099"
+                worker.publish(self.directory / f"ready-{original['pid']}.json", record)
+            return witness
+
+        native.create.side_effect = create
+        fixture_owner.modules.identity.VerifiedProcess.duplicate_from_handle.side_effect = duplicate
+        return native, fixture_owner.modules, identities, witnesses
+
+    def test_single_worker_root_publishes_closed_tree_schema_with_no_children(self):
+        modules, process, job = self.modules()
+        result, burn = self.run_synthetic(modules)
+        self.assertEqual(result, 0)
+        self.assertEqual(worker.read_ready(self.directory / "tree-ready.json"), {
+            "schema_version": 1, "status": "tree_ready", "root_identity": IDENTITY,
+            "child_identities": [], "nonce": NONCE, "scope_id": SCOPE_ID,
+            "job_name": worker.JOB_PREFIX + NONCE, "source_generation": GENERATION,
+            "source_digest": "b" * 64, "fixture_sha256": "c" * 64,
+            "deadline_monotonic_ns": NOW + 10_000_000_000})
+        burn.assert_called_once_with(NOW + 10_000_000_000, self.directory / "stop")
+        self.assertEqual(process.is_in_job.call_count, 2)  # Existing open and exit checks only.
+        job.close.assert_called_once()
+
+    def test_root_tree_uses_original_create_order_only_after_all_child_ready_checks(self):
+        native, modules, identities, witnesses = self.tree_native()
+        verify, publish, checked = worker.verify_ready, worker.publish, []
+
+        def verify_child(record, **kwargs):
+            self.assertFalse((self.directory / "tree-ready.json").exists())
+            verify(record, **kwargs)
+            checked.append(dict(kwargs["identity"]))
+
+        def publish_original(path, value):
+            if path.name == "tree-ready.json":
+                self.assertEqual(checked, identities)
+                self.assertEqual(value["child_identities"], identities)
+                self.assertEqual(value["root_identity"], IDENTITY)
+                self.assertEqual(native.create.call_count, 2)
+            return publish(path, value)
+
+        with patch.object(worker, "verify_ready", side_effect=verify_child), \
+                patch.object(worker, "publish", side_effect=publish_original):
+            result, burn = self.run_synthetic(modules, native=native)
+        self.assertEqual(result, 0)
+        tree = worker.read_ready(self.directory / "tree-ready.json")
+        self.assertEqual(tree["child_identities"], identities)  # Creation order, not sorted PIDs.
+        self.assertEqual(tree["deadline_monotonic_ns"], NOW + 10_000_000_000)
+        self.assertEqual(len(tree), 11)
+        self.assertEqual(len(witnesses), 2)
+        for witness in witnesses:
+            witness.is_in_job.assert_called_once_with(88)
+            witness.close.assert_called_once()
+        burn.assert_called_once()
+
+    def assert_tree_failure(self, reason, **fault):
+        native, modules, identities, witnesses = self.tree_native(**fault)
+        with patch.object(worker, "NativeChildren", return_value=native), \
+                patch.object(worker.time, "monotonic_ns", return_value=NOW), \
+                patch.object(worker, "cpu_work") as burn:
+            with self.assertRaisesRegex(worker.FixtureError, reason):
+                worker.run(self.args, self.directory, NOW + 10_000_000_000, modules)
+        burn.assert_not_called()
+        self.assertTrue((self.directory / "ready-1234.json").exists())
+        self.assertFalse((self.directory / "tree-ready.json").exists())
+        self.assertFalse((self.directory / "exit-1234.json").exists())
+        for witness in witnesses:
+            witness.close.assert_called_once()
+        modules.jobs.NativeJob.open.return_value.close.assert_called_once()
+        modules.identity.VerifiedProcess.current.return_value.close.assert_called_once()
+
+    def test_missing_original_child_ready_never_publishes_partial_tree(self):
+        self.assert_tree_failure("fixture_child_ready_missing", missing_ready_at=1)
+
+    def test_wrong_child_birth_never_publishes_tree_even_when_all_files_exist(self):
+        self.assert_tree_failure("fixture_child_ready_mismatch", mismatched_ready_at=1)
+
+    def test_failed_second_original_create_never_publishes_partial_tree(self):
+        self.assert_tree_failure("fixture_child_create_failed", failed_create_at=1)
+
+    def test_stop_after_last_child_verification_prevents_tree_publication_and_cpu(self):
+        native, modules, identities, witnesses = self.tree_native()
+        verify, checked = worker.verify_ready, []
+
+        def stop_after_ready(record, **kwargs):
+            verify(record, **kwargs)
+            checked.append(kwargs["identity"])
+            if len(checked) == len(identities):
+                (self.directory / "stop").touch()
+
+        with patch.object(worker, "NativeChildren", return_value=native), \
+                patch.object(worker.time, "monotonic_ns", return_value=NOW), \
+                patch.object(worker, "verify_ready", side_effect=stop_after_ready), \
+                patch.object(worker, "cpu_work") as burn:
+            with self.assertRaisesRegex(worker.FixtureError, "fixture_stopped_before_tree_ready"):
+                worker.run(self.args, self.directory, NOW + 10_000_000_000, modules)
+        self.assertEqual(checked, identities)
+        self.assertFalse((self.directory / "tree-ready.json").exists())
+        burn.assert_not_called()
+        for witness in witnesses:
+            witness.close.assert_called_once()
 
     def test_child_deadline_expiring_during_buffer_preparation_never_enters_create(self):
         native, owner, verified = self.raw_native()

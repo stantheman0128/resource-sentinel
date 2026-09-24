@@ -105,6 +105,18 @@ the clock, shorten windows, retry selective rounds or relax reducer thresholds.
 
 Ready files are bounded observations, matched to original root identity, exact
 Job membership, nonce/scope/source/fixture pins and one common actual work cutoff.
+The normal workload root also publishes `tree-ready.json` only after every leaf
+ready record matches its retained original Create witness. Its closed schema is
+`schema_version=1`, `status=tree_ready`, `root_identity`, `child_identities`,
+`nonce`, `scope_id`, `job_name`, `source_generation`, `source_digest`,
+`fixture_sha256` and `deadline_monotonic_ns`. Identities contain only PID, creation
+FILETIME and logon ID; children retain original creation order, at most 63.
+A single-worker root has an empty child list. Leaves and the foreign-parent
+probe publish no tree manifest. Partial/mismatched readiness, stop or expiry
+before publication refuses it. This remains a root-observed identity record,
+not guardian-owned child handles, proof of exit or permission to release capacity.
+The measurement consumer must match it to the original root and actual Job PID
+set before using it; that consumer integration is still unfinished.
 Every window must end before that cutoff and the original scope deadline. Use
 raw Job CPU 100 ns and monotonic ns measurements. Observe actual scope control
 during a capped window and reject one that restored early. Outside cap, continue

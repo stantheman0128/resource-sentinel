@@ -312,21 +312,32 @@ class SupervisorHost:
         from .supervisor_reconcile import FinishedBarrierJanitor
         from .supervisor_startup import SupervisorStartup
 
+        daily_successor = getattr(self, "_daily_successor_operation", None)
+        if daily_successor is not None:
+            from .daily_successor import DailySuccessorOperation
+            if type(daily_successor) is not DailySuccessorOperation:
+                raise SupervisorHostRefused("daily_successor_original_operation_required")
+            daily_successor.bind_supervisor(self)
+
         try:
             self.capability = read_host_capability()
         except HostCapabilityUnsupported as error:
             raise SupervisorHostRefused(error.reason, error.win32_error) from None
         try:
-            self.store = LifecycleStore(self.data_dir / "sentinel.db", existing_path=True)
+            self.store = (LifecycleStore(self.data_dir / "sentinel.db", existing_path=True)
+                if daily_successor is None else daily_successor.store)
         except Exception as error:
             raise SupervisorHostRefused("supervisor_host_ledger_unavailable", _reason(error)) from None
         try:
-            self.journal = RecoveryJournal(self.journal_dir)
+            self.journal = RecoveryJournal(self.journal_dir) if daily_successor is None else daily_successor.retirement.journal
         except Exception as error:
             raise SupervisorHostRefused("supervisor_host_journal_unavailable", _reason(error)) from None
         # Keep the owner reachable even if acquiring its native lifetime fence
         # fails. A new process never substitutes PID absence for old custody.
         self.startup = SupervisorStartup(self.store, self.journal)
+        if daily_successor is not None:
+            self.startup._daily_successor_operation = daily_successor
+            self.startup._daily_successor_supervisor = self
         try:
             self.startup.acquire()
         except Exception as error:
@@ -345,6 +356,27 @@ class SupervisorHost:
         try:
             if self._initial_start_operation is None:
                 self.startup.assert_fresh()
+            daily_successor = getattr(self, "_daily_successor_operation", None)
+            if daily_successor is not None:
+                from .daily_successor_epoch import SuccessorGuardianEpoch
+                epoch = daily_successor._guardian_epoch_operation
+                if self._initial_start_operation is None:
+                    if epoch is None:
+                        epoch = SuccessorGuardianEpoch(daily_successor, self)
+                    result = epoch.tick()
+                    if not result.complete:
+                        raise SupervisorHostRefused(result.reason or "daily_successor_epoch_pending")
+                    epoch.assert_complete()
+                else:
+                    if type(epoch) is not SuccessorGuardianEpoch:
+                        raise SupervisorHostRefused("daily_successor_original_epoch_required")
+                    # The original child may already have registered (+1
+                    # revision). Resume its retained creation/cleanup owner;
+                    # re-publication is neither necessary nor permitted.
+                    epoch.assert_retained_publication()
+                if self._initial_epoch is not None and self._initial_epoch != epoch.new_epoch:
+                    raise SupervisorHostRefused("daily_successor_epoch_changed")
+                self._initial_epoch = epoch.new_epoch
             if self.creation is None:
                 self.creation = _Creation()
             if self.draining and self.guardian is None:
@@ -653,6 +685,13 @@ class SupervisorHost:
                     self.operations.last_error = error
 
     def _start_initial_guardian(self):
+        successor = getattr(self, "_daily_successor_operation", None)
+        if successor is None:
+            return self._start_initial_guardian_owned()
+        with successor.startup_sql_scope(self):
+            return self._start_initial_guardian_owned()
+
+    def _start_initial_guardian_owned(self):
         # No SQLite transaction spans CreateProcess; POLICY still serializes
         # the final fresh-state check with cooperating infrastructure writers.
         from .supervisor_reconcile import RetainedPolicyOperation

@@ -945,9 +945,11 @@ class LifecycleStore:
         successor = successor_operation(self.db_path if pinned is None else pinned)
         from .daily_successor_scope import current_startup_operation
         from .daily_successor_epoch import current_sql_owner
+        from .guardian_registration import current_sql_owner as registration_sql_owner
         trackers = [item for item in (successor,
             current_startup_operation(self.db_path if pinned is None else pinned),
-            current_sql_owner(self.db_path if pinned is None else pinned)) if item is not None]
+            current_sql_owner(self.db_path if pinned is None else pinned),
+            registration_sql_owner(self.db_path if pinned is None else pinned)) if item is not None]
         if len(trackers) > 1:
             raise LifecycleError("daily_successor_foreign_sql_scope")
         successor = trackers[0] if trackers else None

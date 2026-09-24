@@ -1,6 +1,7 @@
 """Bounded successor epoch SQL; synthetic native fixtures, no guardian Create."""
 from contextlib import closing, contextmanager
 import copy
+import os
 import sqlite3
 import unittest
 from unittest.mock import patch
@@ -8,11 +9,14 @@ from uuid import uuid4
 
 from sentinel.adaptive import daily_generation as generation
 from sentinel.adaptive import daily_successor_epoch as epoch
+from sentinel.adaptive.contracts import ProcessIdentity
+from sentinel.adaptive.guardian_registration import GuardianRegistration
 from sentinel.adaptive.policy import PolicyBinding
 from sentinel.adaptive.store import LifecycleError
 from sentinel.adaptive.supervisor_epoch import SettledEpochRollover
 from sentinel.adaptive.supervisor_startup import supervisor_instance_binding
 from tests import test_adaptive_daily_successor_host as host_fixture
+from tests.test_adaptive_guardian_launch import ProcessBackend
 
 
 class SuccessorEpochReaderTests(unittest.TestCase):
@@ -236,6 +240,42 @@ class SuccessorGuardianEpochTests(unittest.TestCase):
         self.assertEqual((self.owner.attempt_id, self.owner.new_epoch, self.owner._candidate, self.owner._snapshot,
                           self.owner._guard, self.runtime(), self.audits()), originals)
 
+    def test_retained_publication_survives_actual_child_registration_without_relaxing_readback(self):
+        result = self.owner.tick()
+        self.assertTrue(result.complete, result)
+        revision = self.runtime()["registry_revision"]
+        originals = (self.owner._candidate, self.owner._snapshot, self.owner._guard, self.owner._result)
+        backend = ProcessBackend()
+        child = backend.process(ProcessIdentity(os.getpid(), 134343072009999999,
+                                                self.owner.binding.logon_id))
+        self.addCleanup(child.close)
+        registration = GuardianRegistration(self.store, self.operation.retirement.journal,
+            guardian=child, guardian_epoch=self.owner.new_epoch)
+        registered = registration.tick()
+        self.assertTrue(registered.complete, registered)
+        self.assertEqual(self.runtime()["registry_revision"], revision + 1)
+        self.assertEqual(self.audits().entries[0].to_dict()["registry_revision"], revision)
+        with patch.object(sqlite3, "connect", side_effect=AssertionError("metadata check opened SQL")):
+            self.assertIsNone(self.owner.assert_retained_publication())
+        with self.assertRaisesRegex(LifecycleError, "binding_changed"):
+            self.owner.assert_complete()
+        self.assertIsNone(self.owner.assert_retained_publication())
+        self.assertEqual((self.owner._candidate, self.owner._snapshot, self.owner._guard, self.owner._result), originals)
+        self.assertEqual(self.runtime()["registry_revision"], revision + 1)
+
+    def test_retained_publication_requires_completed_original_and_unchanged_guard(self):
+        with patch.object(sqlite3, "connect", side_effect=AssertionError("unpublished owner opened SQL")), \
+                self.assertRaisesRegex(LifecycleError, "publication_unsettled"):
+            self.owner.assert_retained_publication()
+        self.assertTrue(self.owner.tick().complete)
+        with patch.object(sqlite3, "connect", side_effect=AssertionError("changed owner opened SQL")):
+            with self.assertRaisesRegex(LifecycleError, "original_operation_required"):
+                copy.copy(self.owner).assert_retained_publication()
+            with patch.object(self.owner, "_guard", copy.copy(self.owner._guard)), \
+                    self.assertRaisesRegex(LifecycleError, "original_evidence_changed"):
+                self.owner.assert_retained_publication()
+        self.assertIsNone(self.owner.assert_retained_publication())
+
     def test_copies_or_replaced_original_startup_cannot_publish(self):
         with self.assertRaisesRegex(LifecycleError, "original_operation_required"):
             copy.copy(self.owner).tick()
@@ -289,6 +329,8 @@ class SuccessorGuardianEpochTests(unittest.TestCase):
         with patch.object(sqlite3, "connect", side_effect=AssertionError("unknown close replacement")):
             with self.assertRaisesRegex(LifecycleError, "custody_unsettled"):
                 self.owner.tick()
+            with self.assertRaisesRegex(LifecycleError, "custody_unsettled"):
+                self.owner.assert_retained_publication()
         self.assertIsNone(self.supervisor.guardian)
 
     def test_unknown_readiness_open_retains_original_reader_and_blocks_retry(self):

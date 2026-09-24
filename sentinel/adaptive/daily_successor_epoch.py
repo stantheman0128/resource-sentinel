@@ -488,10 +488,18 @@ class SuccessorGuardianEpoch:
                 self._quarantine = "cleanup_unknown"
             raise
 
-    def assert_complete(self):
+    def assert_retained_publication(self):
+        """Original settled ownership only; never a new Create permission."""
         self._authority()
-        if not self._complete or self._policy_operation.pending:
+        if (not self._complete or self._policy_operation.pending or not self._policy_operation._complete or
+                self._candidate is None or self._snapshot is None or self._guard is None or
+                self._guard._native_exit_confirmed is not True or self._guard._nonce_clear_attempted is not True or
+                self._result is None or not self._result.complete):
             _fail("publication_unsettled")
+        self._settled_connections()
+
+    def assert_complete(self):
+        self.assert_retained_publication()
         with self._scope():
             if not self._readback(require_clear=True):
                 _fail("audit_missing")

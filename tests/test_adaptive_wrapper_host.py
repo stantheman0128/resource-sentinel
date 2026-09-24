@@ -469,5 +469,49 @@ class WrapperHostSubprocessTests(unittest.TestCase):
         self.assertEqual(result.stdout, "")
 
 
+class ExperimentWrapperHostTests(unittest.TestCase):
+    """Typed host orchestration over actual two-ledger SQL and native fixtures.
+
+    The launcher fixture supplies explicit in-process native/transport doubles.
+    These checks establish neither a Windows launch nor production settlement.
+    """
+
+    def setUp(self):
+        self.fixture = harness.ExperimentLauncherTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        for override in (
+            patch.object(module, "emit"),
+            patch.object(module, "stdio_handles", return_value=STDIO),
+            patch.object(module, "read_host_capability", return_value=SYNTHETIC),
+        ):
+            override.start()
+            self.addCleanup(override.stop)
+
+    def arguments(self, **overrides):
+        values = dict(partition=self.fixture.partition,
+                      publication=self.fixture.publication,
+                      endpoint=self.fixture.endpoint,
+                      guardian_epoch=self.fixture.guardian_epoch,
+                      max_wait_sec=1)
+        values.update(overrides)
+        return values
+
+    def build(self, **overrides):
+        return WrapperHost.for_experiment(self.fixture.spec, **self.arguments(**overrides))
+
+    def test_experiment_factory_requires_an_explicit_bounded_integer_wait(self):
+        values = self.arguments()
+        values.pop("max_wait_sec")
+        with self.assertRaises(TypeError):
+            WrapperHost.for_experiment(self.fixture.spec, **values)
+        for value in (None, False, True, 0, -1, 121, 1.0, "1"):
+            with self.subTest(max_wait_sec=value), self.assertRaises(WrapperHostRefused):
+                self.build(max_wait_sec=value)
+        self.assertFalse(self.fixture.context._submitted)
+        self.assertIsNone(self.fixture.partition._context)
+        self.assertEqual(self.fixture.publication.attempts, ())
+
+
 if __name__ == "__main__":
     unittest.main()

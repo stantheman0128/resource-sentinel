@@ -60,6 +60,128 @@ class _UnavailableReadiness:
         raise ManagedLaunchError("native_launch_readiness_unavailable")
 
 
+_EXPERIMENT_BINDING = object()
+
+
+class _ExperimentWrapperBinding:
+    """One original bootstrap's wrapper inputs, never a serialized permit."""
+    def __init__(self, *, _key=None):
+        if _key is not _EXPERIMENT_BINDING:
+            raise ManagedLaunchError("experiment_wrapper_original_factory_required")
+
+    def __reduce__(self):
+        raise TypeError("experiment_wrapper_binding_not_serializable")
+
+    @classmethod
+    def prepare(cls, spec, *, partition, publication, endpoint, guardian_epoch):
+        from .experiment_partition_admission import ExperimentPartitionCoordinator
+        from .experiment_backing_transport import ExperimentBackingPublication
+        from .experiment_host_authority import ExperimentBackedHostAuthority
+        from .pipe_windows import NativePipeEndpoint
+        if (cls is not _ExperimentWrapperBinding or type(spec) is not LaunchSpec or
+                type(partition) is not ExperimentPartitionCoordinator or
+                type(publication) is not ExperimentBackingPublication or type(endpoint) is not NativePipeEndpoint):
+            raise ManagedLaunchError("experiment_wrapper_original_inputs_required")
+        original = getattr(publication, "_wrapper_launcher_binding", None)
+        if original is not None:
+            if (type(original) is not cls or original.spec is not spec or original.partition is not partition or
+                    original.endpoint is not endpoint or original.guardian_epoch != guardian_epoch):
+                raise ManagedLaunchError("experiment_wrapper_original_binding_changed")
+            original.assert_original()
+            return original
+        spec.__post_init__()
+        _identifier(guardian_epoch, "guardian_epoch")
+        partition._original()
+        publication._original()
+        context, request = publication.context, publication.request
+        snapshot = context.snapshot()
+        context.verify_launch_payload(command=spec.command, cwd=spec.cwd)
+        if (partition.child_binding is not publication.child_binding or request.manifest is not partition.manifest or
+                request.member_id != partition.member_id or request.reservation_id != partition.reservation_id or
+                partition._context is not None or snapshot is not publication._snapshot or
+                snapshot.requested != spec.requested or snapshot.role is not spec.role or snapshot.priority is not spec.priority or
+                snapshot.request.repo != spec.repo_identifier or endpoint.logon_id != snapshot.logon_id or
+                endpoint.server_identity == snapshot.wrapper_identity):
+            raise ManagedLaunchError("experiment_wrapper_original_payload_changed")
+        value = cls(_key=_EXPERIMENT_BINDING)
+        value.spec, value.partition, value.publication = spec, partition, publication
+        value.context, value.snapshot, value.endpoint, value.guardian_epoch = context, snapshot, endpoint, guardian_epoch
+        value._epoch = guardian_epoch
+        value._request, value._request_wire = request, request.to_dict()
+        value._publication_fixed = publication._fixed
+        value._spec_payload = (spec.command, spec.cwd, spec.repo_identifier, spec.requested,
+                               spec.role, spec.priority, spec.admission_timeout_sec)
+        value._fixed = (spec, partition, publication, context, snapshot, endpoint, request, value._publication_fixed)
+        value._launcher = value._host = value._result = value._result_payload = value._construction_error = None
+        value._owner, value._thread = value, threading.get_ident()
+        value._publication_errors = []
+        # Register before constructing even the authority. A failed factory may
+        # not discard its original publication/admission in a replacement host.
+        publication._wrapper_launcher_binding = value
+        value.authority = None
+        try:
+            value.authority = ExperimentBackedHostAuthority.for_wrapper(partition)
+        except BaseException as error:
+            value._construction_error = error
+            error.experiment_wrapper_binding = value
+            raise
+        return value
+
+    def assert_original(self, launcher=None):
+        from . import experiment_backing_transport as transport
+        from .experiment_host_authority import ExperimentBackedHostAuthority
+        values = (self.spec, self.partition, self.publication, self.context, self.snapshot,
+                  self.endpoint, self._request, self._publication_fixed)
+        if (type(self) is not _ExperimentWrapperBinding or self._owner is not self or
+                any(a is not b for a, b in zip(values, self._fixed)) or threading.get_ident() != self._thread or
+                self.publication._wrapper_launcher_binding is not self or
+                self.publication._fixed is not self._publication_fixed or
+                self.publication.context is not self.context or self.publication._snapshot is not self.snapshot or
+                self.publication.request is not self._request or self._request.to_dict() != self._request_wire or
+                transport._PUBLICATIONS.get(self.publication._key) is not self.publication or
+                type(self.authority) is not ExperimentBackedHostAuthority or self.authority.adapter is not self.partition or
+                self._construction_error is not None):
+            raise ManagedLaunchError("experiment_wrapper_original_binding_changed")
+        self.partition._original()
+        self.authority._original()
+        if ((self.spec.command, self.spec.cwd, self.spec.repo_identifier, self.spec.requested,
+                self.spec.role, self.spec.priority, self.spec.admission_timeout_sec) != self._spec_payload or
+                self.guardian_epoch != self._guardian_epoch):
+            raise ManagedLaunchError("experiment_wrapper_original_payload_changed")
+        if launcher is not None and (self._launcher is not launcher or launcher._experiment is not self or
+                launcher.admission is not self.context or launcher.coordinator is not self.partition or
+                launcher._readiness is not self.authority or launcher._spec is not self.spec or
+                launcher.endpoint is not self.endpoint or launcher.guardian_epoch != self.guardian_epoch):
+            raise ManagedLaunchError("experiment_wrapper_original_launcher_changed")
+        if self._result is not None:
+            if (self.publication._result is not self._result or
+                    transport._result(self._result, self._request) != self._result_payload):
+                raise ManagedLaunchError("experiment_wrapper_publication_changed")
+
+    @property
+    def _guardian_epoch(self):
+        return self._epoch
+
+    def publish_before_admission(self):
+        self.assert_original()
+        if self._result is not None:
+            return
+        if len(self._publication_errors) >= 32:
+            raise ManagedLaunchError("experiment_wrapper_publication_failure_limit")
+        self.context.verify_launch_payload(command=self.spec.command, cwd=self.spec.cwd)
+        try:
+            result = self.publication.publish(timeout_ms=1000)
+            from .experiment_backing_transport import _result
+            payload = _result(result, self._request)
+            if self.publication._result is not result:
+                raise ManagedLaunchError("experiment_wrapper_publication_unverified")
+            self._result, self._result_payload = result, payload
+        except BaseException as error:
+            self._publication_errors.append(error)
+            error.experiment_wrapper_binding = self
+            raise
+
+
 def resolve_system_cmd(cmd_path: str | None = None) -> str:
     """Resolve the OS system cmd.exe, never COMSPEC/PATH or a supplied program.
 
@@ -116,14 +238,45 @@ class ManagedLauncher:
     That method must raise on uncertainty and return None only after its real
     checks. A boolean or cached fixture readiness receipt is not authority.
     """
+    @classmethod
+    def for_experiment(cls, spec, *, partition, publication, endpoint, guardian_epoch):
+        """Fixed bootstrap entry; no injectable production collaborator seam."""
+        if cls is not ManagedLauncher:
+            raise ManagedLaunchError("experiment_wrapper_original_factory_required")
+        binding = _ExperimentWrapperBinding.prepare(spec, partition=partition, publication=publication,
+            endpoint=endpoint, guardian_epoch=guardian_epoch)
+        if binding._launcher is not None:
+            binding.assert_original(binding._launcher)
+            return binding._launcher
+        owner = cls.__new__(cls)
+        binding._launcher = owner
+        try:
+            cls.__init__(owner, spec, coordinator=partition, endpoint=endpoint, guardian_epoch=guardian_epoch,
+                         readiness=binding.authority, _experiment_binding=binding)
+        except BaseException as error:
+            binding._construction_error = error
+            error.experiment_wrapper_binding = binding
+            raise
+        return owner
+
     def __init__(self, spec: LaunchSpec, *, coordinator, endpoint, guardian_epoch: str,
                  cmd_path=None, readiness=None, client_factory=None,
                  admission_factory=None, job_factory=None, launch=None, cmd_resolver=None,
-                 mutex_factory=None):
+                 mutex_factory=None, _experiment_binding=None):
         if type(spec) is not LaunchSpec:
             raise ManagedLaunchError("launch_spec_required")
         spec.__post_init__()
         _identifier(guardian_epoch, "guardian_epoch")
+        self._experiment = _experiment_binding
+        if _experiment_binding is not None:
+            binding = _experiment_binding
+            if (type(binding) is not _ExperimentWrapperBinding or binding._launcher is not self or
+                    binding.spec is not spec or binding.partition is not coordinator or
+                    binding.endpoint is not endpoint or binding.guardian_epoch != guardian_epoch or
+                    readiness is not binding.authority or any(value is not None for value in
+                        (cmd_path, client_factory, admission_factory, job_factory, launch, cmd_resolver, mutex_factory))):
+                raise ManagedLaunchError("experiment_wrapper_factory_override_forbidden")
+            binding.assert_original()
         self._lock = threading.RLock()
         self._spec, self.coordinator, self.endpoint = spec, coordinator, endpoint
         self.guardian_epoch = guardian_epoch
@@ -134,10 +287,13 @@ class ManagedLauncher:
         self._open_job = NativeJob.open if job_factory is None else job_factory
         self._launch = native_launcher.launch_in_job if launch is None else launch
         self._make_mutex = NativePolicyMutex if mutex_factory is None else mutex_factory
-        factory = ManagedAdmission.current if admission_factory is None else admission_factory
-        self.admission = factory(command=spec.command, cwd=spec.cwd,
-            repo_identifier=spec.repo_identifier, requested=spec.requested,
-            role=spec.role, priority=spec.priority)
+        if self._experiment is not None:
+            self.admission = self._experiment.context
+        else:
+            factory = ManagedAdmission.current if admission_factory is None else admission_factory
+            self.admission = factory(command=spec.command, cwd=spec.cwd,
+                repo_identifier=spec.repo_identifier, requested=spec.requested,
+                role=spec.role, priority=spec.priority)
         self.job = self.process = None
         self._launch_mutex = self._store = None
         self._extra_cleanup_owners = []
@@ -172,6 +328,10 @@ class ManagedLauncher:
                 client_factory = ManagedLaunchClient
             self.client = client_factory(self.admission, endpoint, guardian_epoch=guardian_epoch)
         except BaseException as primary:
+            if self._experiment is not None:
+                primary.experiment_wrapper_binding = self._experiment
+                self._experiment._construction_error = primary
+                raise
             try:
                 self.admission.close()
             except BaseException as cleanup:
@@ -192,6 +352,8 @@ class ManagedLauncher:
     def _assert_context(self, *, submitted=True):
         if self._closed or self._closing:
             raise ManagedLaunchError("launcher_closed_or_closing")
+        if self._experiment is not None:
+            self._experiment.assert_original(self)
         snapshot = (self.admission.snapshot_for_ledger(self.coordinator.db_path)
                     if submitted else self.admission.snapshot())
         if snapshot != self._snapshot:
@@ -201,6 +363,8 @@ class ManagedLauncher:
     def admit_once(self, status, *, config=None):
         """Retry only this exact capacity request; no wait loop or queue removal."""
         with self._lock:
+            if self._experiment is not None and (status is not None or config is not None):
+                raise ManagedLaunchError("experiment_wrapper_capacity_input_forbidden")
             # Coordinator owns first-submission/pinned-ledger reconciliation.
             # A prior call may have failed before it could pin the context.
             self._assert_context(submitted=False)
@@ -208,9 +372,13 @@ class ManagedLauncher:
                 raise ManagedLaunchError("launcher_attempt_sealed")
             if self._admitted is not None:
                 return dict(self._admitted)
-            self._submitted = True
+            if self._experiment is None:
+                self._submitted = True
             self.phase = "ADMITTING"
             try:
+                if self._experiment is not None:
+                    self._experiment.publish_before_admission()
+                    self._submitted = True
                 result = self.coordinator.admit_managed(self.admission, status, config=config)
                 if (type(result) is not dict or type(result.get("allowed")) is not bool or
                         result.get("request_key") != self._snapshot.request.request_key):
@@ -259,7 +427,10 @@ class ManagedLauncher:
         # Opening/migrating the existing ledger happens outside the Job mutex.
         # All work inside that mutex is read-only until the single native create.
         if self._store is None:
-            self._store = LifecycleStore(self.coordinator.db_path, existing_path=True)
+            self._store = (self._experiment.partition._isolated_store if self._experiment is not None else
+                           LifecycleStore(self.coordinator.db_path, existing_path=True))
+        if self._experiment is not None and self._store is not self._experiment.partition._isolated_store:
+            raise ManagedLaunchError("experiment_wrapper_ledger_replaced")
         return self._store
 
     def _scope_row(self, store):
@@ -281,6 +452,17 @@ class ManagedLauncher:
         return row
 
     def _create_fenced(self, command_line, *, timeout_ms, stdin_handle, stdout_handle, stderr_handle):
+        if self._experiment is None:
+            return self._create_with_job_fence(command_line, timeout_ms=timeout_ms,
+                stdin_handle=stdin_handle, stdout_handle=stdout_handle, stderr_handle=stderr_handle)
+        self._experiment.assert_original(self)
+        # Acquire before constructing/waiting on the Job mutex. This scope ends
+        # before launch_once dispatches BindRoot over the guardian pipe.
+        with self._readiness.new_work_scope(self.execution_id, operation="create"):
+            return self._create_with_job_fence(command_line, timeout_ms=timeout_ms,
+                stdin_handle=stdin_handle, stdout_handle=stdout_handle, stderr_handle=stderr_handle)
+
+    def _create_with_job_fence(self, command_line, *, timeout_ms, stdin_handle, stdout_handle, stderr_handle):
         store = self._ledger()
         try:
             self._launch_mutex = self._make_mutex(self._snapshot.logon_id,
@@ -309,12 +491,19 @@ class ManagedLauncher:
                 raise ManagedLaunchError("launcher_launch_fence_state_changed")
             store.assert_admission_covered(self.admission, row)
             store.assert_launch_fence(row, version=1)
+            native_bounds = {}
+            if self._experiment is not None:
+                self._experiment.assert_original(self)
+                self.admission.verify_launch_payload(command=self._spec.command, cwd=self._spec.cwd)
+                if self._readiness.assert_create_ready(self.admission, row, self.endpoint) is not None:
+                    raise ManagedLaunchError("native_launch_readiness_unverified")
+                native_bounds = self._readiness._native_create_limits(self.execution_id)
             self._create_attempted = True
             self.phase = "CREATING"
             try:
                 self.process = self._launch(self.job, self._cmd_path, command_line,
                     cwd=self._spec.cwd, stdin_handle=stdin_handle,
-                    stdout_handle=stdout_handle, stderr_handle=stderr_handle)
+                    stdout_handle=stdout_handle, stderr_handle=stderr_handle, **native_bounds)
             except native_launcher.LaunchOutcomeUnknown as error:
                 self.process = error.process
                 raise

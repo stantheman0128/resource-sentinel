@@ -2,7 +2,23 @@
 
 日期：2026-09-19。狀態：**正式計畫已入庫；2026-09-25 依使用者要求收尾並暫停，production adaptive 維持 off。**
 
-## 2026-09-25 收尾 checkpoint（目前狀態）
+## 2026-09-25 WIP 保存提交（目前狀態）
+
+依使用者後續的 commit 要求，將先前凍結的七個 task-owned 草稿保存入庫：
+`launcher.py`、`wrapper_host.py`、`test_adaptive_wrapper_host.py`，以及
+`experiment_host_authority.py`／`experiment_host_roles.py` 與各自測試。
+這是 **WIP 保存點，未完成且未驗證**，不是可部署或通過驗收的版本。
+七檔與暫停時的本機備份 hash 完全一致，沒有為了提交而繼續擴充功能。
+
+已知 `test_adaptive_wrapper_host.py` 引用尚不存在的
+`harness.ExperimentLauncherTests`；publication 不確定結果的 close/release
+custody、constructor failure、guardian bootstrap／Job intent 仍未接完。
+此次只核對歸屬與 `git diff --check`，沒有執行新測試；下方 249 PASS 僅適用
+其記錄的精確 source tree，**不適用這個 WIP HEAD**。上一個已驗證 source
+仍為 `2e5015f`，完整收尾文件在 `8690eb4`。任務仍暫停，adaptive off，
+不因這次保存提交恢復實作或部署。
+
+## 2026-09-25 收尾 checkpoint（最後已驗證批次）
 
 Source commit `2e5015f179a40a7f4429fd586fbc70e487b2b44f` 補強原始
 DailyReadinessAuthority 的 peer/backend/handle/lock/identity、binding、endpoint

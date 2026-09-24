@@ -139,6 +139,40 @@ class WrapperHost:
     readiness object built here; it is not a way to supply a readiness receipt.
     """
 
+    @classmethod
+    def for_experiment(cls, spec, *, partition, publication, endpoint, guardian_epoch,
+                       max_wait_sec, rpc_timeout_ms=DEFAULT_RPC_TIMEOUT_MS,
+                       poll_interval_ms=DEFAULT_POLL_INTERVAL_MS):
+        """Bound fixed-bootstrap entry, with a finite experiment root wait.
+
+        The bootstrap must resolve its guardian through the original parent;
+        endpoint data alone grants nothing. Live daily actor/Job checks in the
+        typed authority independently bind that server before native Create.
+        """
+        from .launcher import _ExperimentWrapperBinding
+        if (cls is not WrapperHost or type(max_wait_sec) is not int or not 1 <= max_wait_sec <= 120 or
+                type(rpc_timeout_ms) is not int or not 1 <= rpc_timeout_ms <= 1000 or
+                type(poll_interval_ms) is not int or not 1 <= poll_interval_ms <= 1000):
+            raise WrapperHostRefused("experiment_wrapper_bounds_invalid")
+        binding = _ExperimentWrapperBinding.prepare(spec, partition=partition, publication=publication,
+            endpoint=endpoint, guardian_epoch=guardian_epoch)
+        limits = (rpc_timeout_ms, poll_interval_ms, max_wait_sec)
+        if binding._host is not None:
+            original = binding._host
+            if type(original) is not cls or original._experiment_limits != limits:
+                raise WrapperHostRefused("experiment_wrapper_original_host_changed")
+            original._assert_experiment_host()
+            return original
+        owner = cls(data_dir=partition.db_path.parent, command=spec.command, cwd=spec.cwd,
+            repo_identifier=spec.repo_identifier, role=spec.role, priority=spec.priority, requested=spec.requested,
+            guardian_epoch=guardian_epoch, guardian_pid=endpoint.server_identity.pid,
+            guardian_created_filetime_100ns=endpoint.server_identity.created_filetime_100ns,
+            endpoint_instance_id=endpoint.instance_id, admission_timeout_sec=spec.admission_timeout_sec,
+            rpc_timeout_ms=rpc_timeout_ms, poll_interval_ms=poll_interval_ms, max_wait_sec=max_wait_sec)
+        owner._experiment, owner._experiment_limits = binding, limits
+        binding._host = owner
+        return owner
+
     def __init__(self, *, data_dir, command, cwd, repo_identifier, role, priority,
                  requested, guardian_epoch, guardian_pid, guardian_created_filetime_100ns,
                  endpoint_instance_id, status_path=None, config_path=None,
@@ -163,6 +197,7 @@ class WrapperHost:
         self.poll_interval_ms = poll_interval_ms
         self.max_wait_sec = max_wait_sec
         self.launcher_factory = launcher_factory
+        self._experiment = None
         if (type(rpc_timeout_ms) is not int or not 1 <= rpc_timeout_ms <= 1000 or
                 type(poll_interval_ms) is not int or poll_interval_ms < 1 or
                 type(max_wait_sec) is not int or max_wait_sec < 0):
@@ -180,6 +215,23 @@ class WrapperHost:
         self._interrupt_requested = self._recovering = False
 
     # --- preflight --------------------------------------------------------
+
+    def _assert_experiment_host(self):
+        from .launcher import _ExperimentWrapperBinding
+        binding = self._experiment
+        if type(binding) is not _ExperimentWrapperBinding or binding._host is not self:
+            raise WrapperHostRefused("experiment_wrapper_original_host_required")
+        binding.assert_original()
+        spec, endpoint = binding.spec, binding.endpoint
+        if (self.launcher_factory is not None or self.data_dir.resolve() != binding.partition.db_path.parent or
+                (self.command, self.cwd, self.repo_identifier, self.requested, self.role, self.priority,
+                 self.admission_timeout_sec) != (spec.command, spec.cwd, spec.repo_identifier, spec.requested,
+                    spec.role, spec.priority, spec.admission_timeout_sec) or
+                (self.guardian_pid, self.guardian_created_filetime_100ns, self.endpoint_instance_id,
+                 self.guardian_epoch) != (endpoint.server_identity.pid, endpoint.server_identity.created_filetime_100ns,
+                    endpoint.instance_id, binding.guardian_epoch) or
+                (self.rpc_timeout_ms, self.poll_interval_ms, self.max_wait_sec) != self._experiment_limits):
+            raise WrapperHostRefused("experiment_wrapper_original_host_changed")
 
     def _capability(self):
         try:
@@ -261,6 +313,11 @@ class WrapperHost:
 
         factory = ManagedLauncher if self.launcher_factory is None else self.launcher_factory
         try:
+            if self._experiment is not None:
+                self._assert_experiment_host()
+                binding = self._experiment
+                return ManagedLauncher.for_experiment(spec, partition=binding.partition,
+                    publication=binding.publication, endpoint=binding.endpoint, guardian_epoch=binding.guardian_epoch)
             return factory(spec, coordinator=self.coordinator, endpoint=self.endpoint,
                            guardian_epoch=self.guardian_epoch, readiness=self.readiness)
         except BaseException as error:
@@ -269,7 +326,7 @@ class WrapperHost:
                 self.launcher = owner
             elif (getattr(error, "_identity_handle_cleanup", ()) or
                   getattr(error, "_policy_mutex_cleanup", ()) or
-                  getattr(error, "__notes__", ())):
+                  getattr(error, "__notes__", ()) or getattr(error, "experiment_wrapper_binding", None) is not None):
                 # No fabricated launcher/context can inherit this authority.
                 self._construction_unknown = error
             if not isinstance(error, Exception):
@@ -287,12 +344,22 @@ class WrapperHost:
         self.capability = self._capability()
         self.logon_id = self._logon()
         handles = stdio_handles()
-        status = _load_json(self.status_path, "wrapper_host_status_unavailable")
-        config = _load_json(self.config_path, "wrapper_host_config_unavailable")
-        spec = self._spec()
-        self.coordinator = self._coordinator()
-        self.readiness = self._readiness()
-        self.endpoint = self._guardian_endpoint()
+        if self._experiment is not None:
+            self._assert_experiment_host()
+            binding = self._experiment
+            if self.logon_id != binding.snapshot.logon_id:
+                raise WrapperHostRefused("experiment_wrapper_logon_changed")
+            status = config = None
+            spec = binding.spec
+            self.coordinator, self.store = binding.partition, binding.partition._isolated_store
+            self.readiness, self.endpoint = binding.authority, binding.endpoint
+        else:
+            status = _load_json(self.status_path, "wrapper_host_status_unavailable")
+            config = _load_json(self.config_path, "wrapper_host_config_unavailable")
+            spec = self._spec()
+            self.coordinator = self._coordinator()
+            self.readiness = self._readiness()
+            self.endpoint = self._guardian_endpoint()
         self.launcher = self._build_launcher(spec)
         self._check_interrupt()
         emit({"event": "wrapper_host_attempt", "execution_id": self.launcher.execution_id,

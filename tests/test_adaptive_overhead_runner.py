@@ -6,13 +6,15 @@ import sqlite3
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from sentinel.adaptive.contracts import IdentityStatus, ProcessIdentity
 from sentinel.adaptive.identity import VerifiedProcess
 from tests.windows import adaptive_cost_probe as cost
 from tests.windows import adaptive_overhead_native as native
 from tests.windows import adaptive_overhead_runner as runner
+from tests.test_adaptive_daily_monitor import DailyMonitorFixture
+from tests.test_adaptive_decision import profile as decision_profile
 
 
 LOGON = "S-1-5-5-10-20"
@@ -150,7 +152,12 @@ class P4ReducerTests(unittest.TestCase):
 
 
 class MonitorInventoryTests(unittest.TestCase):
-    def build(self):
+    def build(self, *, cohost=True):
+        fixture = DailyMonitorFixture()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        monitor = fixture.capture()
+        keeper = monitor.assert_original()
         owners = []
         for pid in (1, 2, 3, 4):
             owner = VerifiedProcess(None, None, identity(pid))
@@ -158,18 +165,68 @@ class MonitorInventoryTests(unittest.TestCase):
                                                                status=IdentityStatus.ALIVE))
             owners.append(owner)
         helper, guardian, wrapper, supervisor = owners
+        if cohost:
+            supervisor = keeper
         session = SimpleNamespace(helper=helper, guardian=guardian, wrappers=(wrapper,),
+            daily_monitor=monitor,
             helper_host=SimpleNamespace(process=helper, parent_process=supervisor),
             monitor_processes=(("helper", helper), ("guardian", guardian),
                 ("waiting_wrapper", wrapper), ("supervisor", supervisor),
-                ("accounting_keeper", supervisor), ("daily_activation", supervisor)))
+                ("accounting_keeper", keeper), ("daily_activation", keeper)))
+        session.fixture = fixture  # Explicit test-only origin for real SQL release below.
         return session, SimpleNamespace(logon_id=LOGON)
 
     def test_original_cohosted_roles_keep_one_cpu_witness(self):
         session, context = self.build()
-        witnesses, roles = runner.monitor_inventory(session, context, 1)
+        witnesses, roles, monitor, keeper = runner.monitor_inventory(session, context, 1)
         self.assertEqual(len(witnesses), 4)
-        self.assertEqual(roles[identity(4)], runner.COHOST_ROLES)
+        self.assertEqual(roles[session.daily_monitor.identity], runner.COHOST_ROLES)
+        self.assertIs(monitor, session.daily_monitor)
+        self.assertIs(keeper, monitor.assert_original())
+
+    def test_distinct_original_supervisor_is_charged_separately(self):
+        session, context = self.build(cohost=False)
+        witnesses, roles, unused_monitor, unused_keeper = runner.monitor_inventory(session, context, 1)
+        self.assertEqual(len(witnesses), 5)
+        self.assertEqual(roles[identity(4)], frozenset(("supervisor",)))
+        self.assertEqual(roles[session.daily_monitor.identity],
+            frozenset(("accounting_keeper", "daily_activation")))
+
+    def test_absent_or_untyped_monitor_is_not_authenticated_custody(self):
+        session, context = self.build()
+        original = session.daily_monitor
+        for value in (None, SimpleNamespace(assert_original=original.assert_original), {}):
+            session.daily_monitor = value
+            with self.subTest(type=type(value).__name__):
+                with self.assertRaisesRegex(runner.NativeRunBlocked, "authenticated_daily_monitor_required"):
+                    runner.monitor_inventory(session, context, 1)
+
+    def test_live_same_logon_supervisor_cannot_replace_authenticated_keeper(self):
+        session, context = self.build(cohost=False)
+        session.monitor_processes = (*session.monitor_processes[:4],
+            ("accounting_keeper", session.helper_host.parent_process),
+            ("daily_activation", session.helper_host.parent_process))
+        with self.assertRaisesRegex(runner.NativeRunBlocked, "coverage_incomplete"):
+            runner.monitor_inventory(session, context, 1)
+
+    def test_same_identity_alias_must_be_same_original_handle_owner(self):
+        session, context = self.build()
+        original = session.daily_monitor.assert_original()
+        other = VerifiedProcess(None, None, original.identity)
+        other.observe = original.observe
+        # Merely updating the supervisor member as well cannot legitimize a
+        # same-identity, independently reopened peer as the original keeper.
+        session.helper_host.parent_process = other
+        session.monitor_processes = (*session.monitor_processes[:3],
+            ("supervisor", other), *session.monitor_processes[4:])
+        with self.assertRaisesRegex(runner.NativeRunBlocked, "coverage_incomplete"):
+            runner.monitor_inventory(session, context, 1)
+
+    def test_duplicate_role_remains_invalid_even_for_authenticated_witness(self):
+        session, context = self.build()
+        session.monitor_processes = (*session.monitor_processes[:-1], session.monitor_processes[-2])
+        with self.assertRaisesRegex(runner.NativeRunBlocked, "role_duplicate"):
+            runner.monitor_inventory(session, context, 1)
 
     def test_missing_keeper_is_not_complete_monitoring(self):
         session, context = self.build()
@@ -193,6 +250,92 @@ class MonitorInventoryTests(unittest.TestCase):
             ("supervisor", other), *session.monitor_processes[4:])
         with self.assertRaisesRegex(runner.NativeRunBlocked, "coverage_incomplete"):
             runner.monitor_inventory(session, context, 1)
+
+    def test_continuous_check_keeps_the_open_sessions_original_monitor(self):
+        session, context = self.build()
+        runner.monitor_inventory(session, context, 1)
+        session.assert_daily_coverage = lambda: None
+        producer = object.__new__(runner.P4Producer)
+        producer._monitor_pin = (session, session.daily_monitor, session.daily_monitor.assert_original())
+        producer._covered(session)
+        session.daily_monitor = SimpleNamespace(assert_original=producer._monitor_pin[1].assert_original)
+        with self.assertRaisesRegex(runner.NativeRunBlocked, "original_daily_monitor_changed"):
+            producer._covered(session)
+
+    def test_open_cannot_replace_validated_monitor_through_changing_property(self):
+        base, context = self.build()
+        original = base.daily_monitor
+        keeper = original.assert_original()
+        base.helper = base.fixture.caller
+        base.helper_host.process = base.helper
+        base.monitor_processes = (("helper", base.helper), *base.monitor_processes[1:])
+        base.jobs = (("unused-before-native", object()),)
+        profile = decision_profile()
+        base.profile_revision, base.context = runner.profile_revision(profile), context
+        base.scope_nonce = "a" * 32
+        base.log_directory = base.fixture.fixture.scope / "runtime-logs"
+        base.log_directory.mkdir()
+        for name in ("assert_daily_coverage", "read_guardian_set_audit", "read_resident_telemetry",
+                     "enter_idle", "enter_stress", "prepare_wrapper_trial", "retire"):
+            setattr(base, name, lambda: None)
+
+        class ChangingSession:
+            reads = 0
+
+            @property
+            def daily_monitor(self):
+                self.reads += 1
+                return original if self.reads == 1 else SimpleNamespace(assert_original=lambda: keeper)
+
+            def __getattr__(self, name):
+                return getattr(base, name)
+
+        session = ChangingSession()
+        producer = object.__new__(runner.P4Producer)
+        producer.directory, producer.profile, producer.context = base.fixture.fixture.scope, profile, context
+        producer._monitor_pin, producer.local_owners = None, []
+        producer.coverage = SimpleNamespace(open_overhead_session=lambda **unused: session)
+        with patch.object(native, "NativeCostProbe", side_effect=AssertionError("probe initialized")):
+            with self.assertRaisesRegex(runner.NativeRunBlocked, "original_daily_monitor_changed"):
+                producer._open(1, "scale-1")
+        self.assertIs(producer._monitor_pin[1], original)
+        self.assertIs(producer._monitor_pin[2], keeper)
+
+    def test_retirement_boolean_cannot_hide_an_unclosed_daily_monitor(self):
+        session, context = self.build()
+        runner.monitor_inventory(session, context, 1)
+        session.assert_daily_coverage = lambda: None
+        session.retire = Mock()
+        session.custody_pending = False
+        producer = object.__new__(runner.P4Producer)
+        producer._monitor_pin = (session, session.daily_monitor, session.daily_monitor.assert_original())
+        producer.active, producer.local_owners = session, []
+        with self.assertRaisesRegex(runner.NativeRunBlocked, "daily_monitor_retirement_unverified"):
+            producer._retire(session, SimpleNamespace(close=Mock()), SimpleNamespace(close=Mock()))
+        self.assertIs(producer.active, session)
+        self.assertTrue(session.daily_monitor.custody_pending)
+
+    def test_retirement_keeps_monitor_receipt_after_real_daily_release(self):
+        session, context = self.build()
+        runner.monitor_inventory(session, context, 1)
+        session.assert_daily_coverage = lambda: None
+        session.custody_pending = True
+        producer = object.__new__(runner.P4Producer)
+        producer._monitor_pin = (session, session.daily_monitor, session.daily_monitor.assert_original())
+        producer.active, producer.local_owners = session, []
+
+        def retire():
+            session.daily_monitor.close()
+            result = session.fixture.release_original_demand()
+            self.assertTrue(result["released"])
+            session.custody_pending = False
+
+        session.retire = retire
+        producer._retire(session, SimpleNamespace(close=Mock()), SimpleNamespace(close=Mock()))
+        self.assertIsNone(producer.active)
+        self.assertIsNone(producer._monitor_pin)
+        self.assertTrue(session.fixture.demand._closed)
+        self.assertFalse(session.daily_monitor.custody_pending)
 
 
 class NativeAuditTests(unittest.TestCase):

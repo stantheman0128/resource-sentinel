@@ -30,6 +30,7 @@ from sentinel.adaptive.sampler import profile_revision
 from tests.windows.adaptive_capability_runner import (
     NativeRunBlocked, NativeRunUnsettled, _directory, _write_new,
 )
+from tests.windows.adaptive_daily_monitor import DailyMonitorWitness
 
 
 TICKS = 10_000_000
@@ -131,6 +132,10 @@ def memory_totals(roles, readings):
 
 def monitor_inventory(session, context, jobs):
     """Validate original witnesses and role incidence before identity dedup."""
+    monitor = getattr(session, "daily_monitor", None)
+    if type(monitor) is not DailyMonitorWitness:
+        raise NativeRunBlocked("p4_authenticated_daily_monitor_required")
+    keeper = monitor.assert_original()
     inventory = getattr(session, "monitor_processes", None)
     if type(inventory) is not tuple or len(inventory) != jobs + 5:
         raise NativeRunBlocked("p4_monitor_roles_incomplete")
@@ -148,6 +153,8 @@ def monitor_inventory(session, context, jobs):
             raise NativeRunBlocked("p4_monitor_identity_unverified")
         if role in roles.get(identity, ()):
             raise NativeRunBlocked("p4_monitor_role_duplicate")
+        if identity in owners and owners[identity] is not owner:
+            raise NativeRunBlocked("p4_monitor_coverage_incomplete")
         roles.setdefault(identity, set()).add(role)
         owners.setdefault(identity, owner)
         by_role.setdefault(role, []).append(owner)
@@ -157,11 +164,14 @@ def monitor_inventory(session, context, jobs):
             or any(len(values) > 1 and not values <= COHOST_ROLES for values in roles.values())
             or by_role["helper"][0] is not session.helper
             or by_role["guardian"][0] is not session.guardian
+            or by_role["accounting_keeper"][0] is not keeper
+            or by_role["daily_activation"][0] is not keeper
             or by_role["supervisor"][0] is not session.helper_host.parent_process
             or set(by_role["waiting_wrapper"]) != set(session.wrappers)
             or session.helper_host.process is not session.helper):
         raise NativeRunBlocked("p4_monitor_coverage_incomplete")
-    return tuple(owners.values()), {identity: frozenset(values) for identity, values in roles.items()}
+    return (tuple(owners.values()), {identity: frozenset(values) for identity, values in roles.items()},
+            monitor, keeper)
 
 
 def validate_audit(value, previous, *, guardian, nonce, now, maximum_age):
@@ -301,12 +311,19 @@ class P4Producer:
         self.active = None
         self.pending_open = False
         self.local_owners = []
+        self._monitor_pin = None
 
     def _covered(self, session):
         # A successful check is None, never a bool/receipt permission shortcut.
         result = session.assert_daily_coverage()
         if result is not None:
             raise NativeRunBlocked("p4_continuous_coverage_contract_invalid")
+        pinned = getattr(self, "_monitor_pin", None)
+        if pinned is not None:
+            original_session, monitor, witness = pinned
+            if (session is not original_session or session.daily_monitor is not monitor or
+                    monitor.assert_original() is not witness):
+                raise NativeRunBlocked("p4_original_daily_monitor_changed")
 
     def _open(self, jobs, label):
         directory = self.directory / label
@@ -332,7 +349,10 @@ class P4Producer:
             raise NativeRunBlocked("p4_raw_trace_in_runtime_logs")
         if len(session.wrappers) != jobs or len(session.jobs) != jobs:
             raise NativeRunBlocked("p4_cohort_cardinality_invalid")
-        witnesses, roles = monitor_inventory(session, self.context, jobs)
+        witnesses, roles, monitor, keeper = monitor_inventory(session, self.context, jobs)
+        self._monitor_pin = (session, monitor, keeper)
+        if session.daily_monitor is not monitor:
+            raise NativeRunBlocked("p4_original_daily_monitor_changed")
         for _, job in session.jobs:
             if (not isinstance(job, NativeJob) or job.access is not JobAccess.QUERY
                     or job.logon_sid != self.context.logon_id):
@@ -397,8 +417,13 @@ class P4Producer:
         session.retire()
         if session.custody_pending is not False:
             raise NativeRunBlocked("p4_cohort_retirement_unverified")
+        pinned = getattr(self, "_monitor_pin", None)
+        if pinned is not None and (session is not pinned[0] or session.daily_monitor is not pinned[1] or
+                pinned[1].custody_pending is not False):
+            raise NativeRunBlocked("p4_daily_monitor_retirement_unverified")
         self.active = None
         self.local_owners.clear()
+        self._monitor_pin = None
 
     def _scale(self, jobs):
         from sentinel.adaptive.machine_sampler import _WindowsBackend

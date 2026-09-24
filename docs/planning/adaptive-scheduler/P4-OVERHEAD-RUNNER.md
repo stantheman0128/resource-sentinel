@@ -40,7 +40,8 @@ returns one in-process session with the following original custody:
 | `helper_telemetry_sink` | Original running `ResidentTelemetry` installed on the actual helper. Its canonical shared `adaptive-telemetry` directory is exactly `log_directory`; all resident log files and metadata count. The original worker remains in the helper process and its CPU/private memory is charged. |
 | `guardian` | Retained exact witness for a real isolated guardian host. A sleeping fixture must not be labeled guardian. |
 | `wrappers` | Exactly `jobs` original witnesses for real waiting wrapper hosts, all retained and continuously covered. |
-| `monitor_processes` | Tuple of `(role, original VerifiedProcess)` pairs covering exactly one helper, guardian, supervisor, accounting keeper and daily activation/readiness owner, plus every waiting wrapper. The known supervisor/keeper/readiness roles may share an exact process identity; preserve all roles and charge that identity once. No caller-only demand witness may be relabeled as a keeper. |
+| `daily_monitor` | Original `tests.windows.adaptive_daily_monitor.DailyMonitorWitness`, captured from the original admitted S2/P4 `DailyExperimentDemand` before fixture creation. Its authenticated retained cost witness must be used for both accounting keeper and daily activation/readiness roles. It grants no admission, launch, control or retirement authority. |
+| `monitor_processes` | Tuple of `(role, original VerifiedProcess)` pairs covering exactly one helper, guardian, supervisor, accounting keeper and daily activation/readiness owner, plus every waiting wrapper. Keeper and daily activation must be the exact original witness returned by `daily_monitor.assert_original()`. Supervisor must be the actual `helper_host.parent_process`; it may be a separate process. If it shares the keeper's exact identity, it must use that same witness object. Preserve all roles and charge each exact identity once. No caller-only demand witness or arbitrary same-logon process may be relabeled as a keeper. |
 | `jobs` | Exactly `jobs` pairs of canonical execution ID and retained native `QUERY` Job handle. Fixture owners retain the corresponding original launch/cleanup custody. |
 | `scope_nonce`, `context`, `profile_revision` | Exact native scope, current host/logon/topology context, and profile binding. |
 | `database`, `log_directory` | Isolated runtime database and bounded runtime logs, distinct from producer raw evidence. The daily admission DB is never supplied here. |
@@ -71,6 +72,69 @@ owner. Once a session exists, measurement or cleanup failure raises
 An interrupt is re-raised with the same retained owner attached. The external
 orchestrator must remain resident and recover those originals; it must not
 serialize a receipt, reconstruct owners from PIDs or exit with live obligations.
+
+## Authenticated daily cost witness source slice
+
+`DailyMonitorWitness.capture(demand)` accepts only the original admitted,
+settled, unused `DailyExperimentDemand` for S2 or P4, before native preparation
+or sealing. It verifies the pinned canonical source and authenticates that
+generation's exact readiness endpoint with the existing bounded native client.
+The full generation/source/config/ledger binding is sent through the actual
+readiness protocol. Capture runs outside POLICY/Job locks. It duplicates only
+the authenticated original peer, checks the same short deadline again, and
+positively closes that short authority before returning the independent cost
+witness. There is no caller-supplied PID, callback, JSON receipt or boolean
+that can construct this owner, and no reopening by PID.
+
+The cost duplicate does not extend the readiness RPC's lifetime. Subsequent
+same-handle liveness observations establish only who is measured. The original
+provider must still perform actual continuous daily coverage checks and every
+normal admission/readiness fence. Capture neither registers a Job nor permits
+fixture creation. The aggregate provider must call capture before any fixture
+creation and retain it through measurement; the current absent aggregate
+provider has not yet exercised that ordering in a native run.
+
+The original capture owner is retained before its first RPC/duplicate attempt.
+One demand cannot start a replacement capture, including after a failure or
+positive close. Original outcome/exception owners are pinned independently of
+mutable object attributes. Capture errors retain `error.daily_monitor_owner`.
+Original process owners also retain their exact native backend, lock, handle,
+identity and (for a failed transfer) output cell. Replacing the numeric handle
+inside the same Python wrapper cannot change what is observed or closed.
+Positive close acknowledgements and unknown outcomes are retained separately
+from mutable wrapper fields; a later field edit cannot recreate a closed owner
+or erase an unknown close.
+Cleanup follows only the fixed client's explicit ownership links; unrelated
+Python exception context/cause remains retained but grants no cleanup authority.
+`assert_original()` returns the exact original live cost handle or raises;
+`close()` settles only original query/transport owners and never calls connect,
+admission, demand release or a control API. Explicit native close FALSE can
+retry only where the original owner supports it. Unknown duplicate or close
+remains pending; neither absence of an output nor a foreign object's `closed`
+field is proof of cleanup. A failed connection acquisition that did not return
+an original native connection cannot be reconstructed or cleared by this helper.
+Its original error and any transport-registry custody remain retained.
+
+After all originals positively close, interrupted local finish bookkeeping
+replays without native calls. `custody_pending` is false only after that finish;
+its original binding remains verifiable after the actual daily demand release
+closes the caller and clears its launch claim. The P4 runner pins the session,
+monitor and witness during opening, rechecks that original during ongoing
+coverage, and refuses retirement completion until the same monitor is closed.
+The opening pin uses the exact pair returned by inventory validation and
+rechecks the session before probe creation; rereading a changing property
+cannot substitute a different monitor after validation.
+The provider must close this monitor before releasing its daily allocation;
+the runner's completion check does not itself authorize that release.
+
+Portable tests use actual isolated admission/release SQL and the real readiness
+client protocol. Native process and pipe backends are explicit synthetic
+collaborators; known-FALSE versus unknown cleanup also exercises the actual
+`NativePipeConnection` owner. These tests are source verification only. This
+slice does not supply `open_overhead_session`, actual host/cohort launch and
+adoption, authenticated guardian/telemetry transport, bounded aggregate demand
+lifecycle, or measured storage/overhead evidence. The 600-second scale windows,
+3,600-second stress, ten-managed-Job limit and all capability gates are unchanged.
 
 ## Actual host measurement contract
 

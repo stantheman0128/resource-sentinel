@@ -1,5 +1,12 @@
 # Daily readiness 的鎖外權限與鎖內重驗
 
+2026-09-25：使用者已明確批准
+[transaction boundary correction](DAILY-READINESS-TRANSACTION-DECISION.md)，
+以正式計畫的 BEGIN 前觀察／交易內 metadata 核對／native action 前再驗證，
+取代下文「每次 UDF write 重新查 native／filesystem」的觀察時點要求。
+該修正尚未實作；下列測試數字是舊契約歷史證據，不能用來宣稱新邊界或
+native promotion 通過。本輪依使用者要求暫停，最新進度以 README 為準。
+
 日期：2026-09-24。狀態：**source 與 preparation 中央整合驗證已通過。**
 原契約基準為 `codex/adaptive-scheduler-implementation` 的 `41cee4d`，並保留其
 既有 dirty baseline。基礎八模組 217 tests 已過；新增雙帳本、absence pool、

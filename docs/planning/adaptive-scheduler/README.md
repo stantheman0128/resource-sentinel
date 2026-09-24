@@ -1,8 +1,56 @@
 # GPT Pro 規劃交接：Agent 動態資源調度
 
-日期：2026-09-19。狀態：**正式計畫已入庫，分階段實作進行中；production adaptive 維持 off。**
+日期：2026-09-19。狀態：**正式計畫已入庫；2026-09-25 依使用者要求收尾並暫停，production adaptive 維持 off。**
 
-## 2026-09-25 parent backing publication checkpoint（目前狀態）
+## 2026-09-25 收尾 checkpoint（目前狀態）
+
+Source commit `2e5015f179a40a7f4429fd586fbc70e487b2b44f` 補強原始
+DailyReadinessAuthority 的 peer/backend/handle/lock/identity、binding、endpoint
+與 deadline 綁定。相同身分的替代物件、複製 authority 或延長 deadline 都拒絕；
+既有 native 存活檢查與已關閉 authority 的錯誤契約保留。
+
+正常 daily HEAVY/P2/CPU1/RAM1GiB/IO0 准入，在 Windows／Python 3.13.3
+以 `git archive` 匯出精確 tree `014a08a4a8c4fa6033a691b4f435f14cc1b42ff5`、
+清除 PYTHONPATH 後跑七模組：**249 PASS，0 failures／errors／skips，
+runner 29.025 秒**。Source commit tree 與測試 tree 相同；沒有未提交 source
+依賴。原始證據 `.local-adaptive/readiness-pins-export-20260925-2/`。
+第一輪 249 案有 1 failure：新檢查改變已關閉 authority 的公開錯誤碼。
+修回既有契約後全數重跑通過，未修改原測試預期；兩輪不相加。
+
+```powershell
+$sentinelReadinessTests = @(
+    'tests.test_adaptive_daily_readiness_pins'
+    'tests.test_adaptive_daily_readiness_transport'
+    'tests.test_adaptive_daily_readiness_lock_boundary'
+    'tests.test_adaptive_daily_generation'
+    'tests.test_adaptive_policy_cleanup_custody'
+    'tests.test_adaptive_daily_monitor'
+    'tests.test_adaptive_experiment_remote_readiness'
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command ('C:\Python313\python.exe -m unittest -v ' + ($sentinelReadinessTests -join ' ')) -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
+使用者已同意 [transaction boundary 修正](DAILY-READINESS-TRANSACTION-DECISION.md)：
+BEGIN 前實際驗證、交易內核對原始物件與 metadata／未延長期限，Create／Set
+前再即時查驗。**該時點修正尚未實作**；本批 pins 補強沒有移除或移動既有
+存活／檔案查詢，native promotion 仍被此 shared-source 缺口阻擋。實作範圍須
+包含普通 remote/local、absence、nonce cleanup、successor 與 experiment release。
+
+七個未完成草稿保留在工作樹並備份至本機
+`.local-adaptive/wrapup-drafts-20260925/`，不混入已驗證 source commit：
+`launcher.py`、`wrapper_host.py`、`test_adaptive_wrapper_host.py`，以及
+`experiment_host_authority.py`／`experiment_host_roles.py` 與各自測試。
+Wrapper 草稿測試目前引用尚不存在的 `ExperimentLauncherTests` fixture；
+publication 不確定結果的 close/release custody 也待接完，不能宣稱這批 host
+接線可用。恢復時先按已批准契約修 shared boundary，再完成草稿與實際 provider。
+
+P3–P6 仍未完成；下方 provider、bootstrap、Job intent、aggregate completion、
+S2/S3/P4/P6 缺口仍有效。以上是 source/fixture 證據，不是 native gate。
+所有工作者已停止擴充；原有十四個 protected tracked files 與日常 config hash
+未變。沒有部署／restart／Scheduled Task／全域入口變更，沒有施加測試 Job
+限速，沒有待撤回限制。暫停由使用者要求，不是宣稱整個目標已完成。
+
+## 2026-09-25 parent backing publication checkpoint（前一批）
 
 Source commit `78a162b07cf7752233826872efd41947de45b26c` 接上原始 parent 的
 backing publication 方法與固定 transport phase。只有已驗證並接受的 wrapper

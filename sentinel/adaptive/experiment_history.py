@@ -630,6 +630,7 @@ class _Budget:
     def __init__(self, maximum):
         _integer(maximum, 0, MAX_BYTES)
         self.maximum, self.bytes, self.rows = maximum, 0, 0
+        self.observed = []
 
     def add(self, value):
         safe = {key: ({"blob_sha256": hashlib.sha256(item).hexdigest()} if type(item) is bytes else item)
@@ -658,6 +659,7 @@ def _rows(conn, table, fields, budget, *, where="", parameters=(), limit=MAX_HIS
             _fail("cell_exceeded")
         row = dict(zip(fields, tuple(values)[:-1]))
         budget.add(row)
+        budget.observed.append(_ObservedRow(table, tuple(fields), tuple(values)[:-1]))
         result.append(row)
     return result
 
@@ -721,7 +723,19 @@ def _active_demand(metadata):
         admission_binding_hash=metadata["admission_binding_hash"])
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, repr=False)
+class _ObservedRow:
+    """Private exact bounded SQL observation, never serialized as a receipt.
+
+    In particular, credential bytes must not enter diagnostics or public JSON.
+    Retirement consumes these originals instead of reconstructing postimages.
+    """
+    table: str
+    fields: tuple[str, ...]
+    values: tuple
+
+
+@dataclass(frozen=True, repr=False)
 class ExperimentHistory:
     """Immutable observations; JSON values are decoded into fresh copies by callers."""
     completed_execution_ids: frozenset[str]
@@ -733,6 +747,7 @@ class ExperimentHistory:
     rows_used: int
     bytes_used: int
     digest: str
+    _sql_rows: tuple[_ObservedRow, ...]
 
 
 def verify_experiment_history_locked(conn, *, max_bytes=MAX_BYTES):
@@ -828,4 +843,4 @@ def verify_experiment_history_locked(conn, *, max_bytes=MAX_BYTES):
     observed = dict(receipts=records, active=active, archives=archives, exclusions=exclusions)
     return ExperimentHistory(frozenset(completed), frozenset(json.loads(value)["experiment_id"] for value in active),
         tuple(records), tuple(active), tuple(archives), tuple(_canonical(value) for value in exclusions),
-        budget.rows, budget.bytes, _digest("experiment-history-v1", observed))
+        budget.rows, budget.bytes, _digest("experiment-history-v1", observed), tuple(budget.observed))

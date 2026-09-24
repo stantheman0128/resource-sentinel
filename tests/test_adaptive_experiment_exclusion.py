@@ -330,7 +330,9 @@ class ExperimentExclusionTests(unittest.TestCase):
             "DELETE FROM " + exclusion.TABLE,
             "INSERT OR REPLACE INTO " + exclusion.TABLE + " SELECT * FROM " + exclusion.TABLE,
         ):
-            with self.subTest(sql=sql), self.assertRaises(sqlite3.IntegrityError):
+            # Preserve the old raw connection: absent fixed mutation functions
+            # must refuse just as a resolved guard's RAISE refuses.
+            with self.subTest(sql=sql), self.assertRaises(sqlite3.DatabaseError):
                 conn.execute(sql)
             self.assertEqual(self.rows(), before)
 
@@ -347,6 +349,9 @@ class ExperimentExclusionTests(unittest.TestCase):
         self.register()
         allocation = self.fixture.rows("reservations")[0]
         with self.locked() as (conn, guard):
+            # Ordinary consumers install this fixed denial; it permits only
+            # compilation of the unchanged RESERVED -> HOLD expiry branch.
+            conn.create_function("sentinel_experiment_release_mutation", 4, lambda *args: 0)
             self.assertEqual(hold_expired_allocations(conn, "direct", allocation["expires_at"] + 1), 1)
             conn.commit()
         self.assertEqual(self.fixture.rows("managed_executions")[0]["state"], "UNCERTAIN_HOLD")
@@ -373,8 +378,11 @@ class ExperimentExclusionTests(unittest.TestCase):
         self.assertTrue(result["allowed"])
         nonce = uuid4().hex
         name = "Local\\ResourceSentinel.Job." + result["execution_id"] + "." + nonce
-        self.connection().execute("UPDATE managed_executions SET state='RUNNING',job_name=?,job_nonce=? WHERE execution_id=?",
-                                  (name, nonce, result["execution_id"]))
+        conn = self.connection()
+        # This synthetic production-row setup has no experiment release right.
+        conn.create_function("sentinel_experiment_release_mutation", 4, lambda *args: 0)
+        conn.execute("UPDATE managed_executions SET state='RUNNING',job_name=?,job_nonce=? WHERE execution_id=?",
+                     (name, nonce, result["execution_id"]))
         return name
 
     def test_combined_job_limit_allows_ten_and_rejects_eleventh_on_read(self):

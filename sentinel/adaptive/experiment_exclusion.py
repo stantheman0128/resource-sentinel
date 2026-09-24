@@ -3,8 +3,8 @@
 These SQL primitives publish metadata, never capacity or native authority. The
 original scope owner must verify and retain creation/actor/Job custody before
 calling register_locked under the actual daily POLICY. Readers consume the same
-daily reservation and never inspect an alternate capacity database. This slice
-has no closure, deletion, retirement or launch-permit API.
+daily reservation and never inspect an alternate capacity database. Closure is
+an exact original release mutation; historical rows grant no launch authority.
 """
 from __future__ import annotations
 
@@ -51,10 +51,14 @@ _SCHEMA = """CREATE TABLE adaptive_experiment_exclusions (
 _GUARDS = {
     _PREFIX + "insert_guard": """CREATE TRIGGER experiment_exclusion_insert_guard
         BEFORE INSERT ON adaptive_experiment_exclusions
-        WHEN EXISTS(SELECT 1 FROM adaptive_experiment_exclusions)
+        WHEN EXISTS(SELECT 1 FROM adaptive_experiment_exclusions WHERE phase IS NOT 'CLOSED')
         BEGIN SELECT RAISE(ABORT,'experiment_exclusion_scope_occupied'); END""",
     _PREFIX + "update_guard": """CREATE TRIGGER experiment_exclusion_update_guard
         BEFORE UPDATE ON adaptive_experiment_exclusions
+        WHEN OLD.phase IS NOT 'REGISTERED' OR NEW.phase IS NOT 'CLOSED' OR
+            sentinel_experiment_release_mutation('adaptive_experiment_exclusions',OLD.scope_execution_id,""" +
+        experiment_demand._mutation_json_sql("OLD", _FIELDS) + "," +
+        experiment_demand._mutation_json_sql("NEW", _FIELDS) + """ ) IS NOT 1
         BEGIN SELECT RAISE(ABORT,'experiment_exclusion_cleanup_unverified'); END""",
     _PREFIX + "delete_guard": """CREATE TRIGGER experiment_exclusion_delete_guard
         BEFORE DELETE ON adaptive_experiment_exclusions
@@ -191,6 +195,20 @@ def _held(conn, policy, guard):
     return runtime
 
 
+def _bounded_checks(fields, bounds):
+    checks = []
+    for name in fields:
+        if name in bounds:
+            limit = bounds[name]
+            checks.append("CASE WHEN typeof(" + name + ")='null' THEN 1 WHEN typeof(" + name +
+                ")='text' THEN (length(CAST(" + name + " AS BLOB))<=" + str(4 * limit) +
+                " AND length(" + name + ")<=" + str(limit) + " AND instr(" + name +
+                ",char(0))=0) ELSE 0 END")
+        else:
+            checks.append("typeof(" + name + ") IN ('null','integer','real')")
+    return checks
+
+
 def _bounded_row(conn, table, where, params, bounds, *, fields=None):
     """Validate every projected value before materializing editable SQL data.
 
@@ -205,16 +223,7 @@ def _bounded_row(conn, table, where, params, bounds, *, fields=None):
             fields = experiment_demand._FIELDS
         else:
             _fail("row_projection_invalid")
-    checks = []
-    for name in fields:
-        if name in bounds:
-            limit = bounds[name]
-            checks.append("CASE WHEN typeof(" + name + ")='null' THEN 1 WHEN typeof(" + name +
-                ")='text' THEN (length(CAST(" + name + " AS BLOB))<=" + str(4 * limit) +
-                " AND length(" + name + ")<=" + str(limit) + " AND instr(" + name +
-                ",char(0))=0) ELSE 0 END")
-        else:
-            checks.append("typeof(" + name + ") IN ('null','integer','real')")
+    checks = _bounded_checks(fields, bounds)
     inspected = conn.execute("SELECT " + ",".join(checks) + " FROM " + table +
                              " WHERE " + where + " LIMIT 2", params).fetchall()
     if len(inspected) != 1 or any(type(value) is not int or value != 1 for value in inspected[0]):
@@ -357,14 +366,16 @@ def _combined_jobs_locked(conn, names):
 def read_locked(conn, *, policy, guard):
     """Strict bounded SQL read; expiry/HOLD never drops actors or a Job."""
     _held(conn, policy, guard)
-    if not validate_schema_locked(conn):
+    present = validate_schema_locked(conn)
+    history = _history_locked(conn)
+    if not present:
         return ExclusionInventory((), frozenset(), ())
-    ids = conn.execute("SELECT substr(scope_execution_id,1,37) FROM " + TABLE + " LIMIT 2").fetchall()
-    if len(ids) > MAX_SCOPES:
+    rows = [json.loads(value) for value in history.exclusions_json]
+    active = [row for row in rows if row["phase"] != "CLOSED"]
+    if len(active) > MAX_SCOPES:
         _fail("scope_limit")
     bindings, identities, jobs = [], set(), []
-    for (execution,) in ids:
-        row = _bounded_row(conn, TABLE, "scope_execution_id=?", (execution,), _BOUNDS)
+    for row in active:
         binding = _binding_from_row(row)
         identities.add(_demand_locked(conn, binding, guard))
         identities.add(binding.guardian_identity)
@@ -374,6 +385,27 @@ def read_locked(conn, *, policy, guard):
         jobs.append(binding.job_name)
     _combined_jobs_locked(conn, jobs)
     return ExclusionInventory(tuple(bindings), frozenset(identities), tuple(jobs))
+
+
+def _history_locked(conn):
+    from .experiment_history import ExperimentHistoryError, verify_experiment_history_locked
+    try:
+        # Preserve this consumer's narrower pre-materialization field bounds;
+        # the shared history reader's generic 64 KiB ceiling is not a substitute
+        # for NUL/type checks on actor and path metadata.
+        for table, fields, bounds in ((TABLE, _FIELDS, _BOUNDS),
+                (experiment_demand.TABLE, experiment_demand._FIELDS,
+                 {name: (32768 if name == "scope_directory" else 2048)
+                  for name in experiment_demand._FIELDS if name not in {"schema_version", "revision", "owner_pid"}})):
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+                if table == experiment_demand.TABLE:
+                    experiment_demand._schema(conn)
+                if conn.execute("SELECT 1 FROM " + table + " WHERE (" +
+                        " AND ".join(_bounded_checks(fields, bounds)) + ") IS NOT 1 LIMIT 1").fetchone():
+                    _fail("row_unverified")
+        return verify_experiment_history_locked(conn)
+    except ExperimentHistoryError:
+        raise ExperimentExclusionError("history_unverified") from None
 
 
 def assert_available_locked(conn, *, policy, guard):
@@ -387,6 +419,9 @@ def assert_available_locked(conn, *, policy, guard):
         _fail("daily_mode_required")
     if read_locked(conn, policy=policy, guard=guard).bindings:
         _fail("scope_occupied")
+    from .experiment_history import MAX_HISTORY
+    if validate_schema_locked(conn) and conn.execute("SELECT count(*) FROM " + TABLE).fetchone()[0] >= MAX_HISTORY:
+        _fail("history_exhausted")
     _combined_jobs_locked(conn, ("<pending-experiment-scope>",))
 
 
@@ -411,6 +446,9 @@ def register_locked(conn, binding, *, policy, guard):
         if current.bindings != (binding,):
             _fail("scope_occupied")
         return _bounded_row(conn, TABLE, "scope_execution_id=?", (binding.scope_execution_id,), _BOUNDS)
+    from .experiment_history import MAX_HISTORY
+    if conn.execute("SELECT count(*) FROM " + TABLE).fetchone()[0] >= MAX_HISTORY:
+        _fail("history_exhausted")
     _combined_jobs_locked(conn, (binding.job_name,))
     revision = runtime["registry_revision"]
     if type(revision) is not int or not 0 <= revision < (1 << 63) - 1:
@@ -423,4 +461,6 @@ def register_locked(conn, binding, *, policy, guard):
     if conn.execute("UPDATE adaptive_runtime SET registry_revision=registry_revision+1 WHERE singleton=1 "
             "AND registry_revision=?", (revision,)).rowcount != 1:
         _fail("revision_changed")
+    # Includes the new row and every retained CLOSED tuple in the same budget.
+    _history_locked(conn)
     return row

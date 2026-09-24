@@ -203,7 +203,7 @@ class DailyRetirementInventoryTests(unittest.TestCase):
                 with self.held(fixture), self.assertRaisesRegex(Exception, "schema_unknown"):
                     inventory.capture_retirement_inventory(fixture.store, fixture.journal)
 
-    def test_any_experiment_demand_blocks_until_original_completion_api_exists(self):
+    def test_malformed_experiment_demand_never_becomes_closed_history(self):
         from sentinel.adaptive import experiment_demand
         fixture, _ = self.fixture()
         with self.held(fixture):
@@ -213,7 +213,7 @@ class DailyRetirementInventoryTests(unittest.TestCase):
                 values.update(schema_version=1, owner_pid=1, state="ADMITTED", revision=0)
                 connection.execute("INSERT INTO adaptive_experiment_demands(" +
                     ",".join(values) + ") VALUES(" + ",".join("?" for _ in values) + ")", tuple(values.values()))
-            with self.assertRaisesRegex(LifecycleError, "experiment_retirement_unimplemented"):
+            with self.assertRaisesRegex(LifecycleError, "experiment_history_unverified"):
                 inventory.capture_retirement_inventory(fixture.store, fixture.journal)
 
     def test_orphan_action_is_not_covered_by_another_scopes_receipt(self):

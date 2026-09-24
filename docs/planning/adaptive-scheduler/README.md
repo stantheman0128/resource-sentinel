@@ -4,6 +4,19 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
+History consumer 接線已完成，**9 模組、204 tests 全過，44.941 秒，
+0 failures／errors／skips**，私人日誌為
+`.local-adaptive/experiment-release-consumers-20260924-2.log`。新准入與 exclusion
+讀取先核對完整歷史，再計算仍未完成的名額；retirement 同時保留已完成實驗與
+production FINISHED／C2 的各自證據，從同一 snapshot 的原始 SQL rows 計帳，
+共用 16 MiB 上限。已完成 managed row 的所有欄位受到不可變 guard 保護。
+首次 203 tests 有 1 failure／17 errors：舊 raw SQL fixture 缺少新的固定拒絕
+UDF、舊拒絕位置／訊息預期，以及三個 C2 fixture 欄位引用錯誤；修正後仍保留
+拒絕、實際 INSERT 失敗 rollback 與歷史完整性斷言。這個 consumer 提交本身
+不提供原始 receipt publisher；原子 release 的獨立提交與完整驗證仍在進行。
+此外，initial admission 回覆遺失後若 completion seal 已生效，原 admission
+guard 的公開收尾入口仍需補上，不能將它列為只需外部 console 的缺口。
+
 Cleanup history 資料驗證器已完成：**9 模組、165 tests 全過，21.627 秒，
 0 failures／errors／skips**，包含 23 個 history 案例；完整私人日誌為
 `.local-adaptive/experiment-history-20260924-1.log`。它在同一 SQL snapshot
@@ -13,9 +26,9 @@ Cleanup history 資料驗證器已完成：**9 模組、165 tests 全過，21.62
 scope／ledger 身分、preparation 順序、task／reservation aliases 與異常歷史。
 獨立 review 已完成；測試使用隔離資料及 synthetic closed tuples，經正常日常
 wrapper 准入，仍依賴受保護的 dirty baseline。這不是 native gate 證據。
-**驗證器目前只讀，不發布 receipt、不釋放容量；admission／exclusion／retirement
-consumer 接線與原子 release 交易仍待實作。** 下一步先整合這些 consumer，
-再讓原始 typed operation 執行同一筆 cancellation／archive／receipt／exclusion 交易。
+**驗證器本身只讀，不發布 receipt、不釋放容量。** Consumer 接線已完成，見
+上方最新驗證；原始 typed operation 的 cancellation／archive／receipt／exclusion
+原子交易仍待獨立提交與驗證。
 
 Cleanup 的原始 operation／read／nonce 接線已完成，**15 模組、351 tests 全過，
 45.886 秒，0 failures／errors／skips**。`DailyExperimentDemand.prepare_release`

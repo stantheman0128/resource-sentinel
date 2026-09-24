@@ -71,7 +71,10 @@ _LAYOUTS = {
 _REQUIRED = frozenset({"adaptive_runtime", "managed_executions", "adaptive_control_slot", "adaptive_actions",
     "adaptive_launch_requests", "adaptive_launch_fences", "adaptive_retirement_requests",
     "adaptive_prelaunch_retirements", "adaptive_infrastructure", "queue"})
-_SPECIAL = frozenset({"adaptive_daily_generation", "adaptive_daily_retirement", "adaptive_experiment_demands"})
+_SPECIAL = frozenset({"adaptive_daily_generation", "adaptive_daily_retirement", "adaptive_experiment_demands",
+    "adaptive_experiment_exclusions", "adaptive_experiment_cleanup_receipts"})
+_EXPERIMENT_TABLES = frozenset({"adaptive_experiment_demands", "adaptive_experiment_exclusions",
+    "adaptive_experiment_cleanup_receipts"})
 
 
 def _refuse(reason):
@@ -99,7 +102,10 @@ class _Budget:
         self.bytes = 0
 
     def add(self, value):
-        self.bytes += len(_encoded(value))
+        self.charge(len(_encoded(value)))
+
+    def charge(self, count):
+        self.bytes += count
         if self.bytes > MAX_BYTES:
             _refuse("bytes_exceeded")
 
@@ -161,17 +167,25 @@ def _reader(path):
                 raise
 
 
-def _rows(conn, table, columns, budget, *, limit=MAX_HISTORY, where=None, parameters=()):
+def _rows(conn, table, columns, budget, *, limit=MAX_HISTORY, where=None, parameters=(), exclude_execution_ids=()):
     if not re.fullmatch(r"[a-z_][a-z0-9_]*", table) or not columns or len(columns) > 128:
         _refuse("schema_unknown")
     if any(not re.fullmatch(r"[a-z_][a-z0-9_]*", name) for name in columns):
         _refuse("schema_unknown")
-    valid = " AND ".join(f"({name} IS NULL OR length(CAST({name} AS BLOB))<={_CELL_BYTES})" for name in columns)
+    from .experiment_history import MAX_RECEIPT_BYTES, TABLE as receipt_table
+    valid = " AND ".join(f"({name} IS NULL OR length(CAST({name} AS BLOB))<=" +
+        str(MAX_RECEIPT_BYTES if table == receipt_table and name == "receipt_json" else _CELL_BYTES) + ")"
+        for name in columns)
     projection = ",".join(f"CASE WHEN {valid} THEN {name} END AS {name}" for name in columns)
     # The only filtered reader below supplies this fixed archive predicate.
     if where not in (None, "reservation_id=?"):
         _refuse("reader_scope_invalid")
     predicate = "" if where is None else " WHERE " + where
+    if exclude_execution_ids:
+        if table != "managed_executions" or where is not None or len(exclude_execution_ids) > MAX_HISTORY:
+            _refuse("reader_scope_invalid")
+        predicate = " WHERE execution_id NOT IN (" + ",".join("?" for _ in exclude_execution_ids) + ")"
+        parameters = tuple(exclude_execution_ids)
     cursor = conn.execute(f"SELECT {projection},CASE WHEN {valid} THEN 1 ELSE 0 END AS bounded "
                           f"FROM {table}{predicate} ORDER BY rowid LIMIT ?", (*parameters, limit + 1))
     values = []
@@ -246,9 +260,37 @@ def _validate_schemas(conn, columns):
 
 
 def _read_ledger(conn, store, guard, budget):
+    from . import experiment_history
     store._policy.assert_held(guard)
     schema, columns = _schema(conn, budget)
-    values = {name: _rows(conn, name, fields, budget) for name, fields in columns.items()}
+    try:
+        history = experiment_history.verify_experiment_history_locked(conn, max_bytes=MAX_BYTES - budget.bytes)
+    except experiment_history.ExperimentHistoryError as error:
+        if error.reason == "experiment_history_schema_invalid":
+            raise LifecycleError("daily_retirement_inventory_schema_unknown") from None
+        raise LifecycleError("daily_retirement_inventory_experiment_history_unverified") from None
+    budget.charge(history.bytes_used)
+    if history.active_experiment_ids:
+        _refuse("experiment_obligation_remaining")
+    # Consume the original bounded SQL rows from the verifier, including actual
+    # archive IDs and credential bytes. Receipt postimages are never substituted
+    # for the ledger. The verifier's charges enter this shared budget once.
+    observed = {}
+    for row in history._sql_rows:
+        observed.setdefault(row.table, []).append(dict(zip(row.fields, row.values)))
+    completed = history.completed_execution_ids
+    values = {}
+    for name, fields in columns.items():
+        if name in _EXPERIMENT_TABLES:
+            values[name] = observed.get(name, [])
+        elif name == "managed_executions":
+            historical = observed.get(name, [])
+            production = _rows(conn, name, fields, budget, limit=MAX_HISTORY - len(historical),
+                               exclude_execution_ids=tuple(sorted(completed)))
+            values[name] = sorted(historical + production, key=lambda row: row["execution_id"])
+        else:
+            values[name] = _rows(conn, name, fields, budget)
+    experiment_archives = observed.get("executions", [])
     _validate_schemas(conn, columns)
     runtime = dict(store._policy.revalidate(conn, guard))
     if runtime["mode"] != "off" or runtime["admission_barrier"] != "NONE":
@@ -256,14 +298,12 @@ def _read_ledger(conn, store, guard, budget):
     for table in ("reservations", "worker_reservations", "adaptive_infrastructure"):
         if conn.execute("SELECT 1 FROM " + table + " LIMIT 1").fetchone() is not None:
             _refuse("allocation_remaining" if table != "adaptive_infrastructure" else "infrastructure_remaining")
-    if "adaptive_experiment_demands" in columns and conn.execute(
-            "SELECT 1 FROM adaptive_experiment_demands LIMIT 1").fetchone() is not None:
-        _refuse("experiment_retirement_unimplemented")
     managed = values["managed_executions"]
     if any(row["state"] not in TERMINAL_STATES for row in managed):
         _refuse("scope_unretired")
     if any(row["parent_execution_id"] is not None or row["allocation_kind"] not in {"direct", "routed"}
-           or row["job_name"] is None or row["job_nonce"] is None for row in managed):
+           or row["job_name"] is None or row["job_nonce"] is None
+           for row in managed if row["execution_id"] not in completed):
         _refuse("scope_proof_unsupported")
     by_id = {row["execution_id"]: row for row in managed}
     if len(by_id) != len(managed):
@@ -278,7 +318,7 @@ def _read_ledger(conn, store, guard, budget):
     # Every execution-associated side record belongs to one positively closed
     # scope. These permanent records are not deleted to produce an empty ledger.
     for name, rows in values.items():
-        if name in {"managed_executions", "adaptive_experiment_demands"}:
+        if name == "managed_executions" or name in _EXPERIMENT_TABLES:
             continue
         for row in rows:
             if "execution_id" in row:
@@ -334,7 +374,8 @@ def _read_ledger(conn, store, guard, budget):
             _refuse("action_tail_unsettled")
     if writer_obligations_present(conn):
         _refuse("writer_obligation_remaining")
-    return {"schema": schema, "tables": values}
+    return {"schema": schema, "tables": values, "experiment_execution_ids": sorted(completed),
+            "experiment_archives": experiment_archives}
 
 
 def _journal_names(journal, expected):
@@ -395,6 +436,9 @@ def _journal_inventory(journal, rows, budget):
 def _receipts(conn, store, ledger, records, budget):
     result = {}
     for raw in ledger["tables"]["managed_executions"]:
+        if raw["execution_id"] in ledger["experiment_execution_ids"]:
+            # Complete original SQL receipt/archive rows are already in ledger.
+            continue
         row = store._public(raw)
         record = records[row["execution_id"]]
         archive_table = "executions" if row["allocation_kind"] == "direct" else "routed_executions"
@@ -418,6 +462,16 @@ def _receipts(conn, store, ledger, records, budget):
     return result
 
 
+def _serialized_bound(ledger, receipts, records):
+    # Also cover list/dict framing and original BLOB encoding, beyond the row
+    # charges shared with the history verifier. Every retained snapshot payload
+    # belongs to this one aggregate allowance.
+    size = len(_encoded(ledger)) + len(_encoded(receipts))
+    size += sum(len(records[key].to_json().encode("utf-8")) for key in records)
+    if size > MAX_BYTES:
+        _refuse("bytes_exceeded")
+
+
 def capture_retirement_inventory(store, journal):
     """Capture exact closed history while the caller retains original POLICY.
 
@@ -431,12 +485,15 @@ def capture_retirement_inventory(store, journal):
     budget = _Budget()
     with _reader(path) as conn:
         ledger = _read_ledger(conn, store, guard, budget)
-    records = _journal_inventory(journal, ledger["tables"]["managed_executions"], budget)
+    production = [row for row in ledger["tables"]["managed_executions"]
+                  if row["execution_id"] not in ledger["experiment_execution_ids"]]
+    records = _journal_inventory(journal, production, budget)
     with _reader(path) as conn:
         current = _read_ledger(conn, store, guard, _Budget())
         if current != ledger:
             _refuse("ledger_changed")
         receipts = _receipts(conn, store, current, records, budget)
+    _serialized_bound(ledger, receipts, records)
     store._policy.assert_held(guard)
     snapshot = RetirementInventorySnapshot(_token=_MINT)
     _SNAPSHOTS[snapshot] = (store, journal, guard, path, os.getpid(), threading.get_ident(),
@@ -466,6 +523,7 @@ def revalidate_retirement_inventory(conn, store, snapshot):
     if _encoded(current) != ledger_bytes:
         _refuse("ledger_changed")
     receipts = _receipts(conn, store, current, records, budget)
+    _serialized_bound(current, receipts, records)
     if _encoded(receipts) != receipt_bytes:
         _refuse("receipt_changed")
     return None

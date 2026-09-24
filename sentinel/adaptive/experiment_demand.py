@@ -56,10 +56,42 @@ _MANAGED_IMMUTABLE = (
     "root_outcome", "created_at", "finished_at", "admission_binding_hash", "ipc_auth_key",
 ) + tuple(prefix + name for prefix in ("requested_", "floor_")
           for name in ("cpu_units", "physical_bytes", "commit_bytes", "io_slots"))
+# Fixed trigger projections must remain identical to the history reader's row
+# layouts. BLOB credentials stay only in the original SQL/UDF call; no receipt
+# or diagnostic persists these arguments.
+_MUTATION_MANAGED_FIELDS = ("execution_id", "task_id", "session_id", "principal_id", "logon_id", "allocation_kind",
+    "reservation_id", "parent_execution_id", "spec_hash", "wrapper_pid", "wrapper_created_filetime_100ns",
+    "root_pid", "root_created_filetime_100ns", "job_name", "role", "priority", "coverage", "state",
+    "state_revision", "guardian_epoch", "launch_in_flight", "launch_sealed", "claim_token_hash",
+    "claim_consumed", "root_outcome", "hold_reason", "created_at", "heartbeat_at", "finished_at",
+    "cancel_requested_at", "requested_cpu_units", "requested_physical_bytes", "requested_commit_bytes",
+    "requested_io_slots", "floor_cpu_units", "floor_physical_bytes", "floor_commit_bytes", "floor_io_slots",
+    "admission_binding_hash", "ipc_auth_key", "job_nonce")
+_MUTATION_ALLOCATION_FIELDS = ("id", "request_key", "owner_pid", "owner_started", "tool_use_id", "repo",
+    "command_signature", "command_text", "resource_class", "priority", "priority_rank", "cpu_units",
+    "ram_gib", "io_slots", "created_at", "heartbeat_at", "expires_at", "lease_duration_sec", "spec_hash",
+    "execution_id", "lifecycle_managed", "physical_bytes", "commit_bytes", "managed_spec_hash",
+    "writer_protocol", "writer_revision")
+
+
+def _mutation_json_sql(prefix, fields):
+    pairs = []
+    for field in fields:
+        value = prefix + "." + field
+        if field == "ipc_auth_key":
+            pairs.extend(("'ipc_auth_key'", "lower(hex(" + value + "))",
+                          "'ipc_auth_key_sqlite_type'", "typeof(" + value + ")"))
+        else:
+            pairs.extend(("'" + field + "'", value))
+    return "json_object(" + ",".join(pairs) + ")"
+
+
 _TRIGGER_SQL = {
     "experiment_reservation_delete_guard": """CREATE TRIGGER experiment_reservation_delete_guard
         BEFORE DELETE ON reservations WHEN EXISTS(SELECT 1 FROM adaptive_experiment_demands
-            WHERE reservation_id=OLD.id OR execution_id=OLD.execution_id)
+            WHERE reservation_id=OLD.id OR execution_id=OLD.execution_id) AND
+            sentinel_experiment_release_mutation('reservations',OLD.id,""" +
+        _mutation_json_sql("OLD", _MUTATION_ALLOCATION_FIELDS) + """,NULL) IS NOT 1
         BEGIN SELECT RAISE(ABORT,'experiment_native_cleanup_unverified'); END""",
     "experiment_reservation_update_guard": """CREATE TRIGGER experiment_reservation_update_guard
         BEFORE UPDATE ON reservations WHEN EXISTS(SELECT 1 FROM adaptive_experiment_demands
@@ -69,7 +101,12 @@ _TRIGGER_SQL = {
         BEFORE UPDATE ON managed_executions WHEN
             EXISTS(SELECT 1 FROM adaptive_experiment_demands WHERE execution_id=OLD.execution_id) AND (
             NOT(NEW.state IS OLD.state OR (OLD.state='RESERVED' AND NEW.state='UNCERTAIN_HOLD')) OR """ +
-        " OR ".join("NEW." + key + " IS NOT OLD." + key for key in _MANAGED_IMMUTABLE) + """ )
+        " OR ".join("NEW." + key + " IS NOT OLD." + key for key in _MANAGED_IMMUTABLE) +
+        " OR (OLD.state='CANCELLED_BEFORE_START' AND (" +
+        " OR ".join("NEW." + key + " IS NOT OLD." + key for key in _MUTATION_MANAGED_FIELDS) + """ ))) AND
+            sentinel_experiment_release_mutation('managed_executions',OLD.execution_id,""" +
+        _mutation_json_sql("OLD", _MUTATION_MANAGED_FIELDS) + "," +
+        _mutation_json_sql("NEW", _MUTATION_MANAGED_FIELDS) + """ ) IS NOT 1
         BEGIN SELECT RAISE(ABORT,'experiment_native_cleanup_unverified'); END""",
     "experiment_execution_delete_guard": """CREATE TRIGGER experiment_execution_delete_guard
         BEFORE DELETE ON managed_executions WHEN EXISTS(SELECT 1 FROM adaptive_experiment_demands
@@ -139,16 +176,22 @@ class ExperimentDeclaration:
 
 
 def _schema(conn, *, create=False):
+    from . import experiment_history
     if not conn.in_transaction:
         _deny("transaction_required")
+    if (_MUTATION_MANAGED_FIELDS != experiment_history.MANAGED_FIELDS or
+            _MUTATION_ALLOCATION_FIELDS != experiment_history.ALLOCATION_FIELDS):
+        _deny("mutation_schema_unknown")
     present = conn.execute("SELECT type,sql FROM sqlite_master WHERE name=?", (TABLE,)).fetchone()
+    created = present is None and create
     if present is None:
         if not create:
             _deny("metadata_missing")
         conn.execute(_TABLE_SQL)
-        # These persist across older connections and owner death. The first
-        # slice provides no native retirement authority, so all release routes
-        # remain fenced, including direct store finalization and legacy DELETE.
+        # Installation belongs only to a first admission, not schema repair.
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE name IN (" +
+                ",".join("?" for _ in _TRIGGER_SQL) + ") LIMIT 1", tuple(_TRIGGER_SQL)).fetchone():
+            _deny("metadata_guards_unknown")
         for statement in _TRIGGER_SQL.values():
             conn.execute(statement)
     elif present[0] != "table" or _sql(present[1]) != _sql(_TABLE_SQL):
@@ -161,8 +204,15 @@ def _schema(conn, *, create=False):
     if conn.execute("SELECT 1 FROM " + TABLE +
             " WHERE schema_version IS NOT 1 OR state IS NOT 'ADMITTED' OR revision IS NOT 0 LIMIT 1").fetchone():
         _deny("metadata_version_unknown")
-    if len(conn.execute("SELECT experiment_id FROM " + TABLE + " LIMIT 2").fetchall()) > 1:
-        _deny("metadata_scope_count_invalid")
+    if not experiment_history.schema_locked(conn):
+        if not created:
+            _deny("cleanup_schema_missing")
+        conn.execute(experiment_history.TABLE_SQL)
+        for statement in experiment_history.TRIGGER_SQL.values():
+            conn.execute(statement)
+    if len(conn.execute("SELECT experiment_id FROM " + TABLE + " LIMIT ?",
+            (experiment_history.MAX_HISTORY + 1,)).fetchall()) > experiment_history.MAX_HISTORY:
+        _deny("metadata_history_exceeded")
 
 
 @dataclass(frozen=True, init=False)
@@ -591,10 +641,19 @@ class DailyExperimentDemand:
 
     def admission_blocker_locked(self, conn, snapshot, policy):
         self._locked(conn, snapshot, policy)
+        from .experiment_history import MAX_HISTORY, verify_experiment_history_locked
         # This serial test-run guard is separate from production Job and user
         # exemption limits. It never grants or changes either policy.
-        row = conn.execute("SELECT experiment_id FROM " + TABLE + " LIMIT 1").fetchone()
-        return None if row is None or row[0] == self.declaration.experiment_id else "experiment_scope_occupied"
+        history = verify_experiment_history_locked(conn)
+        if history.active_experiment_ids - {self.declaration.experiment_id}:
+            return "experiment_scope_occupied"
+        existing = conn.execute("SELECT 1 FROM " + TABLE + " WHERE experiment_id=?",
+            (self.declaration.experiment_id,)).fetchone()
+        if existing is not None and self.declaration.experiment_id not in history.active_experiment_ids:
+            return "experiment_history_identity_reused"
+        if existing is None and conn.execute("SELECT count(*) FROM " + TABLE).fetchone()[0] >= MAX_HISTORY:
+            return "experiment_history_exhausted"
+        return None
 
     def _binding(self, reservation_id):
         spec, snap = self.declaration, self._snapshot
@@ -628,6 +687,12 @@ class DailyExperimentDemand:
                 _deny("metadata_already_exists", self)
             conn.execute("INSERT INTO " + TABLE + "(" + ",".join(_FIELDS) + ") VALUES(" +
                 ",".join("?" for _ in _FIELDS) + ")", tuple(expected[k] for k in _FIELDS))
+        # Charge the complete prospective tuple before the caller's COMMIT.
+        # A receipt-shaped row or an expired lease never frees the serial slot.
+        from .experiment_history import verify_experiment_history_locked
+        history = verify_experiment_history_locked(conn)
+        if history.active_experiment_ids != frozenset({self.declaration.experiment_id}):
+            _deny("published_obligation_unverified", self)
         return result | {"experiment_id": self.declaration.experiment_id,
                          "native_scope_authorized": False}
 

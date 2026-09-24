@@ -163,9 +163,41 @@ class ExperimentDemandTests(unittest.TestCase):
         conn.execute("BEGIN IMMEDIATE")
         bridge._schema(conn, create=True)
         conn.execute("COMMIT")
+        original = owner.publish_locked
+        denied = []
+
+        def fail_metadata_insert(connection, *args, **kwargs):
+            def authorize(action, table, column, database, trigger):
+                if action == sqlite3.SQLITE_INSERT and table == bridge.TABLE:
+                    denied.append(table)
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+            # Fail the actual INSERT on its original transaction. An extra
+            # schema trigger would now correctly refuse before this mutation.
+            connection.set_authorizer(authorize)
+            try:
+                return original(connection, *args, **kwargs)
+            finally:
+                connection.set_authorizer(None)
+
+        with patch.object(owner, "publish_locked", side_effect=fail_metadata_insert), \
+                self.assertRaisesRegex(sqlite3.DatabaseError, "not authorized"):
+            self.coordinator.admit_experiment(owner)
+        self.assertEqual(denied, [bridge.TABLE])
+        self.assertEqual(self.fixture.counts(), (0, 0, 0))
+        self.assertEqual(self.rows(bridge.TABLE), [])
+        self.assertTrue(owner._admission._submitted)
+
+    def test_unknown_metadata_guard_refuses_before_any_admission_mutation(self):
+        from sentinel.adaptive.experiment_history import ExperimentHistoryError
+        owner = self.capture()
+        conn = self.fixture.conn()
+        conn.execute("BEGIN IMMEDIATE")
+        bridge._schema(conn, create=True)
+        conn.execute("COMMIT")
         conn.execute("CREATE TRIGGER injected_metadata_failure BEFORE INSERT ON " + bridge.TABLE +
             " BEGIN SELECT RAISE(ABORT,'injected_metadata_failure'); END")
-        with self.assertRaisesRegex(sqlite3.IntegrityError, "injected_metadata_failure"):
+        with self.assertRaisesRegex(ExperimentHistoryError, "schema_invalid"):
             self.coordinator.admit_experiment(owner)
         self.assertEqual(self.fixture.counts(), (0, 0, 0))
         self.assertEqual(self.rows(bridge.TABLE), [])
@@ -270,7 +302,9 @@ class ExperimentDemandTests(unittest.TestCase):
             "UPDATE managed_executions SET claim_consumed=1",
             "UPDATE managed_executions SET root_pid=123,root_created_filetime_100ns='999'")
         for statement in statements:
-            with self.subTest(sql=statement), self.assertRaises(sqlite3.IntegrityError):
+            # An old connection may fail at function resolution before RAISE;
+            # it receives no replacement release function or new authority.
+            with self.subTest(sql=statement), self.assertRaises(sqlite3.DatabaseError):
                 old.execute(statement)
             self.assert_retained(owner)
 

@@ -773,6 +773,9 @@ def prepare_connection(conn, *, role, db_path):
     if operation is not None:
         operation.bind_connection(conn, role=role, db_path=db_path)
         return None
+    # Persistent experiment guards reference this fixed function even on their
+    # ordinary HOLD branch. Name resolution is not release authority.
+    conn.create_function("sentinel_experiment_release_mutation", 4, lambda *_: 0)
     row = read_generation(conn)
     if row is None:
         scope = getattr(_READINESS_LOCAL, "scope", None)

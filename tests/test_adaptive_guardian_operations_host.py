@@ -595,7 +595,7 @@ class GuardianOperationsHostTests(unittest.TestCase):
         records = []
         with patch.object(module, "GuardianHost", return_value=self.host), \
                 patch.object(self.host, "start", return_value={"event": "fixture_started"}), \
-                patch.object(module, "emit", side_effect=records.append):
+                patch.object(self.host, "emit", side_effect=records.append):
             code = module.main(["--data-dir", str(self.directory), "--journal-dir", str(self.directory),
                                 "--guardian-epoch", EPOCH, "--iterations", "1"])
         self.assertEqual(code, module.EXIT_OK)

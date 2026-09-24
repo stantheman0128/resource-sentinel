@@ -25,6 +25,7 @@ class StartupHost:
         self.steps = list(steps)
         self.repeat_error = repeat_error
         self.events = []
+        self.records = []
         self.guardian = object()
         self.owner = object()
         self.original_guard = object()
@@ -35,6 +36,12 @@ class StartupHost:
         self.started = self.closed = self.draining = False
         self.close_error = None
         self.sleep_callback = None
+
+    def emit(self, record):
+        self.records.append(record)
+
+    def _start_telemetry(self):
+        """Synthetic diagnostics retain no native or filesystem resources."""
 
     @property
     def registration_pending(self):
@@ -101,14 +108,12 @@ class GuardianStartupRetentionTests(unittest.TestCase):
                 "--guardian-epoch", EPOCH, "--iterations", str(iterations)]
 
     def invoke(self, host, *, iterations=1):
-        records = []
-        with patch.object(module, "GuardianHost", return_value=host) as constructor, \
-                patch.object(module, "emit", side_effect=records.append):
+        with patch.object(module, "GuardianHost", return_value=host) as constructor:
             try:
                 code = module.main(self.arguments(iterations=iterations))
             finally:
                 constructor.assert_called_once()
-        return code, records
+        return code, host.records
 
     def assert_same_startup_owners(self, host, expected_count):
         self.assertEqual(len(host.start_owners), expected_count)
@@ -235,7 +240,7 @@ class GuardianStartupRetentionTests(unittest.TestCase):
         error = HostCapabilityUnsupported("host_foreign_parent_job")
         with patch.object(module, "GuardianHost", return_value=host), \
                 patch.object(module, "read_host_capability", side_effect=error), \
-                patch.object(module, "emit", side_effect=records.append), \
+                patch.object(host, "emit", side_effect=records.append), \
                 patch.object(host, "close", side_effect=AssertionError("preflight owns no native resources")) as close, \
                 patch("sentinel.adaptive.store.LifecycleStore", side_effect=AssertionError("preflight touched ledger")) as store:
             code = module.main(self.arguments())

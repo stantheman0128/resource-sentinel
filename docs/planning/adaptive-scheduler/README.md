@@ -4,7 +4,48 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
-最新 source checkpoint 已接通 **原始 successor startup、guardian 的完整歷史
+最新已補齊 **restart 的 installer／CLI、完整 chain exit 與兩代收尾驗證**：
+
+- 兩個 console 入口新增明確的 `--restart-after-retirement`，預設 off，必須同時
+  要求 retirement；installer 還須另有 apply 與 backup directory。參數不完整時，
+  在讀取 preparation／manifest 前拒絕。旗標只要求一代 successor，不遞迴重啟。
+- Installer 在進入 runtime 前保留原始 host；退出使用完整
+  `chain_retirement_complete()`，前一代已退休或 caller 的 JSON 不能代替它。
+  Quarantine 的 chain 查詢錯誤現在保留在原始 host，狀態查詢和 console 不會因此
+  拋出到程序外；正常 pacing 與原始責任持續保留，不重建未知 SQL／native owner。
+- 隔離測試實際走完原始 retirement → successor/readiness/startup/epoch → guardian
+  註冊 → 第二代 freeze/drain/seal/close，確認只有最後一代完成才允許整條 chain
+  退出；普通資料列、豁免與完整 archive/audit 保留，舊 connection 仍被 fenced。
+  第二代 listener close ACK 遺失會保留原始 owner，不能重關 handle 或宣告完成。
+
+本批 source commit 為 `c47b88a6066a161f2da6e52a37a4410586698150`。將精確
+staged tree `abc8fdeca386be591c999cf9e40f24ffba410766` 用 `git archive`
+匯出到獨立目錄，清除 `PYTHONPATH`，驗證六模組 **160 PASS，
+0 failures／errors／skips，runner 223.921 秒**；提交後 tree 與測試版本完全相同。
+Windows／`C:\Python313\python.exe` 經日常 wrapper 正常 HEAVY／P2／
+1 CPU／1 GiB／0 I/O 准入，未依賴 protected dirty files 或尚未完成的 S2／P4 草稿。
+使用實際隔離 SQLite／journal／serving thread 與原始 production 操作；
+process/mutex/pipe 為明確 synthetic native collaborators，cycle 不測 operator
+RPC／telemetry。這不是實機 restart 或 native gate 證據。
+原始日誌與測試 manifest 留在本機
+`.local-adaptive/successor-entry-export-20260924-1/`。先前五模組 130 PASS
+與本次重疊，不得加總。完整 native 啟動與收尾仍待驗證。
+
+在包含本批 source commit 的乾淨 checkout，以正常准入重現六模組：
+
+```powershell
+$sentinelEntryTests = @(
+    'tests.test_adaptive_daily_source_install'
+    'tests.test_adaptive_daily_activation_host'
+    'tests.test_adaptive_daily_successor_host'
+    'tests.test_adaptive_daily_successor_console'
+    'tests.test_adaptive_daily_successor_cycle'
+    'tests.test_adaptive_producer_bootstrap'
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command ('C:\Python313\python.exe -m unittest -v ' + ($sentinelEntryTests -join ' ')) -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
+先前 source checkpoint 已接通 **原始 successor startup、guardian 的完整歷史
 驗證與註冊、父程序重試，以及跨世代共用歷史計帳**。契約見
 [DAILY-GENERATION-SUCCESSOR.md](DAILY-GENERATION-SUCCESSOR.md)。
 本批分為 `7451329`（history）、`d3c000b`（startup）、`a573f8e`（registration）。
@@ -28,13 +69,12 @@
   observations／16 MiB 上限。每筆 epoch audit 必須對應其 immutable succession、
   generation 與 POLICY；後續 retirement 保留並驗證完整歷史，不重算成新權限。
 
-**完整 fresh-generation restart 仍未完成。** 本批已提交 supervisor／startup
-接線，不再把它們列為本機草稿；尚需 installer／CLI 的明確 restart 入口、
-chain exit 接線及完整連續兩代 retire／restart 驗證。S2／P4 actual aggregate
-provider、storage／overhead、其餘 S3 driver／140 次 orchestration、P6 actual A/B
-與 A0 等價性也仍有 source 工作。Items 5/6 未完成，不能說只剩 Windows gate。
+**Fresh-generation restart 的 source 接線與兩代收尾測試已補齊，native 未驗證。**
+仍未完成的 source 是 S2／P4 actual aggregate provider、storage／overhead、
+其餘 S3 driver／140 次 orchestration、P6 actual A/B 與 A0 等價性。
+Items 5/6 未全部完成，不能說只剩 Windows gate。
 
-最終 **31 模組、796 PASS，0 failures／errors／skips，runner 182.288 秒**。
+上一批 startup／registration 為 **31 模組、796 PASS，0 failures／errors／skips，runner 182.288 秒**。
 測試使用 Windows／`C:\Python313\python.exe`，經日常 wrapper 的正常
 HEAVY／P2／1 CPU／1 GiB／0 I/O 准入。將精確 staged tree
 `a31e712e18ef30afb074589e2f1f2a9db22886ac` 用 `git archive` 匯出到獨立目錄，
@@ -153,7 +193,7 @@ consumer 卻要求 bool。已依實際 schema 修正並測試拒絕 `0`／`True`
 先前 182 PASS 的初版 code comparison 已由本輪較完整的 335-test 結果取代。
 
 **Items 5/6 尚未全部完成，P3–P6 native gates 仍未通過。** 下一個 source 項目為
-fresh-generation restart；其後還有 S2/P4 actual aggregate provider、P4 storage／
+S2/P4 actual aggregate provider；另有 P4 storage／
 overhead、其餘 S3 故障 driver／140 次 orchestration、P6 actual A/B 與 A0 等價性。
 舊 common admission placeholder 及其他 v2 gates 繼續拒絕；不能說只差使用者
 執行 console。日常 canonical runtime 尚未安裝此 generation，仍需獨立授權及
@@ -911,7 +951,7 @@ loader error 或未跑的 native gate 算成 pass。
 | 2. 裁決 ④ | 契約與 source 完成；最後完整 adaptive 2,127 tests 通過。沒有舊 witness 的 cold adoption 仍不支援；native recovery 未驗證。 |
 | 3. helper sender | Source 接線、獨立 review 與完整 2,298 tests 通過。後續 original launch/stdio provenance、guardian scope 比對與 helper proposal adapter 已接線，344 targeted tests 通過（30.960 秒，含 30 個專用 scope tests）。實際 S2 topology producer／native bundle／新增採集成本仍未驗證，缺證據不啟用控制。 |
 | 4. release／CLI | Source 整合與完整 2,800 tests 通過；包含 exact discovery、typed operator transport、原子 off／audit、同 owner 收尾與三個 host 的 drain。後續 rootless C2 post-close receipt 已補上，保持原 terminal state，不偽造 FINISHED；新增 29 個案例。232 targeted tests 中 231 通過，唯一錯誤文字預期修正後單獨重跑通過，production 未因該失敗改動。沒有原始 close 證據的舊歷史仍 unknown。Native 操作通訊、控制及恢復仍未驗證。 |
-| 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport](P2-DAILY-ACTIVATION.md)、typed daily release、queued／rejected cleanup、原始 scope／wrapper／probe 與 [serial S1 provider](S1-SERIAL-PROVIDER.md) 已有 source 與隔離測試。最新 S1 measurement、bootstrap／v2 publication 與測試狀態見本頁頂端。Successor startup／registration 已接通；restart 的 installer／CLI、chain exit 與連續兩代驗證仍缺，尚未執行日常安裝或 native S1，不能宣稱 live grace 前提已解鎖。 |
+| 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport](P2-DAILY-ACTIVATION.md)、typed daily release、queued／rejected cleanup、原始 scope／wrapper／probe 與 [serial S1 provider](S1-SERIAL-PROVIDER.md) 已有 source 與隔離測試。最新 S1 measurement、bootstrap／v2 publication 與測試狀態見本頁頂端。Successor startup／registration、restart installer／CLI 與 chain exit 已接通，兩代收尾 source 測試通過；尚未執行日常安裝或 native S1，不能宣稱 live grace 前提已解鎖。 |
 | 6. console 驗收命令 | [P6 矩陣與 raw reducer](P6-RUNNER-CONTRACT.md)、[S1/S2 bridge](S1-DAILY-BRIDGE-CONTRACT.md)、[S3 14×10 記錄器](S3-REAL-HOST-RECOVERY.md)、[P4 host 成本量測](P4-OVERHEAD-RUNNER.md) 已有 source。新增 S1 entry 與來源驗證路徑見本頁頂端。S2/P4 的 actual aggregate provider、部分 S3 故障 driver／完整 orchestration、P6 actual A/B 接線與 A0 等價性仍缺；§11.2 成本及所有 native gates 未驗證，不是只剩 console 執行。 |
 
 已提交的基礎：項目 5 的同帳本 demand 與 retirement fence 為 `1072786`／
@@ -926,7 +966,7 @@ reducer 已提交為 `ff6f31b`，S3 原始 action cutpoints／三個實際故障
 以上是目前缺口；下列較早日期的段落保留其歷史測試範圍。Native S1–S3、完整
 P3–P6 都尚未通過。日常 config／Scheduled Task／啟動入口未修改。
 
-下一個獨立 source 項目是 fresh-generation restart；之後接 S2/P4 的實際
+下一個獨立 source 項目是 S2/P4 的實際
 aggregate provider、其餘 S3 故障 driver／140 次 orchestration 及 P6 A/B。
 S1 原始 serial provider、reopened restore、fixture bootstrap／v2 publication
 不再列為未寫的程式。完整固定窗口與原始 capacity cleanup 必須由 native S1

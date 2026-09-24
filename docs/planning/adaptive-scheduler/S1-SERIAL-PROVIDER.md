@@ -115,8 +115,9 @@ A single-worker root has an empty child list. Leaves and the foreign-parent
 probe publish no tree manifest. Partial/mismatched readiness, stop or expiry
 before publication refuses it. This remains a root-observed identity record,
 not guardian-owned child handles, proof of exit or permission to release capacity.
-The measurement consumer must match it to the original root and actual Job PID
-set before using it; that consumer integration is still unfinished.
+The measurement consumer matches it to the original root and actual Job PID
+set before using it. It observes the immutable tree manifest before scanning
+ready files, so the final child's normal publication cannot race an earlier scan.
 Every window must end before that cutoff and the original scope deadline. Use
 raw Job CPU 100 ns and monotonic ns measurements. Observe actual scope control
 during a capped window and reject one that restored early. Outside cap, continue
@@ -139,6 +140,14 @@ fixture closure, including initializers, runner, provider, scope launch, wrapper
 workload and entry. Exact `tests.windows.adaptive_scope_launch` identity is
 required by the scope API. No general worktree import path or stale pyc fallback.
 
+Measurement requires an explicit absolute `--profile` path. Read this bounded,
+stable JSON as data through the canonical profile parser before native context
+or demand construction; only off/shadow are accepted. The resulting immutable
+profile is bound by its revision into run/bundle evidence. Reading it does not
+write a daily configuration or enable production control. `--check-source`
+requires no profile and performs only source verification, never native host
+context acquisition, admission, measurement or artifact publication.
+
 Mixed canonical runtime/worktree fixture build observations need a concrete
 producer/consumer binding before this entry can publish native evidence. The
 current `CurrentBuildSource` hashes tests under its own production root and
@@ -146,6 +155,26 @@ cannot represent different executed fixtures. Do not rewrite `_ROOT`, accept
 reported CLI hashes, or copy tests into the production installer to bypass this.
 This provenance bridge and security observation have their own source/tests;
 the custody provider can be implemented and verified before the console unlock.
+
+The integrated runner retains the exact bootstrap, context source, source binding
+and concrete build reader. Run schema v2 adds only `source_binding`; bundle v2
+uses the same original descriptor and gate envelopes stay v1. A v2 run cannot
+downgrade to v1 or replace these observations with callbacks. Audit execution
+before each demand capture/admission and artifact publication. Cleanup must not
+depend on that audit succeeding after a source change.
+
+Retain the original serial provider before its constructor/measurement handoff.
+Its constructor creates no demand or native owner; capture starts only after
+positive construction. A successful S1 publication requires the same in-memory
+producer result and provider, all thirteen original cases in the fixed order,
+positive original native completion/release and no retained measurement errors.
+Copied JSON, arbitrary `publish_gate` calls, pending cleanup or later data
+mutation cannot publish an S1 gate. Other v2 gates remain unavailable until
+their real producer integration exists. The external entry keeps the original
+run/provider alive after an unsettled outcome, calls only its original cleanup
+tick and still returns failure after eventual recovery; it never starts another
+measurement to replace a failed one. Unknown native context cleanup also retains
+its original reader and does not reacquire context to make the run eligible.
 
 ## Verification and promotion
 

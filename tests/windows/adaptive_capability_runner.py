@@ -1,13 +1,11 @@
-"""Native S1 producer and immutable evidence-run bookkeeping.
+"""Native evidence bookkeeping with an attested serial S1 route.
 
-This is an external-console test runner, not a deployment or admission bypass.
-Every new native experiment first obtains the real continuous-admission owner.
-The presently unavailable daily cohort therefore returns BLOCKED before a Job
-is created. Unit tests of the reducers/bookkeeping establish no Windows gate.
-
-The S1 owner is the existing isolated P1 launcher/controller, with an actual
-same-host reservation, protected Job and recovery journal. No duration, round
-count, target or admission estimate is configurable from the command line.
+V2 S1 uses the exact original daily demand, scope and release provider. Its
+canonical runtime must separately support that protocol; this runner neither
+deploys it nor enables production control. Legacy routes keep their existing
+refusing common-admission placeholder. Other v2 gates require their own producer.
+No duration, round count, target or admission estimate is CLI-configurable.
+Unit tests of the reducers/bookkeeping establish no Windows gate.
 """
 from __future__ import annotations
 
@@ -56,6 +54,12 @@ class NativeRunUnsettled(NativeRunBlocked):
 
 
 def custody_pending(coverage):
+    from tests.windows.adaptive_s1_provider import S1SerialProvider
+    if type(coverage) is S1SerialProvider:
+        coverage._original(filesystem=False)
+        for case in coverage._cases:
+            case._original(cleanup=True)
+        return any(case._closed is not True for case in coverage._cases)
     return bool(coverage.pending_admissions or
                 any(not owner._closed for owner in coverage.owners))
 
@@ -431,45 +435,130 @@ class NativeEvidenceRun:
     production authority refuses it. Resuming requires the exact same current
     native context and source bytes. No command imports arbitrary gate JSON.
     """
-    def __init__(self, directory, profile):
+    def __init__(self, directory, profile, *, bootstrap=None):
         if os.name != "nt":
             raise NativeRunBlocked("native_windows_required")
         base_python()
+        self._bootstrap = bootstrap
+        self._source_original = None
+        self.source_binding = None
+        self._s1_provider = None
+        self._s1_initialized = self._s1_started = False
+        self._s1_publication = None
         self.directory = _directory(directory)
+        info = self.directory.stat()
+        self._directory_original = (self.directory, info.st_dev, info.st_ino)
         self.profile = profile
         self.context_source = evidence.NativeContextSource()
-        self.build_source = evidence.CurrentBuildSource()
+        if bootstrap is None:
+            self.build_source = evidence.CurrentBuildSource()
+        else:
+            from tests.windows.adaptive_producer_bootstrap import ProducerBootstrap
+            from sentinel.adaptive.capability_build import SourceBinding, SourceBoundBuildSource
+            if (type(bootstrap) is not ProducerBootstrap or type(bootstrap.source_binding) is not SourceBinding or
+                    type(bootstrap.build_source) is not SourceBoundBuildSource):
+                raise NativeRunBlocked("native_original_bootstrap_required")
+            # Execute this before even a read-only native context acquisition.
+            bootstrap.assert_unchanged()
+            self.source_binding, self.build_source = bootstrap.source_binding, bootstrap.build_source
+            self._source_original = (bootstrap, self.source_binding, self.build_source, self.context_source, profile)
         self.context, self.build = self.context_source(), self.build_source()
         self.revision = profile_revision(profile)
         self.run_path = self.directory / "run.json"
+        version = 2 if bootstrap is not None else 1
         if self.run_path.exists():
             payload, _ = evidence._read(self.run_path, MAX_FILE_BYTES)
             self.record = strict_json_loads(payload)
             expected = {"schema_version", "run_id", "context", "build", "profile_revision"}
+            if version == 2:
+                expected.add("source_binding")
             if (type(self.record) is not dict or set(self.record) != expected or
-                    self.record["schema_version"] != 1):
+                    type(self.record["schema_version"]) is not int or self.record["schema_version"] != version):
                 raise NativeRunBlocked("native_run_schema_invalid")
             evidence._uuid(self.record["run_id"])
             self._assert_record()
         else:
-            self.record = dict(schema_version=1, run_id=str(uuid4()), context=asdict(self.context),
+            self.record = dict(schema_version=version, run_id=str(uuid4()), context=asdict(self.context),
                                build=asdict(self.build), profile_revision=self.revision)
+            if version == 2:
+                self.record["source_binding"] = self.source_binding.to_dict()
             _write_new(self.run_path, self.record)
+        self._record_bytes = canonical(self.record)
 
     def _assert_record(self):
         if (self.record["context"] != asdict(self.context) or
                 self.record["build"] != asdict(self.build) or
-                self.record["profile_revision"] != self.revision):
+                self.record["profile_revision"] != self.revision or
+                getattr(self, "_record_bytes", canonical(self.record)) != canonical(self.record)):
             raise NativeRunBlocked("native_run_provenance_changed")
+        original = getattr(self, "_source_original", None)
+        if original is not None and (self.record.get("schema_version") != 2 or
+                self.record.get("source_binding") != original[1].to_dict()):
+            raise NativeRunBlocked("native_run_provenance_changed")
+        if original is not None and hasattr(self, "_record_bytes"):
+            if self.run_path != self.directory / "run.json":
+                raise NativeRunBlocked("native_run_record_changed")
+            raw, _ = evidence._read(self.run_path, MAX_FILE_BYTES)
+            if raw != self._record_bytes:
+                raise NativeRunBlocked("native_run_record_changed")
 
     def assert_unchanged(self):
-        if self.context_source() != self.context or self.build_source() != self.build:
+        original = getattr(self, "_source_original", None)
+        if original is not None:
+            if any(current is not expected for current, expected in zip(
+                    (self._bootstrap, self.source_binding, self.build_source, self.context_source, self.profile), original)):
+                raise NativeRunBlocked("native_original_bootstrap_required")
+            observed_build = self._bootstrap.assert_unchanged()
+            evidence._safe_directory(self.directory)
+            info = self.directory.stat()
+            if (self.directory, info.st_dev, info.st_ino) != self._directory_original:
+                raise NativeRunBlocked("native_run_directory_changed")
+            if profile_revision(self.profile) != self.revision:
+                raise NativeRunBlocked("native_run_provenance_changed")
+        else:
+            if self.record.get("schema_version") == 2 or getattr(self, "_bootstrap", None) is not None:
+                raise NativeRunBlocked("native_original_bootstrap_required")
+            observed_build = self.build_source()
+        if self.context_source() != self.context or observed_build != self.build:
             raise NativeRunBlocked("native_run_provenance_changed")
+        self._assert_record()
+
+    def _verify_s1_completion(self, provider):
+        from tests.windows.adaptive_s1_provider import S1SerialProvider
+        from sentinel.adaptive.experiment_scope import NativeScopeCompletion
+        from sentinel.adaptive.experiment_cleanup import ExperimentReleaseOperation
+        if type(provider) is not S1SerialProvider or provider is not self._s1_provider:
+            raise NativeRunBlocked("native_s1_original_provider_required")
+        provider._original(filesystem=False)
+        cases = provider.completed_cases
+        expected = ("self_stop", "empty_probe", "foreign_parent", *("round",) * ROUNDS)
+        if (tuple(case.kind for case in cases) != expected or tuple(provider._cases) != cases or
+                provider._bootstrap is not self._bootstrap or provider.context is not self.context):
+            raise NativeRunBlocked("native_s1_cases_incomplete")
+        for case in cases:
+            case._original(cleanup=True)
+            if (case._closed is not True or case.errors or case.scope is None or case.scope.errors or
+                    type(case.completion) is not NativeScopeCompletion or case.completion.owner is not case.scope or
+                    type(case.release_operation) is not ExperimentReleaseOperation or
+                    case.release_operation.demand is not case.demand or
+                    case.release_operation.completion is not case.completion or
+                    case.release_operation._completed is not True or case.cleanup_result.get("released") is not True):
+                raise NativeRunBlocked("native_s1_cleanup_unverified")
+            case.completion.assert_original()
 
     def publish_gate(self, gate, data):
         if gate not in {"S1", "S2", "S3", "P4", "P5", "P6"}:
             raise NativeRunBlocked("native_gate_unknown")
         self.assert_unchanged()
+        if getattr(self, "_source_original", None) is not None:
+            publication = self._s1_publication
+            if (gate != "S1" or publication is None or publication[0] is not self._s1_provider or
+                    publication[1] is not data or publication[2] != canonical(data)):
+                raise NativeRunBlocked("native_original_s1_result_required")
+            self._verify_s1_completion(publication[0])
+            evidence._s1(data, self.context)
+            if any((self.directory / (name + ".json")).exists() for name in ("S2", "S3", "P4", "P5", "P6")):
+                raise NativeRunBlocked("native_gate_requires_own_producer")
         path = self.directory / f"{gate}.json"
         digest = _write_new(path, dict(schema_version=1, run_id=self.record["run_id"],
             gate=gate, evidence_source="native", data=data), expected_gate=gate)
@@ -487,9 +576,11 @@ class NativeEvidenceRun:
                     value["gate"] != name or value["evidence_source"] != "native"):
                 raise NativeRunBlocked("native_artifact_run_mismatch")
             references.append(dict(gate=name, path=artifact.name, sha256=hashlib.sha256(raw).hexdigest()))
-        bundle = dict(schema_version=1, kind="native_capability_bundle",
+        bundle = dict(schema_version=self.record["schema_version"], kind="native_capability_bundle",
             run_id=self.record["run_id"], evidence_source="native", build=asdict(self.build),
             context=asdict(self.context), profile_revision=self.revision, artifacts=references)
+        if getattr(self, "_source_original", None) is not None:
+            bundle["source_binding"] = self.source_binding.to_dict()
         raw = canonical(bundle)
         temporary = self.directory / ("bundle-" + uuid4().hex + ".pending")
         _write_new(temporary, bundle)
@@ -497,7 +588,54 @@ class NativeEvidenceRun:
         return dict(gate=gate, artifact_sha256=digest, bundle_sha256=hashlib.sha256(raw).hexdigest(),
                     measured_gates=[row["gate"] for row in references], promotion=False)
 
+    def run_s1(self):
+        """Run the actual serial provider; never enter the legacy placeholder."""
+        if getattr(self, "_source_original", None) is None:
+            raise NativeRunBlocked("native_original_bootstrap_required")
+        if self._s1_started or (self.directory / "S1.json").exists():
+            raise NativeRunBlocked("native_s1_already_started")
+        self._s1_started = True
+        self.assert_unchanged()
+        from tests.windows.adaptive_s1_provider import S1SerialProvider
+        from tests.windows.adaptive_s1_measurements import produce_s1 as produce_serial_s1
+        directory = self.directory / ("s1-raw-" + uuid4().hex)
+        directory.mkdir()
+        # Constructor is source-only. Capture/admission is first entered by
+        # produce_serial_s1 after this original object is positively initialized.
+        self._s1_provider = provider = S1SerialProvider.__new__(S1SerialProvider)
+        try:
+            S1SerialProvider.__init__(provider, directory, self.context, bootstrap=self._bootstrap)
+            self._s1_initialized = True
+            data = produce_serial_s1(provider, directory, self.context)
+            if custody_pending(provider):
+                raise NativeRunUnsettled(provider)
+            self._verify_s1_completion(provider)
+            evidence._s1(data, self.context)
+            self._s1_publication = (provider, data, canonical(data))
+            return self.publish_gate("S1", data)
+        except BaseException as primary:
+            self._s1_publication = None
+            try:
+                _write_new(directory / "failure.json", dict(gate="S1", status="failed",
+                    errors=error_evidence(primary, stage="measurement"), promotion=False))
+            except BaseException:
+                primary.add_note("native_failure_evidence_write_failed")
+            if isinstance(primary, NativeRunUnsettled):
+                raise
+            if self._s1_initialized:
+                try:
+                    pending = custody_pending(provider)
+                except BaseException:
+                    pending = True
+                if pending:
+                    raise NativeRunUnsettled(provider, additional_custody=primary) from primary
+            raise
+
     def run_gate(self, gate):
+        if getattr(self, "_source_original", None) is not None:
+            if gate != "S1":
+                raise NativeRunBlocked("native_gate_requires_own_producer")
+            return self.run_s1()
         if gate not in {"S1", "S2"}:
             raise NativeRunBlocked("native_gate_requires_own_producer")
         if (self.directory / f"{gate}.json").exists():

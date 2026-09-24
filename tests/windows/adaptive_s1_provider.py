@@ -130,11 +130,17 @@ class S1SerialProvider:
     is deliberately no callback, alternate ledger, policy or status argument.
     The console's aggregate source attestation is a separate prerequisite.
     """
-    def __init__(self, directory, context):
+    def __init__(self, directory, context, *, bootstrap=None):
         if type(self) is not S1SerialProvider or type(context) is not LiveCapabilityContext:
             _fail("exact_provider_and_context_required")
         self.directory = _directory(directory)
         self.context = context
+        if bootstrap is not None:
+            from tests.windows.adaptive_producer_bootstrap import ProducerBootstrap
+            if type(bootstrap) is not ProducerBootstrap:
+                _fail("exact_bootstrap_required")
+        self._bootstrap = bootstrap
+        self._original_bootstrap = bootstrap
         self._thread, self._pid = threading.current_thread(), os.getpid()
         self._immutable = self.directory, self.context, _identity(self.directory)
         self._cases = []
@@ -144,10 +150,22 @@ class S1SerialProvider:
     def _original(self, *, filesystem=True):
         if (type(self) is not S1SerialProvider or _PROVIDERS.get(id(self)) is not self or
                 self._thread is not threading.current_thread() or self._pid != os.getpid() or
-                (self.directory, self.context) != self._immutable[:2]):
+                (self.directory, self.context) != self._immutable[:2] or
+                self._bootstrap is not self._original_bootstrap):
             _fail("original_provider_required")
         if filesystem and _identity(_directory(self.directory)) != self._immutable[2]:
             _fail("provider_directory_changed")
+
+    def _attest(self, generation=None):
+        # Only new capture/admission depends on source attestation. Original
+        # restoration/release must still run when source files later change.
+        self._original()
+        if self._bootstrap is not None:
+            self._bootstrap.assert_unchanged()
+            binding = self._bootstrap.source_binding
+            if generation is not None and (generation.get("source_digest") != binding.source_digest or
+                    Path(generation.get("source_root", "")) != self._bootstrap.runtime_root):
+                _fail("bootstrap_generation_changed")
 
     @property
     def current_case(self):
@@ -160,7 +178,7 @@ class S1SerialProvider:
         return tuple(case for case in self._cases if case._closed)
 
     def start_case(self, kind="round"):
-        self._original()
+        self._attest()
         if type(kind) is not str or kind not in _KINDS:
             _fail("case_kind_invalid")
         if self._current is not None and not self._current._closed:
@@ -215,6 +233,13 @@ class S1Case:
                 self.coordinator is not self._coordinator_original or self.scope is not self._scope_original or
                 self.completion is not self._completion_original or self.release_operation is not self._release_original):
             _fail("original_case_changed", self)
+        if self._closed and self.release_operation is not None:
+            # A later read-only evidence observation can itself retain an
+            # uncertain SQL close on the same original release operation.
+            # The earlier release flag must not hide that new custody.
+            if type(self.release_operation) is not ExperimentReleaseOperation:
+                _fail("original_release_required", self)
+            self.release_operation._original()
 
     def _retain(self, error):
         if not any(value is error for value in self.errors):
@@ -231,6 +256,7 @@ class S1Case:
     def _capture(self):
         generation_json = _capture_generation(self)
         row = json.loads(generation_json)
+        self.provider._attest(row)
         daily = Path(row["ledger_path"]).parent
         if self.provider.directory == daily or daily in self.provider.directory.parents:
             _fail("isolated_directory_required", self)
@@ -285,6 +311,7 @@ class S1Case:
             _fail("admission_not_available", self)
         try:
             self.spec.command.verify()
+            self.provider._attest(json.loads(self.spec.generation_json))
             # Publish uncertainty before the original API can acquire/commit.
             # Its SQL/guard cleanup may finish before an outer reply or local
             # result assignment is interrupted. That still requires original

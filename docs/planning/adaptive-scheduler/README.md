@@ -4,6 +4,92 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
+S1 的 **serial measurement、受驗證來源 bootstrap、外部 console entry 與 v2
+publication source 已接通並通過隔離測試**。保留三個 prerequisites＋十回合、
+每回合三個完整 30 秒窗口、2500 rate、原始 115／120 秒期限；沒有缩短測試或
+調降准入需求。量測使用實際 API 的 raw CPU counter、原始 Job security／PID
+membership、root／每個 child 的結束紀錄及原始 completion／daily release。
+發布要求同一 provider、同一結果、固定順序的 13 個原始案例均正面收尾。
+未知 SQL close、context cleanup 或中斷會保留原始責任；恢復只清理，不重跑量測。
+
+來源驗證誤判已修正：`marshal` 會因相同常數的 reference sharing 不同而輸出
+不同 bytes，隔離診斷定位到 `_windows_memory`。改成完整的 typed structural
+key，保留 bytecode、所有持久 metadata、巢狀 code、IEEE bits 與 frozenset
+同位元 NaN 的數量，未知常數／interpreter 欄位拒絕。Runtime、stdlib observer
+與 producer bootstrap 使用同一契約；沒有改用會漏掉 stack size／qualified
+name 的裸 CodeType equality。原始來源路徑及 import observer 檢查保留。
+契約：[S1-SOURCE-BINDING.md](S1-SOURCE-BINDING.md)、
+[S1-SERIAL-PROVIDER.md](S1-SERIAL-PROVIDER.md)。
+
+最終 **11 模組、335 PASS，0 failures／errors／skips，runner 234.810 秒**。
+其中 78 個 daily source／observer 案例、30 個 producer bootstrap 案例、36 個
+measurement 案例、26 個 publication 案例及 14 個 entry 案例，都是同一批次的
+子集，不重複相加。實際 entry＋四個實際 producer 模組的 `--check-source`
+也已在隔離來源目錄、子程序 HOME／USERPROFILE 下通過，確認未建立 artifact、
+daily data 或 cache。原始 scope／release 整合使用真實隔離 SQLite 和明確
+synthetic Win32／IPC collaborators；不是 native S1 或 clean-clone full-suite
+證據。獨立 review 找到的 code metadata／NaN multiplicity 問題已修正並複查。
+私人日誌 `.local-adaptive/s1-source-final-20260924-1.log`。正常准入重現命令：
+
+```powershell
+$sentinelS1SourceTests = @(
+    'tests.test_adaptive_daily_generation'
+    'tests.test_adaptive_daily_bootstrap'
+    'tests.test_adaptive_producer_bootstrap'
+    'tests.test_adaptive_capability_build'
+    'tests.test_adaptive_capability_evidence'
+    'tests.test_adaptive_s1_measurements'
+    'tests.test_adaptive_s1_publication'
+    'tests.test_adaptive_s1_entry'
+    'tests.test_adaptive_s1_provider'
+    'tests.test_adaptive_s1_provider_native'
+    'tests.test_adaptive_capability_runner'
+)
+$sentinelS1SourceCommand = 'C:\Python313\python.exe -m unittest ' + ($sentinelS1SourceTests -join ' ') + ' -q'
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command $sentinelS1SourceCommand -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
+本輪修正前的失敗保留：首個 integration batch 在 source-only entry fixture
+停住，原因是空參數 `PolicyProfile()`；只停止經精確 identity 核對的本批 test
+process，當時沒有 native workload。入口現在先讀取有界、穩定的 `--profile`
+JSON，用既有 parser 驗證 off/shadow，再建立 run。下一批 **136 tests、2 failures／
+3 errors、13.844 秒**，原因是 journal `launch_sealed` 為 exact integer `1`，
+consumer 卻要求 bool。已依實際 schema 修正並測試拒絕 `0`／`True`／`"1"`。
+兩份私人日誌 `s1-integration-20260924-1.log`、`-2.log` 都在 `.local-adaptive/`。
+先前 182 PASS 的初版 code comparison 已由本輪較完整的 335-test 結果取代。
+
+**Items 5/6 尚未全部完成，P3–P6 native gates 仍未通過。** 下一個 source 項目為
+fresh-generation restart；其後還有 S2/P4 actual aggregate provider、P4 storage／
+overhead、其餘 S3 故障 driver／140 次 orchestration、P6 actual A/B 與 A0 等價性。
+舊 common admission placeholder 及其他 v2 gates 繼續拒絕；不能說只差使用者
+執行 console。日常 canonical runtime 尚未安裝此 generation，仍需獨立授權及
+fresh readiness，不能拿 implementation worktree 或另一個帳本冒充日常來源。
+
+S1 entry 的確切語法已可交接。以下來源檢查唯讀、沒有 native measurement，但
+只有 canonical runtime 的 source 前提到位才會成功；不是安裝／activation 指令：
+
+```powershell
+& 'C:\Python313\python.exe' -I 'C:\Users\stans\Projects\resource-sentinel\.worktrees\adaptive-scheduler-implementation\tests\windows\run_adaptive_s1.py' --check-source
+```
+
+完成另行授權的 canonical activation 與 fresh-generation readiness 後，才在
+app 外的 PowerShell 執行隔離 S1。Entry 自行沿原始 daily demand 排隊，沒有
+替代 data directory 的准入捷徑。`--profile` 只讀取設定資料並綁定其 revision，
+不能選 enforce 或改寫 production。每次使用新的 evidence directory：
+
+```powershell
+$sentinelS1Evidence = Join-Path $env:LOCALAPPDATA ('ResourceSentinel\adaptive-evidence\S1-' + [guid]::NewGuid().ToString('N'))
+& 'C:\Python313\python.exe' -I 'C:\Users\stans\Projects\resource-sentinel\.worktrees\adaptive-scheduler-implementation\tests\windows\run_adaptive_s1.py' --directory $sentinelS1Evidence --profile 'C:\Users\stans\Projects\resource-sentinel\.worktrees\adaptive-scheduler-implementation\config\adaptive.example.json'
+```
+
+若回報 `cleanup_pending`，保留原 console 讓它只清理原始資源；不要重跑量測
+來覆蓋失敗結果。本輪未執行上述實機 S1，未施加真實 Job CPU cap，沒有需要
+撤回的測試限制。Daily runtime／config／Scheduled Task／啟動入口保持不變，
+adaptive off，沒有豁免。受保護 dirty baseline 與私密資料均未提交；測試依賴
+在 commit message 揭露。以下 checkpoint 保留歷史範圍，不覆蓋這份現況。
+
+### Tree readiness checkpoint（歷史驗證）
+
 S1 workload root 的整棵程序樹就緒紀錄已補上。只有全部 child ready 與原始
 Create witness 相符後才發布 bounded `tree-ready.json`，保留原始建立順序、
 source pins 與共同截止時間；單 worker 的 child list 為空，leaf／foreign-parent
@@ -731,14 +817,14 @@ loader error 或未跑的 native gate 算成 pass。
 | 2. 裁決 ④ | 契約與 source 完成；最後完整 adaptive 2,127 tests 通過。沒有舊 witness 的 cold adoption 仍不支援；native recovery 未驗證。 |
 | 3. helper sender | Source 接線、獨立 review 與完整 2,298 tests 通過。後續 original launch/stdio provenance、guardian scope 比對與 helper proposal adapter 已接線，344 targeted tests 通過（30.960 秒，含 30 個專用 scope tests）。實際 S2 topology producer／native bundle／新增採集成本仍未驗證，缺證據不啟用控制。 |
 | 4. release／CLI | Source 整合與完整 2,800 tests 通過；包含 exact discovery、typed operator transport、原子 off／audit、同 owner 收尾與三個 host 的 drain。後續 rootless C2 post-close receipt 已補上，保持原 terminal state，不偽造 FINISHED；新增 29 個案例。232 targeted tests 中 231 通過，唯一錯誤文字預期修正後單獨重跑通過，production 未因該失敗改動。沒有原始 close 證據的舊歷史仍 unknown。Native 操作通訊、控制及恢復仍未驗證。 |
-| 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport 與接線](P2-DAILY-ACTIVATION.md)已完成 installer、常駐 owner 與日常 consumers 接線。Generation 正面退場整合 654 tests 通過；typed daily release／history、sealed admission guard、queued／rejected 原始 context 收尾及 native scope remote readiness 均已實作。Reopened probe／restore 已提交 `c29bf14`，288 tests 通過；root／child scope timing 與 wrapper 自身 readiness 已接線，最新 17 模組 414 tests 全過（runner 58.500 秒）。真正 serial native provider 與 fresh restart 仍待完成。未執行日常安裝，grace 前提未解鎖。 |
-| 6. console 驗收命令 | [P6 矩陣編排與 raw reducer](P6-RUNNER-CONTRACT.md)、[S1/S2 bridge 契約](S1-DAILY-BRIDGE-CONTRACT.md)、[S3 精確故障點與 14×10 記錄器](S3-REAL-HOST-RECOVERY.md)、[P4 實際 host 成本量測](P4-OVERHEAD-RUNNER.md)已提交。新 bounded telemetry／helper 非阻塞接線 276 tests 通過（8.418 秒）；P4 原 sink 與 v2 schema 最新 259 tests 通過（13.765 秒）。Actual provider、部分 S3 故障 driver／完整 orchestration、A0 等價性及 P4 native storage／overhead 證據仍缺；不是只剩 console 執行。 |
+| 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport](P2-DAILY-ACTIVATION.md)、typed daily release、queued／rejected cleanup、原始 scope／wrapper／probe 與 [serial S1 provider](S1-SERIAL-PROVIDER.md) 已有 source 與隔離測試。最新 S1 measurement、bootstrap／v2 publication 與測試狀態見本頁頂端。Fresh-generation restart 仍是 source 缺口；尚未執行日常安裝或 native S1，不能宣稱 live grace 前提已解鎖。 |
+| 6. console 驗收命令 | [P6 矩陣與 raw reducer](P6-RUNNER-CONTRACT.md)、[S1/S2 bridge](S1-DAILY-BRIDGE-CONTRACT.md)、[S3 14×10 記錄器](S3-REAL-HOST-RECOVERY.md)、[P4 host 成本量測](P4-OVERHEAD-RUNNER.md) 已有 source。新增 S1 entry 與來源驗證路徑見本頁頂端。S2/P4 的 actual aggregate provider、部分 S3 故障 driver／完整 orchestration、P6 actual A/B 接線與 A0 等價性仍缺；§11.2 成本及所有 native gates 未驗證，不是只剩 console 執行。 |
 
-最新追加：項目 5 的同帳本 demand 與 retirement fence 已提交為 `1072786`／
+已提交的基礎：項目 5 的同帳本 demand 與 retirement fence 為 `1072786`／
 `a48925a`；native scope source 曾通過 303-test 整合；後續正向 daily release
-已實作，actual provider 仍缺。項目 6 的 P6 矩陣編排及 raw
+及 serial S1 provider 已實作。項目 6 的 P6 矩陣編排及 raw
 reducer 已提交為 `ff6f31b`，S3 原始 action cutpoints／三個實際故障 driver／
-14×10 記錄器為 `7307055`；真正 native provider、部分故障 driver、A0 等價性及
+14×10 記錄器為 `7307055`；S2/P4/P6 provider、部分故障 driver、A0 等價性及
 140 次完整實驗 orchestration 尚缺。[原始成員的 bounded memory 查詢](P4-MEMBER-MEMORY.md)
 已提交為 `2922e09`，以 private working set／private Commit、原始 process handles
 與完整 membership 證據計算；不使用共享 RSS，不完整採樣保持 unknown。
@@ -746,24 +832,20 @@ reducer 已提交為 `ff6f31b`，S3 原始 action cutpoints／三個實際故障
 以上是目前缺口；下列較早日期的段落保留其歷史測試範圍。Native S1–S3、完整
 P3–P6 都尚未通過。日常 config／Scheduled Task／啟動入口未修改。
 
-下一步是項目 5 actual serial provider 與 fresh-generation restart。Scope 已接上
-完整原始 generation 比對與相鄰 native 邊界的原始 deadline 重驗。Provider 仍須
-保留同一 demand 的排隊／收尾、呼叫已完成的 reopened-handle restore，以及在 import
-runner 前完成 canonical fixture bootstrap；不能把舊 S1Runtime 當作新 provider。
-Root／child scope deadline 與 wrapper 自己的 launch readiness source 已完成；
-provider 必須接上這些原始 API，不延長一秒 window 或重建已凍結的 command。新增測試繼續
-使用隔離帳本；任何實際
-日常 source activation 都需要獨立授權，不因 commit/push 自動執行。項目 6
-尚未完成的內容不能以 mock、空 provider、另外一個 DB 或假量測取代。
+下一個獨立 source 項目是 fresh-generation restart；之後接 S2/P4 的實際
+aggregate provider、其餘 S3 故障 driver／140 次 orchestration 及 P6 A/B。
+S1 原始 serial provider、reopened restore、fixture bootstrap／v2 publication
+不再列為未寫的程式。完整固定窗口與原始 capacity cleanup 必須由 native S1
+再次驗證，不能以 source tests 取代。日常 source activation 仍需要獨立授權，
+不因 commit/push 自動執行；缺口不能以空 provider、另一個帳本或假量測取代。
 
-Serial provider 的接線另有兩個具體 source 前提：`CurrentBuildSource` 目前將
-runtime 與 tests inventory 都綁在 production module 的 `_ROOT`。Canonical
-production 與已審核 worktree fixture 分置時，必須對實際載入的 fixture closure
-計算 producer digest，不能發布另一個目錄的 hash。另 `NativeJob` 確實在原始
-handle 上驗證 DACL，但沒有公開 S1 evidence 所需的實際 protected-DACL／ACE-count
-observation；須保留原查詢／descriptor 正面 cleanup 後的 bounded 結果，不能從舊
-`OwnedJob.security` 預設值或固定常數製造實測欄位。這兩項是 provider 接線工作，
-不是 Windows capability 已失敗，也不需要放寬既有安全條件。
+先前兩個 S1 接線前提已有 source：`SourceBoundBuildSource` 分別核對 canonical
+runtime 與實際 fixture inventory，producer bootstrap 驗證實際執行來源；
+`NativeJob.query_security()` 回傳同一 handle 的 protected-DACL／ACE-count 等
+typed observation，正面清理 descriptor／token 後才成功。兩者的 scope、測試
+與限制見頂端 checkpoint；它們都不等於 Windows capability 通過。
+
+### 更早的 demand／P4 整合紀錄（歷史狀態，非目前缺口清單）
 
 同帳本 experiment demand 的新增契約已先以 `ed0c2cf` 提交；
 [generation 正面退場契約](DAILY-GENERATION-RETIREMENT.md)為 `b281fd3`。

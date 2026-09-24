@@ -37,6 +37,29 @@ The reader also calls the existing canonical `verify_import_provenance` audit;
 matching files cannot certify a consumer still executing different loaded code.
 This production audit imports no fixture code and runs outside control locks.
 
+Loaded-function verification compares a complete normalized code structural key,
+not a hash of `marshal.dumps()` storage. The latter includes object-reference
+encoding: the same `_windows_memory` code produced equal normalized structure
+but different marshal bytes during the isolated bootstrap diagnostic. Preserve
+exact canonical function origins, recursively normalized nested code, constants,
+bytecode and metadata, plus the independent complete-module import observer.
+Different executed code still refuses; this changes neither the SourceManifest
+digest nor admission authority. Test equal code with different reference sharing
+as well as real bytecode/constant/origin changes. Bare CodeType equality is not
+enough: [CPython 3.13's comparison](https://github.com/python/cpython/blob/v3.13.0/Objects/codeobject.c#L1807-L1907)
+omits metadata including stack size and qualified name. The closed structural
+key must include all persisted code fields (separate local/free/cell names,
+stack size, qualified name, line and exception tables), recursively including
+nested code. Constants retain their exact types and floating-point bit patterns;
+equal immutable values may differ in reference sharing without changing the key.
+Frozenset keys preserve the multiplicity of equal bit-pattern keys: distinct
+same-payload NaNs can coexist in the original set. Unknown constant types or a
+changed interpreter `co_*` inventory refuse comparison. The stdlib-only daily
+import observer and producer bootstrap use the same reviewed structural schema;
+they deliberately cannot import its runtime implementation before attestation.
+Cross-copy parity and actual module/entry metadata mutation tests cover this
+pre-import boundary as well as the runtime diagnostic.
+
 `NativeEvidenceAuthority` must choose this concrete reader itself after parsing
 and hash-checking bundle v2. It must reject an injected build callback for v2.
 It never imports test code. Before evaluating any gate, actual two-root digests
@@ -57,9 +80,12 @@ bundle v2. Before capture/admission and before publication it must attest the
 actual executed canonical runtime and original fixture modules against that
 binding. A matching on-disk inventory alone is not execution provenance.
 
-The first source slice implements only the bounded reader and strict consumer.
-It does not unlock the old runner or admission placeholder. Producer/bootstrap
-integration must be complete before any actual S1 v2 artifact can be published.
+The producer bootstrap executes checked bytes for the finite S1 fixture module
+closure and retains original module, function and imported-binding identities.
+The v2 S1 route uses this bootstrap and original serial provider for publication.
+This leaves the old runner/admission placeholder refusing; other gates still
+need their own actual integration. Source tests and `--check-source` verify no
+native capability and grant no activation or production-control permission.
 
 ## Verification
 

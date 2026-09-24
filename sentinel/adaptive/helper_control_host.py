@@ -167,6 +167,7 @@ class _HelperOperatorHost:
         self.parent_process = self.operator_endpoint = self.operator_service = self.operator_listener = None
         self._pipe_registry = self._drain_observer = self._drain_last = None
         self._operator_ready = self._drain_requested = self._cleanup_started = self._closed = False
+        self._operator_accept_stopping = False
         self._drain_request = self._startup_error = self._cleanup_error = self._operator_error = None
         self._operator_requests = {}
         self._last_enrollment_complete = False
@@ -335,13 +336,14 @@ class _HelperOperatorHost:
         from .ipc import IpcError
         from .pipe_windows import NativePipeError
 
-        if self.operator_listener is None or self._operator_error is not None:
+        if (self.operator_listener is None or self._operator_error is not None
+                or self._operator_accept_stopping):
             return
         try:
-            self.operator_service.serve_once(self.operator_listener, timeout_ms=50)
+            self.operator_service.poll_once(self.operator_listener, timeout_ms=50)
         except (IpcError, NativePipeError) as error:
             # NativePipeRegistry retains partial I/O/cleanup. Unknown ownership
-            # is sticky; a normal idle timeout carries no such obligation.
+            # is sticky; ordinary pending acceptance returned None above.
             status = self._pipe_registry.status()
             if status.pending or status.quarantined or getattr(error, "__notes__", ()):
                 self._operator_error = error
@@ -423,7 +425,7 @@ class _HelperOperatorHost:
             except Exception as error:
                 self._run_failure = error
                 self.request_drain("helper_host_failure")
-                emit({"event": "helper_host_pending", "reason": _reason(error)})
+                self.emit({"event": "helper_host_pending", "reason": _reason(error)})
                 self._sleep(1)
 
     def close(self):
@@ -442,6 +444,20 @@ class _HelperOperatorHost:
             self._check_runtime_binding()
         if self._operator_ready and not self._drain_ready():
             raise HelperHostRefused("helper_operator_drain_pending")
+        if self.operator_listener is not None:
+            # Stop is terminal for this original listener. A normal pending
+            # cancellation must leave query/sink/identity custody untouched and
+            # allow the next drain tick to observe that same original attempt.
+            self._operator_accept_stopping = True
+            try:
+                settled = self.operator_listener.stop_accept()
+                if type(settled) is not bool:
+                    raise HelperHostRefused("helper_operator_accept_stop_invalid")
+            except BaseException as error:
+                self._cleanup_error = error
+                raise
+            if not settled:
+                raise HelperHostRefused("helper_operator_accept_stop_pending")
         self._cleanup_started = True
         try:
             # Bypass active-host's per-execution barrier marker: the dedicated
@@ -459,11 +475,13 @@ class _HelperOperatorHost:
                 if process is not None:
                     process.close()
                     setattr(self, name, None)
+            record = self._finish_telemetry({**record, "event": "helper_operator_host_closed",
+                                              "operator_scope": "helper"})
         except BaseException as error:
             self._cleanup_error = error
             raise
         self._closed = True
-        return {**record, "event": "helper_operator_host_closed", "operator_scope": "helper"}
+        return record
 
 
 class OperationalHelperHost(_HelperOperatorHost, HelperHost):
@@ -479,38 +497,54 @@ def run_operational(host, *, iterations=0):
     from .helper_host import EXIT_OK, EXIT_REFUSED
 
     try:
-        emit(host.start())
+        host.emit(host.start())
     except BaseException as error:
         host._startup_error = error
-        emit({"event": "helper_host_refused", "reason": _reason(error)})
+        refusal = {"event": "helper_host_refused", "reason": _reason(error)}
+        if getattr(host, "telemetry", None) is not None:
+            host.emit(refusal)
+            refusal = None
         try:
-            emit(host.close())
+            closed = host.close()
         except BaseException as cleanup:
             host._exit_failure = cleanup
-            return retain_cleanup(host)
+            return retain_cleanup(host, initial_record=refusal)
+        if refusal is not None:
+            host.emit(refusal)
+        host.emit(closed)
         return EXIT_REFUSED
     if iterations:
         try:
-            emit(host.run_bounded(iterations))
+            host.emit(host.run_bounded(iterations))
         except BaseException as error:
             host._run_failure = error
         host.request_drain("bounded_run_complete")
-    emit(host.serve_until_stopped())
+    host.emit(host.serve_until_stopped())
     return EXIT_OK
 
 
-def retain_cleanup(host):
+def retain_cleanup(host, *, initial_record=None):
     """Unknown close keeps the original objects alive; it never proves exit.
 
     Only existing owners may eventually prove cleanup. This deliberately has
     no fresh process open, retry-close loop or force flag. External process
     termination is outside the clean-shutdown contract.
     """
+    from .contracts import ProcessIdentity
+
+    # A startup refusal can precede the ordinary success-path sink binding.
+    # Reuse only the self identity already acquired by this host; never reopen
+    # a PID or synthesize provenance merely to retain diagnostics.
+    process = getattr(host, "process", None)
+    if type(getattr(process, "identity", None)) is ProcessIdentity:
+        host._start_telemetry()
+    if initial_record is not None:
+        host.emit(initial_record)
     reported = False
     while True:
         try:
             if not reported:
-                emit({"event": "helper_host_pending", "reason": "helper_cleanup_unverified"})
+                host.emit({"event": "helper_host_pending", "reason": "helper_cleanup_unverified"})
                 reported = True
             operation = getattr(host, "_registration_operation", None)
             if operation is not None and operation.pending and not operation._quarantine:
@@ -518,7 +552,7 @@ def retain_cleanup(host):
                     # Retry the same original operation/guard; _run itself
                     # verifies nonce and native cleanup before another attempt.
                     host._register()
-                    emit(host.close())
+                    host.emit(host.close())
                     from .helper_host import EXIT_REFUSED
                     return EXIT_REFUSED
                 except Exception as error:

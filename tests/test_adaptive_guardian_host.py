@@ -580,7 +580,7 @@ class GuardianHostTests(unittest.TestCase):
 
         lifecycle.reconcile = reconcile
         records = []
-        with patch.object(module, "emit", side_effect=records.append):
+        with patch.object(self.host, "emit", side_effect=records.append):
             record = self.host.drain_until_settled()
         self.assertEqual((record["settled"], record["iterations"]), (True, 2))
         self.assertEqual(records[0], {"event": "guardian_host_interrupt_deferred",

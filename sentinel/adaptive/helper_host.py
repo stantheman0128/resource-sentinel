@@ -82,8 +82,10 @@ class HelperHostRefused(RuntimeError):
         super().__init__(reason)
 
 
-def emit(record, stream=None):
+def emit(record, stream=None, *, sink=None):
     """One JSON record per line on stderr, so stdout stays free for a workload."""
+    if stream is None and sink is not None:
+        return sink.offer(record)
     print(json.dumps(record, sort_keys=True, default=str),
           file=sys.stderr if stream is None else stream, flush=True)
 
@@ -372,7 +374,7 @@ class HelperHost:
     def __init__(self, *, data_dir, profile_path=None,
                  enroll_every_ticks=DEFAULT_ENROLL_EVERY, report_every_ticks=DEFAULT_REPORT_EVERY,
                  sleep=time.sleep, clock=None, machine_source=None, open_job=None,
-                 memory_scanner=None):
+                 memory_scanner=None, telemetry_factory=None):
         self.data_dir = Path(data_dir)
         self.profile_path = Path(DEFAULT_PROFILE if profile_path is None else profile_path)
         self.enroll_every_ticks = enroll_every_ticks
@@ -385,6 +387,9 @@ class HelperHost:
         self._machine_source = machine_source
         self._native_sources = clock is None and machine_source is None
         self._supplied_memory_scanner = memory_scanner
+        self.telemetry = None
+        self._telemetry_factory = telemetry_factory
+        self._telemetry_instance_id = str(uuid4())
         self._opener = self._open_job if open_job is None else open_job
         self.capability = None
         self.profile = None
@@ -400,6 +405,28 @@ class HelperHost:
         self._last_reason = None
         self._deadline_100ns = None
         self._registration_operation = None
+
+    def emit(self, record, stream=None):
+        if stream is not None:
+            return emit(record, stream=stream)
+        from .telemetry import emit_resident
+        return emit_resident(self, record)
+
+    def _start_telemetry(self):
+        # Explicit paired sources keep portable fixtures free of native work;
+        # fixtures that need telemetry supply the trusted in-process factory.
+        if not self._native_sources and self._telemetry_factory is None:
+            return
+        from .telemetry import start_resident_telemetry
+        start_resident_telemetry(self, role="helper", identity=self.process.identity,
+            instance_id=getattr(self, "instance_id", self._telemetry_instance_id),
+            data_dir=self.data_dir)
+
+    def _finish_telemetry(self, record):
+        if self.telemetry is None:
+            return record
+        from .telemetry import stop_resident_telemetry
+        return {**record, "telemetry": stop_resident_telemetry(self, record)}
 
     # --- startup ----------------------------------------------------------
 
@@ -436,6 +463,7 @@ class HelperHost:
         self._register()
         self._started = True
         enrollment = self.refresh_enrollment()
+        self._start_telemetry()
         return {"event": "helper_host_started", "pid": self.capability.pid,
                 "mode": self.shadow.mode.value, "config_revision": self.sampler.config_revision,
                 "sample_interval_ms": self.profile.sample_interval_ms,
@@ -847,7 +875,7 @@ class HelperHost:
     def _report(self):
         """A record every report_every ticks, and never one for zero ticks."""
         if self._iterations and self._iterations % self.report_every_ticks == 0:
-            emit(self.metrics_record())
+            self.emit(self.metrics_record())
 
     def serve_until_stopped(self):
         """Run iterations until the process is interrupted.
@@ -890,9 +918,12 @@ class HelperHost:
             raise HelperHostRefused("helper_host_handle_cleanup_unverified",
                                     ",".join(sorted(set(cleanup))))
         self._started = False
-        return {"event": "helper_host_closed", "iterations": self._iterations,
+        record = {"event": "helper_host_closed", "iterations": self._iterations,
                 "enrolled": len(self.jobs.enrolled), "registry_row_retained": self.registered,
                 "handles_retained_uncertain": self.jobs.retained_uncertain}
+        # The operator host still owns listeners and exact parent/self handles;
+        # its final close calls _finish_telemetry after those owners are closed.
+        return record if hasattr(self, "_operator_ready") else self._finish_telemetry(record)
 
 
 def build_parser():
@@ -938,9 +969,11 @@ def main(argv=None):
         return run_operational(host, iterations=options.iterations)
     host = HelperHost(**common)
     try:
-        emit(host.start())
+        host.emit(host.start())
     except HelperHostRefused as error:
-        emit({"event": "helper_host_refused", "reason": error.reason, "detail": error.detail})
+        if host._registration_operation is not None and host._registration_operation.pending:
+            host._start_telemetry()
+        host.emit({"event": "helper_host_refused", "reason": error.reason, "detail": error.detail})
         if host._registration_operation is not None and host._registration_operation.pending:
             from .helper_control_host import retain_cleanup
             return retain_cleanup(host)
@@ -948,23 +981,23 @@ def main(argv=None):
     code = EXIT_OK
     try:
         if options.iterations == 0:
-            emit(host.serve_until_stopped())
+            host.emit(host.serve_until_stopped())
         else:
-            emit(host.run_bounded(options.iterations))
+            host.emit(host.run_bounded(options.iterations))
     except KeyboardInterrupt:
-        emit({"event": "helper_host_stopping", "reason": "interrupted"})
+        host.emit({"event": "helper_host_stopping", "reason": "interrupted"})
     except HelperHostRefused as error:
-        emit({"event": "helper_host_failed", "reason": error.reason, "detail": error.detail})
+        host.emit({"event": "helper_host_failed", "reason": error.reason, "detail": error.detail})
         code = EXIT_FAILED
     except Exception as error:
-        emit({"event": "helper_host_failed", "reason": _reason(error)})
+        host.emit({"event": "helper_host_failed", "reason": _reason(error)})
         code = EXIT_FAILED
     finally:
         # Handles are released on every path, including an unexpected failure.
         try:
-            emit(host.close())
+            host.emit(host.close())
         except HelperHostRefused as error:
-            emit({"event": "helper_host_refused", "reason": error.reason, "detail": error.detail})
+            host.emit({"event": "helper_host_refused", "reason": error.reason, "detail": error.detail})
             if host.jobs.retained_uncertain:
                 from .helper_control_host import retain_cleanup
                 return retain_cleanup(host)

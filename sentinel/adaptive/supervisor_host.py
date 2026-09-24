@@ -80,7 +80,9 @@ class SupervisorHostRefused(RuntimeError):
         super().__init__(reason)
 
 
-def emit(record, stream=None):
+def emit(record, stream=None, *, sink=None):
+    if stream is None and sink is not None:
+        return sink.offer(record)
     try:
         print(json.dumps(record, sort_keys=True, default=str),
               file=sys.stderr if stream is None else stream, flush=True)
@@ -215,7 +217,7 @@ class SupervisorHost:
     def __init__(self, *, data_dir, journal_dir, child_cwd=None, python_executable=None,
                  profile_path=None, max_guardians=1, guardian_iterations=0,
                  helper_profile_path=None, max_helpers=1,
-                 sleep=time.sleep, tick_interval_sec=1.0):
+                 sleep=time.sleep, tick_interval_sec=1.0, telemetry_factory=None):
         self.data_dir = Path(data_dir)
         self.journal_dir = Path(journal_dir)
         self.child_cwd = Path(_REPO_ROOT if child_cwd is None else child_cwd)
@@ -268,6 +270,8 @@ class SupervisorHost:
         self._operational_current = self._operational_error = None
         self._initial_epoch = None
         self._instance_id, self._operator_instance_id = str(uuid4()), str(uuid4())
+        self.telemetry = None
+        self._telemetry_factory = telemetry_factory
         self._guardian_endpoints = {}
         self._helper_endpoints = None
         self._helper_epoch_drain = None
@@ -276,6 +280,29 @@ class SupervisorHost:
         self._drain_closed_children = set()
         self._last_barrier = None
         self._descriptor_removed = self._operator_closed = self._discovery_closed = False
+
+    def emit(self, record, stream=None):
+        if stream is not None:
+            return emit(record, stream=stream)
+        from .telemetry import emit_resident
+        return emit_resident(self, record)
+
+    def _start_telemetry(self):
+        current = getattr(self.startup, "_current", None)
+        if (current is None or getattr(self.startup, "_acquire_stage", None)
+                not in {"binding", "mutex", "held"}):
+            # Portable startup-order fixtures own no native self handle.
+            return
+        from .telemetry import start_resident_telemetry
+        start_resident_telemetry(self, role="supervisor", identity=current.identity,
+            instance_id=self._instance_id, data_dir=self.data_dir,
+            excluded_paths=(self.journal_dir,))
+
+    def _finish_telemetry(self, record):
+        if self.telemetry is None:
+            return record
+        from .telemetry import stop_resident_telemetry
+        return {**record, "telemetry": stop_resident_telemetry(self, record)}
 
     # --- startup ----------------------------------------------------------
 
@@ -304,6 +331,7 @@ class SupervisorHost:
             self.startup.acquire()
         except Exception as error:
             if getattr(self.startup, "policy_pending", False) is True:
+                self._start_telemetry()
                 self.cold_reason = _reason(error)
                 return {"event": "supervisor_host_started", "state": "COLD_RECOVERY_HOLD",
                         "reason": self.cold_reason, "attached": False,
@@ -327,6 +355,7 @@ class SupervisorHost:
             self.guardian = self._start_initial_guardian()
         except Exception as error:
             self.cold_reason = _reason(error)
+            self._start_telemetry()
             return {"event": "supervisor_host_started", "state": "COLD_RECOVERY_HOLD",
                     "reason": self.cold_reason, "attached": False,
                     "guardian_created": self.guardian is not None or bool(self.unverified) or self._creation_unknown,
@@ -345,6 +374,7 @@ class SupervisorHost:
             self.supervisor = self._attach(self.guardian)
         except SupervisorHostRefused as error:
             record["attached"], record["attach_reason"] = False, error.detail
+        self._start_telemetry()
         return record
 
     def _child_arguments(self, epoch):
@@ -978,7 +1008,7 @@ class SupervisorHost:
             try:
                 if self.draining and self._local_drain_request is None and self.operations is not None and not self.operations.operations:
                     self.request_local_drain()
-                emit(self.run_once())
+                self.emit(self.run_once())
                 iterations += 1
                 if self.draining and self._custody_snapshot()["settled"]:
                     return {"event": "supervisor_host_stopping", "reason": "drain_settled",
@@ -986,7 +1016,7 @@ class SupervisorHost:
                 self._sleep(self.tick_interval_sec)
             except KeyboardInterrupt:
                 self.begin_drain()
-                emit({"event": "supervisor_host_stopping", "reason": "drain_requested",
+                self.emit({"event": "supervisor_host_stopping", "reason": "drain_requested",
                       "iterations": iterations})
                 try:
                     self.request_local_drain()
@@ -997,7 +1027,7 @@ class SupervisorHost:
                 # Failure is retained by its original owners. An uncaught
                 # ordinary exception must not turn into silent witness loss.
                 self.begin_drain()
-                emit({"event": "supervisor_host_draining", "reason": _reason(error),
+                self.emit({"event": "supervisor_host_draining", "reason": _reason(error),
                       "iterations": iterations})
                 try:
                     self._sleep(self.tick_interval_sec)
@@ -1372,6 +1402,7 @@ class SupervisorHost:
         if self.cold_reason is not None:
             record["cold_recovery_reason"] = self.cold_reason
         if not cleanup:
+            record = self._finish_telemetry(record)
             self._closed = True
             self._close_record = dict(record)
         return record
@@ -1453,14 +1484,18 @@ def main(argv=None):
                           helper_profile_path=options.helper_profile,
                           max_helpers=options.max_helpers)
     try:
-        emit(host.start())
+        host.emit(host.start())
     except (Exception, KeyboardInterrupt) as error:
         # A refusal after the child was created leaves a guardian behind. The
         # record names it, and that case is not a clean refusal.
         child = (host.guardian is not None or bool(host.unverified) or host._creation_unknown or
                  host.unsettled_captures or any(item.get("child") is not None for item in host._creation_records) or
                  getattr(host.startup, "policy_pending", False) is True)
-        emit({"event": "supervisor_host_refused", "reason": _reason(error), "detail": getattr(error, "detail", None),
+        if child:
+            # An interrupted pending binding can already retain native self
+            # custody even though start() never returned its HOLD record.
+            host._start_telemetry()
+        host.emit({"event": "supervisor_host_refused", "reason": _reason(error), "detail": getattr(error, "detail", None),
               "guardian_created": child,
               "guardian_epoch": None if host.guardian is None else host.guardian.epoch,
               "guardian_pid": None if host.guardian is None else host.guardian.pid,
@@ -1470,22 +1505,22 @@ def main(argv=None):
         host.begin_drain()
     try:
         if options.iterations == 0:
-            emit(host.supervise_until_stopped())
+            host.emit(host.supervise_until_stopped())
         else:
             for _ in range(options.iterations):
-                emit(host.run_once())
+                host.emit(host.run_once())
                 if host.draining:
                     break
             host.request_local_drain()
-            emit(host.supervise_until_stopped())
+            host.emit(host.supervise_until_stopped())
     except KeyboardInterrupt:
-        emit({"event": "supervisor_host_stopping", "reason": "interrupted"})
+        host.emit({"event": "supervisor_host_stopping", "reason": "interrupted"})
         host.begin_drain()
-        emit(host.supervise_until_stopped())
+        host.emit(host.supervise_until_stopped())
     except Exception as error:
-        emit({"event": "supervisor_host_stopping", "reason": _reason(error)})
+        host.emit({"event": "supervisor_host_stopping", "reason": _reason(error)})
         host.begin_drain()
-        emit(host.supervise_until_stopped())
+        host.emit(host.supervise_until_stopped())
     # A failed final close still owns its exact native objects. Stay resident
     # through a known retry or quarantined outcome. Never tick a closed listener
     # merely because final singleton cleanup remains unfinished.
@@ -1494,16 +1529,16 @@ def main(argv=None):
             record = host.close()
             if not record["cleanup_errors"]:
                 break
-            emit(record)
+            host.emit(record)
         except (Exception, KeyboardInterrupt) as pending:
-            emit({"event": "supervisor_host_draining", "reason": _reason(pending)})
+            host.emit({"event": "supervisor_host_draining", "reason": _reason(pending)})
         try:
             if not host._drain_children_settled():
-                emit(host.run_once())
+                host.emit(host.run_once())
             host._sleep(host.tick_interval_sec)
         except (Exception, KeyboardInterrupt) as pending:
-            emit({"event": "supervisor_host_draining", "reason": _reason(pending)})
-    emit(record)
+            host.emit({"event": "supervisor_host_draining", "reason": _reason(pending)})
+    host.emit(record)
     # A child with no witness or a partial capture that would not close is not
     # a clean exit, even though the supervision itself settled.
     return EXIT_UNSETTLED if (record["unverified"] or record["unsettled_captures"] or

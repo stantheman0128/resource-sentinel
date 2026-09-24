@@ -829,7 +829,7 @@ class SupervisorHostTests(unittest.TestCase):
         records = []
         with patch.object(module, "SupervisorHost", return_value=host), \
                 patch.object(host, "start", side_effect=refusal), \
-                patch.object(module, "emit", side_effect=records.append), \
+                patch.object(host, "emit", side_effect=records.append), \
                 patch.object(host, "supervise_until_stopped", side_effect=ObservationBoundary) as resident:
             with self.assertRaises(ObservationBoundary):
                 module.main(["--data-dir", str(self.directory),
@@ -849,7 +849,7 @@ class SupervisorHostTests(unittest.TestCase):
         records = []
         with patch.object(module, "SupervisorHost", return_value=host), \
                 patch.object(host, "start", side_effect=refusal), \
-                patch.object(module, "emit", side_effect=records.append):
+                patch.object(host, "emit", side_effect=records.append):
             code = module.main(["--data-dir", str(self.directory),
                                 "--journal-dir", str(self.directory)])
         self.assertEqual(code, EXIT_REFUSED)

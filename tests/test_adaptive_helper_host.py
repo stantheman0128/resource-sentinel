@@ -817,7 +817,7 @@ class ZeroSetStructureTests(unittest.TestCase):
             "sentinel.adaptive.identity", "sentinel.adaptive.legacy_writer",
             "sentinel.adaptive.machine_sampler", "sentinel.adaptive.member_memory",
             "sentinel.adaptive.native_job",
-            "sentinel.adaptive.sampler", "sentinel.adaptive.store",
+            "sentinel.adaptive.sampler", "sentinel.adaptive.store", "sentinel.adaptive.telemetry",
             "sentinel.adaptive.helper_control_host", "sentinel.adaptive.supervisor_reconcile"})
 
     def test_it_imports_nothing_that_can_set_a_cap_or_reach_a_guardian(self):
@@ -842,6 +842,18 @@ class ZeroSetStructureTests(unittest.TestCase):
                    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
                    and node.value.id == "kernel"}
         self.assertEqual(exports, {"K32GetProcessMemoryInfo", "GetCurrentProcess"})
+
+    def test_telemetry_dependency_has_no_control_or_recovery_writer(self):
+        path = PACKAGE / "telemetry.py"
+        self.assertEqual(imported_modules(path), {
+            "__future__", "collections", "dataclasses", "enum", "errno", "json", "os", "pathlib",
+            "re", "stat", "threading", "time", "uuid", "msvcrt", "fcntl", "sys",
+            "sentinel.adaptive.contracts"})
+        self.assertEqual(named(path) & (DENIED_NAMES | {
+            "SetInformationProcess", "SetProcessWorkingSetSize", "EmptyWorkingSet", "TerminateProcess",
+            "SuspendThread", "ResumeThread", "CreateProcessW", "CreateJobObjectW", "subprocess",
+            "Popen", "fsync", "RecoveryJournal", "LifecycleStore",
+        }), set())
 
     def test_its_source_names_no_job_mutation_and_no_proposal(self):
         self.assertEqual(named(PACKAGE / "helper_host.py") & DENIED_NAMES, set())

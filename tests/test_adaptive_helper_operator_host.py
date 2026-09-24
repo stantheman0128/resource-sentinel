@@ -50,6 +50,22 @@ class Listener:
         self.endpoint, self.registry = endpoint, registry
         self.closes = 0
         self.error = None
+        self.polls = self.stop_calls = 0
+        self.stop_ready, self.stopping = True, False
+        self.stop_error = None
+
+    def poll_accept(self):
+        if self.stopping:
+            raise AssertionError("polled a terminally stopped listener")
+        self.polls += 1
+        return None
+
+    def stop_accept(self):
+        self.stop_calls += 1
+        self.stopping = True
+        if self.stop_error is not None:
+            raise self.stop_error
+        return self.stop_ready
 
     def close(self):
         self.closes += 1
@@ -90,7 +106,6 @@ class HelperOperatorHostTests(unittest.TestCase):
                 patch.object(VerifiedProcess, "current", return_value=self.fixture.process), \
                 patch("sentinel.adaptive.store.LifecycleStore", return_value=self.fixture.store):
             self.started = host.start()
-        host.operator_service.serve_once = lambda *args, **kwargs: None
         self.host = host
         return host
 
@@ -330,6 +345,138 @@ class HelperOperatorHostTests(unittest.TestCase):
         self.assertIs(host.parent_process, self.parent)
         self.assertIs(host.process, self.fixture.process)
 
+    def test_pending_accept_stop_preserves_custody_and_resumes_same_owner(self):
+        self.fixture.seed(1)
+        host = self.build()
+        self.ready(host)
+        listener = host.operator_listener
+        listener.stop_ready = False
+        job = self.fixture.jobs[fixtures.job_name(1)]
+        process_handle, parent_handle = host.process._handle, host.parent_process._handle
+        with patch.object(cli.HelperHost, "close") as base_close, \
+                patch.object(host, "_finish_telemetry") as finish:
+            for attempt in range(1, 4):
+                with self.assertRaisesRegex(cli.HelperHostRefused, "accept_stop_pending"):
+                    host.close()
+                self.assertEqual(listener.stop_calls, attempt)
+                self.assertIs(host.operator_listener, listener)
+                self.assertIs(host.process, self.fixture.process)
+                self.assertIs(host.parent_process, self.parent)
+                self.assertTrue(host._operator_accept_stopping)
+                self.assertFalse(host._cleanup_started)
+                self.assertFalse(host._closed)
+                self.assertIsNone(host._cleanup_error)
+                self.assertEqual((listener.closes, job.close_calls), (0, 0))
+                self.assertFalse(self.fixture.processes.entries[process_handle].closed)
+                self.assertFalse(self.fixture.processes.entries[parent_handle].closed)
+            base_close.assert_not_called()
+            finish.assert_not_called()
+        polls, observer_ticks = listener.polls, host._drain_observer.ticks
+        host.run_once()
+        self.assertEqual(listener.polls, polls)
+        self.assertGreater(host._drain_observer.ticks, observer_ticks)
+        self.assertIs(host.operator_listener, listener)
+        listener.stop_ready = True
+        result = host.close()
+        self.assertEqual(result["event"], "helper_operator_host_closed")
+        self.assertEqual((listener.stop_calls, listener.closes, job.close_calls), (4, 1, 1))
+        self.assertTrue(host._closed)
+        self.assertIsNone(host.operator_listener)
+        self.assertIsNone(host.process)
+        self.assertIsNone(host.parent_process)
+
+    def assert_unknown_stop_retains_original_error(self, error):
+        host = self.build()
+        self.ready(host)
+        listener = host.operator_listener
+        listener.stop_error = error
+        with patch.object(cli.HelperHost, "close") as base_close, \
+                patch.object(host, "_finish_telemetry") as finish:
+            with self.assertRaises(type(error)) as raised:
+                host.close()
+            self.assertIs(raised.exception, error)
+            self.assertIs(host._cleanup_error, error)
+            self.assertTrue(host._operator_accept_stopping)
+            self.assertFalse(host._cleanup_started)
+            self.assertFalse(host._closed)
+            self.assertIs(host.operator_listener, listener)
+            self.assertIs(host.process, self.fixture.process)
+            self.assertIs(host.parent_process, self.parent)
+            with self.assertRaisesRegex(cli.HelperHostRefused, "cleanup_quarantined"):
+                host.close()
+            base_close.assert_not_called()
+            finish.assert_not_called()
+        self.assertEqual((listener.stop_calls, listener.closes), (1, 0))
+        polls = listener.polls
+        host._operator_poll()
+        self.assertEqual(listener.polls, polls)
+
+    def test_unknown_accept_stop_keeps_original_error_and_never_retries(self):
+        self.assert_unknown_stop_retains_original_error(OSError("fixture cancellation unknown"))
+
+    def test_interrupted_accept_stop_keeps_original_error_and_never_retries(self):
+        self.assert_unknown_stop_retains_original_error(KeyboardInterrupt("fixture cancellation interrupted"))
+
+    def test_nonboolean_accept_stop_is_unknown_not_completion(self):
+        host = self.build()
+        self.ready(host)
+        listener = host.operator_listener
+        listener.stop_ready = 1
+        with self.assertRaisesRegex(cli.HelperHostRefused, "accept_stop_invalid") as raised:
+            host.close()
+        self.assertIs(host._cleanup_error, raised.exception)
+        with self.assertRaisesRegex(cli.HelperHostRefused, "cleanup_quarantined"):
+            host.close()
+        self.assertEqual((listener.stop_calls, listener.closes), (1, 0))
+        self.assertFalse(host._cleanup_started)
+        self.assertIs(host.parent_process, self.parent)
+        self.assertIs(host.process, self.fixture.process)
+
+    def test_stop_precedes_base_cleanup_and_telemetry_finishes_after_all_owners(self):
+        host = self.build()
+        self.ready(host)
+        listener = host.operator_listener
+        events = []
+        original_stop, original_listener_close = listener.stop_accept, listener.close
+        original_base_close = cli.HelperHost.close
+
+        def stop():
+            events.append("stop")
+            self.assertFalse(host._cleanup_started)
+            return original_stop()
+
+        def base_close(subject):
+            events.append("base")
+            self.assertIs(subject, host)
+            self.assertEqual(listener.stop_calls, 1)
+            self.assertTrue(host._cleanup_started)
+            self.assertEqual(listener.closes, 0)
+            self.assertIs(host.parent_process, self.parent)
+            return original_base_close(subject)
+
+        def listener_close():
+            events.append("listener")
+            return original_listener_close()
+
+        def finish(record):
+            events.append("telemetry")
+            self.assertEqual(record["event"], "helper_operator_host_closed")
+            self.assertIsNone(host.operator_listener)
+            self.assertIsNone(host.parent_process)
+            self.assertIsNone(host.process)
+            self.assertEqual(host._pipe_registry.status().resources, 0)
+            return {**record, "telemetry": {"state": "pending"}}
+
+        listener.stop_accept, listener.close = stop, listener_close
+        with patch.object(cli.HelperHost, "close", base_close), \
+                patch.object(host, "_finish_telemetry", side_effect=finish) as telemetry:
+            record = host.close()
+            host.close()
+        self.assertEqual(events, ["stop", "base", "listener", "telemetry"])
+        telemetry.assert_called_once()
+        self.assertEqual(record["telemetry"], {"state": "pending"})
+        self.assertTrue(host._closed)
+
     def test_changed_off_barrier_between_readiness_and_close_keeps_host_alive(self):
         host = self.build()
         self.ready(host)
@@ -342,19 +489,41 @@ class HelperOperatorHostTests(unittest.TestCase):
         host = self.build()
         error = IpcError("fixture_pipe_unknown")
         error.add_note("pipe_peer_close_failed")
-        host.operator_service.serve_once = lambda *args, **kwargs: (_ for _ in ()).throw(error)
+        host.operator_service.poll_once = lambda *args, **kwargs: (_ for _ in ()).throw(error)
         host._operator_poll()
         self.assertIs(host._operator_error, error)
         self.assertTrue(host._drain_requested)
-        host.operator_service.serve_once = lambda *args, **kwargs: self.fail("reused unverified pipe")
+        host.operator_service.poll_once = lambda *args, **kwargs: self.fail("reused unverified pipe")
         host._operator_poll()
 
-    def test_operator_idle_timeout_does_not_create_a_drain_or_cleanup_obligation(self):
+    def test_operator_connected_timeout_does_not_create_a_drain_or_cleanup_obligation(self):
         host = self.build()
-        host.operator_service.serve_once = lambda *args, **kwargs: (_ for _ in ()).throw(IpcError("ipc_timeout"))
+        host.operator_service.poll_once = lambda *args, **kwargs: (_ for _ in ()).throw(IpcError("ipc_timeout"))
         host._operator_poll()
         self.assertFalse(host._drain_requested)
         self.assertIsNone(host._operator_error)
+
+    def test_idle_poll_does_not_start_deadline_or_latch_drain(self):
+        host = self.build()
+        with patch("sentinel.adaptive.operator_transport.NativeDeadline.after_ms",
+                side_effect=AssertionError("idle accept created request deadline")):
+            for _ in range(3):
+                host._operator_poll()
+        self.assertEqual(host.operator_listener.polls, 3)
+        self.assertFalse(host._drain_requested)
+        self.assertIsNone(host._operator_error)
+        self.assertIsNone(host._cleanup_error)
+
+    def test_ordinary_and_drain_ticks_each_poll_original_listener_once(self):
+        host = self.build()
+        listener = host.operator_listener
+        host.run_once()
+        self.assertEqual(listener.polls, 1)
+        self.drain(host)
+        host.run_once()
+        self.assertEqual(listener.polls, 2)
+        self.assertIs(host.operator_listener, listener)
+        self.assertEqual(listener.stop_calls, 0)
 
     def test_missing_runtime_report_keeps_proof_fields_unknown(self):
         host = self.build()
@@ -443,7 +612,7 @@ class HelperOperatorCliTests(unittest.TestCase):
     def test_startup_cleanup_failure_is_retained_instead_of_returning_clean_exit(self):
         failure, cleanup = OSError("fixture startup"), OSError("fixture cleanup")
         host = SimpleNamespace(start=lambda: (_ for _ in ()).throw(failure),
-            close=lambda: (_ for _ in ()).throw(cleanup))
+            close=lambda: (_ for _ in ()).throw(cleanup), emit=lambda record: None)
         with patch.object(module, "retain_cleanup", return_value="retained") as retained:
             self.assertEqual(module.run_operational(host), "retained")
         self.assertIs(host._startup_error, failure)

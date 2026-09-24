@@ -1,12 +1,14 @@
-# Proposed bounded resident-host telemetry contract
+# Bounded resident-host telemetry contract
 
-Status: implementation proposal for review, **not an implemented sink, measured
-P4 result, changed gate or production activation**. Formal authority remains
-`IMPLEMENTATION-PLAN.md` §5.5, §8, §11.2 and §12.1/S4. Existing capability
-validation stays unchanged until this proposal and its evidence schema are
-reviewed and implemented together.
+Status: slices 1–2 have a source implementation and passed central verification
+on 2026-09-24: **276 tests, 8.418 seconds, zero failures/errors/skips**.
+This is **not a measured P4 result, changed
+gate or production activation**. Slices 3–4 remain pending. Formal authority
+remains `IMPLEMENTATION-PLAN.md` §5.5, §8, §11.2 and §12.1/S4. Existing P4
+capability validation and its strict idle comparison remain unchanged until the
+producer and evidence schema below receive their separate review.
 
-## Observed production and evidence paths
+## Observed production and evidence paths before slices 1–2
 
 | Owner | Current writer / sink | Persistence and failure behavior |
 | --- | --- | --- |
@@ -18,11 +20,11 @@ reviewed and implemented together.
 | Action/lifecycle audit | `LifecycleStore`, `adaptive_actions`, managed execution/owner state | SQLite safety/audit state. Its transaction and durability rules are independent of diagnostic output. |
 | P4 producer | `NativeHelperHostSampler`, `read_runtime_footprint()` | Requires the original `sys.stderr` to be a writable UTF-8 regular file in isolated `session.log_directory`; verifies same file identity and measures actual report-file byte deltas. Footprint recursively counts all files in that directory and all noninternal SQLite rows. Raw producer traces live elsewhere. |
 
-No resident-host production component currently owns the formal **20 MiB total /
-7-day** adaptive aggregate/event policy. Redirecting stderr creates a file but
-does not implement that policy. No proposed implementation may report this gap as
-closed merely by discarding reports, excluding them from footprint, redirecting
-to NUL, or lowering the test's report cadence.
+Before this change, no resident-host production component owned the formal
+**20 MiB total / 7-day** adaptive aggregate/event policy. Redirecting stderr
+creates a file but does not implement that policy. No implementation may report
+the evidence gap as closed merely by discarding reports, excluding them from
+footprint, redirecting to NUL, or lowering the test's report cadence.
 
 Wrapper/workload stdio is a separate launch protocol. Preserve the actual
 workload handles and wrapper launch-state output; this proposal does not route
@@ -40,15 +42,16 @@ deletion paths.
 
 ### Host-owned asynchronous interface
 
-Proposed exact interface shape:
+Implemented interface shape:
 
 ```python
-sink = ResidentTelemetry(data_dir, role, identity, instance_id,
-                         interrupt_clock=clock)
+sink = ResidentTelemetry(data_dir=data_dir, role=role, identity=identity,
+                         instance_id=instance_id, excluded_paths=(journal_dir,))
 sink.start()
 receipt = sink.offer(record, kind=TelemetryKind.AGGREGATE)  # or EVENT
 status = sink.snapshot()
 sink.request_stop()
+status = sink.finish(timeout=0.05)
 ```
 
 `role` is one of helper, guardian or supervisor. Original native identity and
@@ -62,15 +65,17 @@ API. Nothing is emitted from inside POLICY/SQLite/mutation scopes.
 Use one bounded worker thread per resident host, a bounded event queue and one
 coalesced latest aggregate per role. The implementation constants (queue count,
 serialized record bound, chunk bound and worker batch bound) are internal bounds,
-not a second user policy or a tunable route around the 20 MiB cap. Proposed
-starting bounds: 128 pending records, 16 KiB per record, 512 KiB chunks, at most
-64 chunks/metadata files in the managed inventory. Aggregate records remain on
+not a second user policy or a tunable route around the 20 MiB cap. Fixed
+implementation bounds: 128 pending records including the worker's active batch,
+16 KiB per record, 64 KiB per batch, 512 KiB chunks, at most 64 chunks/metadata
+files in the managed inventory. Aggregate records remain on
 the existing 30-second helper cadence; unchanged per-iteration guardian and
 supervisor status is coalesced into 30-second summaries. Actual errors,
 restoration outcomes and lifecycle transitions remain events. Coalescing and
 dropped-record counts are visible; they are not silently counted as persisted.
 
-The worker uses ordinary buffered writes/flush, **no periodic fsync**. Required
+The worker uses ordinary bounded `os.write` batches and closes each file within
+the shared lock, **no periodic fsync**. Required
 first-intent/audit durability remains in the existing recovery journal/ledger.
 Best-effort telemetry is never evidence that intent was durable, a cap was
 applied/restored, a child exited or capacity was released.
@@ -84,6 +89,13 @@ later batch. The implementation must use a local ordinary noninheritable lock
 file, validate file/directory identity, reject symlinks/reparse points, and retain
 uncertain file owners without retrying an ambiguous close. A failed lock never
 means permission to write without accounting.
+
+The actual open descriptor is checked with `fstat` against the expected leaf
+identity/size and fresh `lstat`; directory identities are rechecked. An interrupted
+open or lock acquisition retains the original uncertain owner and quarantines
+the store. It does not infer absence from a missing returned descriptor. This is
+the existing cooperative same-user governance model, not a hostile same-SID
+filesystem sandbox or a claim that other applications cannot alter the files.
 
 Within the lock, the writer:
 
@@ -242,5 +254,30 @@ replaces it nor makes its missing original host/process custody optional.
    costs charged. Save genuine failures and unexercised branches. Do not promote
    on implementation tests, a contract document or bounded-policy constants.
 
-No source, runtime setting, Scheduled Task, capability predicate or gate result
-is changed by this proposal file.
+Slices 1–2 do not change runtime settings, Scheduled Tasks, capability predicates
+or gate results. Source-level bounded storage is distinct from native P4
+performance, retention and recovery evidence; those outcomes remain unverified.
+
+## Central source verification, 2026-09-24
+
+The first 269-test run had four fixture errors: three tests still intercepted
+module-level `emit` instead of the actual host-owned method, and one fixture
+referenced an unimported Mock. The corrected fixtures preserve their custody and
+drain assertions. Review also found that separate refused RPC requests sharing
+one error reason were coalesced; they now remain discrete events across idle
+polls. Only an explicit no-service-attempt custody-full status may coalesce.
+Real supervisor action fields and guardian frame/launch/operator record shapes
+have persistence regressions. Helper polling uses the committed retained
+nonblocking accept and settles it before any native owner cleanup.
+
+```text
+C:\Python313\python.exe -m unittest tests.test_adaptive_telemetry tests.test_adaptive_host_telemetry tests.test_adaptive_helper_host tests.test_adaptive_guardian_host tests.test_adaptive_supervisor_host tests.test_adaptive_helper_operator_host -q
+```
+
+The command ran through normal daily P2 HEAVY admission on the protected dirty
+integration baseline. Complete private output is in
+`.local-adaptive/telemetry-host-regression-20260924-1.log`. The existing P4
+producer still expects synchronous stderr writes; its original-sink integration
+and schema change are source work, not an external-console-only gap. No native
+performance/retention claim, production installation or control enablement follows
+from this regression result.

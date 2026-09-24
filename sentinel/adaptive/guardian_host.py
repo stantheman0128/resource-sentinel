@@ -60,8 +60,10 @@ class GuardianHostRefused(RuntimeError):
         super().__init__(reason)
 
 
-def emit(record, stream=None):
+def emit(record, stream=None, *, sink=None):
     """One JSON record per line on stderr, so stdout stays free for a workload."""
+    if stream is None and sink is not None:
+        return sink.offer(record)
     try:
         print(json.dumps(record, sort_keys=True, default=str),
               file=sys.stderr if stream is None else stream, flush=True)
@@ -93,7 +95,7 @@ class GuardianHost:
                  query_instance_id=None, control_instance_id=None, sleep=time.sleep,
                  evidence_directory=None, evidence_sha256=None, control_purpose="isolated_canary",
                  instance_id=None, operator_instance_id=None, policy_instance_id=None,
-                 parent_identity=None, parent_instance_id=None):
+                 parent_identity=None, parent_instance_id=None, telemetry_factory=None):
         self.data_dir = Path(data_dir)
         self.journal_dir = Path(journal_dir)
         self.guardian_epoch = guardian_epoch
@@ -110,6 +112,8 @@ class GuardianHost:
         self.operator_instance_id = str(uuid4()) if operator_instance_id is None else operator_instance_id
         self.policy_instance_id = policy_instance_id
         self.parent_identity, self.parent_instance_id = parent_identity, parent_instance_id
+        self.telemetry = None
+        self._telemetry_factory = telemetry_factory
         self.parent = self.discovery = self.descriptor = None
         self._descriptor_attempt = None
         self.operator_endpoint = self.operator_service = self.operator_listener = None
@@ -131,6 +135,24 @@ class GuardianHost:
         self._registration = None
         self._startup_profile = None
         self._started = False
+
+    def emit(self, record, stream=None):
+        if stream is not None:
+            return emit(record, stream=stream)
+        from .telemetry import emit_resident
+        return emit_resident(self, record)
+
+    def _start_telemetry(self):
+        from .telemetry import start_resident_telemetry
+        start_resident_telemetry(self, role="guardian", identity=self.guardian.identity,
+            instance_id=self.instance_id, data_dir=self.data_dir,
+            excluded_paths=(self.journal_dir,))
+
+    def _finish_telemetry(self, record):
+        if self.telemetry is None:
+            return record
+        from .telemetry import stop_resident_telemetry
+        return {**record, "telemetry": stop_resident_telemetry(self, record)}
 
     # --- startup ----------------------------------------------------------
 
@@ -194,6 +216,7 @@ class GuardianHost:
         self._operator_endpoint()
         self._publish_descriptor("ready")
         self._started = True
+        self._start_telemetry()
         return {"event": "guardian_host_started", "guardian_epoch": self.guardian_epoch,
                 "pid": self.capability.pid, "launch_endpoint": self.launch_endpoint.name,
                 "query_endpoint": self.query_endpoint.name,
@@ -455,7 +478,7 @@ class GuardianHost:
         iterations = 0
         try:
             while not self._draining:
-                emit(self.run_once())
+                self.emit(self.run_once())
                 iterations += 1
             return {"event": "guardian_host_stopping", "reason": "operator_drain",
                     "iterations": iterations}
@@ -486,18 +509,18 @@ class GuardianHost:
                         "exiting": False, "iterations": iterations,
                         "retained": list(self.retained_execution_ids())}
             try:
-                emit(self.run_once(serve_launch=False))
+                self.emit(self.run_once(serve_launch=False))
                 self._sleep(min(.25, self.rpc_timeout_ms / 1000))
             except KeyboardInterrupt:
                 # A second interrupt does not release custody. The drain goes
                 # on, and ending this process by force is a guardian death that
                 # the supervisor handles.
-                emit({"event": "guardian_host_interrupt_deferred",
+                self.emit({"event": "guardian_host_interrupt_deferred",
                       "retained": list(self.retained_execution_ids())})
             except Exception as error:
                 self._runtime_error = error
                 self._retain_rpc_cleanup(error)
-                emit({"event": "guardian_host_recovery_pending", "reason": _reason(error)})
+                self.emit({"event": "guardian_host_recovery_pending", "reason": _reason(error)})
                 try:
                     self._sleep(.25)
                 except KeyboardInterrupt:
@@ -618,7 +641,8 @@ class GuardianHost:
                     raise
                 raise GuardianHostRefused("guardian_host_identity_cleanup_unverified") from None
         self._started = False
-        return {"event": "guardian_host_closed", "guardian_epoch": self.guardian_epoch}
+        return self._finish_telemetry(
+            {"event": "guardian_host_closed", "guardian_epoch": self.guardian_epoch})
 
 
 def build_parser():
@@ -682,47 +706,50 @@ def main(argv=None):
     stopping = False
     while True:
         try:
-            emit(host.start())
+            host.emit(host.start())
             break
         except (Exception, KeyboardInterrupt) as error:
             host._runtime_error = error
             host._retain_rpc_cleanup(error)
             stopping = stopping or isinstance(error, KeyboardInterrupt)
             if host.registration_pending:
+                host._start_telemetry()
                 # Retry through the same registration object. Its original
                 # guard decides whether progress is safe; quarantine stays
                 # resident and never turns into a new transaction/identity.
-                emit({"event": "guardian_host_registration_retained", "reason": _reason(error)})
+                host.emit({"event": "guardian_host_registration_retained", "reason": _reason(error)})
                 try:
                     host._sleep(1)
                 except KeyboardInterrupt:
                     stopping = True
                 continue
-            emit({"event": "guardian_host_refused", "reason": _reason(error),
-                  "detail": getattr(error, "detail", None)})
+            refusal = {"event": "guardian_host_refused", "reason": _reason(error),
+                       "detail": getattr(error, "detail", None)}
             # A later startup refusal may already own native identity or
             # listener handles. Finish the original cleanup before returning.
             if host.guardian is not None or host.owner is not None:
-                _close_until_settled(host)
+                _close_until_settled(host, initial_record=refusal)
+            else:
+                host.emit(refusal)
             return EXIT_REFUSED
     try:
         if stopping:
             host.begin_drain()
         elif options.iterations == 0:
-            emit(host.serve_until_stopped())
+            host.emit(host.serve_until_stopped())
         else:
             for _ in range(options.iterations):
-                emit(host.run_once())
+                host.emit(host.run_once())
     except KeyboardInterrupt:
-        emit({"event": "guardian_host_stopping", "reason": "interrupted"})
+        host.emit({"event": "guardian_host_stopping", "reason": "interrupted"})
     except Exception as error:
         host._runtime_error = error
         host._retain_rpc_cleanup(error)
         host.begin_drain()
-        emit({"event": "guardian_host_stopping", "reason": "runtime_failure"})
+        host.emit({"event": "guardian_host_stopping", "reason": "runtime_failure"})
     # The drain is unbounded on purpose. This host does not return to the shell
     # while it still owns an execution.
-    emit(host.drain_until_settled())
+    host.emit(host.drain_until_settled())
     # Unknown CloseHandle does not authorize dropping its only cleanup witness.
     # Keep the original owner alive; a second interrupt cannot turn uncertainty
     # into successful retirement or cause a blind repeated native close.
@@ -730,13 +757,27 @@ def main(argv=None):
     return EXIT_OK
 
 
-def _close_until_settled(host):
+def _close_until_settled(host, *, initial_record=None):
+    if initial_record is not None and getattr(host, "telemetry", None) is not None:
+        host.emit(initial_record)
+        initial_record = None
     while True:
         try:
-            emit(host.close())
+            closed = host.close()
+            if initial_record is not None:
+                host.emit(initial_record)
+            host.emit(closed)
             return
         except (Exception, KeyboardInterrupt) as error:
-            emit({"event": "guardian_host_cleanup_retained", "reason": _reason(error)})
+            from .contracts import ProcessIdentity
+
+            guardian = getattr(host, "guardian", None)
+            if type(getattr(guardian, "identity", None)) is ProcessIdentity:
+                host._start_telemetry()
+            if initial_record is not None:
+                host.emit(initial_record)
+                initial_record = None
+            host.emit({"event": "guardian_host_cleanup_retained", "reason": _reason(error)})
             try:
                 host._sleep(1)
             except KeyboardInterrupt:

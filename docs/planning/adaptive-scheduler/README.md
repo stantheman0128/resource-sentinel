@@ -10,6 +10,9 @@
 檔案身分修正。不是 native acceptance 或日常 activation；remote readiness 鎖外
 驗證、fresh restart、真正 native provider 與下述 P4/P6 source 缺口仍待完成。
 完整私人日誌為 `.local-adaptive/retirement-integration-20260924-1.log`。
+該包已提交為 `41cee4d`。Resident host bounded telemetry 與 helper 非阻塞
+poll／cleanup 接線另通過 **276 tests，8.418 秒，0 failures／errors／skips**。
+固定共用 20 MiB／7 天日誌上限已實作；P4 原始 sink 量測接線與 native 成本仍缺。
 
 接手時 Coordinator 的既存 freshness／共用計帳修正已獨立提交為 `6abadba`。
 裁決 ② 的[退場契約](P3-PRELAUNCH-RETIREMENT.md)先於程式提交為 `8cd06e7`。
@@ -79,7 +82,7 @@ loader error 或未跑的 native gate 算成 pass。
 | 3. helper sender | Source 接線、獨立 review 與完整 2,298 tests 通過。後續 original launch/stdio provenance、guardian scope 比對與 helper proposal adapter 已接線，344 targeted tests 通過（30.960 秒，含 30 個專用 scope tests）。實際 S2 topology producer／native bundle／新增採集成本仍未驗證，缺證據不啟用控制。 |
 | 4. release／CLI | Source 整合與完整 2,800 tests 通過；包含 exact discovery、typed operator transport、原子 off／audit、同 owner 收尾與三個 host 的 drain。後續 rootless C2 post-close receipt 已補上，保持原 terminal state，不偽造 FINISHED；新增 29 個案例。232 targeted tests 中 231 通過，唯一錯誤文字預期修正後單獨重跑通過，production 未因該失敗改動。沒有原始 close 證據的舊歷史仍 unknown。Native 操作通訊、控制及恢復仍未驗證。 |
 | 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport 與接線](P2-DAILY-ACTIVATION.md)已完成 installer、常駐 owner 與日常 consumers 接線，279 tests 通過（10.587 秒）。同帳本 demand／retirement fence 已提交，與 P6 合跑 308 tests 通過（21.977 秒）。Generation 正面退場整合最新 654 tests 通過（94.827 秒）；remote readiness 鎖外驗證、真正 native experiment provider 與 fresh restart 仍待完成。未執行日常安裝，grace 前提未解鎖。 |
-| 6. console 驗收命令 | [P6 矩陣編排與 raw reducer](P6-RUNNER-CONTRACT.md)、[S1/S2 bridge 契約](S1-DAILY-BRIDGE-CONTRACT.md)、[S3 精確故障點與 14×10 記錄器](S3-REAL-HOST-RECOVERY.md)、[P4 實際 host 成本量測](P4-OVERHEAD-RUNNER.md)已提交。最新 P4 155 tests 通過（12.967 秒）；S3／memory／helper 在 459 合跑中通過，唯一 P4 fixture error 已修正並重跑。Actual provider、部分 S3 故障 driver／完整 orchestration、A0 等價性與 bounded telemetry／非阻塞 operator source 仍缺；不是只剩 console 執行。 |
+| 6. console 驗收命令 | [P6 矩陣編排與 raw reducer](P6-RUNNER-CONTRACT.md)、[S1/S2 bridge 契約](S1-DAILY-BRIDGE-CONTRACT.md)、[S3 精確故障點與 14×10 記錄器](S3-REAL-HOST-RECOVERY.md)、[P4 實際 host 成本量測](P4-OVERHEAD-RUNNER.md)已提交。P4 原 stderr producer 155 tests 通過（12.967 秒）；新 bounded telemetry／helper 非阻塞接線 276 tests 通過（8.418 秒）。Actual provider、部分 S3 故障 driver／完整 orchestration、A0 等價性及 P4 新 sink／schema 整合仍缺；不是只剩 console 執行。 |
 
 最新追加：項目 5 的同帳本 demand 與 retirement fence 已提交為 `1072786`／
 `a48925a`；native scope 和正向 release 仍未提供。項目 6 的 P6 矩陣編排及 raw
@@ -136,8 +139,9 @@ C:\Python313\python.exe -m unittest tests.test_adaptive_overhead_runner tests.te
 
 P4 尚存的具體 source／native 缺口：actual provider 的 keeper role 必須綁定原始
 daily-generation owner，不能只提供任意同 logon 的 live process；現有 operator
-idle poll 可花 50 ms，尚未證明符合 tick p95；stderr reports 仍需實際 bounded
-storage 實作。既有 idle-after log bytes 不可大於 idle-before 的 gate 比正式計畫
+idle poll 已改成 nonblocking，但尚未實測 tick p95；bounded storage source 已通過
+276 host tests，原 P4 stderr producer 還需接上實際 sink 與新的證據 schema。
+既有 idle-after log bytes 不可大於 idle-before 的 gate 比正式計畫
 bounded growth 更嚴格，尚未放寬或忽略其失敗。所有 native 成本門檻仍未驗證。
 
 舊 raw-only measurement runner 已補上 partial acquisition、`Popen` 前的原始
@@ -167,7 +171,8 @@ host telemetry fixture 缺少 emit，以及 Windows journal inventory 的真正�
 原始 nonblocking pipe／operator core 則已獨立驗證：**205 tests 通過，16.096 秒，
 0 failures／errors／skips**，已提交為 `c0d4edd`。範圍包含 pipe Windows／async、
 operator、control、launch 與 daily-readiness transports。Helper 的實際 poll／
-telemetry 收尾接線仍待同批驗證，不宣稱 native idle cost 已通過。完整私人 log 為
+telemetry 收尾接線已在 2026-09-24 的 276 tests 中通過，不宣稱 native idle cost
+已通過。完整私人 log 為
 `.local-adaptive/pipe-core-regression-1.log`；等價的直接命令如下：
 
 ```text

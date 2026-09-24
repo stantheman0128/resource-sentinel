@@ -72,7 +72,8 @@ _REQUIRED = frozenset({"adaptive_runtime", "managed_executions", "adaptive_contr
     "adaptive_launch_requests", "adaptive_launch_fences", "adaptive_retirement_requests",
     "adaptive_prelaunch_retirements", "adaptive_infrastructure", "queue"})
 _SPECIAL = frozenset({"adaptive_daily_generation", "adaptive_daily_retirement", "adaptive_experiment_demands",
-    "adaptive_experiment_exclusions", "adaptive_experiment_cleanup_receipts", "adaptive_generation_successions"})
+    "adaptive_experiment_exclusions", "adaptive_experiment_cleanup_receipts", "adaptive_generation_successions",
+    "adaptive_successor_guardian_epochs"})
 _EXPERIMENT_TABLES = frozenset({"adaptive_experiment_demands", "adaptive_experiment_exclusions",
     "adaptive_experiment_cleanup_receipts"})
 
@@ -259,9 +260,51 @@ def _validate_schemas(conn, columns):
     _infra_schema(conn)
 
 
+def _validate_successor_epoch_bindings(previous, audits):
+    """Join bounded canonical history data; never mint current authority.
+
+    Historical generations need not be the current generation. Each audit must
+    nevertheless identify its exact original immutable succession and POLICY;
+    a well-shaped orphan is not evidence of a completed transition.
+    """
+    archives = {}
+    for entry in previous.entries:
+        record = json.loads(entry.record)
+        archives[record["transition_id"]] = entry, record
+    for entry in audits.entries:
+        row = entry.to_dict()
+        bound = archives.get(row["transition_id"])
+        if bound is None:
+            _refuse("successor_epoch_binding_changed")
+        archived, record = bound
+        if (row["succession_sha256"] != archived.sha256 or
+                row["successor_generation"] != record["successor"]["generation"] or
+                row["policy_instance_id"] != record["policy"]["instance_id"] or
+                row["policy_logon_id"] != record["policy"]["logon_id"]):
+            _refuse("successor_epoch_binding_changed")
+
+
+def _read_successor_histories(conn, budget, *, experiment_rows):
+    """One additive history allowance for experiments, successions and epochs."""
+    from . import daily_successor_history as successions
+    from . import daily_successor_epoch as epochs
+    if type(experiment_rows) is not int or not 0 <= experiment_rows <= MAX_HISTORY:
+        _refuse("history_exceeded")
+    previous = successions.read_successor_history(conn, max_rows=MAX_HISTORY - experiment_rows,
+        max_bytes=MAX_BYTES - budget.bytes)
+    budget.charge(previous.bytes_used)
+    audits = epochs.read_successor_guardian_epochs(conn,
+        max_rows=MAX_HISTORY - experiment_rows - previous.rows_used,
+        max_bytes=MAX_BYTES - budget.bytes)
+    budget.charge(audits.bytes_used)
+    _validate_successor_epoch_bindings(previous, audits)
+    return previous, audits
+
+
 def _read_ledger(conn, store, guard, budget):
     from . import experiment_history
     from . import daily_successor_history as successions
+    from . import daily_successor_epoch as epochs
     store._policy.assert_held(guard)
     schema, columns = _schema(conn, budget)
     try:
@@ -271,8 +314,7 @@ def _read_ledger(conn, store, guard, budget):
             raise LifecycleError("daily_retirement_inventory_schema_unknown") from None
         raise LifecycleError("daily_retirement_inventory_experiment_history_unverified") from None
     budget.charge(history.bytes_used)
-    previous = successions.read_successor_history(conn, max_bytes=MAX_BYTES - budget.bytes)
-    budget.charge(previous.bytes_used)
+    previous, audits = _read_successor_histories(conn, budget, experiment_rows=history.rows_used)
     if history.active_experiment_ids:
         _refuse("experiment_obligation_remaining")
     # Consume the original bounded SQL rows from the verifier, including actual
@@ -282,10 +324,11 @@ def _read_ledger(conn, store, guard, budget):
     for row in history._sql_rows:
         observed.setdefault(row.table, []).append(dict(zip(row.fields, row.values)))
     observed[successions.TABLE] = [dict(zip(successions._FIELDS, entry._row)) for entry in previous.entries]
+    observed[epochs.TABLE] = [entry.to_dict() for entry in audits.entries]
     completed = history.completed_execution_ids
     values = {}
     for name, fields in columns.items():
-        if name in _EXPERIMENT_TABLES or name == successions.TABLE:
+        if name in _EXPERIMENT_TABLES or name in {successions.TABLE, epochs.TABLE}:
             values[name] = observed.get(name, [])
         elif name == "managed_executions":
             historical = observed.get(name, [])

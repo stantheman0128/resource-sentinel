@@ -234,6 +234,7 @@ def _rows(conn, table, columns, budget, already_charged):
 
 
 def _read(conn, retirement, guard, expected, preimage, records, budget):
+    from . import daily_successor_epoch as epochs
     if not isinstance(conn, sqlite3.Connection) or not conn.in_transaction:
         _refuse("transaction_required")
     _connection_path(conn, retirement, guard)
@@ -249,14 +250,14 @@ def _read(conn, retirement, guard, expected, preimage, records, budget):
     budget.charge(history.bytes_used)
     if history.active_experiment_ids:
         _refuse("experiment_obligation_remaining")
-    previous = succession.read_successor_history(conn, max_rows=MAX_HISTORY,
-        max_bytes=MAX_BYTES - budget.bytes)
-    budget.charge(previous.bytes_used)
+    previous, audits = prior._read_successor_histories(conn, budget, experiment_rows=history.rows_used)
     charged = {}
     for row in history._sql_rows:
         charged.setdefault(row.table, Counter())[prior._encoded(dict(zip(row.fields, row.values)))] += 1
     for entry in previous.entries:
         charged.setdefault(succession.TABLE, Counter())[prior._encoded(dict(zip(succession._FIELDS, entry._row)))] += 1
+    for entry in audits.entries:
+        charged.setdefault(epochs.TABLE, Counter())[prior._encoded(entry.to_dict())] += 1
     full = {}
     for kind, name, unused_table, unused_sql in schema:
         if kind == "table":
@@ -286,7 +287,8 @@ def _read(conn, retirement, guard, expected, preimage, records, budget):
     encoded = prior._encoded(dict(schema=schema, tables=full))
     retained_bytes = len(encoded) + len(preimage[1]) + sum(len(value) for _, value in preimage[2])
     budget.charge(max(0, retained_bytes - budget.bytes))
-    return encoded, SuccessorInventoryBudget(budget.bytes, previous.rows_used, previous.bytes_used)
+    return encoded, SuccessorInventoryBudget(budget.bytes,
+        history.rows_used + previous.rows_used + audits.rows_used, previous.bytes_used + audits.bytes_used)
 
 
 def _records(preimage):

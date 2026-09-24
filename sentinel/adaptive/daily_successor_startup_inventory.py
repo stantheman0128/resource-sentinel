@@ -178,14 +178,7 @@ def _read(conn, operation, supervisor, guard, preimage, published, records, budg
     budget.charge(history.bytes_used)
     if history.active_experiment_ids:
         _refuse("experiment_obligation_remaining")
-    if history.rows_used > MAX_HISTORY:
-        _refuse("history_exceeded")
-    archives = succession.read_successor_history(conn, max_rows=MAX_HISTORY - history.rows_used,
-        max_bytes=MAX_BYTES - budget.bytes)
-    budget.charge(archives.bytes_used)
-    audit = epochs.read_successor_guardian_epochs(conn,
-        max_rows=MAX_HISTORY - history.rows_used - archives.rows_used, max_bytes=MAX_BYTES - budget.bytes)
-    budget.charge(audit.bytes_used)
+    archives, audit = prior._read_successor_histories(conn, budget, experiment_rows=history.rows_used)
     charged = {}
     for row in history._sql_rows:
         charged.setdefault(row.table, Counter())[prior._encoded(dict(zip(row.fields, row.values)))] += 1

@@ -132,6 +132,22 @@ class DailySuccessorInventoryTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT state FROM adaptive_daily_generation").fetchone()[0], "DRAINING")
             self.assertIsNone(conn.execute("SELECT policy_entry_nonce FROM adaptive_runtime").fetchone()[0])
 
+    def test_history_budget_includes_actual_experiment_revision_observation(self):
+        with self.held() as guard:
+            snapshot = self.capture(guard)
+            with self.raw() as conn:
+                conn.execute("BEGIN")
+                observed = inventory.experiment_history.verify_experiment_history_locked(conn)
+            self.assertEqual(observed.rows_used, 1)
+            self.assertEqual([(row.table, row.fields) for row in observed._sql_rows],
+                [("adaptive_runtime", ("registry_revision",))])
+            self.assertEqual(snapshot.budget.history_rows, observed.rows_used)
+            self.assertEqual(snapshot.budget.remaining_history_rows, inventory.MAX_HISTORY - observed.rows_used)
+            self.revalidate(guard, snapshot)
+            with patch.object(prior, "MAX_HISTORY", 0), \
+                    self.assertRaisesRegex(LifecycleError, "history_exceeded"):
+                self.capture(guard)
+
     def test_unobserved_ordinary_rows_are_captured_now_then_frozen(self):
         self.complete()
         # The predecessor did not capture resource_samples. Its new observation

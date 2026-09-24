@@ -54,6 +54,17 @@ restored control state. Preserve unrelated queued work and every lifecycle,
 exemption, launch, experiment and control-history row. Do not delete terminal
 rows or journal files to satisfy the ordinary cold-start empty check.
 
+The original retirement inventory retains adaptive lifecycle rows and the
+experiment archive subset; it does not retain ordinary queue, worker, exemption
+or general execution-archive payloads. Do not claim those were captured at the
+old seal. Capture their complete bounded current contents under the new original
+POLICY guard and require equality again in the final transaction. Compare all
+actually retained predecessor rows against the old snapshot, allowing only the
+original ACTIVE-to-DRAINING seal, its exact FROZEN-to-SEALED retirement row, and
+the old nonce-to-new-original-guard nonce change. This check preserves current
+ordinary rows without inventing earlier observations; no ordinary row is
+changed by succession and private payloads stay local.
+
 One transaction archives the complete predecessor generation and retirement
 binding/seal, the retained inventory digest, successor binding and exact
 transition/POLICY identity, and replaces the live generation/fence state. The

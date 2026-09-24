@@ -36,14 +36,22 @@ class ExperimentDemandTests(unittest.TestCase):
         self.scope = Path(self.scope_temp.name)
         config_bytes = json.dumps(CONFIG, sort_keys=True).encode()
         self.coordinator.db_path.with_name("config.json").write_bytes(config_bytes)
-        self.generation = dict(generation=str(uuid4()), state="ACTIVE",
-            source_digest="a" * 64, config_digest=hashlib.sha256(config_bytes).hexdigest())
+        manifest = generation.SourceManifest(tuple(generation.SourceEntry(path, "a" * 64, 0)
+            for path in sorted(generation.REQUIRED_PATHS)))
+        self.generation = dict(singleton=1, schema_version=1, generation=str(uuid4()), state="ACTIVE",
+            source_digest=manifest.digest, config_digest=hashlib.sha256(config_bytes).hexdigest(),
+            source_manifest_json=bridge._canonical(manifest.to_dict()), source_root=str(self.scope.resolve()),
+            ledger_path=str(self.coordinator.db_path.resolve()),
+            owner_identity_json=bridge._canonical(self.fixture.process.identity.to_dict()),
+            ledger_identity_json=bridge._canonical([str(value) for value in bridge._identity(self.coordinator.db_path)]),
+            readiness_instance_id=str(uuid4()))
         # This explicitly synthetic collaborator does not install a generation
         # or bypass the production generation implementation at other call sites.
         self.proof = SimpleNamespace(
             daily_locations=Mock(return_value=(self.scope, self.fixture.directory)),
             _assert_daily_locations=Mock(),
             prepare_connection=Mock(side_effect=lambda *a, **k: self.generation["generation"]),
+            revalidate_transaction=Mock(),
             read_generation=Mock(side_effect=lambda *a: dict(self.generation)))
         override = patch.object(bridge, "daily_generation", self.proof)
         override.start()

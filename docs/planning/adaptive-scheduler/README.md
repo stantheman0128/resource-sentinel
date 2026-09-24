@@ -4,6 +4,16 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
+原始 experiment generation binding 已補上：同一 authenticated SQL reader 在
+`BEGIN` 後重驗完整 generation row，正面 close 後才固定原始 pin；後續 admission
+與 writer snapshot 比較所有欄位，completion 只回傳原始資料的副本。缺少原始
+pin 的舊物件拒絕補建，不從 cleanup 時的新 row 推回來源。五個相關模組
+**179 tests 全過，19.063 秒，0 failures／errors／skips**；包含 10 個新增案例，
+私人日誌為 `.local-adaptive/experiment-generation-pin-20260924-1.log`。
+測試經正常日常 wrapper 准入，依賴受保護的 dirty baseline；未執行 native 控制。
+這是 typed release 的前置 binding；精確 cleanup-only SQL、receipt／history
+交易、remote scope 與 native provider 仍待完成，尚未授予容量釋放權限。
+
 最新完成 generation 正面退場整合：**654 tests 全過，94.827 秒，
 0 failures／errors／skips**。包含固定凍結下的收尾、完整歷史與 journal inventory、
 原始 SQL／POLICY／readiness／native owner 的正面 cleanup，以及 Windows

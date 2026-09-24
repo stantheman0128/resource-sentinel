@@ -29,6 +29,9 @@ TABLE = "adaptive_experiment_demands"
 _CREATE = object()
 _BEFORE_NATIVE = object()
 _RETAINED = {}
+_GENERATION_FIELDS = frozenset({"singleton", "schema_version", "generation", "state",
+    "source_digest", "config_digest", "source_manifest_json", "source_root", "ledger_path",
+    "owner_identity_json", "ledger_identity_json", "readiness_instance_id"})
 _FIELDS = ("experiment_id", "schema_version", "execution_id", "reservation_id",
     "request_key", "suite", "scope_sha256", "scope_directory", "scope_identity_json",
     "source_generation", "source_digest", "config_digest", "ledger_identity_json",
@@ -204,6 +207,7 @@ class DailyExperimentDemand:
             _deny("original_owner_required")
         self._lock = threading.RLock()
         self._admission = self._prepared = None
+        self._generation_original = None
         self._original_admission = None
         self._errors = []
         self._quarantine = None
@@ -278,7 +282,41 @@ class DailyExperimentDemand:
             caller_identity=snap.wrapper_identity.to_dict(), ledger_path=str(self.ledger_path),
             ledger_identity=list(self.ledger_identity), scope_directory=str(self.directory),
             scope_directory_identity=list(self.directory_identity), source_root=str(self._source_root),
-            generation=None if self._prepared is None else dict(self._prepared[0]))
+            generation=None if self._prepared is None else dict(self._prepared[0]),
+            generation_binding=self._original_generation_binding())
+
+    def _original_generation_binding(self):
+        """Return copied data from the original admission pin, never a fresh row."""
+        original = getattr(self, "_generation_original", None)
+        if type(original) is not str:
+            _deny("original_generation_required", self)
+        try:
+            row = json.loads(original)
+        except (ValueError, TypeError):
+            _deny("original_generation_required", self)
+        if (type(row) is not dict or set(row) != _GENERATION_FIELDS or
+                row["state"] != "ACTIVE" or _canonical(row) != original):
+            _deny("original_generation_required", self)
+        return row
+
+    def _generation_row(self, conn):
+        """Read and bind the same SQL snapshot already checked by daily readiness."""
+        if not conn.in_transaction:
+            _deny("generation_transaction_required", self)
+        row = daily_generation.read_generation(conn)
+        if (type(row) is not dict or set(row) != _GENERATION_FIELDS or
+                any(type(row[key]) is not int or row[key] != 1 for key in ("singleton", "schema_version")) or
+                any(type(row[key]) is not str for key in _GENERATION_FIELDS - {"singleton", "schema_version"}) or
+                row["state"] != "ACTIVE"):
+            _deny("daily_generation_unverified", self)
+        main = [value[2] for value in conn.execute("PRAGMA database_list") if value[1] == "main"]
+        if (len(main) != 1 or Path(main[0]).resolve(strict=True) != self.ledger_path or
+                _identity(self.ledger_path) != self.ledger_identity or
+                row["ledger_path"] != str(self.ledger_path) or
+                row["source_root"] != str(self._source_root) or
+                row["ledger_identity_json"] != _canonical([str(value) for value in self.ledger_identity])):
+            _deny("daily_generation_binding_changed", self)
+        return row
 
     def _register_native_preparation(self, scope):
         """Called only by the concrete scope factory, before its first acquisition."""
@@ -457,6 +495,11 @@ class DailyExperimentDemand:
             self._original()
             if self._native_preparation_sealed:
                 _deny("preparation_sealed", self)
+            if self._generation_original is None:
+                if self._prepared is not None or self._admission._submitted:
+                    _deny("original_generation_required", self)
+            else:
+                self._original_generation_binding()
             if type(coordinator) is not Coordinator or Path(coordinator.db_path).resolve(strict=True) != self.ledger_path:
                 _deny("daily_coordinator_required", self)
             conn = sqlite3.connect(self.ledger_path.as_uri() + "?mode=ro", uri=True,
@@ -473,9 +516,19 @@ class DailyExperimentDemand:
                     # readiness attempt until that original is reconciled.
                     self._quarantine = (conn, error)
                     raise
-                row = daily_generation.read_generation(conn)
-                if generation is None or row is None or row["generation"] != generation or row["state"] != "ACTIVE":
+                if generation is None:
                     _deny("daily_generation_unverified", self)
+                # Bind the captured row to the original authenticated authority
+                # on this same read snapshot. A row read after prepare_connection
+                # without BEGIN could otherwise change before it becomes origin.
+                conn.execute("BEGIN")
+                daily_generation.revalidate_transaction(conn, db_path=self.ledger_path)
+                row = self._generation_row(conn)
+                if row["generation"] != generation:
+                    _deny("daily_generation_unverified", self)
+                original = _canonical(row)
+                if self._generation_original is not None and self._generation_original != original:
+                    _deny("daily_generation_changed", self)
                 pin = {key: row[key] for key in ("generation", "source_digest", "config_digest")}
                 if self._prepared is not None and self._prepared[0] != pin:
                     _deny("daily_generation_changed", self)
@@ -483,7 +536,10 @@ class DailyExperimentDemand:
                 if digest != pin["config_digest"]:
                     _deny("daily_config_changed", self)
                 status, _ = _read_json(self.ledger_path.with_name("status.json"), limit=4 * 1024 * 1024)
-                self._prepared = (pin, time.monotonic() + 2)
+                if _canonical(self._generation_row(conn)) != original:
+                    _deny("daily_generation_changed", self)
+                prepared_until = time.monotonic() + 2
+                conn.rollback()
             except BaseException as error:
                 primary = error
                 self._errors.append(error)
@@ -503,6 +559,11 @@ class DailyExperimentDemand:
                     if primary is None:
                         raise
                     primary.add_note("experiment_read_connection_cleanup_unverified")
+            # Only the same reader's positive close publishes the first pin.
+            # A failed close keeps quarantine and cannot establish an origin.
+            if self._generation_original is None:
+                self._generation_original = original
+            self._prepared = (pin, prepared_until)
             return self._admission, status, config
 
     def _locked(self, conn, snapshot, policy):
@@ -516,8 +577,10 @@ class DailyExperimentDemand:
         runtime = policy.revalidate(conn, guard)
         if runtime["mode"] != "off" or guard.binding.logon_id != snapshot.logon_id:
             _deny("daily_off_required", self)
-        row = daily_generation.read_generation(conn)
-        if row is None or row["state"] != "ACTIVE" or any(row[key] != value for key, value in self._prepared[0].items()):
+        self._original_generation_binding()
+        row = self._generation_row(conn)
+        if (_canonical(row) != self._generation_original or
+                any(row[key] != value for key, value in self._prepared[0].items())):
             _deny("daily_generation_changed", self)
         main = [r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main"]
         if len(main) != 1 or Path(main[0]).resolve() != self.ledger_path:

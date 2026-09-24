@@ -683,6 +683,17 @@ class Coordinator:
             owner._retain_submission_error(error)
             raise
 
+    def release_experiment(self, operation):
+        """Release only a retained original experiment with positive cleanup.
+
+        This route neither manufactures a managed cancellation context nor
+        invokes the ordinary mirroring/readiness path during cleanup.
+        """
+        from sentinel.adaptive.experiment_cleanup import ExperimentReleaseOperation
+        if type(operation) is not ExperimentReleaseOperation:
+            raise TypeError("experiment_original_release_required")
+        return operation.release(self)
+
     @staticmethod
     def _managed_context_snapshot(context, db_path, *, pin=False):
         from sentinel.adaptive.admission import ManagedAdmission, ManagedAdmissionUnavailable

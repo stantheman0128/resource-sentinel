@@ -1,30 +1,63 @@
 # Original experiment cleanup receipt and daily demand release
 
-Status: implementation proposal for item 5 of
-[S1-DAILY-BRIDGE-CONTRACT.md](S1-DAILY-BRIDGE-CONTRACT.md), based on the source
-following `ebd936c`. Names below marked **proposed** are not implemented APIs or
-permission to release a reservation. This document changes no source, database,
-runtime setting, policy or capability gate. Daily adaptive remains off.
+Status: implemented original release contract for item 5 of
+[S1-DAILY-BRIDGE-CONTRACT.md](S1-DAILY-BRIDGE-CONTRACT.md). The original proposal
+was based on source following `ebd936c`; its source-boundary table below is
+historical context. Daily adaptive remains off. No native capability gate or
+production activation is claimed.
 
-Implementation checkpoint (2026-09-24): original preparation/completion and the
-full generation pin are implemented. `prepare_release` now retains the exact
-completion plus the POLICY binding captured during original admission. The
-read/nonce connection phases are implemented and verified by 351 tests across
-15 modules (45.886 seconds; no failures, errors or skips). This does not yet
-implement receipt publication, `Coordinator.release_experiment`, reservation
-release, closed-history reuse or mixed retirement. The original self witness
-remains retained. No native gate or runtime activation is claimed.
+Implementation checkpoint (2026-09-24): `prepare_release` retains the exact
+completion, original generation and POLICY binding. `Coordinator.release_experiment`
+now publishes the immutable receipt, unused daily cancellation, archive, exact
+reservation/queue removal, CLOSED exclusion and one registry revision in one
+transaction. It reports success only after positive SQL/native POLICY cleanup,
+full committed-history readback and original final self-witness close. Completed
+replay performs bounded reads only. Private per-guard positive-exit/no-entry and
+nonce-clear facts preserve the original attempt; they confer no new authority.
+Full-row temporary receipt/archive guards supplement persistent exact mutation
+guards. A correct receipt ID/hash cannot authorize a different payload. Every
+write revalidates the actual connection, frozen preimage and original guard;
+SQLite statement caching cannot bypass those checks.
+
+The stored IPC key must match the original admission snapshot with a
+constant-time comparison before publication. A never-COMMIT-attempted candidate
+may be discarded only after a positively confirmed rollback, original SQL close,
+native exit/no-entry, nonce cleanup and complete-history readback proving that
+the original demand is still active without a receipt. The next writer then
+freezes a newly validated preimage under the same original operation/completion.
+This permits ordinary expiry to HOLD and registry revision changes after a
+known rollback. A lost COMMIT acknowledgement is never rebased; its original
+candidate remains the sole reconciliation target.
+
+Unknown native/SQL/self close retains the original owner and refuses reopening.
+A documented final CloseHandle FALSE may retry only that same original owner
+after full readback; positive close followed by interrupted local bookkeeping
+resumes without another native call. Initial admission uncertainty before a
+completion can be minted remains a separate pending source item: an irreversibly
+sealed demand currently lacks a public original-admission settlement route.
 
 The separate `experiment_history` module implements the closed, bounded data
 validator. It validates the immutable admission metadata, exact terminal managed
 row, unique archive, absent live obligations and matching closed exclusion as one
-tuple. It does not open a connection, install its exported schema, publish a
-receipt, mint a native completion or release capacity. Receipt publication and
-the admission/exclusion/retirement consumers must still be integrated before a
-completed historical tuple can make another experiment position available.
+tuple. The validator itself does not open a connection, install its exported
+schema, publish a receipt, mint a native completion or release capacity. The
+admission/exclusion/retirement consumers are integrated: only validated complete
+history can free a serial experiment position. Retirement shares the original
+SQL-row inventory and 16 MiB budget with ordinary production history.
 Verification: nine related modules, 165 tests passed in 21.627 seconds, zero
 failures/errors/skips, including 23 history cases. These isolated synthetic
-records test data validation, not native cleanup or a successful release.
+records test data validation, not native cleanup. Consumer verification passed
+204 tests in 44.941 seconds. Original release/fault verification passed 58 tests
+in 20.604 seconds; original scope/release/consumer verification passed 124 tests
+in 33.557 seconds. All had zero failures/errors/skips. The five completion
+variants now exercise original factories and SQLite transactions; native I/O,
+source/readiness attestation and transport remain explicit synthetic fixtures.
+These overlapping batches must not be added as a distinct-test total. No fresh
+real native admission or S1 serial-provider acceptance is established by them.
+After independent review and the rollback/key fixes above, the combined final
+17-module regression passed **322 tests in 85.971 seconds**, zero failures,
+errors or skips. Its two new release test files contain 33 test methods. The
+planning README records the equivalent command and the private log path.
 
 The required result is one truthful daily cancellation after the original
 isolated experiment has positively completed native cleanup. The daily claim
@@ -33,7 +66,7 @@ The daily execution therefore ends as `CANCELLED_BEFORE_START`, while the
 separate experiment receipt preserves whether the isolated root ran, never
 launched, or no wrapper was created. Neither outcome is production `FINISHED`.
 
-## Existing source boundaries
+## Source boundaries at the original proposal
 
 | Source hook | Current behavior | Required addition |
 | --- | --- | --- |
@@ -48,7 +81,7 @@ launched, or no wrapper was created. Neither outcome is production `FINISHED`.
 
 ## The original owners and two completion paths
 
-The following minimal API is **proposed**. These are exact concrete types with
+The following minimal API is implemented. These are exact concrete types with
 private construction and original-object retention, not protocols accepting
 user callbacks or duck-typed `complete=True` objects:
 
@@ -58,11 +91,11 @@ scope = ExperimentNativeScope.prepare(demand, command, ...)
 # Its original factory internally binds the new scope to demand first.
 
 completion = scope.close_native()      # existing NativeScopeCompletion or None
-operation = demand.prepare_release(completion)  # proposed retained operation
-result = coordinator.release_experiment(operation)  # proposed exact daily route
+operation = demand.prepare_release(completion)  # retained original operation
+result = coordinator.release_experiment(operation)  # exact daily route
 
 # Alternative, only when native preparation was never entered:
-completion = demand.seal_without_native()  # proposed BeforeNativeCompletion
+completion = demand.seal_without_native()  # original BeforeNativeCompletion
 operation = demand.prepare_release(completion)
 result = coordinator.release_experiment(operation)
 ```
@@ -124,7 +157,7 @@ release-side resources are already closed.
 
 ## Immutable receipt content and durable representation
 
-Add a bounded, append-only table, proposed
+The bounded, append-only table is
 `adaptive_experiment_cleanup_receipts`, with one unique receipt per experiment,
 daily execution and reservation. Keep the original
 `adaptive_experiment_demands` row unchanged (`ADMITTED`, revision zero and the
@@ -162,7 +195,7 @@ existing `last_applied=None` rule unchanged.
 
 ## One atomic daily release transaction
 
-Introduce a dedicated retained `ExperimentReleaseOperation` in a proposed
+The dedicated retained `ExperimentReleaseOperation` lives in
 `experiment_cleanup.py`, constructed only by `DailyExperimentDemand`.
 `Coordinator.release_experiment` must require its exact type, original demand
 and actual daily Coordinator; reuse the retained submission POLICY/store and
@@ -335,12 +368,11 @@ legitimate next experiment's admission. A passing portable suite, live PID,
 receipt-shaped JSON, native close flag or absent reservation does not establish
 that end-to-end outcome.
 
-## Next implementation: original generation binding and release-only SQL
+## Original generation binding and release-only SQL amendment
 
-This amendment specifies the next release slice. The separate original
-preparation/completion slice does not implement `prepare_release`,
-`release_experiment`, receipt publication or capacity release. None of these
-routes exists merely because readiness and preparation source tests pass.
+This amendment specified the release slice now implemented above. Its authority
+comes from the exact original operation; preparation/readiness tests alone never
+establish receipt publication or capacity release.
 
 During the original authenticated admission, retain the complete validated
 daily generation row on the original demand, before admission can publish.
@@ -409,7 +441,7 @@ capacity UDF. The canonical reservation/queue DELETE guards now call the fixed
 `sentinel_daily_delete_authority(table, exact_key)` instead. Normal consumers
 implement it by the existing full current-generation ACTIVE validation. The
 unactivated installer and release read/nonce phases receive no delete authority.
-The future receipt publication phase must bind that function to the exact
+The receipt publication phase binds that function to the exact
 original operation, same connection/guard and receipt-bound OLD row; no general
 DELETE exception is permitted. The other ten capacity triggers are unchanged.
 All twelve canonical definitions are checked together; missing, altered, extra
@@ -428,5 +460,5 @@ completion/demand/operation binding) from `receipt_sha256` (the entire canonical
 pre/postimage record). CLOSED exclusion rows reference the former, avoiding a
 digest cycle without omitting the exclusion postimage from the latter. A full
 original source manifest may require a bounded 2 MiB receipt_json cell; the
-future retirement reader may allow that exact canonical column while preserving
+retirement reader allows that exact canonical column while preserving
 its 64 KiB default cell bound and shared 16 MiB aggregate inventory limit.

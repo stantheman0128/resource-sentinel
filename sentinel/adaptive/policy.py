@@ -9,7 +9,7 @@ no takeover, TTL cleanup, barrier-clear operation, or fixture fallback here.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 import re
 import threading
@@ -80,6 +80,12 @@ class PolicyGuard:
     nonce: str
     # Set only after a known transaction rejection has rolled back and closed.
     clean_rejection: bool = False
+    # Facts recorded by this exact coordinator/guard's original native and SQL
+    # scopes. They do not attest nested owners or confer standalone authority.
+    _native_exit_confirmed: bool = field(default=False, init=False, repr=False, compare=False)
+    _native_no_entry_confirmed: bool = field(default=False, init=False, repr=False, compare=False)
+    _nonce_clear_attempted: bool = field(default=False, init=False, repr=False, compare=False)
+    _nonce_clear_confirmed: bool = field(default=False, init=False, repr=False, compare=False)
 
 
 class PolicyCoordinator:
@@ -188,8 +194,11 @@ class PolicyCoordinator:
 
     def _clear(self, guard):
         from .daily_generation import readiness_nonce_cleanup
+        guard._nonce_clear_attempted = True
+        guard._nonce_clear_confirmed = False
         with readiness_nonce_cleanup(self, guard):
             self._clear_owned(guard)
+        guard._nonce_clear_confirmed = True
 
     def _clear_owned(self, guard):
         if self.current_guard() is not None or self.current_cleanup_guard() is not None:
@@ -224,6 +233,8 @@ class PolicyCoordinator:
     def _hold_owned(self, guard):
         if self.current_guard() is not None:
             raise PolicyError("policy_scope_nested")
+        guard._native_exit_confirmed = False
+        guard._native_no_entry_confirmed = False
         scope = self.provider.hold(guard.binding, timeout_ms=250)
         enter, leave = getattr(type(scope), "__enter__", None), getattr(type(scope), "__exit__", None)
         if not callable(enter) or not callable(leave):
@@ -234,6 +245,7 @@ class PolicyCoordinator:
             # A timeout is a positive no-ownership result. All other entry
             # failures leave the nonce, including unknown native wait outcomes.
             if error.reason == "policy_mutex_timeout" and not getattr(error, "__notes__", ()):
+                guard._native_no_entry_confirmed = True
                 try:
                     self._clear(guard)
                 except BaseException:
@@ -278,11 +290,13 @@ class PolicyCoordinator:
                 self._held.guard = None
             if suppressed or tuple(getattr(primary, "__notes__", ())) != notes:
                 primary.add_note("policy_scope_cleanup_unverified")
-            elif safe_to_clear or (guard.clean_rejection and not notes):
-                try:
-                    self._clear(guard)
-                except BaseException:
-                    primary.add_note("policy_entry_cleanup_failed")
+            else:
+                guard._native_exit_confirmed = True
+                if safe_to_clear or (guard.clean_rejection and not notes):
+                    try:
+                        self._clear(guard)
+                    except BaseException:
+                        primary.add_note("policy_entry_cleanup_failed")
             raise
         else:
             # The production provider returns only after ReleaseMutex and
@@ -298,4 +312,5 @@ class PolicyCoordinator:
                 raise
             finally:
                 self._held.guard = None
+            guard._native_exit_confirmed = True
             self._clear(guard)

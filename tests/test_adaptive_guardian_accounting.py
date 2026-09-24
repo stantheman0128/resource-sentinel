@@ -454,6 +454,22 @@ class AdaptiveGuardianAccountingTests(unittest.TestCase):
                 self.assertFalse(pinned.exists())
                 self.assertFalse(diversion.exists())
 
+    def test_existing_only_readiness_and_transaction_use_the_original_pinned_ledger(self):
+        from sentinel.adaptive.daily_generation import readiness_scope
+        row, _ = self.enrolled()
+        existing = LifecycleStore(self.db, existing_path=True, policy_provider=self.policy,
+                                  local_host_id=self.store.local_host_id)
+        diversion = self.directory / "unused-diversion.db"
+        with readiness_scope(existing._existing_ledger_path):
+            existing.db_path = diversion
+            with existing._transaction() as conn:
+                original = conn.execute("SELECT state FROM managed_executions WHERE execution_id=?",
+                                        (row["execution_id"],)).fetchone()
+                self.assertEqual(original[0], row["state"])
+                main = [item[2] for item in conn.execute("PRAGMA database_list") if item[1] == "main"]
+                self.assertEqual(main, [str(self.db.resolve())])
+        self.assertFalse(diversion.exists())
+
     def finished(self, kind=AllocationKind.DIRECT):
         row, manifest = self.enrolled(kind)
         self.evidence.overrides = {"active_process_count": 0, "process_ids": ()}

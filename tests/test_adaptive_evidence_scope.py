@@ -459,10 +459,13 @@ class AdaptiveEvidenceScopeTests(unittest.TestCase):
     def test_postcommit_connection_close_error_does_not_return_or_repeat_launch_authority(self):
         spec, args = self.claim()
         self.provider.events.clear()
-        with self.connection_failures(close_error=RuntimeError("PRIVATE connection cleanup")):
+        original_close_error = RuntimeError("PRIVATE connection cleanup")
+        with self.connection_failures(close_error=original_close_error):
             with self.assertRaisesRegex(LifecycleError, "^lifecycle_connection_cleanup_failed$") as error:
                 self.store.claim_launch(spec.execution_id, **args)
         self.assertNotIn("PRIVATE", "".join(traceback.format_exception(error.exception)))
+        self.assertIs(error.exception._sentinel_connection_cleanup_error, original_close_error)
+        self.assertIsInstance(error.exception._sentinel_connection_cleanup, sqlite3.Connection)
         self.assertEqual([event for _, event in self.provider.events],
                          ["enter", "verified", "committed", "close_failed", "exit"])
         self.assertEqual(self.store.query(spec.execution_id)["claim_consumed"], 1)

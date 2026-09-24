@@ -241,6 +241,13 @@ class Coordinator:
 
     @contextmanager
     def _db(self):
+        from .adaptive.daily_generation import readiness_scope
+        with readiness_scope(self.db_path):
+            with self._db_owned() as conn:
+                yield conn
+
+    @contextmanager
+    def _db_owned(self):
         conn = self._connect()
         primary = None
         try:
@@ -254,9 +261,9 @@ class Coordinator:
             except BaseException as error:
                 target = error if primary is None else primary
                 target._sentinel_connection_cleanup = conn
+                target.add_note("coordinator_connection_cleanup_failed")
                 if primary is None:
                     raise
-                primary.add_note("coordinator_connection_cleanup_failed")
 
     def _managed_lifecycle_store(self):
         # Legacy admission does not initialize or acquire a native policy
@@ -662,18 +669,19 @@ class Coordinator:
         separate original creation and cleanup authority before any work.
         """
         from sentinel.adaptive.experiment_demand import DailyExperimentDemand
+        from sentinel.adaptive.daily_generation import readiness_scope
         if type(owner) is not DailyExperimentDemand:
             raise TypeError("experiment_original_owner_required")
-        with owner._lock:
-            try:
+        try:
+            with readiness_scope(self.db_path), owner._lock:
                 context, status, config = owner._prepare_submission(self)
                 with context.submission_scope():
                     snapshot = context.snapshot()
                     return self._admit(snapshot.request, status, config=config,
                         managed=snapshot, managed_context=context, experiment_context=owner)
-            except BaseException as error:
-                owner._retain_submission_error(error)
-                raise
+        except BaseException as error:
+            owner._retain_submission_error(error)
+            raise
 
     @staticmethod
     def _managed_context_snapshot(context, db_path, *, pin=False):
@@ -831,6 +839,11 @@ class Coordinator:
             return result
 
     def _cancel_managed_queue(self, context, snapshot, path):
+        from .adaptive.daily_generation import readiness_scope
+        with readiness_scope(self.db_path):
+            return self._cancel_managed_queue_owned(context, snapshot, path)
+
+    def _cancel_managed_queue_owned(self, context, snapshot, path):
         from sentinel.adaptive.admission import ManagedAdmissionUnavailable
         if context._abandon_error is not None:
             raise ManagedAdmissionUnavailable("managed_abandon_cleanup_unverified")
@@ -902,6 +915,8 @@ class Coordinator:
                 transaction["connection_closed"] = True
             except BaseException as primary:
                 context._abandon_error = primary
+                primary._sentinel_connection_cleanup = conn
+                primary.add_note("managed_abandon_connection_cleanup_failed")
                 raise
         context._abandon_result = result.copy()
         return result

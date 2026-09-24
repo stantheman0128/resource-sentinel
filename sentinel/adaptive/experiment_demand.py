@@ -2,8 +2,9 @@
 
 This first slice reserves real daily capacity and atomically marks its separate
 experiment obligation. It does not authorize native creation/control or supply
-a cleanup capability. There is intentionally no admitted-demand release API
-until original native creation/cleanup custody is connected. Ordinary managed
+a daily release capability. Native preparation and positive cleanup remain
+owned by this original demand; admitted-demand release is still unavailable.
+Ordinary managed
 launch/cancellation cannot consume the private, experiment-bound credential.
 """
 from __future__ import annotations
@@ -26,6 +27,7 @@ from . import daily_generation
 
 TABLE = "adaptive_experiment_demands"
 _CREATE = object()
+_BEFORE_NATIVE = object()
 _RETAINED = {}
 _FIELDS = ("experiment_id", "schema_version", "execution_id", "reservation_id",
     "request_key", "suite", "scope_sha256", "scope_directory", "scope_identity_json",
@@ -160,6 +162,37 @@ def _schema(conn, *, create=False):
         _deny("metadata_scope_count_invalid")
 
 
+@dataclass(frozen=True, init=False)
+class BeforeNativeCompletion:
+    """Positive original never-entered preparation, not capacity release."""
+    owner: object
+    digest: str
+
+    def __init__(self, owner, digest, *, _token=None):
+        if _token is not _BEFORE_NATIVE or type(owner) is not DailyExperimentDemand:
+            _deny("original_completion_required")
+        object.__setattr__(self, "owner", owner)
+        object.__setattr__(self, "digest", digest)
+
+    def assert_original(self):
+        owner = self.owner
+        if (type(owner) is not DailyExperimentDemand or owner._before_native_completion is not self or
+                not owner._native_preparation_sealed or owner._native_preparation is not None or
+                owner._before_native_digest != self.digest):
+            _deny("original_completion_changed", owner)
+        owner._static_original()
+        owner._assert_unused_claim()
+        if (owner._before_native_binding != _canonical(owner._completion_binding()) or
+                owner._before_native_digest != owner._before_native_hash() or
+                owner._seal_connection is not None or owner._seal_connection_unknown):
+            _deny("original_completion_changed", owner)
+
+    def snapshot(self):
+        """Fresh data only; callers must retain this exact capability as authority."""
+        self.assert_original()
+        return json.loads(self.owner._before_native_record)
+
+
 class DailyExperimentDemand:
     """One original native caller, immutable declaration, and daily request.
 
@@ -171,9 +204,18 @@ class DailyExperimentDemand:
             _deny("original_owner_required")
         self._lock = threading.RLock()
         self._admission = self._prepared = None
+        self._original_admission = None
         self._errors = []
         self._quarantine = None
         self._closed = False
+        self._native_preparation = None
+        self._native_preparation_binding = None
+        self._native_preparation_admission = None
+        self._native_preparation_sealed = False
+        self._before_native_completion = self._before_native_digest = None
+        self._before_native_record = self._before_native_binding = None
+        self._seal_connection = None
+        self._seal_connection_unknown = False
 
     @classmethod
     def capture(cls, declaration, isolated_directory):
@@ -210,6 +252,7 @@ class DailyExperimentDemand:
                     declaration.experiment_id + ":" + declaration.scope_sha256,
                 cwd=str(directory), repo_identifier="resource-sentinel-native-verification",
                 requested=declaration.requested, role=Role.BACKGROUND, priority=Priority.P2)
+            owner._original_admission = owner._admission
             owner._admission._experiment_demand = owner
             owner._snapshot = owner._admission.snapshot()
             return owner
@@ -225,6 +268,148 @@ class DailyExperimentDemand:
                 _identity(self.directory) != self.directory_identity):
             _deny("original_binding_changed", self)
 
+    def _completion_binding(self):
+        """Original immutable data shared by either completion disposition."""
+        snap = self._snapshot
+        return dict(experiment_id=self.declaration.experiment_id, suite=self.declaration.suite,
+            scope_sha256=self.declaration.scope_sha256, requested=self.declaration.requested.to_dict(),
+            execution_id=snap.execution_id, request_key=snap.request.request_key,
+            admission_binding_hash=snap.binding_hash, spec_hash=snap.spec_hash,
+            caller_identity=snap.wrapper_identity.to_dict(), ledger_path=str(self.ledger_path),
+            ledger_identity=list(self.ledger_identity), scope_directory=str(self.directory),
+            scope_directory_identity=list(self.directory_identity), source_root=str(self._source_root),
+            generation=None if self._prepared is None else dict(self._prepared[0]))
+
+    def _register_native_preparation(self, scope):
+        """Called only by the concrete scope factory, before its first acquisition."""
+        from .experiment_scope import ExperimentNativeScope, _OWNERS
+        with self._lock:
+            self._static_original()  # Pure original-object checks; no native query.
+            if (type(scope) is not ExperimentNativeScope or scope.demand is not self or
+                    _OWNERS.get(scope.scope_id) is not scope):
+                _deny("original_native_preparation_required", self)
+            if self._native_preparation_sealed or self._native_preparation is not None:
+                _deny("native_preparation_already_registered", self)
+            self._native_preparation_binding = _canonical(self._completion_binding())
+            self._native_preparation_admission = self._admission
+            self._native_preparation = scope
+
+    def _assert_native_preparation(self, scope):
+        from .experiment_scope import ExperimentNativeScope, _OWNERS
+        if (type(scope) is not ExperimentNativeScope or self._native_preparation is not scope or
+                _RETAINED.get(self.declaration.experiment_id) is not self or
+                _OWNERS.get(scope.scope_id) is not scope or scope.demand is not self or
+                self._admission is not self._native_preparation_admission or
+                getattr(self._admission, "_experiment_demand", None) is not self or
+                self._native_preparation_binding != _canonical(self._completion_binding())):
+            _deny("original_native_preparation_changed", self)
+
+    def _seal_native_preparation(self, scope):
+        with self._lock:
+            self._assert_native_preparation(scope)
+            self._native_preparation_sealed = True
+
+    def _assert_unused_claim(self):
+        inner = self._admission
+        inner._require_settled_submission()
+        if (not inner._submitted or inner._claim_exported or inner._prepare_attempted or
+                inner._submission_policy is None or inner._abandon_target is not None or
+                inner._submission_transaction is None or
+                inner._submission_transaction.get("connection_closed") is not True):
+            _deny("unused_daily_claim_required", self)
+
+    def _before_native_hash(self):
+        return hashlib.sha256(("experiment-before-native-v1\n" + self._before_native_record).encode()).hexdigest()
+
+    def _validate_completion_connection(self, conn):
+        """Bind this read transaction to the original ledger, without readiness."""
+        if conn is not self._seal_connection or not conn.in_transaction:
+            _deny("completion_connection_changed", self)
+        main = [row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"]
+        if (len(main) != 1 or Path(main[0]).resolve(strict=True) != self.ledger_path or
+                _identity(self.ledger_path) != self.ledger_identity):
+            _deny("completion_ledger_changed", self)
+
+    def seal_without_native(self):
+        """Seal forever; mint only after original unused admitted custody settles.
+
+        This read-only proof cannot cancel a reservation. An uncertain read or
+        close retains the original operation; it never opens a replacement.
+        """
+        with self._lock:
+            self._native_preparation_sealed = True
+            self._static_original()
+            if self._native_preparation is not None:
+                _deny("native_preparation_entered", self)
+            if self._before_native_completion is not None:
+                self._before_native_completion.assert_original()
+                return self._before_native_completion
+            inner = self._admission
+            with inner._lock:
+                self._assert_unused_claim()
+                if (inner._cancel_sealed or inner._claim_token is None or
+                        hashlib.sha256(inner._claim_token.encode("ascii")).hexdigest() != self._snapshot.claim_token_hash or
+                        inner.snapshot() is not self._snapshot or
+                        _identity(self.ledger_path) != self.ledger_identity or
+                        _identity(self.directory) != self.directory_identity):
+                    _deny("unused_daily_claim_required", self)
+                if self._seal_connection_unknown or self._seal_connection is not None:
+                    _deny("completion_read_unsettled", self)
+                primary = None
+                self._seal_connection_unknown = True
+                try:
+                    self._seal_connection = sqlite3.connect(self.ledger_path.as_uri() + "?mode=ro",
+                        uri=True, timeout=.25, isolation_level=None)
+                    self._seal_connection_unknown = False
+                    conn = self._seal_connection
+                    conn.row_factory = sqlite3.Row
+                    conn.execute("BEGIN")
+                    self._validate_completion_connection(conn)
+                    _schema(conn)
+                    row = conn.execute("SELECT * FROM " + TABLE + " WHERE experiment_id=?",
+                        (self.declaration.experiment_id,)).fetchone()
+                    if row is None or dict(row) != self._binding(row["reservation_id"]):
+                        _deny("admitted_demand_required", self)
+                    execution = conn.execute("SELECT * FROM managed_executions WHERE execution_id=?",
+                        (self._snapshot.execution_id,)).fetchone()
+                    unused = dict(claim_consumed=0, launch_sealed=0, launch_in_flight=0,
+                        claim_token_hash=self._snapshot.claim_token_hash, job_name=None, job_nonce=None,
+                        root_pid=None, root_created_filetime_100ns=None, root_outcome=None, guardian_epoch="")
+                    if (execution is None or execution["state"] not in {"RESERVED", "UNCERTAIN_HOLD"} or
+                            any(execution[key] != value for key, value in unused.items())):
+                        _deny("unused_daily_claim_required", self)
+                    self._validate_completion_connection(conn)
+                    binding = self._completion_binding()
+                    record = dict(schema_version=1, disposition="BEFORE_NATIVE", demand=binding,
+                        reservation_id=row["reservation_id"], daily_binding_sha256=row["binding_sha256"],
+                        native_preparation=None)
+                    conn.rollback()
+                except BaseException as error:
+                    primary = error
+                    self._retain_submission_error(error)
+                    raise
+                finally:
+                    if self._seal_connection is not None:
+                        self._seal_connection_unknown = True
+                        try:
+                            self._seal_connection.close()
+                        except BaseException as error:
+                            self._quarantine = (self._seal_connection, error)
+                            error.experiment_connection_owner = self._seal_connection
+                            self._retain_submission_error(error)
+                            if primary is None:
+                                raise
+                            primary.add_note("experiment_completion_connection_cleanup_unverified")
+                        else:
+                            self._seal_connection = None
+                            self._seal_connection_unknown = False
+                self._before_native_binding = _canonical(binding)
+                self._before_native_record = _canonical(record)
+                self._before_native_digest = self._before_native_hash()
+                self._before_native_completion = BeforeNativeCompletion(self, self._before_native_digest,
+                    _token=_BEFORE_NATIVE)
+                return self._before_native_completion
+
     def _retain_submission_error(self, error):
         """Keep failures from every downstream daily readiness connection.
 
@@ -237,6 +422,7 @@ class DailyExperimentDemand:
         pending, seen = [error], set()
         custody_attributes = ("daily_readiness_current_process", "_identity_handle_cleanup",
             "_policy_mutex_cleanup", "_daily_readiness_connection", "_daily_readiness_owner",
+            "daily_readiness_scope", "_daily_readiness_authority",
             "_sentinel_connection_cleanup", "_native_close_outcome_unknown",
             "_native_duplicate_outcome_unknown", "io_pending")
         while pending:
@@ -259,6 +445,7 @@ class DailyExperimentDemand:
                  self.ledger_identity, self._source_root) != self._immutable or
                 _RETAINED.get(self.declaration.experiment_id) is not self or
                 type(self._admission) is not ManagedAdmission or
+                self._admission is not self._original_admission or
                 getattr(self._admission, "_experiment_demand", None) is not self or
                 self._snapshot.requested != self.declaration.requested):
             _deny("original_binding_changed", self)
@@ -268,6 +455,8 @@ class DailyExperimentDemand:
         from sentinel.coordinator import Coordinator
         with self._lock:
             self._original()
+            if self._native_preparation_sealed:
+                _deny("preparation_sealed", self)
             if type(coordinator) is not Coordinator or Path(coordinator.db_path).resolve(strict=True) != self.ledger_path:
                 _deny("daily_coordinator_required", self)
             conn = sqlite3.connect(self.ledger_path.as_uri() + "?mode=ro", uri=True,
@@ -310,6 +499,7 @@ class DailyExperimentDemand:
                     self._quarantine = (conn, error)
                     error.experiment_connection_owner = conn
                     error.experiment_demand_owner = self
+                    error.add_note("experiment_read_connection_cleanup_unverified")
                     if primary is None:
                         raise
                     primary.add_note("experiment_read_connection_cleanup_unverified")
@@ -317,6 +507,8 @@ class DailyExperimentDemand:
 
     def _locked(self, conn, snapshot, policy):
         self._static_original()
+        if self._native_preparation_sealed:
+            _deny("preparation_sealed", self)
         if (self._prepared is None or time.monotonic() >= self._prepared[1] or
                 snapshot is not self._snapshot or getattr(self._admission, "_experiment_demand", None) is not self):
             _deny("prepared_original_required", self)

@@ -1,12 +1,26 @@
 # Daily readiness 的鎖外權限與鎖內重驗
 
-日期：2026-09-24。狀態：**source 修補前的契約；尚未實作或測試。**
-基準為 `codex/adaptive-scheduler-implementation` 的 `41cee4d`，並保留其
-既有 dirty baseline。此契約只修正目標 5 的 remote readiness 鎖界線；
+日期：2026-09-24。狀態：**source 與 preparation 中央整合驗證已通過。**
+原契約基準為 `codex/adaptive-scheduler-implementation` 的 `41cee4d`，並保留其
+既有 dirty baseline。基礎八模組 217 tests 已過；新增雙帳本、absence pool、
+local lexical 修補與 preparation 的 14 模組合跑 **413 tests 全過，47.653 秒，
+0 failures／errors／skips**，其中 focused module 有 38 案。私人完整日誌為
+`.local-adaptive/readiness-preparation-20260924-2.log`。首次同範圍有 1 failure／
+4 errors：修正 genuine table-absence 與原始 connection fault 注入位置後重跑；
+沒有改動 production validator 來配合 fixture。仍非 clean-clone 或 native gate。
+完整 155 模組回歸曾有 2 failures／9 errors（4,166 tests），其中 connection
+close 的公開 traceback 與 pinned ledger 選取順序是 source 回歸，已修正；
+其餘為舊 guardian telemetry fixture。最終 18 模組整合 **493 tests 全過，
+55.779 秒，0 failures／errors／skips**，包含上述全部失敗模組與 retirement
+整合。私人日誌為 `.local-adaptive/readiness-host-regression-20260924-2.log`。
+此最終回歸保留原始 connection／error 的私密 custody，公開例外保持 sanitized；
+readiness 與實際 transaction 使用同一 pinned ledger，missing ledger 仍拒絕。
+沒有重新執行完整 4,166 tests，不宣稱整套已通過。
+此契約只修正目標 5 的 remote readiness 鎖界線；
 不安裝 daily generation、不啟動 native experiment、不宣稱 P1–P6 通過。
 Adaptive 保持 off，58 GiB／4 GiB／4 GiB／三個豁免租約的政策不變。
 
-## 已確認的 source 缺口
+## 原契約基準已確認的 source 缺口
 
 1. `daily_generation.prepare_connection()`（438 行起）呼叫
    `_prove_retained_owner_ready()`（490 行起）；remote 分支會以
@@ -25,7 +39,7 @@ Adaptive 保持 off，58 GiB／4 GiB／4 GiB／三個豁免租約的政策不變
    當作稍後鎖內重驗的 native witness。`VerifiedProcess.duplicate()` 已存在，
    可在已驗證的 `verified_peer` scope 內保留該**同一個** authenticated peer。
 
-以上來自目前 checkout 的 source 閱讀；沒有執行 native、runtime 或測試。
+以上行號與行為來自原基準 source 閱讀；本 worker 沒有執行 native、runtime 或測試。
 654 個 retirement integration tests 是前一包的證據，不是本修補的證據。
 
 ## 權限契約
@@ -82,7 +96,10 @@ generation。驗證例外在 SQL 中維持拒絕，不能吞掉後回傳舊 gene
 `readiness_scope` 的初始 generation observation 只能使用 bounded、read-only、
 existing-path SQL reader；不得創建帳本、遷移 schema 或將 row 當成 readiness。
 沒有 generation 的 pre-install 操作仍保留既有行為；若 scope 開始時沒有 row，
-之後出現 remote generation，connection binding 必須拒絕，不能在锁內補 RPC。
+之後出現 ACTIVE generation，capacity connection binding 必須拒絕，不能在鎖內補 RPC
+或借用新出現的 local owner。原 unactivated install／retirement 的 nonce-only
+cleanup 特例保留；使用 scope 的 local capacity binding 與每次 UDF write 仍須
+核對原 scope current／未 closed／未 poisoned、原 row 與 exact ledger 路徑。
 程式內已有 original local `DailyGenerationOwner` 的路徑繼續使用該原 owner，
 不透過自己的 pipe，也不以 local owner 名義接管 remote generation。
 
@@ -152,9 +169,11 @@ Source review 後再由主代理更新 checkpoint 與實際測試結果；沒有
 這只驗證基礎修補，尚未包含下列雙帳本整合。主代理另確認
 `ExperimentNativeScope._scope(daily=True)` 依既有契約取得 daily POLICY、
 isolated POLICY、Job。單一 ledger 的 borrowing API 會拒絕第二個 isolated
-ledger；此整合目前 **尚未完成**，不能以基礎 focused tests 通過宣稱 native
-experiment path 已恢復。預計後續獨立契約加入鎖外預先取得兩個 exact-ledger
-lexical owners，再於鎖內選用既存對應 owner；不允许跨 ledger 借用 daily
+ledger；下列補充契約與 source 已加入鎖外預先取得兩個 exact-ledger lexical
+owners，再於鎖內選用既存對應 owner，目前等待中央合併驗證。不能以基礎
+focused tests 通過宣稱 native experiment path 已恢復；實際 native scope 的
+`_ready()` 仍要求原 local generation owner，remote provider 接線是後續獨立工作。
+不允許跨 ledger 借用 daily
 capacity 權限，也不在 daily POLICY 內對 isolated ledger 新做 readiness RPC。
 
 ## 兩個原始帳本 scope 的最小補充契約
@@ -162,8 +181,9 @@ capacity 權限，也不在 daily POLICY 內對 isolated ledger 新做 readiness
 主代理已同意以下 source 邊界；此補充先提交，才開始這一段程式變更。
 
 `readiness_scopes((daily_path, isolated_path))` 最多接受 **兩個**相異、已存在的
-exact ledger 路徑。入口要求目前 thread 沒有 POLICY／Job 鎖、SQLite scope 或
-任何既有 readiness scope/group。它依序取得兩份獨立原始 lexical owner，
+exact ledger 路徑。caller 必須在 SQLite transaction 前進入；程式檢查目前 thread
+沒有已管理的 POLICY／Job 鎖及既有 readiness scope/group，並不宣稱能偵測任意
+外部 SQLite connection 的鎖。它依序取得兩份獨立原始 lexical owner，
 完成各自 bounded read-only reader 的正面 close，保存各自的 native file
 identity 與 generation observation；有 daily generation 的 owner 另外取得
 上述 authenticated authority。第二份取得失敗時只能關閉已取得的原 owner，

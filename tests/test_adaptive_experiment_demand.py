@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 from uuid import uuid4
 
 from sentinel.adaptive import experiment_demand as bridge
+from sentinel.adaptive import daily_generation as generation
 from sentinel.adaptive.admission import ManagedAdmissionUnavailable
 from sentinel.adaptive.contracts import ResourceDemand
 from sentinel.coordinator import Coordinator
@@ -401,7 +402,11 @@ class ExperimentDemandTests(unittest.TestCase):
             conn = actual_connect(*args, **kwargs)
             connections.append(conn)
             return conn
-        with patch.object(bridge.sqlite3, "connect", side_effect=connect):
+        # The fault belongs to demand's original preparation reader. Retain a
+        # genuine outer readiness scope before overriding the next SQL open.
+        with generation.readiness_scope(self.coordinator.db_path) as readiness, \
+                patch.object(bridge.sqlite3, "connect", side_effect=connect):
+            self.assertTrue(readiness.reader.closed)
             with self.assertRaisesRegex(OSError, "synthetic_sql_close_unknown"):
                 self.coordinator.admit_experiment(owner)
             with self.assertRaisesRegex(bridge.ExperimentDemandError, "original_binding_changed"):

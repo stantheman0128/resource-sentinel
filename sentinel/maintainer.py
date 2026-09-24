@@ -197,11 +197,29 @@ class Maintainer:
 
     @contextmanager
     def _db(self):
+        from .adaptive.daily_generation import readiness_scope
+        with readiness_scope(self.db_path):
+            with self._db_owned() as conn:
+                yield conn
+
+    @contextmanager
+    def _db_owned(self):
         conn = self._connect()
+        primary = None
         try:
             yield conn
+        except BaseException as error:
+            primary = error
+            raise
         finally:
-            conn.close()
+            try:
+                conn.close()
+            except BaseException as cleanup:
+                target = primary if primary is not None else cleanup
+                target._sentinel_connection_cleanup = conn
+                target.add_note("maintainer_connection_cleanup_failed")
+                if primary is None:
+                    raise
 
     def _init_db(self) -> None:
         with self._db() as conn:

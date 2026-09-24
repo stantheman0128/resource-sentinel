@@ -182,6 +182,11 @@ class PolicyCoordinator:
         return row
 
     def _clear(self, guard):
+        from .daily_generation import readiness_nonce_cleanup
+        with readiness_nonce_cleanup(self, guard):
+            self._clear_owned(guard)
+
+    def _clear_owned(self, guard):
         if self.current_guard() is not None or self.current_cleanup_guard() is not None:
             raise PolicyError("policy_cleanup_scope_nested")
         self._held.cleanup_guard = guard
@@ -205,6 +210,13 @@ class PolicyCoordinator:
 
     @contextmanager
     def hold(self, guard):
+        from .daily_generation import readiness_scope
+        with readiness_scope(self.store.db_path):
+            with self._hold_owned(guard) as held:
+                yield held
+
+    @contextmanager
+    def _hold_owned(self, guard):
         if self.current_guard() is not None:
             raise PolicyError("policy_scope_nested")
         scope = self.provider.hold(guard.binding, timeout_ms=250)

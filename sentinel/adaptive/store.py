@@ -909,8 +909,30 @@ class LifecycleStore:
         # Construction creates no mutex and performs no native identity query.
         self._policy = PolicyCoordinator(self, policy_provider)
 
+    def _connection_ledger_path(self, existing_path=None):
+        pinned = self._existing_ledger_path if existing_path is None else existing_path
+        if self._existing_ledger_path is not None and pinned != self._existing_ledger_path:
+            raise LifecycleError("coverage_registry_unavailable")
+        if pinned is not None:
+            try:
+                if not pinned.is_file():
+                    raise LifecycleError("coverage_registry_unavailable")
+            except OSError:
+                raise LifecycleError("coverage_registry_unavailable") from None
+        return self.db_path if pinned is None else pinned
+
     @contextmanager
     def _connection(self, *, existing_path: Path | None = None):
+        from .daily_generation import readiness_scope
+        # Apply retained-path/no-create checks before selecting readiness for
+        # that same ledger. The later mode=rw open still defends disappearance.
+        target = self._connection_ledger_path(existing_path)
+        with readiness_scope(target):
+            with self._connection_owned(existing_path=existing_path) as conn:
+                yield conn
+
+    @contextmanager
+    def _connection_owned(self, *, existing_path: Path | None = None):
         # A retained guardian must not recreate a disappeared ledger, or switch
         # relative-path targets while waiting for native evidence. Ordinary
         # constructors retain their existing create/migrate behavior.
@@ -937,13 +959,18 @@ class LifecycleStore:
             try:
                 conn.close()
             except BaseException:
+                primary._sentinel_connection_cleanup = conn
                 primary.add_note("lifecycle_connection_cleanup_failed")
             raise
         else:
             try:
                 conn.close()
-            except BaseException:
-                raise LifecycleError("lifecycle_connection_cleanup_failed") from None
+            except BaseException as cause:
+                failure = LifecycleError("lifecycle_connection_cleanup_failed")
+                failure._sentinel_connection_cleanup = conn
+                failure._sentinel_connection_cleanup_error = cause
+                failure.add_note("lifecycle_connection_cleanup_failed")
+                raise failure from None
 
     @contextmanager
     def _transaction(self, *, existing_path: Path | None = None):
@@ -951,6 +978,8 @@ class LifecycleStore:
         with connection as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                from .daily_generation import revalidate_transaction
+                revalidate_transaction(conn, db_path=self._connection_ledger_path(existing_path))
                 present = _check_version(conn)
                 if (existing_path is not None or self.existing_path) and not present:
                     raise LifecycleError("coverage_registry_unavailable")
@@ -1013,6 +1042,8 @@ class LifecycleStore:
                 connection_entered = True
                 try:
                     conn.execute("BEGIN IMMEDIATE")
+                    from .daily_generation import revalidate_transaction
+                    revalidate_transaction(conn, db_path=self._connection_ledger_path())
                     _check_version(conn)
                     self._policy.assert_held(guard)
                     self._policy.revalidate(conn, guard)

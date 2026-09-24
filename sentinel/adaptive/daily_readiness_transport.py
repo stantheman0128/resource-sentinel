@@ -21,6 +21,7 @@ import re
 import secrets
 import stat
 import struct
+import threading
 from uuid import uuid4
 
 from .contracts import ContractViolation, IdentityStatus, ProcessIdentity, strict_json_loads
@@ -34,6 +35,53 @@ MAX_MESSAGE_BYTES = 4096
 _REASON = re.compile(r"[a-z][a-z0-9_]{0,127}\Z")
 _DECIMAL = re.compile(r"(?:0|[1-9][0-9]{0,38})\Z")
 _BINDING_FIELDS = frozenset({"generation", "source_digest", "config_digest", "ledger_identity"})
+_AUTHORITY_KEY = object()
+
+
+class DailyReadinessAuthority:
+    """An original authenticated peer duplicate, bounded by its RPC deadline.
+
+    Constructed before duplication so an interrupted acquisition retains its
+    original custody. It is usable only after positive pipe/peer cleanup.
+    """
+
+    def __init__(self, endpoint, binding, deadline, *, _key=None):
+        if _key is not _AUTHORITY_KEY:
+            raise DailyReadinessError("daily_readiness_original_authority_required")
+        self._endpoint, self._binding, self._deadline = endpoint, dict(binding), deadline
+        self._thread, self._pid = threading.current_thread(), os.getpid()
+        self._peer = None
+        self._issued = self._closed = self._close_unknown = False
+
+    def __reduce__(self):
+        raise TypeError("daily_readiness_authority_not_serializable")
+
+    def revalidate(self, endpoint, binding):
+        if (not self._issued or self._closed or self._close_unknown or
+                self._thread is not threading.current_thread() or self._pid != os.getpid()):
+            raise DailyReadinessError("daily_readiness_authority_unavailable")
+        if endpoint != self._endpoint or binding != self._binding:
+            raise DailyReadinessError("daily_readiness_authority_binding_changed")
+        self._deadline.require()
+        if type(self._peer) is not VerifiedProcess:
+            raise DailyReadinessError("daily_readiness_original_peer_required")
+        observed = self._peer.observe()
+        if (observed.status is not IdentityStatus.ALIVE or
+                observed.identity != self._endpoint.server_identity):
+            raise DailyReadinessError("daily_readiness_original_peer_unavailable")
+        self._deadline.require()
+
+    def close(self):
+        if self._closed:
+            return
+        if self._close_unknown:
+            raise DailyReadinessError("daily_readiness_authority_cleanup_unknown")
+        self._issued = False
+        if self._peer is not None:
+            self._close_unknown = True
+            self._peer.close()
+            self._close_unknown = False
+        self._closed = True
 
 
 class DailyReadinessError(IpcError):
@@ -240,6 +288,19 @@ class DailyReadinessClient:
         self.endpoint, self.caller_process = endpoint, caller_process
 
     def assert_ready(self, generation, source_digest, config_digest, ledger_identity, *, timeout_ms=1000):
+        return self._request(generation, source_digest, config_digest, ledger_identity,
+                             timeout_ms=timeout_ms, retain=False)
+
+    def acquire_ready(self, generation, source_digest, config_digest, ledger_identity, *, timeout_ms=1000):
+        from .windows import current_thread_holds_mutex
+        if current_thread_holds_mutex():
+            raise DailyReadinessError("daily_readiness_lock_held")
+        if type(timeout_ms) is not int or not 1 <= timeout_ms <= 1000:
+            raise DailyReadinessError("daily_readiness_freshness_bound_invalid")
+        return self._request(generation, source_digest, config_digest, ledger_identity,
+                             timeout_ms=timeout_ms, retain=True)
+
+    def _request(self, generation, source_digest, config_digest, ledger_identity, *, timeout_ms, retain):
         expected = _binding(generation, source_digest, config_digest, ledger_identity)
         caller = _current_process(self.caller_process, self.endpoint)
         request_id = str(uuid4())
@@ -249,6 +310,9 @@ class DailyReadinessClient:
                  "request_id": request_id, "caller": caller.to_dict()}
         deadline = NativeDeadline.after_ms(timeout_ms)
         connection = None
+        authority = (DailyReadinessAuthority(self.endpoint, expected, deadline,
+                     _key=_AUTHORITY_KEY) if retain else None)
+        exchange_complete = peer_settled = channel_settled = False
         try:
             with NativePipeConnection.connect(self.endpoint, deadline) as connection:
                 with connection.verified_peer(self.endpoint.server_identity) as peer:
@@ -269,13 +333,42 @@ class DailyReadinessClient:
                     _live(connection, peer, self.endpoint.server_identity)
                     _current_process(self.caller_process, self.endpoint)
                     _remaining(deadline)
+                    if authority is not None:
+                        if type(peer) is not VerifiedProcess:
+                            raise DailyReadinessError("daily_readiness_original_peer_required")
+                        authority._peer = peer.duplicate()
+                        _live(connection, peer, self.endpoint.server_identity)
+                    exchange_complete = True
+                peer_settled = True
+            channel_settled = True
             # Both native context managers must return positively. No JSON,
             # callback result, or reply observed before cleanup is returned.
             _remaining(deadline)
+            if authority is not None:
+                authority._issued = True
+                authority.revalidate(self.endpoint, expected)
+                return authority
             return None
         except Exception as error:
-            raise _failure(error, connection=connection, owner=self) from None
+            failure = _failure(error, connection=connection, owner=self)
+            failure._daily_readiness_cleanup_pending = exchange_complete and not (peer_settled and channel_settled)
+            if authority is not None:
+                failure._daily_readiness_authority = authority
+                try:
+                    authority.close()
+                except BaseException as cleanup:
+                    failure._daily_readiness_authority_cleanup = cleanup
+                    failure.add_note("daily_readiness_authority_cleanup_unknown")
+            raise failure from None
         except BaseException as error:
             error._daily_readiness_connection = connection
             error._daily_readiness_owner = self
+            error._daily_readiness_authority = authority
+            error._daily_readiness_cleanup_pending = exchange_complete and not (peer_settled and channel_settled)
+            if authority is not None:
+                try:
+                    authority.close()
+                except BaseException as cleanup:
+                    error._daily_readiness_authority_cleanup = cleanup
+                    error.add_note("daily_readiness_authority_cleanup_unknown")
             raise

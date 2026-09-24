@@ -31,12 +31,13 @@ from .native_job import CpuState, JobAccess, NativeJob
 from .policy import PolicyCoordinator
 from .policy import PolicyBusy
 from .store import LifecycleStore
-from .windows import NativePolicyMutex, NativePolicyMutexError
+from .windows import NativePolicyMutex, NativePolicyMutexError, unresolved_construction
 
 
 _NEW = object()
 _COMPLETION = object()
 _OWNERS = {}
+_OWNERS_LOCK = threading.RLock()
 _DISABLED = CpuState(0, 0)
 _CAPPED = CpuState(5, 2500)
 
@@ -77,6 +78,12 @@ class _IsolatedStore(LifecycleStore):
 
     @contextmanager
     def _connection(self, *, existing_path=None):
+        with daily_generation.readiness_scope(self._scope_path):
+            with self._connection_owned(existing_path=existing_path) as conn:
+                yield conn
+
+    @contextmanager
+    def _connection_owned(self, *, existing_path=None):
         if self.sql_errors:
             _fail("isolated_sql_cleanup_unverified")
         if existing_path is not None and Path(existing_path) != self._scope_path:
@@ -89,6 +96,7 @@ class _IsolatedStore(LifecycleStore):
             conn = sqlite3.connect(self._scope_path, timeout=.25, isolation_level=None)
             self.connections[attempt] = conn
             conn.row_factory = sqlite3.Row
+            daily_generation.prepare_connection(conn, role="lifecycle", db_path=self._scope_path)
             conn.execute("PRAGMA foreign_keys=ON")
             yield conn
         except BaseException as error:
@@ -131,6 +139,12 @@ class NativeScopeCompletion:
             _fail("original_completion_changed", owner)
         owner._validate_closed_custody()
 
+    def snapshot(self):
+        """An observation copy; only this retained original object is authority."""
+        self.assert_original()
+        return json.loads(json.dumps(self.owner._completion_record(), sort_keys=True,
+            separators=(",", ":"), allow_nan=False))
+
 
 class ExperimentNativeScope:
     """One actual guardian, independent wrapper, Job and immutable demand owner.
@@ -157,6 +171,11 @@ class ExperimentNativeScope:
         self._mutex_close_attempted = False
         self.completion = self._completion_digest = None
         self.last_grant_revision = None
+        self._preparation_acquisitions = {name: "not_entered" for name in ("store", "launch", "mutex", "job")}
+        self._preparation_pending = set()
+        self._preparation_closed = False
+        self._partial_job = self._partial_job_error = None
+        self._mutex_construction_error = None
 
     @classmethod
     def prepare(cls, demand, command, *, scope_id=None, creation_nonce=None):
@@ -164,20 +183,16 @@ class ExperimentNativeScope:
         from tests.windows.adaptive_scope_launch import ScopeCommand, ScopeLaunch
         from .experiment_scope_journal import ScopeJournal
 
-        if type(demand) is not experiment_demand.DailyExperimentDemand or type(command) is not ScopeCommand:
+        if (cls is not ExperimentNativeScope or type(demand) is not experiment_demand.DailyExperimentDemand or
+                type(command) is not ScopeCommand):
             _fail("original_demand_and_command_required")
-        demand._original()
+        demand._static_original()
         if demand.declaration.suite != "S1" or demand.declaration.scope_sha256 != command.sha256:
             _fail("declared_command_mismatch", demand)
         inner = demand._admission
-        with inner._lock:
-            inner._require_settled_submission()
-            if (not inner._submitted or inner._claim_exported or inner._prepare_attempted or
-                    inner._cancel_sealed or inner._submission_policy is None):
-                _fail("unused_daily_claim_required", demand)
+        if inner._submission_policy is None:
+            _fail("unused_daily_claim_required", demand)
         scope_id, creation_nonce = scope_id or str(uuid4()), creation_nonce or uuid4().hex
-        if scope_id in _OWNERS or any(not item._native_closed for item in _OWNERS.values()):
-            _fail("original_scope_occupied", demand)
         owner = cls(_token=_NEW)
         owner.demand, owner.scope_id, owner.creation_nonce = demand, scope_id, creation_nonce
         owner.command, owner.guardian = command, inner._process
@@ -190,8 +205,19 @@ class ExperimentNativeScope:
         owner._immutable = (demand, command, scope_id, creation_nonce, owner.guardian,
             owner.daily_store, owner._daily_policy, owner.deadline, owner.job_name,
             owner.directory, owner.ledger_path)
-        _OWNERS[scope_id] = owner
+        # This registry publication and exact demand binding precede _original,
+        # readiness, source SQL, and every native/transport factory below.
+        with _OWNERS_LOCK, demand._lock:
+            if (scope_id in _OWNERS or any(not item._native_closed for item in _OWNERS.values()) or
+                    demand._native_preparation is not None or demand._native_preparation_sealed):
+                _fail("original_scope_occupied", demand)
+            _OWNERS[scope_id] = owner
+            demand._register_native_preparation(owner)
         try:
+            with inner._lock:
+                demand._assert_unused_claim()
+                if inner._cancel_sealed:
+                    _fail("unused_daily_claim_required", owner)
             owner._assert_original()
             owner._ready()
             # A submitted-but-still-queued context owns no capacity. Prove the
@@ -201,15 +227,29 @@ class ExperimentNativeScope:
                     owner._coverage_locked(conn, restrictive=True)
             if owner.ledger_path.exists():
                 _fail("isolated_ledger_already_exists", owner)
-            owner.store = _IsolatedStore(owner.ledger_path)
-            owner._original_store = owner.store
+            owner._preparation_acquisitions["store"] = "entered"
+            # Retain even a constructor interrupted before it can return its
+            # first original SQL owner. __init__ establishes tracking first.
+            owner.store = owner._original_store = _IsolatedStore.__new__(_IsolatedStore)
+            _IsolatedStore.__init__(owner.store, owner.ledger_path)
+            owner._preparation_acquisitions["store"] = "returned"
             owner.isolated_identity = _identity(owner.ledger_path)
             owner.journal = ScopeJournal(owner.store, owner.scope_id)
+            owner._preparation_acquisitions["launch"] = "entered"
             owner.launch = ScopeLaunch.prepare(demand, command, scope_id, creation_nonce, owner.deadline)
             owner._original_launch = owner.launch
-            owner.mutex = NativePolicyMutex(owner.guardian.identity.logon_id,
-                job_mutex_instance(scope_id, creation_nonce))
+            owner._preparation_acquisitions["launch"] = "returned"
+            owner._preparation_acquisitions["mutex"] = "entered"
+            try:
+                owner.mutex = NativePolicyMutex(owner.guardian.identity.logon_id,
+                    job_mutex_instance(scope_id, creation_nonce))
+            except BaseException as error:
+                owner._mutex_construction_error = error
+                if type(error) is NativePolicyMutexError and not unresolved_construction(error):
+                    owner._preparation_acquisitions["mutex"] = "known_absent"
+                raise
             owner._original_mutex = owner.mutex
+            owner._preparation_acquisitions["mutex"] = "returned"
             with owner._scope(daily=True):
                 with owner.daily_store._transaction() as conn:
                     owner._coverage_locked(conn, restrictive=True)
@@ -218,9 +258,11 @@ class ExperimentNativeScope:
                 # No SQLite transaction spans native creation. Daily POLICY
                 # remains held until original actors and Job are published.
                 owner._create_attempted = True
+                owner._preparation_acquisitions["job"] = "entered"
                 owner.job = NativeJob.create(owner.job_name, creation_nonce,
                     owner.guardian.identity.logon_id, access=JobAccess.OWNER)
                 owner._original_job = owner.job
+                owner._preparation_acquisitions["job"] = "returned"
                 owner._verify_job(empty=True)
                 wrapper = owner.launch.create_inert()
                 if wrapper.identity == owner.guardian.identity:
@@ -249,6 +291,13 @@ class ExperimentNativeScope:
             raise
 
     def _retain(self, error):
+        if self._preparation_acquisitions["job"] == "entered" and self.job is None:
+            candidates = tuple(item for item in getattr(error, "_native_job_initialization_owners", ())
+                if type(item) is NativeJob and item.name == self.job_name and item.nonce == self.creation_nonce and
+                item.logon_sid == self.guardian.identity.logon_id and item.access is JobAccess.OWNER)
+            if len(candidates) == 1:
+                self._partial_job, self._partial_job_error = candidates[0], error
+                self._preparation_acquisitions["job"] = "failed_retained"
         partial = getattr(error, "scope_launch_owner", None)
         if self.launch is None and partial is not None:
             from tests.windows.adaptive_scope_launch import ScopeLaunch
@@ -257,8 +306,27 @@ class ExperimentNativeScope:
                     partial.job_nonce == self.creation_nonce):
                 self.launch = partial
                 self._original_launch = partial
+                # A retained factory object is custody, not proof that every
+                # constructor inside that factory returned an accounted owner.
+                self._preparation_acquisitions["launch"] = "retained_failure"
+        pending, seen = [error], set()
+        while pending:
+            current = pending.pop()
+            if id(current) in seen:
+                continue
+            seen.add(id(current))
+            if len(seen) > 32 or any(getattr(current, name, None) for name in (
+                    "daily_readiness_scope", "_daily_readiness_scopes", "_daily_readiness_authority_cleanup",
+                    "_daily_readiness_connection", "_daily_readiness_owner", "daily_readiness_current_process",
+                    "_identity_handle_cleanup", "_policy_mutex_cleanup", "_sentinel_connection_cleanup",
+                    "_native_close_outcome_unknown", "_native_duplicate_outcome_unknown", "io_pending")):
+                self._preparation_pending.add("retained_acquisition_error")
+            pending.extend(value for value in (getattr(current, "__cause__", None),
+                getattr(current, "__context__", None), getattr(current, "_daily_readiness_cause", None))
+                if isinstance(value, BaseException))
         self.errors.append(error)
         error.experiment_scope_owner = self
+        error.experiment_demand_owner = self.demand
         return error
 
     def _assert_original(self, *, daily=True):
@@ -281,6 +349,7 @@ class ExperimentNativeScope:
             # Restore does not need the daily ledger, readiness or an unexpired
             # lease; it does still need these exact original native owners.
             _fail("original_demand_custody_changed", self)
+        self.demand._assert_native_preparation(self)
         observed = self.guardian.observe()
         if (self.guardian.identity.pid != os.getpid() or observed.identity != self.guardian.identity or
                 observed.status is not IdentityStatus.ALIVE):
@@ -305,11 +374,19 @@ class ExperimentNativeScope:
                 owner.ledger_identity != self.demand.ledger_identity or
                 owner.manifest.digest != self.demand._prepared[0]["source_digest"]):
             _fail("original_local_generation_required", self)
+        self._preparation_pending.add("generation_readiness")
         owner.assert_ready()
+        self._preparation_pending.discard("generation_readiness")
         self.generation_owner = owner
 
     @contextmanager
     def _policy_scope(self, key, store):
+        with daily_generation.readiness_scope(store.db_path):
+            with self._policy_scope_owned(key, store) as guard:
+                yield guard
+
+    @contextmanager
+    def _policy_scope_owned(self, key, store):
         policy = store._policy
         if key in self._policy_poison or policy.current_guard() is not None:
             _fail("policy_custody_unverified", self)
@@ -378,6 +455,13 @@ class ExperimentNativeScope:
 
     @contextmanager
     def _scope(self, *, daily):
+        paths = ((self.demand.ledger_path, self.ledger_path) if daily else (self.ledger_path,))
+        with daily_generation.readiness_scopes(paths, absent_paths=(self.ledger_path,)):
+            with self._scope_owned(daily=daily):
+                yield
+
+    @contextmanager
+    def _scope_owned(self, *, daily):
         with self._lock:
             self._assert_original(daily=daily)
             if self.store is None or _identity(self.ledger_path) != self.isolated_identity:
@@ -425,6 +509,8 @@ class ExperimentNativeScope:
                 any(source["floor"][key] < amount for key, amount in self.demand.declaration.requested.to_dict().items())):
             _fail("unused_daily_claim_changed", self)
         if restrictive:
+            if self.demand._native_preparation_sealed:
+                _fail("preparation_sealed", self)
             assert_new_capacity_allowed(conn)
             if (generation["state"] != "ACTIVE" or runtime["admission_barrier"] != "NONE" or
                     row["state"] != "RESERVED" or time.monotonic() >= self.deadline or
@@ -621,8 +707,11 @@ class ExperimentNativeScope:
             if self.completion is not None:
                 self.completion.assert_original()
                 return self.completion
+            self.demand._seal_native_preparation(self)
             self._assert_original(daily=False)
             if not self._registered:
+                if self.job is None:
+                    return self._close_preparation()
                 if (self.job is not None and self.launch is not None and
                         self.launch.wrapper_witness is None and self.launch.root_witness is None and
                         not self.launch._command_dispatched and
@@ -708,16 +797,123 @@ class ExperimentNativeScope:
                 self._retain(error)
                 raise
 
-    def _closure_digest(self):
+    def _completion_record(self):
         binding = (self.exclusion_binding._values() if hasattr(self, "exclusion_binding") else
             dict(experiment_id=self.demand.declaration.experiment_id, scope_id=self.scope_id,
                 job_name=self.job_name, creation_nonce=self.creation_nonce,
                 guardian_identity=self.guardian.identity.to_dict(), command_sha256=self.command.sha256,
-                isolated_ledger_identity=self.isolated_identity, wrapper_creation="never_created"))
-        payload = dict(binding=binding, terminal=self._terminal_record,
-            daily_binding_sha256=self._daily_binding_sha256)
-        return hashlib.sha256(json.dumps(payload, sort_keys=True,
+                isolated_ledger_identity=getattr(self, "isolated_identity", None), wrapper_creation="never_created"))
+        return dict(schema_version=1, disposition=self._terminal_record["state"], binding=binding,
+            demand=json.loads(self.demand._native_preparation_binding), terminal=self._terminal_record,
+            scope_id=self.scope_id, isolated_ledger_path=str(self.ledger_path),
+            deadline_monotonic_ns=int(self.deadline * 1_000_000_000),
+            acquisitions=dict(self._preparation_acquisitions),
+            reservation_id=getattr(self, "reservation_id", None),
+            daily_binding_sha256=getattr(self, "_daily_binding_sha256", None))
+
+    def _closure_digest(self):
+        return hashlib.sha256(json.dumps(self._completion_record(), sort_keys=True,
             separators=(",", ":"), allow_nan=False).encode()).hexdigest()
+
+    def _assert_preparation_cleanup(self):
+        """Exact acquired owners or original never-entered slots; no absence inference."""
+        from tests.windows.adaptive_scope_launch import ScopeLaunch
+        self._assert_original_native_owners()
+        self.demand._assert_native_preparation(self)
+        self._assert_partial_job()
+        if (self._registered or self._launch_authorized or self.job is not None or self._preparation_pending or
+                self._policy_poison or self._mutex_poison is not None or any(self._guards.values())):
+            _fail("preparation_cleanup_unverified", self)
+        for name, expected in (("store", _IsolatedStore), ("launch", ScopeLaunch), ("mutex", NativePolicyMutex)):
+            state, original = self._preparation_acquisitions[name], getattr(self, name)
+            if state == "not_entered":
+                if original is not None:
+                    _fail("preparation_cleanup_unverified", self)
+            elif name == "mutex" and state == "known_absent":
+                if (original is not None or type(self._mutex_construction_error) is not NativePolicyMutexError or
+                        unresolved_construction(self._mutex_construction_error)):
+                    _fail("preparation_cleanup_unverified", self)
+            elif name == "store" and state in {"entered", "returned"}:
+                if (type(original) is not expected or not hasattr(original, "connections") or
+                        not hasattr(original, "sql_errors") or original.connections or original.sql_errors):
+                    _fail("preparation_cleanup_unverified", self)
+            elif state == "returned" and type(original) is expected:
+                if name == "launch" and (not self._actors_closed or not original._closed):
+                    _fail("preparation_cleanup_unverified", self)
+                if name == "mutex" and (not self._mutex_closed or original._handle is not None):
+                    _fail("preparation_cleanup_unverified", self)
+            else:
+                # Missing return, even with a retained exception, is not known
+                # absent. The original factory must provide positive accounting.
+                _fail("preparation_acquisition_outcome_unknown", self)
+
+    def _assert_partial_job(self, *, require_closed=True):
+        state = self._preparation_acquisitions["job"]
+        if state == "not_entered":
+            if self._create_attempted or self._partial_job is not None:
+                _fail("preparation_acquisition_outcome_unknown", self)
+            return
+        original = self._partial_job
+        if (state != "failed_retained" or not self._create_attempted or type(original) is not NativeJob or
+                self.job is not None or original.name != self.job_name or original.nonce != self.creation_nonce or
+                original.logon_sid != self.guardian.identity.logon_id or original.access is not JobAccess.OWNER):
+            _fail("preparation_acquisition_outcome_unknown", self)
+        candidates = tuple(item for item in getattr(self._partial_job_error, "_native_job_initialization_owners", ())
+            if type(item) is NativeJob and item.name == self.job_name and item.nonce == self.creation_nonce and
+            item.logon_sid == self.guardian.identity.logon_id and item.access is JobAccess.OWNER)
+        if len(candidates) != 1 or candidates[0] is not original or require_closed and not original.closed:
+            _fail("preparation_acquisition_outcome_unknown", self)
+
+    def _close_preparation(self):
+        """Close only accounted early preparation; unknown factories stay HOLD."""
+        from tests.windows.adaptive_scope_launch import ScopeLaunch
+        self._close_started = True
+        try:
+            self._assert_partial_job(require_closed=False)
+            if self._partial_job is not None and not self._partial_job.closed:
+                # NativeJob itself permits retry only for known-owned resources;
+                # allocation_unknown/close_unknown never repeats a native call.
+                self._partial_job.close()
+            launch_state = self._preparation_acquisitions["launch"]
+            if launch_state == "returned":
+                if (type(self.launch) is not ScopeLaunch or self.launch.demand is not self.demand or
+                        self.launch.command is not self.command or self.launch.scope_id != self.scope_id or
+                        self.launch.job_nonce != self.creation_nonce or self.launch._wrapper_create_entered or
+                        self.launch.wrapper_witness is not None or self.launch.root_witness is not None or
+                        self.launch._command_dispatched):
+                    _fail("preparation_cleanup_unverified", self)
+                if not self._actors_closed:
+                    self.launch.close()
+                    self._actors_closed = True
+            elif launch_state != "not_entered":
+                _fail("preparation_acquisition_outcome_unknown", self)
+            for key, store in (("isolated", self.store), ("daily", self.daily_store)):
+                if self._guards[key] is not None:
+                    with self._policy_scope(key, store):
+                        pass
+            mutex_state = self._preparation_acquisitions["mutex"]
+            if mutex_state == "returned":
+                if type(self.mutex) is not NativePolicyMutex:
+                    _fail("preparation_cleanup_unverified", self)
+                if not self._mutex_closed:
+                    if self._mutex_close_attempted:
+                        _fail("mutex_close_outcome_unknown", self)
+                    self._mutex_close_attempted = True
+                    self.mutex.close()
+                    self._mutex_closed = True
+            elif mutex_state not in {"not_entered", "known_absent"}:
+                _fail("preparation_acquisition_outcome_unknown", self)
+            self._assert_preparation_cleanup()
+            self._terminal_record = dict(state="PREPARATION_CLOSED", scope_id=self.scope_id,
+                launch_sealed=True, wrapper_created=False, job_factory=self._preparation_acquisitions["job"])
+            self._preparation_closed = True
+            self._completion_digest = self._closure_digest()
+            self._native_closed = True
+            self.completion = NativeScopeCompletion(self, self._completion_digest, _token=_COMPLETION)
+            return self.completion
+        except BaseException as error:
+            self._retain(error)
+            raise
 
     def _close_uncreated_wrapper(self):
         """Only original positive Create FALSE/pre-Create custody, never PID absence.
@@ -778,6 +974,14 @@ class ExperimentNativeScope:
 
     def _validate_closed_custody(self):
         self._assert_original_native_owners()
+        self.demand._assert_native_preparation(self)
+        if not self.demand._native_preparation_sealed or self._preparation_pending:
+            _fail("native_cleanup_unverified", self)
+        if self._preparation_closed:
+            self._assert_preparation_cleanup()
+            if self._terminal_record["state"] != "PREPARATION_CLOSED":
+                _fail("native_cleanup_unverified", self)
+            return
         if (not self._job_closed or not self._mutex_closed or not self.job.closed or
                 not self.launch._closed or self.store.connections or self.store.sql_errors or
                 any(self._guards.values()) or self._policy_poison or self._mutex_poison is not None or

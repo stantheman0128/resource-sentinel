@@ -100,12 +100,13 @@ class ScopeControlTests(unittest.TestCase):
 
         # Concrete original types with fake native backend, never a serialized
         # readiness/admission authority or invocation of prepare().
-        self.demand = object.__new__(experiment_demand.DailyExperimentDemand)
+        self.demand = experiment_demand.DailyExperimentDemand(_token=experiment_demand._CREATE)
         self.demand.declaration = SimpleNamespace(experiment_id=str(uuid4()))
         self.demand.ledger_path = Path(self.daily.db_path).absolute()
         self.demand._admission = SimpleNamespace(_process=self.guardian,
             _submission_policy=self.daily._policy, _experiment_demand=self.demand)
         self.demand._original = Mock()
+        self.demand._completion_binding = Mock(return_value={"fixture": True})
         experiment_demand._RETAINED[self.demand.declaration.experiment_id] = self.demand
         self.owner = scope.ExperimentNativeScope(_token=scope._NEW)
         owner = self.owner
@@ -120,6 +121,9 @@ class ScopeControlTests(unittest.TestCase):
             owner.guardian, owner.daily_store, owner._daily_policy, owner.deadline,
             owner.job_name, owner.directory, owner.ledger_path)
         scope._OWNERS[owner.scope_id] = owner
+        self.demand._native_preparation = owner
+        self.demand._native_preparation_admission = self.demand._admission
+        self.demand._native_preparation_binding = experiment_demand._canonical(self.demand._completion_binding())
         self.addCleanup(self.remove_originals)
         owner._ready = Mock(side_effect=lambda: self.events.append("ready:synthetic"))
         owner._coverage_locked = Mock(side_effect=self.synthetic_coverage)
@@ -594,7 +598,11 @@ class IsolatedConnectionCustodyTests(unittest.TestCase):
         return conn
 
     def test_unknown_connection_close_retains_same_connection_and_blocks_reopen(self):
-        with patch.object(scope.sqlite3, "connect", side_effect=self.connection) as connect:
+        # Acquire and positively close the real readiness reader before the
+        # fault targets the original isolated-store connection under test.
+        with scope.daily_generation.readiness_scope(self.store._scope_path) as readiness, \
+                patch.object(scope.sqlite3, "connect", side_effect=self.connection) as connect:
+            self.assertTrue(readiness.reader.closed)
             with self.assertRaises(OSError) as raised:
                 with self.store._connection() as original:
                     original.execute("SELECT 1")
@@ -609,7 +617,9 @@ class IsolatedConnectionCustodyTests(unittest.TestCase):
 
     def test_primary_sql_failure_keeps_its_original_and_unknown_close_obligation(self):
         original = ValueError("synthetic transaction failure")
-        with patch.object(scope.sqlite3, "connect", side_effect=self.connection):
+        with scope.daily_generation.readiness_scope(self.store._scope_path) as readiness, \
+                patch.object(scope.sqlite3, "connect", side_effect=self.connection):
+            self.assertTrue(readiness.reader.closed)
             with self.assertRaises(ValueError) as raised:
                 with self.store._connection() as conn:
                     raise original
@@ -622,7 +632,9 @@ class IsolatedConnectionCustodyTests(unittest.TestCase):
 
     def test_unknown_connection_open_is_retained_and_never_retried_implicitly(self):
         original = OSError("synthetic SQLite open ACK loss")
-        with patch.object(scope.sqlite3, "connect", side_effect=original) as connect:
+        with scope.daily_generation.readiness_scope(self.store._scope_path) as readiness, \
+                patch.object(scope.sqlite3, "connect", side_effect=original) as connect:
+            self.assertTrue(readiness.reader.closed)
             with self.assertRaises(OSError):
                 with self.store._connection():
                     self.fail("failed open yielded")

@@ -331,8 +331,8 @@ class DailyGenerationTests(unittest.TestCase):
                     patch.object(generation.VerifiedProcess, "open", return_value=self.process):
                 self.assertEqual(generation.prepare_connection(fresh, role="coordinator", db_path=self.db),
                                  self.owner.generation)
-            fresh.execute("INSERT INTO reservations VALUES('new')")
-            fresh.commit()
+                fresh.execute("INSERT INTO reservations VALUES('new')")
+                fresh.commit()
             self.assertEqual(fresh.execute("SELECT count(*) FROM reservations").fetchone()[0], 1)
         finally:
             fresh.close()

@@ -8,18 +8,64 @@
 0 failures／errors／skips**。包含固定凍結下的收尾、完整歷史與 journal inventory、
 原始 SQL／POLICY／readiness／native owner 的正面 cleanup，以及 Windows
 檔案身分修正。不是 native acceptance 或日常 activation；remote readiness 鎖外
-驗證、fresh restart、真正 native provider 與下述 P4/P6 source 缺口仍待完成。
+接線另見下述 413-test 驗證；fresh restart、真正 native provider 與下述
+P4/P6 source 缺口仍待完成。
 完整私人日誌為 `.local-adaptive/retirement-integration-20260924-1.log`。
 該包已提交為 `41cee4d`。Resident host bounded telemetry 與 helper 非阻塞
 poll／cleanup 接線另通過 **276 tests，8.418 秒，0 failures／errors／skips**。
-固定共用 20 MiB／7 天日誌上限已實作；P4 原始 sink 量測接線與 native 成本仍缺。
+固定共用 20 MiB／7 天日誌上限已實作；P4 原始 sink 接線最新七模組
+**259 tests 全過，13.765 秒，0 failures／errors／skips**。包含真實 offer／
+append receipt、精確 shared inventory 對帳、closed P4 v2 schema，以及
+提早拒絕超過 2 MiB 的 trace／拒絕保存錯誤 traceback 造成的隱藏滯留。
+整份 artifact 上限與既有 idle／Private Commit／log gate 保持不變。
+私人日誌為 `.local-adaptive/p4-sink-regression-20260924-1.log`；真正 aggregate
+provider、storage-fault／rollover／recovery 證據及 native 成本仍缺。
+P4 source 包已正常 push 為 `852044b`。
 Telemetry 包為 `2b34df2`；原始 launch deadline 修正為 `10e42f5`，日常
 legacy writer 的 experiment exclusion 為 `9f4d080`。原始 S1 scope／journal、
 distinct wrapper 與 source bootstrap 最新 **303 tests 通過，19.533 秒，
 0 failures／errors／skips**；CPU fixture 已提交為 `82e3450`。九個實際隔離
 Python subprocess tests 驗證 stale `.pyc`／initializer 拒絕，沒有執行 native
-Job 或 CPU 壓力實驗。Daily cleanup receipt、serial provider、remote readiness
-整合及 generation successor 仍是 source 工作，不是只等主控台執行。
+Job 或 CPU 壓力實驗。Daily release／history、serial provider、native scope 的
+remote owner 接線及 generation successor 仍是 source 工作，不是只等主控台執行。
+
+後續 [readiness 鎖界線](DAILY-READINESS-LOCK-BOUNDARY.md)與 experiment preparation
+的 14 模組整合 **413 tests 全過，47.653 秒，0 failures／errors／skips**。
+已涵蓋兩帳本鎖外預先取得、獨立 absence pool、原 local scope 結束後拒絕寫入、
+原始 preparation registration／不可逆 seal、正面 early cleanup，以及
+`BEFORE_NATIVE` 收據的同連線／檔案身分重驗。這些完成證據仍不能自行釋放日常
+reservation；typed release／歷史重用的原子交易尚未實作。S1 native 尚未接通。
+首次同範圍有 1 failure／4 errors，均為新預讀路徑下的 fixture 注入位置及
+空表與不存在表的區分，保留 production 檢查後修正並重跑。
+完整私人日誌為 `.local-adaptive/readiness-preparation-20260924-2.log`。
+[實驗 cleanup receipt 契約](EXPERIMENT-CLEANUP-RECEIPT.md)已先以
+`ca2944b` 提交，完整 generation binding 與 cleanup-only SQL 階段補充為
+`fdf2621`。失敗 Job factory 的原始物件保留修補為 `9b50531`，
+**48 portable tests 全過，0.207 秒，0 failures／errors／skips**。
+此修補分開保存已正面關閉與尚未確定的 acquisition，不把沒有回傳物件
+當作沒有資源，也不授予任何新的 query／control 權限。
+
+本輪另執行一般 adaptive 回歸：**155 個 root test modules，4,166 tests，
+752.034 秒，2 failures／9 errors／0 skips**。沒有選入 `tests/windows` 的
+控制 spikes。失敗確認為兩項 connection source 回歸（原始 close 例外進入
+公開 traceback、existing-only 帳本檢查晚於 readiness 選取），以及 `2b34df2`
+後尚未更新的 guardian telemetry fixture。Source 已保留私密原始 connection／
+error custody 並恢復 sanitized exception；readiness 與 transaction 共同使用
+實際 pinned ledger，既有 mode=rw 仍禁止遺失檔案被重建。Fixture 只接上真實
+host emit 介面，保留全部同 owner、drain、no-relaunch、no-recreate 斷言。
+完整失敗日誌為 `.local-adaptive/adaptive-full-20260924-1.log`；修正後的最終
+18 模組回歸 **493 tests 全過，55.779 秒，0 failures／errors／skips**，
+涵蓋全部原失敗模組及 readiness／preparation／retirement 整合。私人日誌為
+`.local-adaptive/readiness-host-regression-20260924-2.log`。前一輪相同 493 tests
+剩一個 fixture 未先建立 existing-only 帳本的 error，補上真實臨時 SQLite 後
+重跑，未放寬檢查。沒有重新執行完整 4,166 tests，不把前述整套紀錄改寫為全過。
+
+上述測試在 Windows／`C:\Python313\python.exe` 執行，使用正常日常 wrapper
+准入，`HEAVY / P2 / CPU 1 / RAM 1 GiB / I/O 0`，無豁免。完整一般回歸的
+精確清單留在 `.local-adaptive/adaptive-portable-modules-20260924.txt`；檔名不
+代表全部只跑 portable mock，既有 Windows 自身身分／隔離 IPC／mutex 等
+smoke 也在一般 suite 內。未執行 native CPU cap／故障控制 spikes，沒有
+production activation。測試包含受保護的 dirty baseline；不宣稱 clean clone。
 
 接手時 Coordinator 的既存 freshness／共用計帳修正已獨立提交為 `6abadba`。
 裁決 ② 的[退場契約](P3-PRELAUNCH-RETIREMENT.md)先於程式提交為 `8cd06e7`。
@@ -88,8 +134,8 @@ loader error 或未跑的 native gate 算成 pass。
 | 2. 裁決 ④ | 契約與 source 完成；最後完整 adaptive 2,127 tests 通過。沒有舊 witness 的 cold adoption 仍不支援；native recovery 未驗證。 |
 | 3. helper sender | Source 接線、獨立 review 與完整 2,298 tests 通過。後續 original launch/stdio provenance、guardian scope 比對與 helper proposal adapter 已接線，344 targeted tests 通過（30.960 秒，含 30 個專用 scope tests）。實際 S2 topology producer／native bundle／新增採集成本仍未驗證，缺證據不啟用控制。 |
 | 4. release／CLI | Source 整合與完整 2,800 tests 通過；包含 exact discovery、typed operator transport、原子 off／audit、同 owner 收尾與三個 host 的 drain。後續 rootless C2 post-close receipt 已補上，保持原 terminal state，不偽造 FINISHED；新增 29 個案例。232 targeted tests 中 231 通過，唯一錯誤文字預期修正後單獨重跑通過，production 未因該失敗改動。沒有原始 close 證據的舊歷史仍 unknown。Native 操作通訊、控制及恢復仍未驗證。 |
-| 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport 與接線](P2-DAILY-ACTIVATION.md)已完成 installer、常駐 owner 與日常 consumers 接線，279 tests 通過（10.587 秒）。同帳本 demand／retirement fence 已提交，與 P6 合跑 308 tests 通過（21.977 秒）。Generation 正面退場整合最新 654 tests 通過（94.827 秒）；remote readiness 鎖外驗證、真正 native experiment provider 與 fresh restart 仍待完成。未執行日常安裝，grace 前提未解鎖。 |
-| 6. console 驗收命令 | [P6 矩陣編排與 raw reducer](P6-RUNNER-CONTRACT.md)、[S1/S2 bridge 契約](S1-DAILY-BRIDGE-CONTRACT.md)、[S3 精確故障點與 14×10 記錄器](S3-REAL-HOST-RECOVERY.md)、[P4 實際 host 成本量測](P4-OVERHEAD-RUNNER.md)已提交。P4 原 stderr producer 155 tests 通過（12.967 秒）；新 bounded telemetry／helper 非阻塞接線 276 tests 通過（8.418 秒）。Actual provider、部分 S3 故障 driver／完整 orchestration、A0 等價性及 P4 新 sink／schema 整合仍缺；不是只剩 console 執行。 |
+| 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport 與接線](P2-DAILY-ACTIVATION.md)已完成 installer、常駐 owner 與日常 consumers 接線。Generation 正面退場整合 654 tests 通過（94.827 秒）；readiness 鎖外驗證、雙帳本與原始 preparation 的最終 18 模組整合 493 tests 通過（55.779 秒），包含完整回歸發現的 connection 修補。Typed daily release／歷史重用、native scope 的 remote owner 接線、真正 native provider 與 fresh restart 仍待完成。未執行日常安裝，grace 前提未解鎖。 |
+| 6. console 驗收命令 | [P6 矩陣編排與 raw reducer](P6-RUNNER-CONTRACT.md)、[S1/S2 bridge 契約](S1-DAILY-BRIDGE-CONTRACT.md)、[S3 精確故障點與 14×10 記錄器](S3-REAL-HOST-RECOVERY.md)、[P4 實際 host 成本量測](P4-OVERHEAD-RUNNER.md)已提交。新 bounded telemetry／helper 非阻塞接線 276 tests 通過（8.418 秒）；P4 原 sink 與 v2 schema 最新 259 tests 通過（13.765 秒）。Actual provider、部分 S3 故障 driver／完整 orchestration、A0 等價性及 P4 native storage／overhead 證據仍缺；不是只剩 console 執行。 |
 
 最新追加：項目 5 的同帳本 demand 與 retirement fence 已提交為 `1072786`／
 `a48925a`；native scope source 現已通過 303-test 整合，正向 daily release
@@ -103,8 +149,8 @@ reducer 已提交為 `ff6f31b`，S3 原始 action cutpoints／三個實際故障
 以上是目前缺口；下列較早日期的段落保留其歷史測試範圍。Native S1–S3、完整
 P3–P6 都尚未通過。日常 config／Scheduled Task／啟動入口未修改。
 
-下一步是項目 5 同一日常帳本的 native evidence fixture 全程容量覆蓋，以及
-remote readiness 鎖外驗證與 fresh-generation restart。新增測試將繼續使用隔離帳本；任何實際
+下一步是項目 5 同一日常帳本的精確 experiment release／history 交易、native
+provider 接線與 fresh-generation restart。新增測試將繼續使用隔離帳本；任何實際
 日常 source activation 都需要獨立授權，不因 commit/push 自動執行。項目 6
 尚未完成的內容不能以 mock、空 provider、另外一個 DB 或假量測取代。
 
@@ -149,7 +195,8 @@ C:\Python313\python.exe -m unittest tests.test_adaptive_overhead_runner tests.te
 P4 尚存的具體 source／native 缺口：actual provider 的 keeper role 必須綁定原始
 daily-generation owner，不能只提供任意同 logon 的 live process；現有 operator
 idle poll 已改成 nonblocking，但尚未實測 tick p95；bounded storage source 已通過
-276 host tests，原 P4 stderr producer 還需接上實際 sink 與新的證據 schema。
+276 host tests；原 P4 stderr producer 已由真實 sink 與 v2 schema 取代，
+新接線的 259 tests 通過，完整 authenticated aggregate provider 仍缺。
 既有 idle-after log bytes 不可大於 idle-before 的 gate 比正式計畫
 bounded growth 更嚴格，尚未放寬或忽略其失敗。所有 native 成本門檻仍未驗證。
 
@@ -188,11 +235,10 @@ telemetry 收尾接線已在 2026-09-24 的 276 tests 中通過，不宣稱 nati
 C:\Python313\python.exe -m unittest tests.test_adaptive_pipe_windows tests.test_adaptive_pipe_async tests.test_adaptive_operator_transport tests.test_adaptive_control_transport tests.test_adaptive_launch_transport tests.test_adaptive_daily_readiness_transport -q
 ```
 
-另一個已確認的 source 整合問題仍待修正：remote daily readiness 在
-`prepare_connection()` 中發送 RPC，但某些呼叫位於 POLICY 之內，與禁止鎖內 IPC
-的契約衝突。需要在鎖外取得原始 authenticated readiness authority，再於鎖內
-做 exact generation／ledger／native witness 核對；不能以 boolean、另外的 DB
-或任意快取取代。這是 source 缺口，不是必須等 Windows 實驗才知道的限制。
+較早確認的 remote readiness 鎖內 RPC 問題已由 2026-09-24 的 413-test 接線
+修正：鎖外取得原始 authenticated authority，鎖內於實際 consumer connection
+重驗 generation／ledger／source／native witness。Native scope 的 remote owner
+adapter 與真正 provider 仍未完成，不把這項 source 修正視為 S1 native 通過。
 
 另修正 source keeper 在 stdout 失效時略過等待、持續忙轉的問題：診斷與 pacing
 分開，保持同一原始 operation，固定每個錯誤邊界只保留第一個錯誤。

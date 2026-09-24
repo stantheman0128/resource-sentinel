@@ -40,6 +40,13 @@ _THREAD_NAMES = set()
 _THREAD_NAMES_LOCK = threading.Lock()
 
 
+def current_thread_holds_mutex():
+    """Read existing native POLICY/Job ownership; grant no locking authority."""
+    current = threading.current_thread()
+    with _THREAD_NAMES_LOCK:
+        return any(owner is current for owner, _name in _THREAD_NAMES)
+
+
 class NativePolicyMutexError(RuntimeError):
     """Stable reason plus optional numeric Win32 error, with no private values."""
     def __init__(self, reason: str, win32_error: int | None = None):

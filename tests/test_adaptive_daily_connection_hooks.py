@@ -3,7 +3,7 @@
 These tests are intended for the prepared connection-wiring patches. They do
 not activate a daily generation or establish native readiness evidence.
 """
-from contextlib import closing
+from contextlib import closing, nullcontext
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -53,6 +53,13 @@ class DailyConnectionHookTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name)
         self.db = self.directory / "sentinel.db"
+        # These tests isolate the existing connection hook/cleanup ordering.
+        # Full original readiness custody is exercised by lock-boundary tests.
+        for replacement in (
+                patch.object(generation, "readiness_scope", side_effect=lambda path: nullcontext()),
+                patch.object(generation, "revalidate_transaction")):
+            replacement.start()
+            self.addCleanup(replacement.stop)
 
     def bare_store(self, *, pinned=None):
         # Bypass construction only for connection-order tests. The separate
@@ -135,6 +142,8 @@ class DailyConnectionHookTests(unittest.TestCase):
         events = []
         connection = RecordingConnection(events)
         pinned = (self.directory / "pinned-existing.db").resolve()
+        with closing(sqlite3.connect(pinned)) as fixture:
+            fixture.execute("CREATE TABLE fixture(value INTEGER)")
         owner = self.bare_store()
         with patch.object(store.sqlite3, "connect", return_value=connection) as connect, \
                 patch.object(generation, "prepare_connection") as readiness:

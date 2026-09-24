@@ -96,6 +96,42 @@ first guardian Create boundary. The generic cold-start path remains refusing;
 no flag or public status dictionary substitutes for original retirement and
 complete retained history. Preserve off mode and every normal launch boundary.
 
+Generation transfer preserves the current runtime guardian epoch and all
+historical provenance. A later, separately retained successor epoch publication
+may advance that current epoch and registry revision before the first fresh
+guardian Create. The existing SettledEpochRollover contract cannot supply this
+proof: its old guardian handle and held supervisor instance have already been
+positively closed by daily retirement. Never reopen them or fabricate that audit.
+
+The successor epoch operation requires the exact acknowledged successor and
+fresh supervisor/startup, its newly acquired original instance lease, complete
+bounded terminal/experiment/control history, and the completed original
+retirement. Premint its attempt and new epoch once. Under a distinct original
+POLICY guard, atomically insert an immutable successor-specific audit and CAS
+only runtime epoch/logon/revision; increment the revision once and preserve all
+ordinary allocations, queue, exemptions and historical rows. The new epoch must
+be absent from managed history and both epoch-audit routes. A failed SQL/native
+close, unknown acquisition or nonce cleanup retains the same operation; no
+guardian Create precedes positive original commit/close/POLICY/readback evidence.
+
+The canonical `adaptive_successor_guardian_epochs` audit binds schema_version,
+attempt_id, transition_id, successor_generation, succession_sha256, old_epoch,
+new_epoch, supervisor_pid, supervisor_created_filetime_100ns,
+supervisor_logon_id, supervisor_instance_id, policy_instance_id, policy_logon_id,
+previous_revision, registry_revision and inventory_digest. All fields are bounded
+scalars, included in the shared 4096-row/16 MiB history accounting. UPDATE/DELETE
+are forbidden. The original startup checks revalidate this distinct route both
+initially and immediately before Create. Guardian registration must validate
+this exact current generation/transition/archive/POLICY/epoch/revision plus
+complete obligation checks and its own original live self handle; ambiguous
+audit routes refuse. The generic fresh and ordinary rollover paths stay intact.
+
+Fresh readiness construction has a private original-host bootstrap check;
+public/local admission stays fenced until that exact retained listener is
+published with its serving thread, service and registry positively bound.
+Metadata acknowledgement alone is not readiness, and readiness alone is not
+permission to bypass the fresh supervisor or epoch checks above.
+
 The original source installer and console retain the complete predecessor /
 successor chain. A completed predecessor cannot satisfy the exit condition
 while a successor owns SQL, native handles, readiness or a running host. On

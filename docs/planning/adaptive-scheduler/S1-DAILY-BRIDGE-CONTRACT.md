@@ -139,6 +139,85 @@ native identity proves a legitimate cohosted role.
 This approved contract is implementation scope. It is not a measured native
 result and does not unlock `require_continuous_admission()` by itself.
 
+### Original-scope source slice (not yet a native gate)
+
+The new `experiment_scope.py` owner and isolated `experiment_scope_journal.py`
+implement original native custody for one S1 Job. The corresponding explicit
+fixture closure is `adaptive_scope_launch.py`, `adaptive_scope_wrapper.py`, and
+`adaptive_scope_cpu_worker.py`. This test guardian directly owns the existing
+`NativeJob` mechanism and uses the existing `native_launcher.launch_in_job`
+inside its distinct authenticated wrapper. It does not pretend to be a
+production `GuardianLaunchOwner`, enroll an isolated reservation, or provide a
+production S1 capability receipt. The previously described production-owner
+integration remains a separate prerequisite for S2/S3 and subsequent phases.
+
+The implemented native scope performs the following concrete operations:
+
+- Prove its original daily reservation before creating the test listener;
+  create its empty test Job and inert wrapper under daily POLICY, isolated
+  POLICY, then the original Job mutex; publish the exact exclusion before any
+  workload launch. The actual daily legacy writer reads that exclusion.
+- Persist isolated launch/control intents and apply only the explicit S1
+  2,500-basis-point cap. Recheck the original lease and experiment deadline
+  immediately before Set. Actual bound daily grants deny a new cap; the owning
+  guardian's observation path restores the whole Job after a grant or loss of
+  readiness. Legacy grant ancestry without exact native identity is treated
+  conservatively. An unbound exemption store refuses control.
+- Restore from the original native owners without requiring the daily database,
+  source readiness, or a valid lease. Exact original/last-applied/pending CPU
+  states bound the recovery write; an external CPU setting is not overwritten.
+- Reconcile a registration acknowledgement against the same original Job and
+  wrapper, and distinguish authenticated noCreate from an originally retained
+  root. `SEALED_UNCREATED` is isolated test bookkeeping and never resets the
+  production lifecycle or changes ordinary C2.
+- Preserve separate actor-close, Job-close and mutex-close checkpoints. A
+  positive native completion capability requires sealed launch, zero members,
+  disabled CPU control, settled original transport and native owners, and
+  completed original POLICY cleanup. Known wrapper Create failure can close
+  its original empty Job without inventing a wrapper or journal identity.
+
+The source still has concrete integration limits. The current core requires
+the genuine original in-process `DailyGenerationOwner`: the existing remote
+readiness call cannot run inside POLICY, so an external-console provider needs
+an authenticated pre-lock readiness owner with retirement-race semantics.
+Unknown native Job construction or ambiguous pipe/close outcomes retain the
+original owners and demand; these are not positive cleanup. The immutable
+daily cleanup/retirement receipt, truthful never-exported claim cancellation,
+historical validator, and serial S1 producer adapter are not yet wired. In
+particular, `NativeScopeCompletion` by itself does not release capacity, change
+the daily mode, satisfy P1, or enable `require_continuous_admission()`.
+
+All new control and cleanup tests use isolated SQLite and explicit synthetic
+native collaborators. They are source verification only; no new native gate,
+daily activation, runtime configuration change or production control is claimed.
+
+Central verification on 2026-09-24 passed **303 tests in 19.533 seconds, zero
+failures/errors/skips**. Review found and corrected two concrete boundaries:
+both wrapper and workload Create now check the original absolute scope deadline
+after preparation, independently of a later RPC deadline; wrapper bootstrap
+compiles the exact verified fixture bytes and validates complete canonical import
+provenance. Nine isolated base-Python subprocess tests include a real
+timestamp-valid stale `.pyc` and a stale production module initializer. These
+subprocesses acquire no native Job or capacity authority.
+
+The initial 255-test foundation run had three errors in a fixture that requested
+zero CPU/RAM. It now uses valid .1 CPU/128 MiB demand and the real admission
+checks; the ten-Job limit assertions are unchanged. The subsequent 263-test core
+run passed before the final 303-test bootstrap integration. All runs used normal
+daily P2 HEAVY admission and isolated test ledgers. Complete private evidence is
+`.local-adaptive/original-scope-integration-20260924-1.log`; the protected dirty
+baseline and adjacent uncommitted additive readiness primitives remain test
+dependencies. Consumer wiring for those readiness primitives is unverified.
+
+```text
+C:\Python313\python.exe -m unittest tests.test_adaptive_experiment_scope_journal tests.test_adaptive_experiment_exclusion tests.test_adaptive_scope_cpu_worker tests.test_adaptive_scope_launch tests.test_adaptive_scope_bootstrap tests.test_adaptive_native_launcher tests.test_adaptive_legacy_writer tests.test_adaptive_legacy_native tests.test_adaptive_experiment_demand tests.test_adaptive_experiment_scope -q
+```
+
+This source slice does not assemble the aggregate provider's canonical fixture
+module bindings, release daily admitted capacity, make the experiment exclusion
+reusable, or provide later S2/S3/P4/P6 execution evidence. Those remain explicit
+source and execution dependencies.
+
 ## Two independent authorities
 
 The original daily accounting owner obtains all capacity from the actual daily

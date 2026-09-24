@@ -13,6 +13,13 @@
 該包已提交為 `41cee4d`。Resident host bounded telemetry 與 helper 非阻塞
 poll／cleanup 接線另通過 **276 tests，8.418 秒，0 failures／errors／skips**。
 固定共用 20 MiB／7 天日誌上限已實作；P4 原始 sink 量測接線與 native 成本仍缺。
+Telemetry 包為 `2b34df2`；原始 launch deadline 修正為 `10e42f5`，日常
+legacy writer 的 experiment exclusion 為 `9f4d080`。原始 S1 scope／journal、
+distinct wrapper 與 source bootstrap 最新 **303 tests 通過，19.533 秒，
+0 failures／errors／skips**；CPU fixture 已提交為 `82e3450`。九個實際隔離
+Python subprocess tests 驗證 stale `.pyc`／initializer 拒絕，沒有執行 native
+Job 或 CPU 壓力實驗。Daily cleanup receipt、serial provider、remote readiness
+整合及 generation successor 仍是 source 工作，不是只等主控台執行。
 
 接手時 Coordinator 的既存 freshness／共用計帳修正已獨立提交為 `6abadba`。
 裁決 ② 的[退場契約](P3-PRELAUNCH-RETIREMENT.md)先於程式提交為 `8cd06e7`。
@@ -85,7 +92,8 @@ loader error 或未跑的 native gate 算成 pass。
 | 6. console 驗收命令 | [P6 矩陣編排與 raw reducer](P6-RUNNER-CONTRACT.md)、[S1/S2 bridge 契約](S1-DAILY-BRIDGE-CONTRACT.md)、[S3 精確故障點與 14×10 記錄器](S3-REAL-HOST-RECOVERY.md)、[P4 實際 host 成本量測](P4-OVERHEAD-RUNNER.md)已提交。P4 原 stderr producer 155 tests 通過（12.967 秒）；新 bounded telemetry／helper 非阻塞接線 276 tests 通過（8.418 秒）。Actual provider、部分 S3 故障 driver／完整 orchestration、A0 等價性及 P4 新 sink／schema 整合仍缺；不是只剩 console 執行。 |
 
 最新追加：項目 5 的同帳本 demand 與 retirement fence 已提交為 `1072786`／
-`a48925a`；native scope 和正向 release 仍未提供。項目 6 的 P6 矩陣編排及 raw
+`a48925a`；native scope source 現已通過 303-test 整合，正向 daily release
+與 actual provider 仍未提供。項目 6 的 P6 矩陣編排及 raw
 reducer 已提交為 `ff6f31b`，S3 原始 action cutpoints／三個實際故障 driver／
 14×10 記錄器為 `7307055`；真正 native provider、部分故障 driver、A0 等價性及
 140 次完整實驗 orchestration 尚缺。[原始成員的 bounded memory 查詢](P4-MEMBER-MEMORY.md)
@@ -115,9 +123,10 @@ C:\Python313\python.exe -m unittest tests.test_adaptive_daily_retirement_fence t
 ```
 
 測試依賴受保護的 dirty baseline 及相鄰未提交 retirement 整合；不是乾淨 clone
-或 native gate 的證據。Demand 尚未提供 native scope／admitted release；actual
-creation registry、日常 grant 同步／writer exclusion、canonical runner imports、
-A0 source equivalence 與 native cleanup bridge 仍待整合。退場之後的明確 fresh-generation
+或 native gate 的證據。後續 original native scope／grant 同步／writer exclusion
+及 wrapper source bootstrap 已有 source 與 303-test 證據；Demand 的 admitted
+release、actual provider 的 canonical fixture module 接線、A0 source equivalence
+與完整 native cleanup bridge 仍待整合。退場之後的明確 fresh-generation
 restart 仍是 source 缺口；不能把關閉 keeper 說成恢復 admission-only。
 
 Memory／helper／P4／S3 合跑 459 tests（18.746 秒），458 通過，唯一 error 是 P4

@@ -214,6 +214,90 @@ class NativeLauncherTests(unittest.TestCase):
         self.assertNotIn(("CloseHandle", PROCESS_HANDLE), self.kernel.calls)
         self.assertEqual(len(self.calls("CreateProcessW")), 1)
 
+    def test_deadline_rejects_duck_typed_authority_before_native_acquisition(self):
+        with self.assertRaisesRegex(ValueError, "native_launch_deadline_invalid"):
+            self.launch(native_deadline=SimpleNamespace(require=lambda: None))
+        self.assertEqual(self.kernel.calls, [])
+        self.assertEqual(self.identity.calls, [])
+
+    def test_deadline_expiring_during_capture_preserves_positive_no_create_cleanup(self):
+        from sentinel.adaptive import pipe_windows
+        clock = SimpleNamespace(now=1000)
+        clock.tick_ms = lambda: clock.now
+        deadline = pipe_windows.NativeDeadline(clock, 1000, 100,
+                                                pipe_windows._DEADLINE_KEY)
+
+        class Capture:
+            cleanup_pending = False
+
+            def capture(self, **unused):
+                pass
+
+            def confirm_launch(self):
+                clock.now = 1100
+
+        with self.assertRaises(pipe_windows.NativePipeError) as caught:
+            self.launch(native_deadline=deadline, capture_factory=Capture)
+        self.assert_no_create()
+        owner = caught.exception.native_launch_owner
+        self.assertTrue(owner.creation_definitely_absent)
+        self.assertEqual(owner._creation_outcome, "not_attempted")
+        self.assertEqual(self.calls("CloseHandle"), [("CloseHandle", handle) for handle in STDIO_COPIES])
+        self.assertEqual(len(self.calls("DeleteProcThreadAttributeList")), 1)
+        owner.close()
+        self.assertTrue(owner._closed)
+
+    def test_current_native_deadline_keeps_single_original_create(self):
+        from sentinel.adaptive import pipe_windows
+        clock = SimpleNamespace(tick_ms=lambda: 1000)
+        deadline = pipe_windows.NativeDeadline(clock, 1000, 100,
+                                                pipe_windows._DEADLINE_KEY)
+        owner = self.launch(native_deadline=deadline)
+        self.assertEqual(len(self.calls("CreateProcessW")), 1)
+        self.assertFalse(owner.creation_definitely_absent)
+        owner.close()
+
+    def test_invalid_scope_deadline_refuses_before_native_acquisition(self):
+        for value in (True, 0, -1, float("inf"), float("nan"), "100"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "native_scope_deadline_invalid"):
+                self.launch(scope_deadline_monotonic=value)
+        self.assertEqual(self.kernel.calls, [])
+
+    def test_original_scope_expiry_during_capture_is_not_extended_by_rpc_deadline(self):
+        from sentinel.adaptive import pipe_windows
+        clock = SimpleNamespace(now=100.0, tick_ms=lambda: 1000)
+        rpc = pipe_windows.NativeDeadline(clock, 1000, 5000, pipe_windows._DEADLINE_KEY)
+
+        class Capture:
+            cleanup_pending = False
+
+            def capture(self, **unused):
+                pass
+
+            def confirm_launch(self):
+                clock.now = 101.0
+
+        with patch.object(native.time, "monotonic", side_effect=lambda: clock.now):
+            with self.assertRaisesRegex(native.NativeLaunchError, "native_scope_deadline_expired") as caught:
+                self.launch(native_deadline=rpc, scope_deadline_monotonic=101.0, capture_factory=Capture)
+        self.assertGreater(rpc.require(), 0)
+        self.assert_no_create()
+        owner = caught.exception.native_launch_owner
+        self.assertTrue(owner.creation_definitely_absent)
+        self.assertEqual(owner._creation_outcome, "not_attempted")
+        self.assertEqual(self.calls("CloseHandle"), [("CloseHandle", handle) for handle in STDIO_COPIES])
+        owner.close()
+        self.assertTrue(owner._closed)
+
+    def test_both_original_deadlines_current_allow_exactly_one_create(self):
+        from sentinel.adaptive import pipe_windows
+        rpc = pipe_windows.NativeDeadline(SimpleNamespace(tick_ms=lambda: 1000),
+                                         1000, 5000, pipe_windows._DEADLINE_KEY)
+        with patch.object(native.time, "monotonic", return_value=100.0):
+            owner = self.launch(native_deadline=rpc, scope_deadline_monotonic=101.0)
+        self.assertEqual(len(self.calls("CreateProcessW")), 1)
+        owner.close()
+
     def test_single_create_uses_exact_command_job_and_only_duplicated_stdio(self):
         process = self.launch()
         self.assertEqual(self.calls("CreateProcessW"), [

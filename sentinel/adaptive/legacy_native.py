@@ -38,6 +38,7 @@ from uuid import UUID
 
 from .contracts import IdentityStatus, ProcessIdentity
 from .identity import IdentityUnavailable, VerifiedProcess, retry_identity_cleanup
+from .native_job import JobAccess, NativeJob
 from . import windows as _security
 
 
@@ -55,6 +56,7 @@ _PRIORITIES = {"Idle": 0x40, "BelowNormal": 0x4000, "Normal": 0x20,
                "AboveNormal": 0x8000, "High": 0x80, "RealTime": 0x100}
 _OPERATIONS = frozenset(("priority", "io_priority", "trim"))
 _JOB_NAME = re.compile(r"Local\\ResourceSentinel\.Job\.([0-9a-f-]{36})\.([0-9a-f]{32})\Z")
+_EXPERIMENT_JOB_NAME = re.compile(r"Local\\ResourceSentinel\.Test\.Job\.([0-9a-f]{32})\Z")
 
 
 class NativeLegacyError(RuntimeError):
@@ -191,6 +193,10 @@ class NativeLegacyJob:
 
     @classmethod
     def open(cls, name, logon_id):
+        if type(name) is str and _EXPERIMENT_JOB_NAME.fullmatch(name):
+            # Only the fresh daily experiment registry enrolls this namespace.
+            # This opener contributes query custody, never registration/launch.
+            return _NativeExperimentLegacyJob.open(name, logon_id)
         match = _JOB_NAME.fullmatch(name) if isinstance(name, str) else None
         if match is None:
             raise ValueError("legacy_registered_job_name_required")
@@ -243,6 +249,54 @@ class NativeLegacyJob:
                 raise
             _retain(primary, self)
             primary.add_note("legacy_job_cleanup_failed")
+
+
+class _NativeExperimentLegacyJob(NativeLegacyJob):
+    """Independently owned QUERY handle for a registered original test Job.
+
+    Canonical NativeJob owns verification and uncertain-close quarantine. This
+    adapter never adopts, duplicates by assignment, or closes a guardian handle.
+    """
+    def __init__(self, native):
+        self._native = native
+        self.name, self.logon_id = native.name, native.logon_sid
+        self._lock = threading.RLock()
+        self._closing = False
+
+    @classmethod
+    def open(cls, name, logon_id):
+        match = _EXPERIMENT_JOB_NAME.fullmatch(name) if type(name) is str else None
+        if match is None:
+            raise ValueError("legacy_registered_test_job_name_required")
+        _validate_logon(logon_id)
+        # NativeJob.open verifies owner, exact protected DACL, namespace/nonce,
+        # and noninheritance before returning its retained query-only owner.
+        native = NativeJob.open(name, match.group(1), logon_id, access=JobAccess.QUERY)
+        try:
+            return cls(native)
+        except BaseException as error:
+            # A failed adapter allocation must retain the new native owner.
+            owners = getattr(error, "_native_job_cleanup", ())
+            if not any(owner is native for owner in owners):
+                error._native_job_cleanup = (*owners, native)
+            error.add_note("legacy_job_initialization_cleanup_failed")
+            raise
+
+    @contextmanager
+    def _borrow(self, logon_id):
+        with self._lock, self._native._lock:
+            if self._closing or self.logon_id != logon_id:
+                raise NativeLegacyError("legacy_job_unavailable")
+            yield self._native.handle
+
+    def close(self):
+        with self._lock:
+            self._closing = True
+            try:
+                self._native.close()
+            except BaseException as error:
+                _retain(error, self)
+                raise
 
 
 class NativeLegacyProcess:

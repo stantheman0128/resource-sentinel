@@ -180,6 +180,7 @@ def unregister_dead_infrastructure_locked(store, role, process):
 
 
 def _registry_locked(store, guard, deadline, clock):
+    from .experiment_exclusion import ExperimentExclusionError, read_locked
     # No native query, second database or wait while this read transaction lives.
     with store._connection() as conn:
         # A lifecycle connection may permit pending-install nonce cleanup;
@@ -208,6 +209,10 @@ def _registry_locked(store, guard, deadline, clock):
         infrastructure = conn.execute("""SELECT role,pid,substr(created_filetime_100ns,1,21) AS birth,
             substr(logon_id,1,129) AS logon_id,schema_version
             FROM adaptive_infrastructure LIMIT ?""", (MAX_INFRASTRUCTURE + 1,)).fetchall()
+        try:
+            experiment = read_locked(conn, policy=store._policy, guard=guard)
+        except ExperimentExclusionError as error:
+            raise LegacyMutationError("legacy_experiment_scope_unverified") from error
     if len(rows) > MAX_CANDIDATES or len(infrastructure) > MAX_INFRASTRUCTURE:
         raise LegacyMutationError("legacy_registry_too_large")
     identities, jobs = set(), []
@@ -234,6 +239,10 @@ def _registry_locked(store, guard, deadline, clock):
             raise LegacyMutationError("legacy_infrastructure_registry_invalid")
         identities.add(ProcessIdentity.from_dict({"pid": row["pid"],
             "created_filetime_100ns": row["birth"], "logon_id": row["logon_id"]}))
+    identities.update(experiment.identities)
+    jobs.extend(experiment.job_names)
+    if len(jobs) > 10 or len(set(jobs)) != len(jobs):
+        raise LegacyMutationError("legacy_job_scope_unknown")
     return runtime["registry_revision"], identities, jobs
 
 

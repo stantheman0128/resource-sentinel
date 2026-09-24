@@ -213,6 +213,8 @@ def validate_schema_locked(conn):
         "OR (type='trigger' AND tbl_name IN (" + ",".join("?" for _ in TABLES) + ")) LIMIT 65",
         (*names, _PREFIX + "*", *TABLES)).fetchall()
     if not found:
+        if experiment_host_backing.validate_schema_locked(conn):
+            _fail("backing_without_scope")
         return False
     expected = {name: ("table", _sql(statement)) for name, statement in SCHEMA.items()}
     expected.update({name: ("trigger", _sql(statement)) for name, statement in GUARDS.items()})
@@ -319,15 +321,17 @@ class JobBinding:
 
 class RegisteredHostScope:
     """Exact original publication custody only; no native/readiness authority."""
-    def __init__(self, demand, spec, row, *, _token=None):
+    def __init__(self, demand, spec, row, *, preparation=None, _token=None):
         if _token is not _CREATE:
             _fail("original_scope_required")
         self.demand, self.spec = demand, spec
+        self.preparation = preparation
         self._binding = _canonical(row)
-        self._immutable = (demand, spec, self._binding)
+        self._immutable = (demand, spec, self._binding, preparation)
         self._claims = {}
         self._actors = {}
         self._jobs = {}
+        self._backings = {}
 
     def _original(self):
         if (type(self.demand) is not experiment_demand.DailyExperimentDemand or
@@ -338,7 +342,21 @@ class RegisteredHostScope:
         if (type(self.spec) is not HostScopeSpec or self.demand is not self._immutable[0] or
                 self.spec is not self._immutable[1] or self._binding != self._immutable[2]):
             _fail("original_scope_changed")
+        if self.preparation is not self._immutable[3]:
+            _fail("original_preparation_changed")
+        _assert_preparation(self.demand, self.spec, self.preparation, self)
         return _decode(self._binding)
+
+
+def _assert_preparation(demand, spec, preparation, registered=None):
+    if preparation is None:
+        if demand._native_preparation is not None:
+            _fail("original_preparation_changed")
+        return
+    kind = experiment_host_scope.ProductionExperimentScope
+    if type(preparation) is not kind or demand._native_preparation is not preparation:
+        _fail("original_preparation_required")
+    kind._assert_ledger_original(preparation, demand, spec, registered)
 
 
 @dataclass(frozen=True)
@@ -353,6 +371,7 @@ class HostExclusionInventory:
     host_rows: int = 0
     host_bytes_used: int = 0
     prior_exclusion: experiment_exclusion.ExclusionInventory | None = None
+    admission_backings: tuple[experiment_host_backing.BackingObservation, ...] = ()
 
 
 class _Budget:
@@ -472,13 +491,17 @@ def _daily_binding(conn, scope, history, guard, *, restrictive=False):
     return metadata
 
 
-def _combined_jobs(conn, history, managed, query):
+def _combined_jobs(conn, history, managed, query, backings=()):
     old_names = []
     for raw in history.exclusions_json:
         row = _decode(raw)
         if row["phase"] != "CLOSED":
             old_names.append(row["job_name"])
-    _combined_jobs_locked(conn, tuple(old_names) + tuple(managed))
+    # A pending partition already occupies an enrolled slot. These count-only
+    # labels are never returned as Job names or passed to native operations.
+    pending = tuple("pending-partition:" + row.binding.execution_id for row in backings
+                    if not any(".Job." + row.binding.execution_id + "." in name for name in managed))
+    _combined_jobs_locked(conn, tuple(old_names) + tuple(managed) + pending)
     if len(query) > MAX_QUERY_JOBS or len(set((*old_names, *managed, *query))) != len(old_names) + len(managed) + len(query):
         _fail("job_limit_or_duplicate")
 
@@ -547,11 +570,13 @@ def _inventory(conn, policy, guard):
                 if spec.suite != "P4" or guardian.role != "query_owner":
                     _fail("query_scope_invalid")
                 query.append(job.job_name)
-    _combined_jobs(conn, history, managed, query)
+    backings = experiment_host_backing.read_for_inventory_locked(conn, tables=tables,
+        revision=runtime["registry_revision"], budget=budget)
+    _combined_jobs(conn, history, managed, query, backings)
     prior = experiment_exclusion._inventory_from_history_locked(conn, guard, history)
     return HostExclusionInventory(frozenset(identities), tuple(managed), tuple(query), budget.rows,
         budget.bytes, len(scopes), tuple(_canonical(row) for row in scopes),
-        budget.rows - start_rows, budget.bytes - start_bytes, prior), history, tables
+        budget.rows - start_rows, budget.bytes - start_bytes, prior, backings), history, tables
 
 
 def read_locked(conn, *, policy, guard):
@@ -646,19 +671,19 @@ def _insert(conn, table, row, runtime, *, scope, publication, policy, guard):
         _fail("revision_changed")
 
 
-def declare_scope_locked(conn, *, demand, spec, policy, guard):
+def declare_scope_locked(conn, *, demand, spec, policy, guard, preparation=None):
     """Retain one original SQL owner; caller retains it even across lost ACKs."""
     runtime = _held(conn, policy, guard)
     if type(demand) is not experiment_demand.DailyExperimentDemand or type(spec) is not HostScopeSpec:
         _fail("original_demand_required")
     demand._static_original()
     demand._assert_unused_claim()
-    if (demand.declaration.suite != spec.suite or demand._native_preparation is not None or
-            demand._native_preparation_sealed or demand._policy_original != guard.binding or
+    if (demand.declaration.suite != spec.suite or demand._policy_original != guard.binding or
             Path(policy.store.db_path) != demand.ledger_path or
             Path(spec.isolated_ledger_path).parent != demand.directory or
             spec.isolated_ledger_identity == demand.ledger_identity):
         _fail("original_demand_changed")
+    _assert_preparation(demand, spec, preparation, _ORIGINALS.get(demand.declaration.experiment_id))
     present = validate_schema_locked(conn)
     history = _history_locked(conn, _Budget())
     rows = [_decode(value) for value in history.active_json]
@@ -678,10 +703,13 @@ def declare_scope_locked(conn, *, demand, spec, policy, guard):
     _daily_binding(conn, values, history, guard)
     original = _ORIGINALS.get(metadata["experiment_id"])
     if original is None:
-        original = RegisteredHostScope(demand, spec, _new_row(values, runtime["registry_revision"]), _token=_CREATE)
+        original = RegisteredHostScope(demand, spec, _new_row(values, runtime["registry_revision"]),
+                                       preparation=preparation, _token=_CREATE)
         _ORIGINALS[metadata["experiment_id"]] = original
+        if preparation is not None:
+            experiment_host_scope.ProductionExperimentScope._retain_ledger_scope(preparation, original)
     expected = original._original()
-    if (original.demand is not demand or original.spec is not spec or
+    if (original.demand is not demand or original.spec is not spec or original.preparation is not preparation or
             {key: expected[key] for key in values} != values):
         _fail("original_scope_changed")
     conn.execute("SAVEPOINT experiment_host_declaration")
@@ -694,6 +722,8 @@ def declare_scope_locked(conn, *, demand, spec, policy, guard):
             if tables[SCOPES_TABLE] != [expected]:
                 _fail("scope_occupied")
         else:
+            if demand._native_preparation_sealed:
+                _fail("no_new_work")
             _daily_binding(conn, values, history, guard, restrictive=True)
             if expected["registered_revision"] != runtime["registry_revision"] + 1:
                 _fail("publication_revision_changed")
@@ -716,8 +746,6 @@ def _publication(conn, scope, policy, guard):
     _, history, tables = _inventory(conn, policy, guard)
     if history is None or tables[SCOPES_TABLE] != [expected]:
         _fail("original_scope_changed")
-    if scope.demand._native_preparation_sealed or scope.demand._native_preparation is not None:
-        _fail("original_demand_changed")
     _daily_binding(conn, expected, history, guard)
     return expected, runtime, tables, history
 
@@ -738,6 +766,8 @@ def _publish(conn, scope, table, key, values, originals, original, policy, guard
     # A committed exact original can reconcile after HOLD/expiry/freeze without
     # claiming fresh capacity. Only a missing publication enters the new-work
     # gate; persisted rows and original object custody were checked above.
+    if scope.demand._native_preparation_sealed:
+        _fail("no_new_work")
     _daily_binding(conn, expected, history, guard, restrictive=True)
     if saved[1]["registered_revision"] != runtime["registry_revision"] + 1:
         _fail("publication_revision_changed")
@@ -758,9 +788,53 @@ def _publish(conn, scope, table, key, values, originals, original, policy, guard
 def reserve_member_locked(conn, *, scope, claim, policy, guard):
     if type(claim) is not MemberClaim or type(scope) is not RegisteredHostScope:
         _fail("original_member_required")
+    if scope.preparation is not None:
+        scope._original()
+        if not any(item is claim for item in scope.preparation.plan.members):
+            _fail("declared_original_member_required")
     values = dict(member_id=claim.member_id, scope_id=scope.spec.scope_id, kind=claim.kind,
                   role=claim.role, demand_json=_canonical(claim.requested.to_dict()))
     return _publish(conn, scope, MEMBERS_TABLE, claim.member_id, values, scope._claims, claim, policy, guard)
+
+
+@dataclass(frozen=True)
+class MemberCreationObservation:
+    """Same-transaction lease observation, not native custody or a permit."""
+    member_id: str
+    registered_revision: int
+    daily_expires_at: float
+
+
+def validate_member_creation_locked(conn, *, scope, claim, policy, guard):
+    """Recheck new creation separately from readonly original member replay.
+
+    The native owner must retain its own original creation operation and check
+    its expiry/readiness at the final native boundary after this SQL closes.
+    No claim, allocation, registry revision or publication is changed here.
+    """
+    if type(scope) is not RegisteredHostScope or type(claim) is not MemberClaim:
+        _fail("original_member_required")
+    expected, _, tables, history = _publication(conn, scope, policy, guard)
+    saved = scope._claims.get(claim.member_id)
+    values = dict(member_id=claim.member_id, scope_id=scope.spec.scope_id, kind=claim.kind,
+                  role=claim.role, demand_json=_canonical(claim.requested.to_dict()))
+    if (saved is None or saved[0] is not claim or
+            any(saved[1][key] != value for key, value in values.items()) or
+            [row for row in tables[MEMBERS_TABLE] if row["member_id"] == claim.member_id] != [saved[1]]):
+        _fail("original_member_required")
+    if scope.preparation is not None and not any(item is claim for item in scope.preparation.plan.members):
+        _fail("declared_original_member_required")
+    if any(row["member_id"] == claim.member_id for table in (ACTORS_TABLE, JOBS_TABLE) for row in tables[table]):
+        _fail("member_already_published")
+    if scope.demand._native_preparation_sealed:
+        _fail("no_new_work")
+    _daily_binding(conn, expected, history, guard, restrictive=True)
+    allocations = conn.execute("SELECT expires_at FROM reservations WHERE id=? AND execution_id=? LIMIT 2",
+        (expected["reservation_id"], expected["daily_execution_id"])).fetchall()
+    if (len(allocations) != 1 or type(allocations[0][0]) not in (float, int) or
+            not math.isfinite(allocations[0][0]) or allocations[0][0] <= 0):
+        _fail("daily_allocation_missing")
+    return MemberCreationObservation(claim.member_id, saved[1]["registered_revision"], float(allocations[0][0]))
 
 
 def publish_actor_locked(conn, *, scope, member_id, actor, policy, guard):
@@ -777,6 +851,23 @@ def publish_job_locked(conn, *, scope, binding, policy, guard):
     """Publish after retained native proof and before launch; no permit minted."""
     if type(scope) is not RegisteredHostScope or type(binding) is not JobBinding:
         _fail("original_job_required")
+    if scope.preparation is not None and binding.kind == "managed":
+        backing = scope._backings.get(binding.member_id)
+        if type(backing) is not experiment_host_backing.ParentAdmissionBacking:
+            _fail("admission_backing_required")
+        backing._original()
+        if (binding.wrapper_member_id != backing.wrapper_member_id or
+                binding.isolated_execution_id != backing.binding.execution_id or
+                binding.isolated_reservation_id != backing.binding.reservation_id):
+            _fail("admission_backing_changed")
+        experiment_host_backing.validate_backing_locked(conn, scope_id=scope.spec.scope_id,
+            member_id=binding.member_id, wrapper_member_id=binding.wrapper_member_id,
+            binding=backing.binding, policy=policy, guard=guard)
     values = {key: getattr(binding, key) for key in JobBinding.__dataclass_fields__}
     values["scope_id"] = scope.spec.scope_id
     return _publish(conn, scope, JOBS_TABLE, binding.member_id, values, scope._jobs, binding, policy, guard)
+
+
+# Load fixed collaborators before any *_locked function can enter SQL. These
+# modules may refer back to this module in methods, never during construction.
+from . import experiment_host_scope, experiment_host_backing

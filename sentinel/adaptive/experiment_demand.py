@@ -376,10 +376,12 @@ class DailyExperimentDemand:
     def _register_native_preparation(self, scope):
         """Called only by the concrete scope factory, before its first acquisition."""
         from .experiment_scope import ExperimentNativeScope, _OWNERS
+        from .experiment_host_scope import is_original_preparation
         with self._lock:
             self._static_original()  # Pure original-object checks; no native query.
-            if (type(scope) is not ExperimentNativeScope or scope.demand is not self or
-                    _OWNERS.get(scope.scope_id) is not scope):
+            s1_original = (type(scope) is ExperimentNativeScope and scope.demand is self and
+                           _OWNERS.get(scope.scope_id) is scope)
+            if not (s1_original or is_original_preparation(scope, self)):
                 _deny("original_native_preparation_required", self)
             if self._native_preparation_sealed or self._native_preparation is not None:
                 _deny("native_preparation_already_registered", self)
@@ -389,9 +391,11 @@ class DailyExperimentDemand:
 
     def _assert_native_preparation(self, scope):
         from .experiment_scope import ExperimentNativeScope, _OWNERS
-        if (type(scope) is not ExperimentNativeScope or self._native_preparation is not scope or
+        from .experiment_host_scope import is_original_preparation
+        s1_original = (type(scope) is ExperimentNativeScope and scope.demand is self and
+                       _OWNERS.get(scope.scope_id) is scope)
+        if (not (s1_original or is_original_preparation(scope, self)) or self._native_preparation is not scope or
                 _RETAINED.get(self.declaration.experiment_id) is not self or
-                _OWNERS.get(scope.scope_id) is not scope or scope.demand is not self or
                 self._admission is not self._native_preparation_admission or
                 getattr(self._admission, "_experiment_demand", None) is not self or
                 self._native_preparation_binding != _canonical(self._completion_binding())):

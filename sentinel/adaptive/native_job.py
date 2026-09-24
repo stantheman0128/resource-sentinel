@@ -13,8 +13,8 @@ CPU hard-cap/disable writes exist. Close neither restores limits nor proves exit
 Unknown allocation/close outcomes retain custody and cannot be retried blindly.
 
 Security readback reuses windows.py's strict owner/protected single-logon-ACE
-validator. Its internal token/readback-buffer cleanup fails closed but does not
-retain every dependency allocation; this extraction does not repair that helper.
+parser. Original token/readback-buffer custody participates in cleanup; unknown
+security allocation or release cannot be replaced by a new observation.
 
 Native contracts:
 https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-createjobobjectw
@@ -71,6 +71,12 @@ class CpuState:
 class JobLimits:
     limit_flags: int
     ui_restrictions: int
+
+
+@dataclass(frozen=True)
+class JobSecurity(_security.SecurityObservation):
+    """Fresh descriptor and handle data; never launch or cleanup authority."""
+    handle_flags: int
 
 
 @dataclass(frozen=True)
@@ -173,7 +179,12 @@ def _security_call(function, *args, **kwargs):
         failure = NativeJobError("native_job_security_unavailable", error.win32_error)
         for note in getattr(error, "__notes__", ()):
             failure.add_note(note)
-        raise failure from None
+        failure._native_job_security_error = error
+        for name in ("_policy_mutex_cleanup", "_policy_mutex_cleanup_errors", "_identity_handle_cleanup",
+                     "_native_close_outcome_unknown"):
+            if hasattr(error, name):
+                setattr(failure, name, getattr(error, name))
+        raise failure from error
 
 
 class _WindowsBackend:
@@ -208,6 +219,7 @@ class _WindowsBackend:
         try:
             result = self.kernel.CloseHandle(handle)
         except BaseException as error:
+            error._known_native_close_failed = False
             error._native_close_outcome_unknown = True
             raise
         if not result:
@@ -219,6 +231,7 @@ class _WindowsBackend:
         try:
             result = self.kernel.LocalFree(pointer)
         except BaseException as error:
+            error._known_native_close_failed = False
             error._native_close_outcome_unknown = True
             raise
         if result:
@@ -264,6 +277,8 @@ class NativeJob:
         self._descriptor = _Resource("descriptor")
         self._resources = (self._descriptor, self._creation, self._job)
         self._uncertain_outputs = []
+        self._security_cleanup_error = None
+        self._security_cleanup_owners = ()
 
     @classmethod
     def create(cls, name: str, nonce: str, logon_id: str, *,
@@ -300,7 +315,7 @@ class NativeJob:
 
     def _create(self, *, native_deadline=None):
         k, a = self._backend.kernel, self._backend.advapi
-        owner_sid = _security_call(self._backend.security.current_owner_sid)
+        owner_sid = self._security_operation(self._backend.security.current_owner_sid)
         # The helper validates real owner SIDs; injected fixtures must do so too.
         if type(owner_sid) is not str or _security._SID_TEXT.fullmatch(owner_sid) is None:
             raise NativeJobError("native_job_owner_sid_invalid")
@@ -359,14 +374,64 @@ class NativeJob:
 
     def _verify(self, handle, *, owner_sid=None):
         if owner_sid is None:
-            owner_sid = _security_call(self._backend.security.current_owner_sid)
-        _security_call(self._backend.security.verify_security, handle,
-                       self.logon_sid, owner_sid, access_mask=_DACL_ACCESS)
+            owner_sid = self._security_operation(self._backend.security.current_owner_sid)
+        observed = self._security_operation(self._backend.security.verify_security, handle,
+            self.logon_sid, owner_sid, access_mask=_DACL_ACCESS)
         flags = _DWORD()
         _check(self._backend.kernel.GetHandleInformation(handle, C.byref(flags)),
                "native_job_handle_information_failed")
         if flags.value & 1:
             raise NativeJobError("native_job_handle_inheritable")
+        return observed, int(flags.value), owner_sid
+
+    def _security_dependencies_closed(self):
+        return all(type(owner) is _security._RetainedNative and owner.closed
+                   for owner in self._security_cleanup_owners)
+
+    def _security_operation(self, function, *args, **kwargs):
+        if not self._security_dependencies_closed():
+            error = NativeJobError("native_job_security_cleanup_unverified")
+            error._native_job_security_error = self._security_cleanup_error
+            _retain(error, self)
+            raise error from self._security_cleanup_error
+        try:
+            return _security_call(function, *args, **kwargs)
+        except BaseException as error:
+            owners = _security.retained_owners(error)
+            if owners:
+                self._security_cleanup_error = error
+                self._security_cleanup_owners = tuple(owners)
+                _retain(error, self)
+            raise
+
+    def _settle_security_attachments(self):
+        """Remove only settled original pending entries, preserving history."""
+        pending, seen = [self._security_cleanup_error], set()
+        while pending and len(seen) < 32:
+            error = pending.pop()
+            if not isinstance(error, BaseException) or id(error) in seen:
+                continue
+            seen.add(id(error))
+            owners = getattr(error, "_policy_mutex_cleanup", ())
+            if type(owners) is tuple and owners:
+                remaining = tuple(owner for owner in owners if not any(
+                    owner is original and type(original) is _security._RetainedNative and original.closed
+                    for original in self._security_cleanup_owners))
+                if len(remaining) != len(owners):
+                    if remaining:
+                        error._policy_mutex_cleanup = remaining
+                    else:
+                        del error._policy_mutex_cleanup
+            jobs = getattr(error, "_native_job_cleanup", ())
+            if type(jobs) is tuple and any(owner is self for owner in jobs) and self.closed:
+                remaining = tuple(owner for owner in jobs if owner is not self)
+                if remaining:
+                    error._native_job_cleanup = remaining
+                else:
+                    del error._native_job_cleanup
+            pending.extend(getattr(error, name, None) for name in (
+                "_native_job_security_error", "_native_job_cleanup_error", "__cause__", "__context__"))
+            pending.extend(getattr(error, "_policy_mutex_cleanup_errors", ()))
 
     @property
     def handle(self) -> int:
@@ -379,8 +444,8 @@ class NativeJob:
     def closed(self) -> bool:
         """Only handle/buffer cleanup completion, never workload termination."""
         with self._lock:
-            return not self._ready and all(resource.state in ("absent", "closed")
-                                           for resource in self._resources)
+            return (not self._ready and self._security_dependencies_closed() and
+                    all(resource.state in ("absent", "closed") for resource in self._resources))
 
     def _query(self, handle, information_class, result):
         _check(self._backend.kernel.QueryInformationJobObject(handle, information_class,
@@ -403,6 +468,25 @@ class NativeJob:
     def query_limits(self) -> JobLimits:
         with self._lock:
             return self._limits(self.handle)
+
+    def query_security(self) -> JobSecurity:
+        """Observe the same retained Job now, after positive readback cleanup."""
+        with self._lock:
+            observed, flags, expected_owner = self._verify(self.handle)
+            if type(observed) is not _security.SecurityObservation:
+                raise NativeJobError("native_job_security_observation_unavailable")
+            numbers = (observed.descriptor_control, observed.descriptor_revision, observed.acl_revision,
+                observed.ace_count, observed.ace_type, observed.ace_flags, observed.access_mask)
+            if (type(observed.owner_sid) is not str or type(observed.logon_sid) is not str or
+                    observed.owner_sid != expected_owner or observed.logon_sid != self.logon_sid or
+                    any(type(value) is not int for value in numbers) or
+                    not 0 <= observed.descriptor_control <= 0xFFFF or
+                    not 0 <= observed.descriptor_revision <= 0xFFFFFFFF or
+                    observed.descriptor_control & 0x1004 != 0x1004 or observed.descriptor_control & 0x0009 or
+                    (observed.acl_revision, observed.ace_count, observed.ace_type, observed.ace_flags,
+                     observed.access_mask) != (2, 1, 0, 0, _DACL_ACCESS)):
+                raise NativeJobError("native_job_security_observation_invalid")
+            return JobSecurity(observed.owner_sid, observed.logon_sid, *numbers, flags)
 
     def accounting(self) -> JobAccounting:
         with self._lock:
@@ -496,7 +580,8 @@ class NativeJob:
             release = self._backend.free if resource.kind == "descriptor" else self._backend.close
             release(resource.value)
         except BaseException as error:
-            if getattr(error, "_known_native_close_failed", False) is True:
+            if (getattr(error, "_known_native_close_failed", False) is True and
+                    getattr(error, "_native_close_outcome_unknown", False) is not True):
                 resource.state = "owned"
             raise
         # Tombstone first: interrupted local publication never causes double-close.
@@ -507,6 +592,15 @@ class NativeJob:
         with self._lock:
             self._ready = False
             primary = None
+            for owner in self._security_cleanup_owners:
+                try:
+                    if type(owner) is not _security._RetainedNative:
+                        raise NativeJobError("native_job_security_cleanup_unverified")
+                    owner.close()
+                except BaseException:
+                    # Preserve the original graph; neither a new diagnostic nor
+                    # a positively closed Job handle can settle this dependency.
+                    primary = self._security_cleanup_error
             for resource in self._resources:
                 try:
                     self._release(resource)
@@ -515,6 +609,7 @@ class NativeJob:
                         primary = error
                     else:
                         primary.add_note("native_job_additional_cleanup_unverified")
+            self._settle_security_attachments()
             if primary is not None:
                 _retain(primary, self)
                 raise primary

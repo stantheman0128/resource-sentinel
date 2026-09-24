@@ -32,7 +32,7 @@ from .native_job import CpuState, JobAccess, NativeJob
 from .policy import PolicyCoordinator
 from .policy import PolicyBusy
 from .store import LifecycleStore
-from .windows import NativePolicyMutex, NativePolicyMutexError, unresolved_construction
+from .windows import NativePolicyMutex, NativePolicyMutexError, _RetainedNative, unresolved_construction
 
 
 _NEW = object()
@@ -267,6 +267,7 @@ class ExperimentNativeScope:
                 raise
             owner._original_mutex = owner.mutex
             owner._preparation_acquisitions["mutex"] = "returned"
+            native_failure = None
             with owner._scope(daily=True):
                 with owner.daily_store._transaction() as conn:
                     owner._coverage_locked(conn, restrictive=True)
@@ -279,36 +280,45 @@ class ExperimentNativeScope:
                     _fail("control_deadline_expired", owner)
                 owner._create_attempted = True
                 owner._preparation_acquisitions["job"] = "entered"
-                owner.job = NativeJob.create(owner.job_name, creation_nonce,
-                    owner.guardian.identity.logon_id, access=JobAccess.OWNER,
-                    native_deadline=native_deadline)
-                owner._original_job = owner.job
-                owner._preparation_acquisitions["job"] = "returned"
-                owner._verify_job(empty=True)
-                native_deadline = owner._ready()
-                if (time.monotonic() >= owner.deadline or time.time() >= owner._restriction_lease_deadline):
-                    _fail("control_deadline_expired", owner)
-                wrapper = owner.launch.create_inert(native_deadline=native_deadline)
-                if wrapper.identity == owner.guardian.identity:
-                    _fail("distinct_wrapper_required", owner)
-                with owner.store._transaction() as conn:
-                    owner.journal.initialize_locked(conn, owner._journal_binding(wrapper.identity))
-                owner.exclusion_binding = experiment_exclusion.ExperimentExclusionBinding(
-                    experiment_id=demand.declaration.experiment_id,
-                    daily_execution_id=demand._snapshot.execution_id,
-                    reservation_id=owner.reservation_id,
-                    source_generation=demand._prepared[0]["generation"],
-                    scope_execution_id=scope_id, isolated_ledger_path=str(owner.ledger_path),
-                    isolated_ledger_identity=owner.isolated_identity,
-                    isolated_policy_instance_id=owner._guards["isolated"].binding.instance_id,
-                    job_name=owner.job_name, creation_nonce=creation_nonce,
-                    logon_id=owner.guardian.identity.logon_id,
-                    guardian_identity=owner.guardian.identity, wrapper_identity=wrapper.identity)
-                with owner.daily_store._transaction() as conn:
-                    owner._coverage_locked(conn, restrictive=True)
-                    experiment_exclusion.register_locked(conn, owner.exclusion_binding,
-                        policy=owner._daily_policy, guard=owner._guards["daily"])
-                owner._registered = True
+                try:
+                    owner.job = NativeJob.create(owner.job_name, creation_nonce,
+                        owner.guardian.identity.logon_id, access=JobAccess.OWNER,
+                        native_deadline=native_deadline)
+                except BaseException as error:
+                    # Retain actual native custody immediately. Its historical
+                    # cleanup notes must not poison independent readiness whose
+                    # own original contexts can still exit positively.
+                    native_failure = owner._retain(error)
+                if native_failure is None:
+                    owner._original_job = owner.job
+                    owner._preparation_acquisitions["job"] = "returned"
+                    owner._verify_job(empty=True)
+                    native_deadline = owner._ready()
+                    if (time.monotonic() >= owner.deadline or time.time() >= owner._restriction_lease_deadline):
+                        _fail("control_deadline_expired", owner)
+                    wrapper = owner.launch.create_inert(native_deadline=native_deadline)
+                    if wrapper.identity == owner.guardian.identity:
+                        _fail("distinct_wrapper_required", owner)
+                    with owner.store._transaction() as conn:
+                        owner.journal.initialize_locked(conn, owner._journal_binding(wrapper.identity))
+                    owner.exclusion_binding = experiment_exclusion.ExperimentExclusionBinding(
+                        experiment_id=demand.declaration.experiment_id,
+                        daily_execution_id=demand._snapshot.execution_id,
+                        reservation_id=owner.reservation_id,
+                        source_generation=demand._prepared[0]["generation"],
+                        scope_execution_id=scope_id, isolated_ledger_path=str(owner.ledger_path),
+                        isolated_ledger_identity=owner.isolated_identity,
+                        isolated_policy_instance_id=owner._guards["isolated"].binding.instance_id,
+                        job_name=owner.job_name, creation_nonce=creation_nonce,
+                        logon_id=owner.guardian.identity.logon_id,
+                        guardian_identity=owner.guardian.identity, wrapper_identity=wrapper.identity)
+                    with owner.daily_store._transaction() as conn:
+                        owner._coverage_locked(conn, restrictive=True)
+                        experiment_exclusion.register_locked(conn, owner.exclusion_binding,
+                            policy=owner._daily_policy, guard=owner._guards["daily"])
+                    owner._registered = True
+            if native_failure is not None:
+                raise native_failure
             return owner
         except BaseException as error:
             owner._retain(error)
@@ -339,10 +349,19 @@ class ExperimentNativeScope:
             if id(current) in seen:
                 continue
             seen.add(id(current))
-            if len(seen) > 32 or any(getattr(current, name, None) for name in (
+            cleanup = getattr(current, "_policy_mutex_cleanup", ())
+            # These exact dependencies remain owned by the original failed Job
+            # factory. Its positive `closed` check, not a sticky diagnostic,
+            # decides whether their later known-failure retry has settled.
+            accounted_security = (type(cleanup) is tuple and bool(cleanup) and
+                type(self._partial_job) is NativeJob and self._partial_job_error is not None and
+                all(type(item) is _RetainedNative and
+                    any(item is original for original in self._partial_job._security_cleanup_owners)
+                    for item in cleanup))
+            if len(seen) > 32 or (cleanup and not accounted_security) or any(getattr(current, name, None) for name in (
                     "daily_readiness_scope", "_daily_readiness_scopes", "_daily_readiness_authority_cleanup",
                     "_daily_readiness_connection", "_daily_readiness_owner", "daily_readiness_current_process",
-                    "_identity_handle_cleanup", "_policy_mutex_cleanup", "_sentinel_connection_cleanup",
+                    "_identity_handle_cleanup", "_sentinel_connection_cleanup",
                     "_native_close_outcome_unknown", "_native_duplicate_outcome_unknown", "io_pending")):
                 self._preparation_pending.add("retained_acquisition_error")
             pending.extend(value for value in (getattr(current, "__cause__", None),

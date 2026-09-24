@@ -93,6 +93,7 @@ class PartialCreateBackend(native._WindowsMutexBackend):
     def __init__(self):
         self.closed, self.freed = [], []
         self.close_error = NativePolicyMutexError("policy_mutex_handle_close_failed", 6)
+        self.close_error._known_native_close_failed = True
         self.security = SimpleNamespace(
             ConvertStringSecurityDescriptorToSecurityDescriptorW=self._descriptor)
         self.kernel = SimpleNamespace(CreateMutexExW=lambda *unused: 909)
@@ -137,7 +138,9 @@ class RetainedNativeCustodyTests(unittest.TestCase):
         def release(value):
             released.append(value)
             if state["fail"]:
-                raise NativePolicyMutexError("policy_mutex_security_free_failed", 6)
+                error = NativePolicyMutexError("policy_mutex_security_free_failed", 6)
+                error._known_native_close_failed = True
+                raise error
         primary = ValueError("body failure")
         with self.assertRaises(ValueError) as caught:
             with native._owned_resource(4242, release, "policy_mutex_security_free_failed"):

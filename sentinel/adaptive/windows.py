@@ -63,6 +63,20 @@ class PolicyMutexLease:
     abandoned: bool
 
 
+@dataclass(frozen=True)
+class SecurityObservation:
+    """Parsed native data after positive cleanup; never object authority."""
+    owner_sid: str
+    logon_sid: str
+    descriptor_control: int
+    descriptor_revision: int
+    acl_revision: int
+    ace_count: int
+    ace_type: int
+    ace_flags: int
+    access_mask: int
+
+
 class _SecurityAttributes(C.Structure):
     _fields_ = [("length", _DWORD), ("descriptor", C.c_void_p), ("inherit", _BOOL)]
 
@@ -98,28 +112,57 @@ def _cleanup_note(primary, reason, cleanup):
 
 
 class _RetainedNative:
-    """Own one raw native value whose release failed, so a settle can retry.
-
-    The value is dropped only after a positive release. Nothing here claims
-    the object is unused; it exists so the failure still has a closable owner.
-    """
-    def __init__(self, release, value):
+    """Own one original value; unknown allocation/release is never repeated."""
+    def __init__(self, release, value, *, state="owned"):
         self._release, self._value = release, value
+        self._state = state
+        self._error = None
         self._lock = threading.Lock()
+
+    @property
+    def closed(self):
+        with self._lock:
+            return self._state in ("absent", "closed")
 
     def close(self):
         with self._lock:
-            if self._value is None:
+            if self._state in ("absent", "closed"):
                 return
-            self._release(self._value)
+            if self._state != "owned":
+                if self._error is not None:
+                    raise self._error
+                raise NativePolicyMutexError("policy_mutex_cleanup_outcome_unknown")
+            self._state = "close_unknown"
+            try:
+                self._release(self._value)
+            except BaseException as error:
+                self._error = error
+                if (getattr(error, "_known_native_close_failed", False) is True and
+                        getattr(error, "_native_close_outcome_unknown", False) is not True):
+                    self._state = "owned"
+                raise
+            self._state = "closed"
             self._value = None
 
 
-def _retain_native(primary, release, value, reason, cleanup):
-    """Note the failed release and keep an owner that can finish it later."""
+def _retain_original(primary, owner, reason, cleanup):
     _cleanup_note(primary, reason, cleanup)
+    if owner._error is None:
+        owner._error = cleanup
     pending = getattr(primary, "_policy_mutex_cleanup", ())
-    primary._policy_mutex_cleanup = (*pending, _RetainedNative(release, value))
+    if not any(value is owner for value in pending):
+        primary._policy_mutex_cleanup = (*pending, owner)
+    if cleanup is not primary:
+        errors = getattr(primary, "_policy_mutex_cleanup_errors", ())
+        if not any(value is cleanup for value in errors):
+            primary._policy_mutex_cleanup_errors = (*errors, cleanup)
+
+
+def _retain_native(primary, release, value, reason, cleanup):
+    """Account an already attempted release without guessing its outcome."""
+    state = "owned" if (getattr(cleanup, "_known_native_close_failed", False) is True and
+        getattr(cleanup, "_native_close_outcome_unknown", False) is not True) else "close_unknown"
+    _retain_original(primary, _RetainedNative(release, value, state=state), reason, cleanup)
 
 
 def retained_owners(error):
@@ -161,18 +204,23 @@ def unresolved_construction(error):
 
 
 @contextmanager
-def _owned_resource(value, release, reason):
+def _owned_resource(value, release, reason, *, owner=None):
     """Preserve the original failure when native resource cleanup also fails."""
+    owner = _RetainedNative(release, value) if owner is None else owner
     try:
         yield value
     except BaseException as primary:
         try:
-            release(value)
+            owner.close()
         except BaseException as cleanup:
-            _retain_native(primary, release, value, reason, cleanup)
+            _retain_original(primary, owner, reason, cleanup)
         raise
     else:
-        release(value)
+        try:
+            owner.close()
+        except BaseException as cleanup:
+            _retain_original(cleanup, owner, reason, cleanup)
+            raise
 
 
 class _WindowsMutexBackend:
@@ -199,12 +247,29 @@ class _WindowsMutexBackend:
         _bind(a, "GetSecurityDescriptorControl", _BOOL, ptr, C.POINTER(_WORD), C.POINTER(_DWORD))
 
     def close(self, handle):
-        _check(self.kernel.CloseHandle(handle), "policy_mutex_handle_close_failed")
+        try:
+            result = self.kernel.CloseHandle(handle)
+        except BaseException as error:
+            error._known_native_close_failed = False
+            error._native_close_outcome_unknown = True
+            raise
+        if not result:
+            error = NativePolicyMutexError("policy_mutex_handle_close_failed", C.get_last_error())
+            error._known_native_close_failed = True
+            raise error
 
     def free(self, pointer):
         C.set_last_error(0)
-        if self.kernel.LocalFree(pointer):
-            raise NativePolicyMutexError("policy_mutex_security_free_failed", C.get_last_error())
+        try:
+            result = self.kernel.LocalFree(pointer)
+        except BaseException as error:
+            error._known_native_close_failed = False
+            error._native_close_outcome_unknown = True
+            raise
+        if result:
+            error = NativePolicyMutexError("policy_mutex_security_free_failed", C.get_last_error())
+            error._known_native_close_failed = True
+            raise error
 
     def _sid_text(self, pointer, start, end):
         if not pointer or not start <= pointer <= end - 8:
@@ -214,73 +279,101 @@ class _WindowsMutexBackend:
         if header[0] != 1 or header[1] > 15 or pointer + size > end:
             raise NativePolicyMutexError("policy_mutex_sid_invalid")
         text = C.c_void_p()
-        _check(self.security.ConvertSidToStringSidW(pointer, C.byref(text)), "policy_mutex_sid_unavailable")
-        with _owned_resource(text, self.free, "policy_mutex_security_free_failed"):
-            result = C.wstring_at(text.value)
-            if len(result) > 184 or _SID_TEXT.fullmatch(result) is None:
-                raise NativePolicyMutexError("policy_mutex_sid_invalid")
-            return result, size
+        retained = _RetainedNative(self.free, text, state="allocation_unknown")
+        try:
+            success = self.security.ConvertSidToStringSidW(pointer, C.byref(text))
+            retained._state = "owned" if success else "absent"
+            _check(success, "policy_mutex_sid_unavailable")
+            with _owned_resource(text, self.free, "policy_mutex_security_free_failed", owner=retained):
+                if not text.value:
+                    raise NativePolicyMutexError("policy_mutex_sid_invalid")
+                result = C.wstring_at(text.value)
+                if len(result) > 184 or _SID_TEXT.fullmatch(result) is None:
+                    raise NativePolicyMutexError("policy_mutex_sid_invalid")
+                return result, size
+        except BaseException as error:
+            if not retained.closed and not any(value is retained for value in retained_owners(error)):
+                _retain_original(error, retained, "policy_mutex_sid_acquisition_unverified", error)
+            raise
 
     def current_owner_sid(self):
         # Query the current process's primary token, never an impersonation
         # token or a PID supplied by a client. TOKEN_QUERY is sufficient.
         token = _HANDLE()
-        _check(self.security.OpenProcessToken(self.kernel.GetCurrentProcess(), 0x0008, C.byref(token)),
-               "policy_mutex_token_unavailable")
-        with _owned_resource(token, self.close, "policy_mutex_token_close_failed"):
-            required = _DWORD()
-            success = self.security.GetTokenInformation(token, 1, None, 0, C.byref(required))
-            if success or C.get_last_error() != 122:
-                raise NativePolicyMutexError("policy_mutex_owner_unavailable", C.get_last_error())
-            if not C.sizeof(_SidAndAttributes) <= required.value <= 65536:
-                raise NativePolicyMutexError("policy_mutex_owner_invalid")
-            size = required.value
-            buffer = C.create_string_buffer(size)
-            _check(self.security.GetTokenInformation(token, 1, buffer, size, C.byref(required)),
-                   "policy_mutex_owner_unavailable")
-            if not C.sizeof(_SidAndAttributes) <= required.value <= size:
-                raise NativePolicyMutexError("policy_mutex_owner_invalid")
-            owner = _SidAndAttributes.from_buffer(buffer).sid
-            start = C.addressof(buffer)
-            return self._sid_text(owner, start, start + required.value)[0]
+        retained = _RetainedNative(self.close, token, state="allocation_unknown")
+        try:
+            success = self.security.OpenProcessToken(self.kernel.GetCurrentProcess(), 0x0008, C.byref(token))
+            retained._state = "owned" if success else "absent"
+            _check(success, "policy_mutex_token_unavailable")
+            with _owned_resource(token, self.close, "policy_mutex_token_close_failed", owner=retained):
+                required = _DWORD()
+                success = self.security.GetTokenInformation(token, 1, None, 0, C.byref(required))
+                if success or C.get_last_error() != 122:
+                    raise NativePolicyMutexError("policy_mutex_owner_unavailable", C.get_last_error())
+                if not C.sizeof(_SidAndAttributes) <= required.value <= 65536:
+                    raise NativePolicyMutexError("policy_mutex_owner_invalid")
+                size = required.value
+                buffer = C.create_string_buffer(size)
+                _check(self.security.GetTokenInformation(token, 1, buffer, size, C.byref(required)),
+                       "policy_mutex_owner_unavailable")
+                if not C.sizeof(_SidAndAttributes) <= required.value <= size:
+                    raise NativePolicyMutexError("policy_mutex_owner_invalid")
+                owner = _SidAndAttributes.from_buffer(buffer).sid
+                start = C.addressof(buffer)
+                return self._sid_text(owner, start, start + required.value)[0]
+        except BaseException as error:
+            if not retained.closed and not any(value is retained for value in retained_owners(error)):
+                _retain_original(error, retained, "policy_mutex_token_acquisition_unverified", error)
+            raise
 
     def verify_security(self, handle, logon_id, owner_sid, *, access_mask=_ACCESS):
         owner, dacl, descriptor = (C.c_void_p() for _ in range(3))
+        retained = _RetainedNative(self.free, descriptor, state="allocation_unknown")
         # SE_KERNEL_OBJECT=6, OWNER_SECURITY_INFORMATION|DACL_SECURITY_INFORMATION.
-        code = self.security.GetSecurityInfo(handle, 6, 0x0001 | 0x0004,
-            C.byref(owner), None, C.byref(dacl), None, C.byref(descriptor))
-        if code:
-            raise NativePolicyMutexError("policy_mutex_security_unavailable", int(code))
-        with _owned_resource(descriptor, self.free, "policy_mutex_security_free_failed"):
-            if not descriptor.value:
-                raise NativePolicyMutexError("policy_mutex_security_invalid")
-            size = int(self.security.GetSecurityDescriptorLength(descriptor))
-            if not 20 <= size <= 65536:
-                raise NativePolicyMutexError("policy_mutex_security_invalid")
-            start, end = descriptor.value, descriptor.value + size
-            if self._sid_text(owner.value, start, end)[0] != owner_sid:
-                raise NativePolicyMutexError("policy_mutex_owner_mismatch")
-            control, revision = _WORD(), _DWORD()
-            _check(self.security.GetSecurityDescriptorControl(descriptor, C.byref(control), C.byref(revision)),
-                   "policy_mutex_security_unavailable")
-            # Require a present, protected DACL; no inherited/defaulted grant.
-            if (control.value & 0x1004 != 0x1004 or control.value & 0x0009 or
-                    not dacl.value or not start <= dacl.value <= end - C.sizeof(_Acl)):
-                raise NativePolicyMutexError("policy_mutex_dacl_mismatch")
-            acl = _Acl.from_address(dacl.value)
-            if (acl.revision != 2 or acl.reserved != 0 or acl.reserved2 != 0 or
-                    acl.ace_count != 1 or acl.size < C.sizeof(_Acl) + C.sizeof(_AceHeader) + 8 or
-                    dacl.value + acl.size > end):
-                raise NativePolicyMutexError("policy_mutex_dacl_mismatch")
-            ace_pointer = dacl.value + C.sizeof(_Acl)
-            ace = _AceHeader.from_address(ace_pointer)
-            if (ace.kind != 0 or ace.flags != 0 or ace.mask != access_mask or
-                    ace.size != acl.size - C.sizeof(_Acl)):
-                raise NativePolicyMutexError("policy_mutex_dacl_mismatch")
-            sid, sid_size = self._sid_text(ace_pointer + C.sizeof(_AceHeader),
-                                          ace_pointer + C.sizeof(_AceHeader), ace_pointer + ace.size)
-            if sid != logon_id or ace.size != C.sizeof(_AceHeader) + sid_size:
-                raise NativePolicyMutexError("policy_mutex_dacl_mismatch")
+        try:
+            code = self.security.GetSecurityInfo(handle, 6, 0x0001 | 0x0004,
+                C.byref(owner), None, C.byref(dacl), None, C.byref(descriptor))
+            retained._state = "absent" if code else "owned"
+            if code:
+                raise NativePolicyMutexError("policy_mutex_security_unavailable", int(code))
+            with _owned_resource(descriptor, self.free, "policy_mutex_security_free_failed", owner=retained):
+                if not descriptor.value:
+                    raise NativePolicyMutexError("policy_mutex_security_invalid")
+                size = int(self.security.GetSecurityDescriptorLength(descriptor))
+                if not 20 <= size <= 65536:
+                    raise NativePolicyMutexError("policy_mutex_security_invalid")
+                start, end = descriptor.value, descriptor.value + size
+                observed_owner = self._sid_text(owner.value, start, end)[0]
+                if observed_owner != owner_sid:
+                    raise NativePolicyMutexError("policy_mutex_owner_mismatch")
+                control, revision = _WORD(), _DWORD()
+                _check(self.security.GetSecurityDescriptorControl(descriptor, C.byref(control), C.byref(revision)),
+                       "policy_mutex_security_unavailable")
+                # Require a present, protected DACL; no inherited/defaulted grant.
+                if (control.value & 0x1004 != 0x1004 or control.value & 0x0009 or
+                        not dacl.value or not start <= dacl.value <= end - C.sizeof(_Acl)):
+                    raise NativePolicyMutexError("policy_mutex_dacl_mismatch")
+                acl = _Acl.from_address(dacl.value)
+                if (acl.revision != 2 or acl.reserved != 0 or acl.reserved2 != 0 or
+                        acl.ace_count != 1 or acl.size < C.sizeof(_Acl) + C.sizeof(_AceHeader) + 8 or
+                        dacl.value + acl.size > end):
+                    raise NativePolicyMutexError("policy_mutex_dacl_mismatch")
+                ace_pointer = dacl.value + C.sizeof(_Acl)
+                ace = _AceHeader.from_address(ace_pointer)
+                if (ace.kind != 0 or ace.flags != 0 or ace.mask != access_mask or
+                        ace.size != acl.size - C.sizeof(_Acl)):
+                    raise NativePolicyMutexError("policy_mutex_dacl_mismatch")
+                sid, sid_size = self._sid_text(ace_pointer + C.sizeof(_AceHeader),
+                                              ace_pointer + C.sizeof(_AceHeader), ace_pointer + ace.size)
+                if sid != logon_id or ace.size != C.sizeof(_AceHeader) + sid_size:
+                    raise NativePolicyMutexError("policy_mutex_dacl_mismatch")
+                observed = SecurityObservation(observed_owner, sid, int(control.value), int(revision.value),
+                    int(acl.revision), int(acl.ace_count), int(ace.kind), int(ace.flags), int(ace.mask))
+            return observed
+        except BaseException as error:
+            if not retained.closed and not any(value is retained for value in retained_owners(error)):
+                _retain_original(error, retained, "policy_mutex_security_acquisition_unverified", error)
+            raise
 
     def create(self, name, logon_id, owner_sid):
         descriptor = C.c_void_p()

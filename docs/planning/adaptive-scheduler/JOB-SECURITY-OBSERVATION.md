@@ -124,6 +124,26 @@ succeed. A clean parse/validation rejection with positively closed dependencies
 does not itself manufacture an outstanding resource, and grants no observation.
 Restoring via an independently retained valid principal is not changed here.
 
+### Independent readiness exit on a Job factory error
+
+An integration regression found that an already positively closed security
+dependency's historical cleanup note poisoned the unrelated daily readiness
+scope. Keep the original error and all notes. In `ExperimentNativeScope.prepare`,
+retain the original Job factory error/partial owner immediately, skip all later
+wrapper/registration work, and let the existing POLICY/Job/readiness contexts
+exit before rethrowing that native error. A genuine context-exit failure remains
+its own retained failure. Unknown Job custody still blocks native completion;
+positive readiness exit cannot discharge it. Do not relax the generic readiness
+classifier or treat note removal as cleanup proof.
+
+Pending security dependencies are accounted by the original partial Job only
+when the nonempty tuple contains exclusively its exact retained native owners.
+That Job's positive close check remains required; known-failure retries may settle
+those same owners. Extra owners, malformed tuples and other unresolved custody
+markers retain HOLD. No generic sticky-error clearing or absence inference is
+permitted. A later readiness exit failure retains both it and the original
+factory error and prevents completion even when the partial Job is closed.
+
 ## Owned patch and focused verification
 
 Worker source ownership remains only `sentinel/adaptive/windows.py`,

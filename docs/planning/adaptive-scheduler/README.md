@@ -4,6 +4,58 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
+Job security observation 與原始 dependency cleanup 已實作並驗證，契約見
+[JOB-SECURITY-OBSERVATION.md](JOB-SECURITY-OBSERVATION.md)。`NativeJob.query_security()`
+只查詢同一原始 handle，傳回实际 owner／logon SID、descriptor／ACL／ACE 及 handle
+flags；buffer／token 正面清理後才產生 typed observation。中斷 acquisition／unknown
+close 保留原始 owner，不能重做 native release；已知 FALSE 僅重試原始資源。
+Job handle 已關閉仍不能掩蓋 security dependency 未清理。
+
+Factory failure 先保管原始 partial Job，讓既有 readiness／POLICY scope 正面退出後
+才重拋；未知退出仍保留原始錯誤與容量。已由 exact partial Job 管理的 security
+owners 透過其實際 `.closed` gate 收尾，避免已知失敗稍後恢復仍被永久 pending
+marker 阻擋。額外 owner、未知結果與其他 pending marker 保持 HOLD。
+
+最終 **14 模組、339 PASS，0 failures／errors／skips，runner 39.635 秒**。
+新增 24 個 security 與 5 個 scope integration 案例；使用真實 ctypes buffer、
+隔離 SQLite／completion／release，以及明確 synthetic native／readiness fixtures。
+獨立 review 找到的 acquisition handoff、舊 exception marker 與 delayed-known-close
+問題已修正，另覆蓋額外 owner 與 readiness exit 再失敗。初測 157 tests 有 27 errors
+（26 個新 fixture handle 型別錯誤與 1 個實際 scope pending 問題）；後續兩輪各有
+1 個新 integration fixture 不完整問題，已補原始 mutex handle／persisted generation。
+先前 159 PASS 與本輪重疊，不加總。私人日誌為
+`.local-adaptive/job-security-shared-20260924-1.log`。
+
+```powershell
+$sentinelSecurityTests = @(
+    'tests.test_adaptive_job_security'
+    'tests.test_adaptive_scope_security_cleanup'
+    'tests.test_adaptive_native_job'
+    'tests.test_adaptive_policy_mutex'
+    'tests.test_adaptive_host_discovery'
+    'tests.test_adaptive_pipe_windows'
+    'tests.test_adaptive_experiment_preparation'
+    'tests.test_adaptive_experiment_scope'
+    'tests.test_adaptive_experiment_release_native'
+    'tests.test_adaptive_experiment_release'
+    'tests.test_adaptive_experiment_native_deadlines'
+    'tests.test_adaptive_experiment_probes'
+    'tests.test_adaptive_native_launcher'
+    'tests.test_adaptive_scope_wrapper_boundary'
+)
+$sentinelSecurityCommand = 'C:\Python313\python.exe -m unittest ' + ($sentinelSecurityTests -join ' ') + ' -q'
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command $sentinelSecurityCommand -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
+Windows／base Python 3.13，正常日常 admission、沒有豁免。測試依賴受保護 dirty
+baseline，commit message 揭露；不是 clean-clone full-suite 或 native gate 證據。
+Serial provider source 尚待本輪獨立驗證／提交，完整 measurement、aggregate producer
+bootstrap／v2 publication、fresh-generation restart、P4／S3／P6 仍有 source 缺口。
+Items 5/6 未完成；舊 common admission placeholder 繼續拒絕。未部署或變更日常
+config／Scheduled Task／啟動入口，adaptive off，沒有施加或需撤回的實際 Job CPU cap。
+
+### Mixed-source reader checkpoint（歷史驗證）
+
 Mixed-source build reader／v2 consumer 已完成。契約見
 [S1-SOURCE-BINDING.md](S1-SOURCE-BINDING.md)，serial custody 契約見
 [S1-SERIAL-PROVIDER.md](S1-SERIAL-PROVIDER.md)。`SourceBoundBuildSource` 分別讀取

@@ -28,7 +28,15 @@ def main(argv=None):
                         help="explicitly apply reviewed source and remain its original resident owner")
     parser.add_argument("--retire-generation-after-drain", action="store_true",
                         help="explicitly request freeze, drain and retirement; daily admission stays fenced")
+    parser.add_argument("--restart-after-retirement", action="store_true",
+                        help="request one original-owner successor after positive retirement; requires retirement and apply")
     args = parser.parse_args(argv)
+    if args.retire_generation_after_drain and not args.apply_daily_accounting_handoff:
+        parser.error("--retire-generation-after-drain requires the separately authorized apply action")
+    if args.restart_after_retirement and not (args.retire_generation_after_drain and args.apply_daily_accounting_handoff):
+        parser.error("--restart-after-retirement requires retirement and the separately authorized apply action")
+    if args.apply_daily_accounting_handoff and args.backup_directory is None:
+        parser.error("--backup-directory is required for explicit apply")
     operation = None
     try:
         assert_no_sentinel_imports()
@@ -36,17 +44,14 @@ def main(argv=None):
             candidate_root=Path(__file__).resolve().parents[1], approved_digest=args.manifest_sha256,
             approved_preparation_digest=args.preparation_sha256)
         if not args.apply_daily_accounting_handoff:
-            if args.retire_generation_after_drain:
-                parser.error("--retire-generation-after-drain requires the separately authorized apply action")
             print(json.dumps({"status": "source_review_verified", "manifest_sha256": plan.digest,
                               "files": len(plan.baseline), "runtime_mutations": 0,
                               "activation_authorized": False}, sort_keys=True))
             return 0
-        if args.backup_directory is None:
-            parser.error("--backup-directory is required for explicit apply")
         operation = SourceInstallation(plan, args.backup_directory)
         operation.apply()
-        operation.enter_daily_host(retire_after_drain=args.retire_generation_after_drain)
+        operation.enter_daily_host(retire_after_drain=args.retire_generation_after_drain,
+                                   restart_after_retirement=args.restart_after_retirement)
         operation.assert_runtime_retired()
         return 0
     except BaseException as error:

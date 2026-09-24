@@ -169,6 +169,22 @@ launch a replacement because a wait timed out. No user process is stopped.
 Clean retirement without an explicit successor request continues to leave
 daily admission fenced, as it does today.
 
+Both resident console entry points expose `--restart-after-retirement`, default
+off, requiring `--retire-generation-after-drain`. The source installer also
+requires the separately authorized `--apply-daily-accounting-handoff`; review
+mode cannot request a successor. Reject incomplete option combinations before
+loading preparation/manifest data or creating an installation/runtime owner.
+The flag requests one successor, not recursive automatic retirement/restart.
+The original installation retains its first host by object identity throughout
+that host's complete chain. Both entry points accept a normal return only when
+`chain_retirement_complete()` positively verifies that exact chain; a retired
+predecessor or a replacement host cannot authorize process exit.
+An exception while inspecting that chain, including an original successor's
+quarantine, is retained as failed exit evidence. Status reporting cannot turn
+that exception into process termination. The direct console keeps servicing
+and pacing the same original chain after an unexpected resident-loop return;
+it does not create a replacement or retry unknown native/SQL ownership.
+
 ## Verification and completion evidence
 
 Use isolated ledger/source/journal fixtures and explicit synthetic native

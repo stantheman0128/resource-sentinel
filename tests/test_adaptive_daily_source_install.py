@@ -319,6 +319,76 @@ class DailySourceInstallTests(unittest.TestCase):
             operation.enter_daily_host(retire_after_drain="yes")
         self.assertFalse(operation.runtime_started)
 
+    def test_restart_intent_refuses_before_runtime_or_source_checks(self):
+        operation = self.operation()
+        for retire, restart in ((False, True), (True, 1), (True, None), (True, "yes")):
+            with self.subTest(retire=retire, restart=restart), \
+                    patch.object(install.PreparedInstall, "assert_config_ledger", side_effect=AssertionError("input checked too late")), \
+                    self.assertRaisesRegex(install.SourceInstallRefused, "successor_intent_invalid"):
+                operation.enter_daily_host(retire_after_drain=retire, restart_after_retirement=restart)
+        self.assertFalse(operation.runtime_started)
+        self.assertIsNone(operation.host)
+
+    def test_entry_retains_original_host_and_explicit_restart_before_running(self):
+        from sentinel.adaptive import daily_activation_host as activation
+        from sentinel.adaptive import daily_generation as generation
+        # Extend only the isolated fixture source to the runtime manifest's
+        # complete required set; canonical source is never imported/replaced.
+        for root in (self.candidate, self.daily):
+            for relative in generation.REQUIRED_PATHS:
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if not target.exists():
+                    target.write_bytes(b"# isolated runtime manifest member\n")
+        self.prepare()
+        operation = self.operation()
+        operation.source_complete = operation.settled = True
+        observed = []
+        class HostObserved(BaseException):
+            pass
+        def run(host):
+            observed.append(host)
+            self.assertIs(operation.host, host)
+            self.assertIs(operation._runtime_host, host)
+            self.assertTrue(host._retire_after_drain)
+            self.assertTrue(host._restart_after_retirement)
+            raise HostObserved()
+        with patch.object(sys, "path", list(sys.path)), \
+                patch.object(operation, "_write_report"), \
+                patch.object(generation, "daily_locations", return_value=(self.daily, self.data)), \
+                patch.object(activation.DailyActivationHost, "run_forever", run), self.assertRaises(HostObserved):
+            operation.enter_daily_host(retire_after_drain=True, restart_after_retirement=True)
+        self.assertEqual(observed, [operation.host])
+        self.assertIs(type(operation.host), activation.DailyActivationHost)
+        self.assertTrue(operation.runtime_started)
+        with self.assertRaisesRegex(install.SourceInstallRefused, "runtime_already_started"):
+            operation.enter_daily_host(retire_after_drain=True, restart_after_retirement=True)
+
+    def test_completed_predecessor_with_pending_successor_cannot_allow_installer_exit(self):
+        from tests.test_adaptive_daily_successor_host import DailySuccessorHostTests
+        fixture = DailySuccessorHostTests()
+        self.addCleanup(fixture.doCleanups)
+        fixture.setUp()
+        host = fixture.predecessor_host
+        self.assertTrue(host._retirement_complete())
+        self.assertFalse(host.chain_retirement_complete())
+        operation = self.operation()
+        operation.runtime_started = operation.source_complete = operation.settled = True
+        operation.host = operation._runtime_host = host
+        with self.assertRaisesRegex(install.SourceInstallRefused, "without_retirement"):
+            operation.assert_runtime_retired()
+        self.assertIs(operation.host, host)
+
+    def test_replacement_concrete_host_is_not_installers_original_chain(self):
+        from sentinel.adaptive.daily_activation_host import DailyActivationHost
+        operation = self.operation()
+        operation.runtime_started = operation.source_complete = operation.settled = True
+        operation._runtime_host = object.__new__(DailyActivationHost)
+        operation.host = object.__new__(DailyActivationHost)
+        with patch.object(operation.host, "chain_retirement_complete", side_effect=AssertionError("replacement queried")), \
+                self.assertRaisesRegex(install.SourceInstallRefused, "without_retirement"):
+            operation.assert_runtime_retired()
+
     def test_retirement_result_requires_original_runtime_started(self):
         operation = self.operation()
         operation.host = SimpleNamespace(_retirement_complete=lambda: True)
@@ -341,6 +411,57 @@ class DailySourceInstallTests(unittest.TestCase):
         operation.release_without_source_mutation()
         self.assertTrue(operation.settled)
         self.assertTrue(self.factory.owners[0].closed)
+
+    def test_cli_incomplete_restart_intent_refuses_before_preparation(self):
+        cli_spec = importlib.util.spec_from_file_location("_daily_activate_restart_cli_tests",
+            SCRIPT.with_name("adaptive-activate.py"))
+        cli = importlib.util.module_from_spec(cli_spec)
+        with patch.dict(sys.modules, {"daily_source_install": install}):
+            cli_spec.loader.exec_module(cli)
+        base = ["--private-preparation", str(self.preparation), "--manifest-sha256", self.digest,
+                "--preparation-sha256", install._hash(self.preparation.read_bytes())]
+        cases = (["--restart-after-retirement"],
+                 ["--restart-after-retirement", "--retire-generation-after-drain"],
+                 ["--restart-after-retirement", "--apply-daily-accounting-handoff"],
+                 ["--restart-after-retirement", "--retire-generation-after-drain",
+                  "--apply-daily-accounting-handoff"])
+        for flags in cases:
+            with self.subTest(flags=flags), patch.object(cli.PreparedInstall, "load") as load, \
+                    patch.object(cli, "SourceInstallation") as create, \
+                    patch.object(sys, "stderr", unittest.mock.Mock()), self.assertRaises(SystemExit) as caught:
+                cli.main(base + flags)
+            self.assertEqual(caught.exception.code, 2)
+            load.assert_not_called()
+            create.assert_not_called()
+        self.assertFalse(self.backup.exists())
+
+    def test_cli_forwards_restart_and_requires_original_chain_completion(self):
+        cli_spec = importlib.util.spec_from_file_location("_daily_activate_restart_forward_tests",
+            SCRIPT.with_name("adaptive-activate.py"))
+        cli = importlib.util.module_from_spec(cli_spec)
+        with patch.dict(sys.modules, {"daily_source_install": install}):
+            cli_spec.loader.exec_module(cli)
+        plan = self.load()
+        operation = install.SourceInstallation(plan, self.backup)
+        argv = ["--private-preparation", str(self.preparation), "--manifest-sha256", self.digest,
+                "--preparation-sha256", install._hash(self.preparation.read_bytes()),
+                "--backup-directory", str(self.backup), "--apply-daily-accounting-handoff",
+                "--retire-generation-after-drain", "--restart-after-retirement"]
+        class CustodyObserved(BaseException):
+            pass
+        def returned():
+            operation.runtime_started = True
+        with patch.object(cli, "assert_no_sentinel_imports"), \
+                patch.object(cli.PreparedInstall, "load", return_value=plan), \
+                patch.object(cli, "SourceInstallation", return_value=operation), \
+                patch.object(operation, "apply"), \
+                patch.object(operation, "enter_daily_host", side_effect=lambda **kwargs: returned()) as enter, \
+                patch.object(cli, "remain_with_source_custody", side_effect=CustodyObserved) as keeper, \
+                patch("builtins.print"), self.assertRaises(CustodyObserved):
+            cli.main(argv)
+        enter.assert_called_once_with(retire_after_drain=True, restart_after_retirement=True)
+        keeper.assert_called_once_with(operation)
+        self.assertFalse(self.backup.exists())
 
     def _assert_cli_source_interruption_custody(self, reporting_error=None):
         cli_spec = importlib.util.spec_from_file_location("_daily_activate_cli_tests",

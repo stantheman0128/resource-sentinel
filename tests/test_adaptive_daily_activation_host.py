@@ -881,5 +881,46 @@ class DailyActivationHostTests(unittest.TestCase):
             self.supervisor.start.assert_called_once_with()
 
 
+class ActivationRestartCliTests(unittest.TestCase):
+    def test_restart_without_retirement_refuses_before_manifest_open(self):
+        argv = ["--manifest", "unopened-fixture.json", "--config-digest", DIGEST,
+                "--ledger-device", "1", "--ledger-inode", "2", "--restart-after-retirement"]
+        with patch.object(Path, "open", side_effect=AssertionError("manifest opened before option validation")), \
+                patch.object(sys, "stderr", Mock()), self.assertRaises(SystemExit) as caught:
+            activation.main(argv)
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_main_passes_intent_but_does_not_accept_an_unretired_chain(self):
+        import json
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "manifest.json"
+            path.write_text(json.dumps(MANIFEST.to_dict()), encoding="utf-8")
+            argv = ["--manifest", str(path), "--config-digest", DIGEST,
+                    "--ledger-device", "1", "--ledger-inode", "2",
+                    "--retire-generation-after-drain", "--restart-after-retirement"]
+            returned = []
+            retained = []
+            class CustodyObserved(BaseException):
+                pass
+            def run(host):
+                returned.append(host)
+                return {"clean_exit_allowed": True}  # A serialized claim supplies no authority.
+            def tick(host):
+                retained.append(host)
+                raise CustodyObserved()
+            with patch.object(generation, "daily_locations", return_value=(root, root / "data")), \
+                    patch.object(activation.DailyActivationHost, "run_forever", run), \
+                    patch.object(activation.DailyActivationHost, "_retained_tick", tick), \
+                    self.assertRaises(CustodyObserved):
+                activation.main(argv)
+            self.assertEqual(returned, retained)
+            self.assertEqual(len(retained), 1)
+            self.assertEqual(retained[0]._failure.reason, "daily_activation_unexpected_return")
+            self.assertTrue(returned[0]._retire_after_drain)
+            self.assertTrue(returned[0]._restart_after_retirement)
+            self.assertFalse(returned[0].chain_retirement_complete())
+
+
 if __name__ == "__main__":
     unittest.main()

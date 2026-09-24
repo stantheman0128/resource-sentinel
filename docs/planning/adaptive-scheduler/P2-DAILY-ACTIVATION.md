@@ -253,13 +253,30 @@ the host exit.
 
 The durable `SEALED` row establishes ledger settlement; only the original
 operation reaches in-process retirement after its own final native cleanup.
-**Daily admission remains fenced after clean exit.** This is not restored
-admission-only service. Fresh-generation restart from positive retirement is a
-separate implementation gap, so this activation command is not reusable after
-retirement. Every current experiment-demand row blocks retirement until its
-native release receipt is implemented. Native activation and retirement remain
-unverified and have not been executed against daily state. Daily adaptive mode
-stays off.
+**Daily admission remains fenced after clean exit without an explicit successor.**
+The original resident command can request one successor with both retirement
+and `--restart-after-retirement`. The installer additionally requires its
+separately authorized apply action; review mode rejects these options before
+reading preparation data. This is an original-owner transition, not permission
+to rerun a command against a SEALED row or adopt a terminated keeper.
+
+After separate source review and activation authorization, the complete command
+shape is:
+
+```powershell
+C:\Python313\python.exe scripts/adaptive-activate.py --private-preparation <private-preparation.json> --preparation-sha256 <exact-private-file-sha256> --manifest-sha256 <exact-reviewed-source-sha256> --backup-directory <new-private-backup-directory> --apply-daily-accounting-handoff --retire-generation-after-drain --restart-after-retirement
+```
+
+This remains resident after starting the successor. Retirement/restart intent
+does not recursively propagate to the new host; a later retirement requires its
+own explicit original-host request. Both console entry points and the installer
+require `chain_retirement_complete()` before normal exit, retaining the original
+first host until every successor has settled. Ctrl+C still requests drain only.
+Active or unreleased experiment demand blocks retirement; complete historical
+experiment records require their original release evidence and bounded verifier.
+See [DAILY-GENERATION-SUCCESSOR.md](DAILY-GENERATION-SUCCESSOR.md) for the complete
+transition and history contract. Native activation, restart and retirement
+remain unverified and have not been executed against daily state. Adaptive stays off.
 
 Python's official [audit-event table](https://docs.python.org/3/library/audit_events.html)
 documents the `exec` event's code-object argument.

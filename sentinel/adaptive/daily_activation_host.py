@@ -44,6 +44,7 @@ _PRELOAD = (
     "daily_retirement", "daily_successor", "daily_successor_scope",
     "daily_successor_history", "daily_successor_inventory",
     "daily_successor_epoch", "daily_successor_startup_inventory",
+    "daily_successor_registration_inventory",
 )
 _EMPTY_TABLES = ("reservations", "worker_reservations", "queue", "managed_executions")
 
@@ -521,6 +522,17 @@ class DailyActivationHost:
                 raise DailyActivationError("daily_activation_successor_host_changed", self)
             host = following
 
+    def _chain_exit_ready(self):
+        """Failed evidence keeps the original chain resident, including status."""
+        try:
+            return self.chain_retirement_complete() is True
+        except BaseException as error:
+            if isinstance(error, KeyboardInterrupt):
+                self._retain_interruption(error)
+            else:
+                self._retain_failure(error)
+            return False
+
     def _tick_successor(self):
         operation = self._original_successor()
         try:
@@ -703,7 +715,7 @@ class DailyActivationHost:
         return self.status()
 
     def status(self):
-        complete = self.chain_retirement_complete()
+        complete = self._chain_exit_ready()
         return {"event": "daily_activation_host", "phase": self._phase,
                 "generation_activation_acknowledged": self._generation_settled,
                 "readiness_listener_started": self._listener_ready.is_set(),
@@ -739,7 +751,7 @@ class DailyActivationHost:
         previous = None
         while True:
             previous = self._retained_tick(previous)
-            if self.chain_retirement_complete():
+            if self._chain_exit_ready():
                 return self.status()
 
     def _retain_interruption(self, error):
@@ -785,7 +797,11 @@ def main(argv=None):
     parser.add_argument("--ledger-inode", required=True)
     parser.add_argument("--retire-generation-after-drain", action="store_true",
         help="explicitly request freeze, supervisor drain and generation retirement after activation")
+    parser.add_argument("--restart-after-retirement", action="store_true",
+        help="request one original-owner successor after positive retirement; requires retirement")
     options = parser.parse_args(argv)
+    if options.restart_after_retirement and not options.retire_generation_after_drain:
+        parser.error("--restart-after-retirement requires --retire-generation-after-drain")
     # A manifest file is bounded public comparison data. It never substitutes
     # for canonical provenance, exact file binding, or native original owners.
     with Path(options.manifest).open("rb") as stream:
@@ -796,10 +812,20 @@ def main(argv=None):
     manifest = generation.SourceManifest.from_dict(strict_json_loads(payload))
     ledger = LedgerFileIdentity.from_dict({"st_dev": options.ledger_device, "st_ino": options.ledger_inode})
     host = DailyActivationHost(manifest, options.config_digest, ledger,
-                               retire_after_drain=options.retire_generation_after_drain)
-    result = host.run_forever()
-    if not host._retirement_complete():
-        raise DailyActivationError("daily_activation_unexpected_return", host)
+                               retire_after_drain=options.retire_generation_after_drain,
+                               restart_after_retirement=options.restart_after_retirement)
+    try:
+        host.run_forever()
+    except BaseException as error:
+        if not host._native_custody_possible and host.owner is None and not host._connections:
+            raise
+        host._retain_interruption(error)
+    if not host._chain_exit_ready():
+        host._retain_failure(DailyActivationError("daily_activation_unexpected_return", host))
+    # Even an unexpected resident-loop return cannot discharge original native
+    # custody. Continue servicing that same chain with its normal pacing.
+    while not host._chain_exit_ready():
+        host._retained_tick()
     return 0
 
 

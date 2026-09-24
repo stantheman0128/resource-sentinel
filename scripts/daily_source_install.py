@@ -271,6 +271,7 @@ class SourceInstallation:
         self.settled = False
         self.runtime_started = False
         self.source_mutation_attempted = False
+        self.host = self._runtime_host = None
 
     def apply(self):
         assert_no_sentinel_imports()
@@ -395,9 +396,14 @@ class SourceInstallation:
         # closed handles or an elapsed interval completed rollback.
         self._write_report("source_rollback_requires_reconciliation")
 
-    def enter_daily_host(self, *, retire_after_drain=False):
+    def enter_daily_host(self, *, retire_after_drain=False, restart_after_retirement=False):
         if type(retire_after_drain) is not bool:
             _reject("daily_retirement_intent_invalid")
+        if (type(restart_after_retirement) is not bool or
+                (restart_after_retirement and not retire_after_drain)):
+            _reject("daily_successor_intent_invalid")
+        if self.runtime_started or self.host is not None or self._runtime_host is not None:
+            _reject("daily_install_runtime_already_started")
         if not self.source_complete or not self.settled:
             _reject("daily_install_source_unsettled")
         assert_no_sentinel_imports()
@@ -415,11 +421,11 @@ class SourceInstallation:
         host = DailyActivationHost(SourceManifest.from_dict(self.plan.manifest),
             expected_config_digest=self.plan.config_digest,
             expected_ledger_identity=LedgerFileIdentity(*self.plan.ledger_identity),
-            retire_after_drain=retire_after_drain)
-        self.host = host
+            retire_after_drain=retire_after_drain,
+            restart_after_retirement=restart_after_retirement)
+        self.host = self._runtime_host = host
         host.run_forever()
-        if type(host) is not DailyActivationHost or host._retirement_complete() is not True:
-            _reject("daily_generation_keeper_returned_without_retirement")
+        self.assert_runtime_retired()
 
     def assert_runtime_retired(self):
         # Lazy import only after this exact operation imported the daily host.
@@ -427,7 +433,8 @@ class SourceInstallation:
         if not self.runtime_started or not self.source_complete or not self.settled:
             _reject("daily_retirement_original_host_required")
         from sentinel.adaptive.daily_activation_host import DailyActivationHost
-        if type(getattr(self, "host", None)) is not DailyActivationHost or self.host._retirement_complete() is not True:
+        if (type(self.host) is not DailyActivationHost or self.host is not self._runtime_host or
+                self.host.chain_retirement_complete() is not True):
             _reject("daily_generation_keeper_returned_without_retirement")
 
 

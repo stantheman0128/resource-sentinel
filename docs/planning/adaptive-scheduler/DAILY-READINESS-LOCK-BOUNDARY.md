@@ -69,14 +69,15 @@ generation。驗證例外在 SQL 中維持拒絕，不能吞掉後回傳舊 gene
 
 | 檔案 | 最小變更 |
 | --- | --- |
-| `daily_readiness_transport.py` | 新增不可序列化的 retained authority 與 `acquire_ready()`；在原 authenticated peer scope 內 duplicate。現有 `assert_ready()` 保留為 acquire＋正面 close 的便利方法，既有無回傳 receipt 語義不變。 |
+| `daily_readiness_transport.py` | 新增不可序列化的 retained authority 與 `acquire_ready()`；在原 authenticated peer scope 內 duplicate。實作保留 `assert_ready()` 原同步 exchange＋正面 pipe/peer close 路徑，不建立 duplicate，仍只回傳 `None`、不授予可重用權限；兩者共用封閉 protocol `_request`。如此避免純觀察 caller 平白新增 duplicate cleanup 義務。 |
 | `daily_generation.py` | 新增 `readiness_scope(db_path)`，以明確 lexical owner 保存本次 authority；同 thread／同 exact ledger 的 nested scope 只能借用。`prepare_connection()` 變為本機驗證及 SQL binding，remote 分支沒有 scope 時直接拒絕，永不隱式 RPC。所有 authority／reader cleanup 持續保留原物件。 |
 | `policy.py` | `hold()` 在 provider wait **之前**進入 readiness scope，涵蓋首次 nonce revalidation、yield、native release 與 exact nonce cleanup；scope 完成後才關 retained witness。既有 guard／nonce、不明 native release 與 clean-rejection 邏輯不變。 |
 | `store.py` | `_connection()` 在開 consumer SQL connection 前取得或借用 scope，涵蓋整個 yield 及原 connection close；`_transaction()` 的鎖內檢查不發 RPC。現有 read-only coverage／IPC readers 不取得 capacity 權限。 |
-| `coordinator.py` | `_db()` 及直接開 connection 的 `_cancel_managed_queue()` 持有 scope 至 connection close；managed admission 的 `_connect()` 借用外層 POLICY 同一權限。直接 `_connect()` 遇到 remote generation 卻無 scope 時拒絕，不能建立短暫權限後丟棄 witness。 |
+| `coordinator.py` | `_db()` 及直接開 connection 的 `_cancel_managed_queue()` 持有 scope 至 connection close；managed admission 的 `_connect()` 借用外層 POLICY 同一權限。`admit_experiment()` 的外層 scope 包住原 demand 的 `_prepare_submission()`、POLICY 與 SQL 收尾，使直接 readiness hook 也有原始權限。直接 `_connect()` 遇到 remote generation 卻無 scope 時拒絕，不能建立短暫權限後丟棄 witness。 |
 | `maintainer.py` | `_db()` 持有 scope 至正面 connection close，使用相同 exact-ledger binding。 |
 | `windows.py` | 只新增既有 `_THREAD_NAMES` ownership registry 的目前 thread 唯讀檢查，讓 remote acquisition 在原 native POLICY／Job mutex 已 held 時拒絕。不改 mutex acquire/release/close 語義。 |
 | `legacy_writer.py` | 既有 lifecycle scope 與 `legacy_writer` role 的二次驗證保留；它會借用外層 POLICY 權限，不另發 RPC。若無需 source hunk，以 integration test 固定此路徑。 |
+| `experiment_demand.py` | 只補原 readiness scope／authority 的 cleanup custody 辨識及 raw reader close 不明的註記；原 demand、native scope 與 release 權限不變。 |
 
 `readiness_scope` 的初始 generation observation 只能使用 bounded、read-only、
 existing-path SQL reader；不得創建帳本、遷移 schema 或將 row 當成 readiness。
@@ -142,3 +143,56 @@ monkey-patched production function 當成 daily source 證據。
 
 Source review 後再由主代理更新 checkpoint 與實際測試結果；沒有 native evidence
 以前，不宣稱 daily activation、fresh generation restart 或 grace 已可用。
+
+## 2026-09-24 Source 實作中的額外呼叫路徑
+
+基礎 scope source 與 focused tests 已寫入。主代理以正常 Resource Sentinel
+准入跑八個模組，**217 tests 全過，31.34 秒，0 failures／errors／skips**；
+私人日誌為 `.local-adaptive/readiness-lock-boundary-20260924-1.log`。
+這只驗證基礎修補，尚未包含下列雙帳本整合。主代理另確認
+`ExperimentNativeScope._scope(daily=True)` 依既有契約取得 daily POLICY、
+isolated POLICY、Job。單一 ledger 的 borrowing API 會拒絕第二個 isolated
+ledger；此整合目前 **尚未完成**，不能以基礎 focused tests 通過宣稱 native
+experiment path 已恢復。預計後續獨立契約加入鎖外預先取得兩個 exact-ledger
+lexical owners，再於鎖內選用既存對應 owner；不允许跨 ledger 借用 daily
+capacity 權限，也不在 daily POLICY 內對 isolated ledger 新做 readiness RPC。
+
+## 兩個原始帳本 scope 的最小補充契約
+
+主代理已同意以下 source 邊界；此補充先提交，才開始這一段程式變更。
+
+`readiness_scopes((daily_path, isolated_path))` 最多接受 **兩個**相異、已存在的
+exact ledger 路徑。入口要求目前 thread 沒有 POLICY／Job 鎖、SQLite scope 或
+任何既有 readiness scope/group。它依序取得兩份獨立原始 lexical owner，
+完成各自 bounded read-only reader 的正面 close，保存各自的 native file
+identity 與 generation observation；有 daily generation 的 owner 另外取得
+上述 authenticated authority。第二份取得失敗時只能關閉已取得的原 owner，
+未知 cleanup 仍保留。兩份都取得之後才公開 group，所有原期限不變。
+
+在 group 內，`readiness_scope(path)` 只選取 group 中已存在、完全相同 ledger
+的 owner；未知第三個 path、已關閉、poisoned、其他 thread 或改變 file identity
+一律拒絕。選取不讀另一個 DB、不發 RPC、不刷新 authority；退出恢復原 selector。
+daily 與 isolated scopes 的 generation、authority、cleanup marker 和原錯誤
+互相獨立。不能以 daily 的 witness、nonce cleanup 或 capacity UDF 授予 isolated
+帳本任何權限。
+
+原 isolated owner 觀察到沒有 generation 時，consumer connection 和取得 SQL
+transaction 後的**同一個 connection**都必須再次核對：generation 仍不存在、
+`PRAGMA database_list` 是原 path、原 native file identity 未更換。有 generation
+突然出現或 ledger 被替換時，拒絕並退出原 scopes，不能在持鎖期間補 RPC。
+沒有 generation 的 isolated connection 不安裝 daily capacity UDF。
+
+`ExperimentNativeScope._scope(daily=True)` 在 daily POLICY 之前建立兩個 owner，
+然後維持既有 **daily POLICY → isolated POLICY → Job** 順序；`_policy_scope`
+在 prepare/readback/hold/clear 全程選取自己的 ledger owner。`_IsolatedStore`
+的原 connection hook 也進入／借用自己的 exact scope，於原 connection 上
+核對 absence 和 identity，SQL connection 的原 custody／close 行為不變。
+`_scope(daily=False)` 只使用 isolated scope，不讀 daily generation、不發 daily
+readiness RPC，維持原 native-only restore 對日常帳本故障的獨立性。
+
+新增 focused integration trace 必須證明兩份 observation 都早於第一個 native
+lock；中途沒有額外 RPC；daily transaction 在持有 isolated／Job 時仍只選取
+已取得的 daily owner；isolated 不借 daily cleanup marker；generation 突然出現、
+替換 file identity、partial second acquisition、原 owner close 不明及 native-only
+restore 均有明確拒絕／保留原 custody 的案例。這段仍只做 source／isolated tests，
+不執行 native experiment，也不改另一 worker 的 demand cleanup state machine。

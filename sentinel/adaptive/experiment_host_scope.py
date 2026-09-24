@@ -112,6 +112,25 @@ class _SqlAttempt:
         self.rollback_unknown = self.close_unknown = self.closed = False
 
 
+class _BackingPublication:
+    """Retained request/data before publication; never child launch authority."""
+    def __init__(self, request, registration):
+        self.request, self.registration = request, registration
+        self.snapshot = request.observation.parent_snapshot
+        self.payload = _canonical(request.to_dict())
+        self.operation = None
+        self._fixed = (request, registration, self.snapshot, self.payload)
+
+    def require(self, request, registration):
+        if ((self.request, self.registration, self.snapshot, self.payload) != self._fixed or
+                self.request is not self._fixed[0] or self.registration is not self._fixed[1] or
+                self.snapshot is not self._fixed[2] or self.registration is not registration or
+                self.snapshot is not self.request.observation.parent_snapshot or
+                _canonical(self.request.to_dict()) != self.payload or
+                _canonical(request.to_dict()) != self.payload):
+            _fail("original_backing_request_changed")
+
+
 class ProductionExperimentScope:
     """One retained parent; even failed preparation remains the daily owner's."""
     def __init__(self, *, _token=None):
@@ -138,6 +157,9 @@ class ProductionExperimentScope:
         self._accepted_children = {}
         self._transport_service = None
         self._transport_endpoint = None
+        self._backing_service = None
+        self._backing_publications = {}
+        self._backing_members = {}
         self._scope_nonce = secrets.token_hex(32)
 
     def __reduce__(self):
@@ -596,3 +618,101 @@ class ProductionExperimentScope:
         if self._sealed and previous is None:
             _fail("new_work_sealed", self)
         self._accepted_children[request.request_id] = registration
+
+    def _retain_backing_transport(self, service):
+        from .experiment_backing_transport import ExperimentBackingService
+        if type(service) is not ExperimentBackingService or service.owner is not self:
+            _fail("original_backing_transport_required", self)
+        self._assert_transport_original(service.endpoint)
+        if self._backing_service is not None and self._backing_service is not service:
+            _fail("original_backing_transport_changed", self)
+        self._backing_service = service
+
+    def _transport_backing_registration(self, request, peer):
+        from .experiment_backing_transport import AdmissionSnapshotObservation, PublishExperimentBackingRequest
+        from .experiment_host_transport import BindExperimentChildRequest
+        if type(request) is not PublishExperimentBackingRequest or type(peer) is not VerifiedProcess:
+            _fail("original_backing_request_required", self)
+        registration = self._transport_child_registration(BindExperimentChildRequest(request.manifest), peer)
+        manifest = registration.manifest
+        if (not self._prepared or self._accepted_children.get(manifest.request_id) is not registration or
+                manifest.role != "wrapper" or request.member_id not in manifest.permitted_member_ids or
+                request.observation.wrapper_identity != manifest.child_identity):
+            _fail("accepted_wrapper_child_required", self)
+        claims = [claim for claim in self.plan.members if claim.member_id == request.member_id]
+        if (len(claims) != 1 or claims[0].kind != "workload" or claims[0].role != "workload" or
+                claims[0].requested != request.observation.requested or
+                AdmissionSnapshotObservation.from_snapshot(request.observation.parent_snapshot).to_dict() !=
+                    request.observation.to_dict()):
+            _fail("declared_backing_member_required", self)
+        return registration
+
+    def _require_unadmitted_partition(self, operation):
+        """Observe the exact isolated identity before NEW daily intent.
+
+        The child's original publication API must precede its submission. This
+        extra parent read rejects an already observable ordinary admission; the
+        later isolated transaction still independently refuses any ordinary-row
+        upgrade, including a concurrent row arriving after this read.
+        """
+        binding = operation.binding
+        with self._sql(self.ledger_path) as conn:
+            runtime = PolicyCoordinator._runtime(conn)
+            policy_binding = PolicyCoordinator._binding(runtime, self.process.identity.logon_id)
+            if (policy_binding.instance_id != self.spec.isolated_policy_instance_id or
+                    runtime["mode"] not in {"off", "shadow"} or runtime["admission_barrier"] != "NONE"):
+                _fail("isolated_policy_changed", self)
+            queries = (
+                ("SELECT 1 FROM managed_executions WHERE execution_id=? OR reservation_id=? LIMIT 1",
+                 (binding.execution_id, binding.reservation_id)),
+                ("SELECT 1 FROM reservations WHERE id=? OR execution_id=? OR request_key=? LIMIT 1",
+                 (binding.reservation_id, binding.execution_id, binding.request_key)),
+                ("SELECT 1 FROM queue WHERE request_key=? OR managed_execution_id=? LIMIT 1",
+                 (binding.request_key, binding.execution_id)),
+                ("SELECT 1 FROM executions WHERE request_key=? LIMIT 1", (binding.request_key,)),
+            )
+            if any(conn.execute(sql, parameters).fetchone() is not None for sql, parameters in queries):
+                _fail("isolated_admission_already_present", self)
+
+    def _publish_transport_backing(self, request, peer, registration):
+        from . import experiment_host_backing as backing
+        with self._lock:
+            try:
+                if self._transport_backing_registration(request, peer) is not registration:
+                    _fail("original_backing_registration_changed", self)
+                entry = self._backing_publications.get(request.request_id)
+                if entry is None:
+                    if (self._sealed or request.member_id in self._backing_members or
+                            len(self._backing_publications) >= ledger.MAX_MANAGED_JOBS):
+                        _fail("new_backing_request_refused", self)
+                    entry = _BackingPublication(request, registration)
+                    # Preserve the exact request/snapshot before any SQL. A
+                    # lost COMMIT/response reuses this same publication owner.
+                    self._backing_publications[request.request_id] = entry
+                    self._backing_members[request.member_id] = entry
+                entry.require(request, registration)
+                if self._backing_members.get(request.member_id) is not entry:
+                    _fail("original_backing_member_changed", self)
+                operation = backing.ParentAdmissionBacking.prepare(scope=self.registered_scope,
+                    member_id=request.member_id, wrapper_member_id=registration.manifest.actor_member_id,
+                    snapshot=entry.snapshot, reservation_id=request.reservation_id)
+                if entry.operation is not None and entry.operation is not operation:
+                    _fail("original_backing_publication_changed", self)
+                entry.operation = operation
+                with self._operation() as guard:
+                    with self._sql(self.demand.ledger_path) as conn:
+                        present = backing.validate_schema_locked(conn)
+                        exists = present and conn.execute("SELECT 1 FROM " + backing.TABLE +
+                            " WHERE member_id=? LIMIT 1", (request.member_id,)).fetchone() is not None
+                    if not exists:
+                        self._require_unadmitted_partition(operation)
+                    # The isolated read is closed before the daily writer. It
+                    # does not mint capacity or stand in for atomic local link
+                    # publication during the child's later admission.
+                    with self._sql(self.demand.ledger_path, write=True) as conn:
+                        observed = backing.publish_locked(conn, operation=operation,
+                            policy=self._daily_policy, guard=guard)
+                # No SQL/POLICY scope survives the result/receipt exchange.
+                return observed
+            except BaseException as error:
+                raise self._retain(error)

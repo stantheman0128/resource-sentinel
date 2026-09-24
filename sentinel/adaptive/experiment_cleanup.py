@@ -49,7 +49,8 @@ def current_operation(db_path=None):
     if frame is None:
         return None
     operation = frame[0]
-    if type(operation) not in (ExperimentReleaseOperation, ExperimentAdmissionSettlement):
+    from .experiment_abandon import ExperimentUnadmittedCleanup
+    if type(operation) not in (ExperimentReleaseOperation, ExperimentAdmissionSettlement, ExperimentUnadmittedCleanup):
         _fail("original_operation_required")
     operation._current(frame)
     if db_path is not None and Path(db_path).resolve() != operation.ledger_path:
@@ -143,7 +144,7 @@ class _OriginalCleanupAccess:
             _fail("generation_changed", self)
         from .daily_retirement_fence import read_retirement
         retirement = read_retirement(conn)
-        if retirement is not None and retirement["phase"] == "SEALED" and frame[1] == "PUBLISH":
+        if retirement is not None and retirement["phase"] == "SEALED" and frame[1] in {"PUBLISH", "ABANDON"}:
             _fail("generation_sealed", self)
         generation._assert_daily_locations(original["source_root"], self.ledger_path)
         if (not generation._ledger_matches(conn, self.ledger_path) or
@@ -191,6 +192,8 @@ class _OriginalCleanupAccess:
             BEGIN SELECT RAISE(ABORT,'experiment_release_nonce_not_owned'); END""")
         if phase == "PUBLISH":
             self._install_publication_functions(conn, frame)
+        elif phase == "ABANDON":
+            self._install_abandon_functions(conn, frame)
         allowed = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_TRANSACTION,
                    sqlite3.SQLITE_FUNCTION, sqlite3.SQLITE_RECURSIVE}
         def authorize(action, table, column, database, source):
@@ -214,6 +217,8 @@ class _OriginalCleanupAccess:
                 return sqlite3.SQLITE_OK
             if (phase in {"NONCE", "CLEAR"} and action == sqlite3.SQLITE_UPDATE and
                     database == "main" and table == "adaptive_runtime" and column == "policy_entry_nonce"):
+                return sqlite3.SQLITE_OK
+            if phase == "ABANDON" and action == sqlite3.SQLITE_DELETE and database == "main" and table == "queue":
                 return sqlite3.SQLITE_OK
             if phase == "PUBLISH" and database == "main":
                 if (action == sqlite3.SQLITE_INSERT and table in {"adaptive_experiment_cleanup_receipts", "executions"} or

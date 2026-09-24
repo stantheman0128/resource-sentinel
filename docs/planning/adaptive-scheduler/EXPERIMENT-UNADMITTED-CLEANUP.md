@@ -1,6 +1,6 @@
 # Original unadmitted experiment cleanup
 
-Status: contract before implementation, following `9657a32`. This completes the
+Status: implemented source following contract `55adc56` and baseline `9657a32`. This completes the
 local owner cleanup needed when an experiment is intentionally abandoned before
 admission/native preparation. It is not permission to discard needed queued work
 to gain capacity or finish a turn. Production adaptive remains off.
@@ -78,3 +78,28 @@ generation binding, admitted and native-prepared refusal, lost COMMIT/close and
 native close outcomes, repeated read-only completion, other-owner preservation,
 readiness-free DRAINING cleanup and sealed-generation mutation refusal. Native
 capability/recovery/overhead/A-B gates remain unverified by these tests.
+
+The concrete `ExperimentUnadmittedCleanup` retains its full original tuple and
+uses the existing bounded cleanup SQL hook. The original first queue preimage
+is frozen only inside the writer transaction; initial reads do not freeze it
+before connect/BEGIN can fail. A positively rolled-back never-COMMIT writer may
+rebase after positive SQL close; a sticky COMMIT-attempt flag forbids this for
+lost acknowledgements. Ordinary readmission confirms an original clear ACK
+loss only from its positively closed null-nonce read and owned clear/native
+facts, then checks that preceding guard before publishing the next nonce.
+
+Thirty new tests exercise real isolated SQLite admission, exact queue DELETE,
+full-row/canonical guards, lost COMMIT, SQL/native close outcomes and replay.
+The focused four-module run passed 71 tests in 13.312 seconds with zero failures,
+errors or skips. An earlier six-module shared regression passed 125 tests in
+28.074 seconds. These are overlapping source tests, not distinct totals or
+native gate evidence. Independent review found and resolved the three retry
+issues above; no further actionable finding remained in the final review.
+
+Final integration: 26 modules, 637 tests passed in 102.596 seconds (102.868
+including runner overhead), zero failures/errors/skips. Includes shared
+generation/readiness/retirement, scope/release, POLICY, guardian and managed
+admission paths. The planning README contains the equivalent command. Tests ran
+on Windows through the normal daily wrapper, HEAVY/P2/CPU1/RAM1GiB/IO0, without
+an exemption, and depend on the protected dirty baseline. No native control
+fault spike or production configuration/activation change was performed.

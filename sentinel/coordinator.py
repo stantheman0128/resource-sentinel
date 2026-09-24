@@ -331,6 +331,9 @@ class Coordinator:
         if binding != guard.binding:
             raise ManagedAdmissionUnavailable("managed_policy_binding_changed")
         nonce = runtime["policy_entry_nonce"]
+        experiment = getattr(context, "_experiment_demand", None)
+        if nonce is None and experiment is not None:
+            experiment._confirm_submission_clear(policy, guard)
         if nonce is not None:
             if nonce != guard.nonce:
                 raise ManagedAdmissionUnavailable("managed_policy_entry_changed")
@@ -362,6 +365,9 @@ class Coordinator:
         logon = policy.current_logon()
         if logon != managed.wrapper_identity.logon_id:
             raise PolicyError("policy_logon_mismatch")
+        experiment = getattr(context, "_experiment_demand", None)
+        if experiment is not None:
+            experiment._check_previous_submission_guard()
         deadline = time.monotonic() + 1.0
         while True:
             try:
@@ -384,6 +390,8 @@ class Coordinator:
                 # a returned original guard its publication cannot be adopted.
                 context._submission_prepare_unknown = True
                 raise
+        if experiment is not None:
+            experiment._remember_submission_guard(policy, guard)
         with policy.hold(guard):
             context._submission_policy_entered = True
             # Native identity and canonical ledger checks remain outside the
@@ -687,6 +695,11 @@ class Coordinator:
         """Settle one original sealed experiment admission without new work."""
         from sentinel.adaptive.experiment_cleanup import settle_admission
         return settle_admission(self, owner)
+
+    def abandon_experiment(self, owner):
+        """Close an intentionally abandoned original unadmitted experiment."""
+        from sentinel.adaptive.experiment_abandon import abandon
+        return abandon(self, owner)
 
     def release_experiment(self, operation):
         """Release only a retained original experiment with positive cleanup.

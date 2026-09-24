@@ -261,6 +261,8 @@ class DailyExperimentDemand:
         self._policy_original = None
         self._release_operation = None
         self._admission_settlement = None
+        self._unadmitted_cleanup = None
+        self._submission_original = None
         self._original_admission = None
         self._errors = []
         self._quarantine = None
@@ -408,6 +410,47 @@ class DailyExperimentDemand:
                 inner._submission_transaction is None or
                 inner._submission_transaction.get("connection_closed") is not True):
             _deny("unused_daily_claim_required", self)
+
+    def _remember_submission_guard(self, policy, guard):
+        """Keep the actual returned guard before its original native wait."""
+        from .policy import PolicyCoordinator, PolicyGuard
+        self._static_original()
+        inner = self._admission
+        if (self._native_preparation_sealed or type(policy) is not PolicyCoordinator or
+                type(guard) is not PolicyGuard or inner._submission_guard is not guard or
+                inner._submission_policy is not policy or policy.store._policy is not policy or
+                Path(policy.store.db_path).resolve() != self.ledger_path):
+            _deny("original_submission_guard_required", self)
+        self._check_previous_submission_guard()
+        self._submission_original = (policy, policy.store, guard, guard.binding, guard.nonce)
+
+    def _check_previous_submission_guard(self):
+        """Reject an unsettled prior attempt before publishing another nonce."""
+        from .policy import PolicyGuard
+        previous = self._submission_original
+        if previous is not None:
+            old = previous[2]
+            if (type(old) is not PolicyGuard or old.binding != previous[3] or old.nonce != previous[4] or
+                    old._nonce_clear_confirmed is not True or
+                    not all(type(value) is bool for value in (old._native_exit_confirmed, old._native_no_entry_confirmed)) or
+                    (old._native_exit_confirmed, old._native_no_entry_confirmed) not in
+                        {(True, False), (False, True)}):
+                _deny("previous_submission_cleanup_unverified", self)
+
+    def _confirm_submission_clear(self, policy, guard):
+        """Called after the original null-nonce reader positively closed."""
+        from .policy import _cleanup_outcome_unverified
+        original, inner = self._submission_original, self._admission
+        facts = (guard._native_exit_confirmed, guard._native_no_entry_confirmed)
+        transaction = inner._submission_transaction
+        if (original is None or policy is not original[0] or guard is not original[2] or
+                guard.binding != original[3] or guard.nonce != original[4] or
+                inner._submission_guard is not guard or guard._nonce_clear_attempted is not True or
+                not all(type(value) is bool for value in facts) or facts not in {(True, False), (False, True)} or
+                inner._submission_policy_error is not None and _cleanup_outcome_unverified(inner._submission_policy_error) or
+                transaction is not None and transaction.get("connection_closed") is not True):
+            _deny("original_submission_cleanup_unverified", self)
+        guard._nonce_clear_confirmed = True
 
     def _before_native_hash(self):
         return hashlib.sha256(("experiment-before-native-v1\n" + self._before_native_record).encode()).hexdigest()

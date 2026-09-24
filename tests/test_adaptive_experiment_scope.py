@@ -190,7 +190,7 @@ class ScopeControlTests(unittest.TestCase):
         self.native_observation("query")
         return self.cpu
 
-    def set_cpu(self, rate):
+    def set_cpu(self, rate, *, native_deadline=None):
         self.assertEqual(rate, 2500)
         self.assertEqual(self.active, ["daily", "isolated", "job"])
         self.native_observation("set")

@@ -1,6 +1,7 @@
 # Original experiment scope with remote daily readiness
 
-Status: contract before implementation, following `90e1b1b`. This connects the
+Status: contract authored before implementation, following `90e1b1b`; source
+integration now verified by the checkpoint below. This connects the
 existing authenticated readiness authority to the original experiment scope.
 It adds no transport, remote owner adoption, provider activation or native gate.
 Production adaptive remains off. The 58/4/4/3 policy and original lifetimes stay.
@@ -113,6 +114,25 @@ Four related modules passed 135 tests with zero failures/errors/skips (0.315
 seconds runner), including 15 new deadline cases. The planning README records
 the equivalent command and private log location. These tests use actual deadline
 and ownership implementations with explicit synthetic time/Win32 APIs. Independent
-review found no actionable issue. Actual remote scope integration remains work
-in progress; this primitive checkpoint does not enable any native gate or daily
-activation. Tests use the protected dirty baseline through normal daily admission.
+review found no actionable issue. This primitive checkpoint does not enable any
+native gate or daily activation. Tests use the protected dirty baseline through
+normal daily admission.
+
+## Scope integration checkpoint
+
+The helper and actual original scope consumers now use the existing lexical
+authority, exact original generation/local pin, and unchanged remote deadline.
+Initial prepare acquires a daily scope; later operations acquire the original
+two-ledger group before locks. Launch authorizes inside that group with no
+ambient-scope prerequisite. Isolated restore remains independent of daily
+readiness. An initially absent generation cannot adopt a later local owner.
+
+Eleven related modules passed 364 tests with zero failures/errors/skips (42.195
+seconds runner), including 15 new helper/custody and original scope cases.
+Tests use real isolated SQLite, retained readiness authorities issued through
+synthetic authenticated transport, and explicit synthetic native APIs. The
+planning README records exact commands, earlier failures and private logs.
+The exemption fixture now binds through the real original POLICY procedure;
+it does not bypass grant checks. Independent review found no remaining
+actionable issue. No native gate, production activation, or completed serial
+provider is claimed; the cross-process root-launch boundary above still applies.

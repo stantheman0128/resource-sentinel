@@ -4,6 +4,55 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
+原始 experiment scope 的 remote readiness 接線已完成並驗證。Helper 只使用
+鎖外已取得的原始 lexical scope／group member，不在鎖內開 SQL／RPC 或取得
+替代 owner。Local owner 在同一次證明中固定；remote 分支不採用稍後出現的
+local owner。Helper 與實際 coverage transaction 都核對完整原始 generation；
+相鄰 Create／Set 將同一個原始 deadline 傳至既有底層檢查。Restore 繼續只依賴
+isolated scope，不因日常 readiness 過期而失去撤回能力。
+
+最後 **11 模組、364 tests 全過，0 failures／errors／skips**（runner 42.195 秒），
+含 15 個新增案例；私人日誌 `.local-adaptive/remote-scope-shared-20260924-4.log`。
+使用 Windows／`C:\Python313\python.exe` 與正常日常 wrapper，資源設定為
+`HEAVY / P2 / CPU 1 / RAM 1 GiB / I/O 0`，沒有豁免。Actual SQLite／scope／
+readiness authority 路徑使用明確 synthetic transport／native backends；不是 native
+gate 或 clean-clone full-suite 證據。測試包含受保護 dirty baseline，commit 會揭露。
+
+初次 349 tests 有 1 failure，修正原始 absence scope 的拒絕原因與驗證順序；
+獨立審查另找到 launch 在取得 lexical scope 前提早呼叫 `_ready`，已修正並以
+實際 `launch_once()` 回歸覆蓋。新增案例首輪有 1 failure／2 errors，原因是
+fixture 未建立正式 exemption binding；改用原 POLICY 下的 `bind_policy_locked`。
+下一輪僅 1 failure，修正新測試對 disabled 原始讀回值的預期（flags=0、rate=10000），
+未更改 production disable 行為或豁免檢查。最後獨立 review 無 actionable finding。
+
+父程序的一秒 readiness window 仍不代表稍後 wrapper root Create 的新鮮度。
+Actual serial provider、reopened-handle restore、canonical fixture bootstrap、
+完整 root／child deadline 與 fresh-generation restart 仍是 source 缺口；P3–P6
+尚未通過 native 驗收。日常 runtime／config／Scheduled Task／啟動入口未改，
+adaptive 維持 off；本批沒有對實際工作施加 Job 限制，沒有需撤回的測試 cap。
+
+從 implementation worktree 執行本批等價回歸：
+
+```powershell
+$sentinelRemoteTests = @(
+    'tests.test_adaptive_daily_generation'
+    'tests.test_adaptive_daily_readiness_lock_boundary'
+    'tests.test_adaptive_daily_readiness_transport'
+    'tests.test_adaptive_experiment_preparation'
+    'tests.test_adaptive_experiment_scope'
+    'tests.test_adaptive_experiment_release_native'
+    'tests.test_adaptive_experiment_release'
+    'tests.test_adaptive_experiment_native_deadlines'
+    'tests.test_adaptive_native_job'
+    'tests.test_adaptive_scope_launch'
+    'tests.test_adaptive_experiment_remote_readiness'
+)
+$sentinelRemoteCommand = 'C:\Python313\python.exe -m unittest ' + ($sentinelRemoteTests -join ' ') + ' -q'
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command $sentinelRemoteCommand -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
+### 原始 deadline 底層 checkpoint（歷史驗證）
+
 Remote readiness 的原始 deadline 底層接線已完成：`NativeJob.create`、
 `ScopeLaunch.create_inert` 與 `set_cpu_rate_unverified` 可接收 exact
 `NativeDeadline`，在 security／fixture／command buffer／internal lock 準備後、
@@ -13,8 +62,8 @@ restore 不被過期期限攔截。原始 setup owner 與未進入 Create 的證
 四模組 **135 tests 全過，0 failures／errors／skips**（runner 0.315 秒），
 包括 15 個新 deadline 案例，私人日誌為
 `.local-adaptive/native-deadline-20260924-1.log`。獨立 review 無 actionable finding。
-這是底層 source 邊界驗證；scope 的實際 remote authority 接線仍在實作，不能
-因 optional 參數或這批 synthetic Win32 fixtures 宣稱 native gate 通過。
+這是底層 source 邊界驗證；scope 的實際 remote authority 接線已在上方最新
+checkpoint 完成，不能因 optional 參數或 synthetic Win32 fixtures 宣稱 native gate 通過。
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command 'C:\Python313\python.exe -m unittest tests.test_adaptive_experiment_native_deadlines tests.test_adaptive_native_job tests.test_adaptive_native_launcher tests.test_adaptive_scope_launch -q' -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
@@ -126,8 +175,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\reso
 
 Settlement 對 QUEUED／SUBMISSION_REJECTED／absence 仍只回報觀測狀態，不提供
 cancel、self close 或釋放權限。這些需求的原始 context 最終收尾已由上方獨立
-abandon 入口補上；native scope remote readiness、actual serial provider、fresh-generation
-restart，以及 P4／S3／P6 下述缺口仍需 source 工作。Native gate 未通過，
+abandon 入口補上；native scope remote readiness 已在最新 checkpoint 接線；actual
+serial provider、fresh-generation restart 及 P4／S3／P6 下述缺口仍需 source 工作。Native gate 未通過，
 production adaptive 維持 off。
 
 ### 先前原始 release checkpoint（歷史驗證）
@@ -375,7 +424,7 @@ loader error 或未跑的 native gate 算成 pass。
 | 2. 裁決 ④ | 契約與 source 完成；最後完整 adaptive 2,127 tests 通過。沒有舊 witness 的 cold adoption 仍不支援；native recovery 未驗證。 |
 | 3. helper sender | Source 接線、獨立 review 與完整 2,298 tests 通過。後續 original launch/stdio provenance、guardian scope 比對與 helper proposal adapter 已接線，344 targeted tests 通過（30.960 秒，含 30 個專用 scope tests）。實際 S2 topology producer／native bundle／新增採集成本仍未驗證，缺證據不啟用控制。 |
 | 4. release／CLI | Source 整合與完整 2,800 tests 通過；包含 exact discovery、typed operator transport、原子 off／audit、同 owner 收尾與三個 host 的 drain。後續 rootless C2 post-close receipt 已補上，保持原 terminal state，不偽造 FINISHED；新增 29 個案例。232 targeted tests 中 231 通過，唯一錯誤文字預期修正後單獨重跑通過，production 未因該失敗改動。沒有原始 close 證據的舊歷史仍 unknown。Native 操作通訊、控制及恢復仍未驗證。 |
-| 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport 與接線](P2-DAILY-ACTIVATION.md)已完成 installer、常駐 owner 與日常 consumers 接線。Generation 正面退場整合 654 tests 通過（94.827 秒）；readiness／preparation 整合 493 tests 通過（55.779 秒）。Typed daily release／歷史重用已實作，原始 scope／POLICY／retirement 整合 322 tests 全過（85.971 秒）。Sealed initial admission guard 及 queued／rejected 原始 context 收尾已實作，最新驗證見上方 checkpoint。Native scope remote readiness、真正 native provider 與 fresh restart 仍待完成。未執行日常安裝，grace 前提未解鎖。 |
+| 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport 與接線](P2-DAILY-ACTIVATION.md)已完成 installer、常駐 owner 與日常 consumers 接線。Generation 正面退場整合 654 tests 通過（94.827 秒）；readiness／preparation 整合 493 tests 通過（55.779 秒）。Typed daily release／歷史重用已實作，原始 scope／POLICY／retirement 整合 322 tests 全過（85.971 秒）。Sealed initial admission guard、queued／rejected 原始 context 收尾及 native scope remote readiness 均已實作；最新 remote 整合 364 tests 通過（runner 42.195 秒）。真正 native provider 與 fresh restart 仍待完成。未執行日常安裝，grace 前提未解鎖。 |
 | 6. console 驗收命令 | [P6 矩陣編排與 raw reducer](P6-RUNNER-CONTRACT.md)、[S1/S2 bridge 契約](S1-DAILY-BRIDGE-CONTRACT.md)、[S3 精確故障點與 14×10 記錄器](S3-REAL-HOST-RECOVERY.md)、[P4 實際 host 成本量測](P4-OVERHEAD-RUNNER.md)已提交。新 bounded telemetry／helper 非阻塞接線 276 tests 通過（8.418 秒）；P4 原 sink 與 v2 schema 最新 259 tests 通過（13.765 秒）。Actual provider、部分 S3 故障 driver／完整 orchestration、A0 等價性及 P4 native storage／overhead 證據仍缺；不是只剩 console 執行。 |
 
 最新追加：項目 5 的同帳本 demand 與 retirement fence 已提交為 `1072786`／
@@ -390,11 +439,13 @@ reducer 已提交為 `ff6f31b`，S3 原始 action cutpoints／三個實際故障
 以上是目前缺口；下列較早日期的段落保留其歷史測試範圍。Native S1–S3、完整
 P3–P6 都尚未通過。日常 config／Scheduled Task／啟動入口未修改。
 
-下一步是項目 5 native scope 的既有 remote readiness 接線、actual serial provider
-與 fresh-generation restart。既有 authenticated transport 已提供真正 retained authority；
-scope 尚未接上完整原始 generation 比對與相鄰 native 邊界的原始 deadline 重驗，
-不能延長一秒 readiness window 或把舊 S1Runtime 當作新 provider。新增測試將
-繼續使用隔離帳本；任何實際
+下一步是項目 5 actual serial provider 與 fresh-generation restart。Scope 已接上
+完整原始 generation 比對與相鄰 native 邊界的原始 deadline 重驗。Provider 仍須
+保留同一 demand 的排隊／收尾、真正 reopened-handle restore，以及在 import
+runner 前完成 canonical fixture bootstrap；不能把舊 S1Runtime 當作新 provider。
+Root／child 的 scope deadline 及跨程序 launch freshness 也須完成接線，不能延長
+一秒 readiness window 或以父程序驗證冒充後續 root Create 證據。新增測試繼續
+使用隔離帳本；任何實際
 日常 source activation 都需要獨立授權，不因 commit/push 自動執行。項目 6
 尚未完成的內容不能以 mock、空 provider、另外一個 DB 或假量測取代。
 
@@ -482,7 +533,7 @@ C:\Python313\python.exe -m unittest tests.test_adaptive_pipe_windows tests.test_
 較早確認的 remote readiness 鎖內 RPC 問題已由 2026-09-24 的 413-test 接線
 修正：鎖外取得原始 authenticated authority，鎖內於實際 consumer connection
 重驗 generation／ledger／source／native witness。Native scope 的 remote owner
-adapter 與真正 provider 仍未完成，不把這項 source 修正視為 S1 native 通過。
+接線已由最新 364-test 回歸驗證，真正 provider 仍未完成；不把 source 修正視為 S1 native 通過。
 
 另修正 source keeper 在 stdout 失效時略過等待、持續忙轉的問題：診斷與 pacing
 分開，保持同一原始 operation，固定每個錯誤邊界只保留第一個錯誤。

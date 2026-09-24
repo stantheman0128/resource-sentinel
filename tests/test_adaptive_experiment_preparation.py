@@ -206,7 +206,7 @@ class PreparationTests(unittest.TestCase):
             initialize(store, path)
             self.assertFalse(store.connections)
             raise failure
-        with patch.object(scope.ExperimentNativeScope, "_ready"), \
+        with patch.object(scope.ExperimentNativeScope, "_ready", return_value=None), \
                 patch.object(scope.ExperimentNativeScope, "_coverage_locked"), \
                 patch.object(scope._IsolatedStore, "__init__", interrupted):
             with self.assertRaises(OSError) as raised:

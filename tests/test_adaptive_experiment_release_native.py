@@ -95,7 +95,7 @@ class ExperimentNativeReleaseTests(unittest.TestCase):
         for change in (
                 patch.object(scope, "daily_generation", proof),
                 patch.object(exclusion, "daily_generation", self.fixture.proof),
-                patch.object(scope.ExperimentNativeScope, "_ready"),
+                patch.object(scope.ExperimentNativeScope, "_ready", return_value=None),
                 patch.object(scope._IsolatedStore, "__init__", initialize_isolated),
                 patch.object(scope, "NativePolicyMutex", _JobMutex),
                 patch.object(NativeJob, "create", side_effect=lambda name, nonce, logon_id, **kw:
@@ -190,7 +190,7 @@ class ExperimentNativeReleaseTests(unittest.TestCase):
             self.wrapper_backend.state = IdentityStatus.DEAD
         return value
 
-    def create_wrapper(self, launcher):
+    def create_wrapper(self, launcher, *, native_deadline=None):
         launcher._created = launcher._wrapper_create_entered = True
         launcher.wrapper_witness = self.wrapper
         launcher.process = SimpleNamespace(creation_definitely_absent=False,

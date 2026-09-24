@@ -46,6 +46,9 @@ REQUIRED_PATHS = frozenset({
     "hooks/sentinel-stop.py", "docs/agent-policy.md",
 })
 _TABLE = "adaptive_daily_generation"
+_GENERATION_FIELDS = frozenset({"singleton", "schema_version", "generation", "state",
+    "source_digest", "config_digest", "source_manifest_json", "source_root", "ledger_path",
+    "owner_identity_json", "ledger_identity_json", "readiness_instance_id"})
 _TOKEN = object()
 _LOCAL_GENERATIONS = {}
 _READINESS_LOCAL = threading.local()
@@ -99,6 +102,7 @@ class _ReadinessScope:
         self.pool = _ABSENCE_SCOPES if absence_only else _READINESS_SCOPES
         self.thread = threading.current_thread()
         self.row = self.authority = self.reader = self.error = None
+        self.local_owner = None
         self.ledger_identity = None
         self.closed = False
         self.cleanup = None
@@ -243,7 +247,10 @@ def _owned_readiness_scope(path, *, absence_only):
             # Original install/retirement cleanup has its own nonce-only gate.
             cleanup = local is not None and (not local._activated or scope.row["state"] == "DRAINING")
             if not cleanup:
-                scope.authority = _prove_retained_owner_ready(scope.row)
+                scope.authority = _prove_retained_owner_ready(scope.row, local_owner=local)
+                # Pin the exact object used by the pre-lock proof, including
+                # the remote None branch. Never adopt a later registry lookup.
+                scope.local_owner = local
         elif not absence_only:
             # A known absent generation retains no native readiness resource.
             # Do not impose the daily native-custody limit on legacy callers.
@@ -307,6 +314,71 @@ def readiness_scopes(db_paths, *, absent_paths=()):
         finally:
             _READINESS_LOCAL.group = None
             _READINESS_LOCAL.scope = None
+
+
+def revalidate_scoped_readiness(db_path, *, expected_generation):
+    """Validate an existing lexical original; return only its timing bound.
+
+    No SQL, RPC, new process handle or acquisition fallback is allowed here.
+    The caller separately proves the actual row on its consumer connection.
+    A returned NativeDeadline is the remote authority's same original object,
+    not readiness/capacity authority that can survive this lexical scope.
+    """
+    path = Path(db_path).resolve()
+    previous = getattr(_READINESS_LOCAL, "scope", None)
+    group = getattr(_READINESS_LOCAL, "group", None)
+    scope = group.get(path) if group is not None else previous
+    if type(scope) is not _ReadinessScope or scope.path != path:
+        _reject("daily_readiness_scope_required")
+    _READINESS_LOCAL.scope = scope
+    try:
+        scope.assert_current()
+        with _READINESS_SCOPES_LOCK:
+            if scope.pool is not _READINESS_SCOPES or _READINESS_SCOPES.get(id(scope)) is not scope:
+                _reject("daily_readiness_original_scope_required")
+        if scope.absence_only or scope.cleanup is not None:
+            _reject("daily_readiness_capacity_scope_required")
+        row = expected_generation
+        for candidate in (row, scope.row):
+            if (type(candidate) is not dict or set(candidate) != _GENERATION_FIELDS or
+                    any(type(candidate[key]) is not int or candidate[key] != 1
+                        for key in ("singleton", "schema_version")) or
+                    any(type(candidate[key]) is not str
+                        for key in _GENERATION_FIELDS - {"singleton", "schema_version"}) or
+                    candidate["state"] != "ACTIVE"):
+                _reject("daily_readiness_scope_binding_changed")
+        if scope.row != row:
+            _reject("daily_readiness_scope_binding_changed")
+        local = scope.local_owner
+        if local is None:
+            _revalidate_remote(scope, row)
+            from .pipe_windows import NativeDeadline
+            if type(scope.authority._deadline) is not NativeDeadline:
+                _reject("daily_readiness_original_deadline_required")
+        else:
+            _revalidate_local_scope(scope, row, path)
+            _revalidate_local(local, row)
+        _assert_daily_locations(row["source_root"], path)
+        if (row["ledger_path"] != str(path) or
+                scope.ledger_identity != tuple(int(value) for value in json.loads(row["ledger_identity_json"])) or
+                _ledger_identity(path) != scope.ledger_identity):
+            _reject("daily_ledger_identity_changed")
+        if _fixed_policy_digest(path) != row["config_digest"]:
+            _reject("daily_config_changed")
+        manifest = SourceManifest.from_dict(json.loads(row["source_manifest_json"]))
+        if manifest.digest != row["source_digest"]:
+            _reject("daily_source_digest_changed")
+        verify_import_provenance(manifest, row["source_root"])
+        # Source/config validation consumes the original deadline. Its cost is
+        # never excused by a successful earlier observation.
+        if local is None:
+            _revalidate_remote(scope, row)
+            return scope.authority._deadline
+        _revalidate_local_scope(scope, row, path)
+        _revalidate_local(local, row)
+        return None
+    finally:
+        _READINESS_LOCAL.scope = previous
 
 
 def _revalidate_absent(conn, scope, db_path):
@@ -838,6 +910,13 @@ def prepare_connection(conn, *, role, db_path):
         policy.revalidate(conn, guard)
         _nonce_only(conn, scope=scope, policy=policy, guard=guard, row=row)
         return None
+    if scope is not None:
+        # Capacity always uses the same branch proved before locks. A new
+        # registry entry cannot replace an authenticated remote original.
+        scope.assert_current()
+        if scope.row != row or scope.path != Path(db_path).resolve():
+            _reject("daily_readiness_scope_binding_changed")
+        local = scope.local_owner
     if local is None:
         if scope is None or scope.row != row or scope.path != Path(db_path).resolve():
             _reject("daily_readiness_scope_required")
@@ -885,6 +964,9 @@ def _revalidate_local_scope(scope, row, db_path):
     scope.assert_current()
     if scope.row != row or scope.path != Path(db_path).resolve():
         _reject("daily_readiness_scope_binding_changed")
+    if (type(scope.local_owner) is not DailyGenerationOwner or
+            _LOCAL_GENERATIONS.get(row["generation"]) is not scope.local_owner):
+        _reject("daily_readiness_local_owner_changed")
 
 
 def _revalidate_local(local, row):
@@ -935,10 +1017,11 @@ def _revalidate_remote(scope, row):
     scope.authority.revalidate(endpoint, binding)
 
 
-def _prove_retained_owner_ready(row):
-    local = _LOCAL_GENERATIONS.get(row["generation"])
+def _prove_retained_owner_ready(row, *, local_owner=_TOKEN):
+    local = _LOCAL_GENERATIONS.get(row["generation"]) if local_owner is _TOKEN else local_owner
     if local is not None:
-        if (local.process.identity.to_dict() != json.loads(row["owner_identity_json"]) or
+        if (type(local) is not DailyGenerationOwner or
+                local.process.identity.to_dict() != json.loads(row["owner_identity_json"]) or
                 local.manifest.digest != row["source_digest"]):
             _reject("daily_generation_owner_mismatch")
         local.assert_ready()

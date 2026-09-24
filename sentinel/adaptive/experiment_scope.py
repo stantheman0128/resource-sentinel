@@ -219,12 +219,13 @@ class ExperimentNativeScope:
                 if inner._cancel_sealed:
                     _fail("unused_daily_claim_required", owner)
             owner._assert_original()
-            owner._ready()
             # A submitted-but-still-queued context owns no capacity. Prove the
             # actual row before even the test listener or isolated store exists.
-            with owner._policy_scope("daily", owner.daily_store):
-                with owner.daily_store._transaction() as conn:
-                    owner._coverage_locked(conn, restrictive=True)
+            with daily_generation.readiness_scope(owner.demand.ledger_path):
+                owner._ready()
+                with owner._policy_scope("daily", owner.daily_store):
+                    with owner.daily_store._transaction() as conn:
+                        owner._coverage_locked(conn, restrictive=True)
             if owner.ledger_path.exists():
                 _fail("isolated_ledger_already_exists", owner)
             owner._preparation_acquisitions["store"] = "entered"
@@ -257,14 +258,21 @@ class ExperimentNativeScope:
                         policy=owner._daily_policy, guard=owner._guards["daily"])
                 # No SQLite transaction spans native creation. Daily POLICY
                 # remains held until original actors and Job are published.
+                native_deadline = owner._ready()
+                if (time.monotonic() >= owner.deadline or time.time() >= owner._restriction_lease_deadline):
+                    _fail("control_deadline_expired", owner)
                 owner._create_attempted = True
                 owner._preparation_acquisitions["job"] = "entered"
                 owner.job = NativeJob.create(owner.job_name, creation_nonce,
-                    owner.guardian.identity.logon_id, access=JobAccess.OWNER)
+                    owner.guardian.identity.logon_id, access=JobAccess.OWNER,
+                    native_deadline=native_deadline)
                 owner._original_job = owner.job
                 owner._preparation_acquisitions["job"] = "returned"
                 owner._verify_job(empty=True)
-                wrapper = owner.launch.create_inert()
+                native_deadline = owner._ready()
+                if (time.monotonic() >= owner.deadline or time.time() >= owner._restriction_lease_deadline):
+                    _fail("control_deadline_expired", owner)
+                wrapper = owner.launch.create_inert(native_deadline=native_deadline)
                 if wrapper.identity == owner.guardian.identity:
                     _fail("distinct_wrapper_required", owner)
                 with owner.store._transaction() as conn:
@@ -363,21 +371,12 @@ class ExperimentNativeScope:
                 _fail("native_owner_replaced", self)
 
     def _ready(self):
-        """Genuine original source owner, outside every SQL/native lock."""
+        """Revalidate this lexical original; return only its unchanged deadline."""
         self._assert_original()
         if self.demand._prepared is None:
             _fail("daily_admission_unverified", self)
-        generation = self.demand._prepared[0]["generation"]
-        owner = daily_generation._LOCAL_GENERATIONS.get(generation)
-        if (type(owner) is not daily_generation.DailyGenerationOwner or
-                owner.ledger_path != self.demand.ledger_path or
-                owner.ledger_identity != self.demand.ledger_identity or
-                owner.manifest.digest != self.demand._prepared[0]["source_digest"]):
-            _fail("original_local_generation_required", self)
-        self._preparation_pending.add("generation_readiness")
-        owner.assert_ready()
-        self._preparation_pending.discard("generation_readiness")
-        self.generation_owner = owner
+        return daily_generation.revalidate_scoped_readiness(self.demand.ledger_path,
+            expected_generation=self.demand._original_generation_binding())
 
     @contextmanager
     def _policy_scope(self, key, store):
@@ -456,9 +455,15 @@ class ExperimentNativeScope:
     @contextmanager
     def _scope(self, *, daily):
         paths = ((self.demand.ledger_path, self.ledger_path) if daily else (self.ledger_path,))
-        with daily_generation.readiness_scopes(paths, absent_paths=(self.ledger_path,)):
-            with self._scope_owned(daily=daily):
-                yield
+        try:
+            with daily_generation.readiness_scopes(paths, absent_paths=(self.ledger_path,)):
+                if daily:
+                    self._ready()
+                with self._scope_owned(daily=daily):
+                    yield
+        except BaseException as error:
+            self._retain(error)
+            raise
 
     @contextmanager
     def _scope_owned(self, *, daily):
@@ -485,7 +490,10 @@ class ExperimentNativeScope:
         if not conn.in_transaction or runtime["mode"] != "off":
             _fail("daily_off_required", self)
         generation = daily_generation.read_generation(conn)
-        if generation is None or any(generation[key] != value for key, value in self.demand._prepared[0].items()):
+        original_generation = self.demand._original_generation_binding()
+        if (type(generation) is not dict or set(generation) != set(original_generation) or
+                any(type(generation[key]) is not type(value) or generation[key] != value
+                    for key, value in original_generation.items())):
             _fail("generation_changed", self)
         experiment_demand._schema(conn)
         metadata = conn.execute("SELECT * FROM adaptive_experiment_demands WHERE experiment_id=?",
@@ -543,7 +551,6 @@ class ExperimentNativeScope:
         publication that may have committed before its acknowledgement failed.
         """
         with self._lock:
-            self._ready()
             if (not self._create_attempted or self.job is None or self.launch is None or
                     self.launch.wrapper_witness is None or self._job_closed):
                 _fail("partial_creation_custody_required", self)
@@ -603,7 +610,6 @@ class ExperimentNativeScope:
         return snapshot
 
     def assert_covered(self):
-        self._ready()
         with self._scope(daily=True):
             with self.daily_store._transaction() as conn:
                 self._coverage_locked(conn, restrictive=True)
@@ -612,13 +618,13 @@ class ExperimentNativeScope:
         if (launcher is not self.launch or job is not self.job or not self._registered or
                 self._launch_authorized or self._close_started):
             _fail("launch_binding_changed", self)
-        self._ready()
         with self._scope(daily=True):
             with self.daily_store._transaction() as conn:
                 self._coverage_locked(conn, restrictive=True)
             self._verify_job(empty=True)
             with self.store._transaction() as conn:
                 self.journal.begin_launch_locked(conn)
+            self._ready()
             self._launch_authorized = True
         # The actual launcher performs authenticated IPC only after every lock
         # above has positively settled. This return is not a serialized permit.
@@ -642,7 +648,6 @@ class ExperimentNativeScope:
         if (rate_bp != 2500 or type(rate_bp) is not int or self._close_started or
                 not self._registered):
             _fail("only_explicit_s1_rate", self)
-        self._ready()
         with self._scope(daily=True):
             with self.daily_store._transaction() as conn:
                 self._coverage_locked(conn, restrictive=True)
@@ -659,9 +664,10 @@ class ExperimentNativeScope:
             # No grant can commit while daily POLICY remains held. Check the
             # original lease/experiment clocks adjacent to the native boundary;
             # an expired pending intent remains owned for restore reconciliation.
+            native_deadline = self._ready()
             if (time.monotonic() >= self.deadline or time.time() >= self._restriction_lease_deadline):
                 _fail("control_deadline_expired", self)
-            self.job.set_cpu_rate_unverified(2500)
+            self.job.set_cpu_rate_unverified(2500, native_deadline=native_deadline)
             observed = _cpu(self.job.query_cpu())
             if observed != _CAPPED:
                 _fail("control_readback_mismatch", self)
@@ -689,7 +695,6 @@ class ExperimentNativeScope:
         """Owning guardian sweep; grant-after-cap restores the entire Job."""
         restore = False
         try:
-            self._ready()
             with self._scope(daily=True):
                 with self.daily_store._transaction() as conn:
                     self._coverage_locked(conn, restrictive=True)

@@ -462,3 +462,57 @@ digest cycle without omitting the exclusion postimage from the latter. A full
 original source manifest may require a bounded 2 MiB receipt_json cell; the
 retirement reader allows that exact canonical column while preserving
 its 64 KiB default cell bound and shared 16 MiB aggregate inventory limit.
+
+## Original admission settlement before completion (next source slice)
+
+An initial admission may commit successfully and then lose its COMMIT or nonce
+clear acknowledgement. `seal_without_native()` seals future work before checking
+submission cleanup. Re-admitting that sealed demand is correctly refused, but
+there must be a distinct way to settle its retained original admission guard.
+No completion can be required as input: minting that completion is the operation
+currently blocked by the unfinished admission guard.
+
+Add `Coordinator.settle_experiment_admission(demand)` for the exact original
+`DailyExperimentDemand`. Retain a separate concrete settlement operation before
+its first SQL acquisition. Seal further admission/native preparation without
+resetting any existing seal. It owns only bounded reads and exact original nonce
+clear; it cannot prepare/acquire a new POLICY guard, take capacity readiness,
+change a capacity/queue/exclusion row, release a reservation, close the original
+self witness, or mint a completion. Its result describes submission cleanup and
+the observed original admission state, never launch or capacity authorization.
+
+Bind the actual demand, inner admission, snapshot, original process witness,
+generation pin, ledger/file identity, submission POLICY/store, returned guard,
+nonce, original transaction and prior failure. A replacement guard/transaction,
+unreturned prepare result, exported claim, native preparation, unresolved SQL
+close, or uncertain native cleanup refuses. The original guard's positive
+native-exit/no-entry facts are necessary; a missing nonce alone is insufficient.
+Existing native/readiness/connection owners on the original error remain
+retained and cannot be discarded by creating this settlement operation.
+
+Use the same closed cleanup connection boundary as release, but permit only
+READ and CLEAR. On the real consumer connection and after BEGIN, validate the
+full original generation (ACTIVE or DRAINING), source/import/config, file
+identity and original POLICY binding. Never reconstruct authority from a new
+generation, current ledger nonce or serialized completion. The only write is
+that returned guard's exact nonce-to-null transition after positive native
+cleanup. Lost clear acknowledgement can be reconciled by a positively closed
+original read; unknown SQL/native close quarantines the original owner and
+forbids reopening. No general capacity UDF or native wait is needed.
+
+Read the original request/metadata and bounded full experiment history before
+and after cleanup. Verify an admitted unused row against the original private
+key/claim and metadata, while preserving reservation/floors/expiry and immutable
+history. An absent row after an uncertain COMMIT is merely observed absence,
+not proof that submission never happened. Only an exact original positively
+rolled-back, never-COMMIT-attempted first transaction permits a rejected-state
+classification. Queued or absent states remain separate from admitted cleanup;
+settling a guard does not cancel their request or invent an admitted receipt.
+
+Only after positive original cleanup and final readback clear the inner pending
+guard/error bookkeeping. Keep the operation and original error graph retained.
+The caller may then ask the existing `seal_without_native()` to prove an
+actually admitted unused claim and use the already implemented release route.
+Repeat settlement must not reacquire/re-publish a nonce, renew capacity, or
+replace any original owner. This amendment adds no native acceptance evidence
+and does not activate the daily source/configuration.

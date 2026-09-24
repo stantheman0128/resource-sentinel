@@ -4,57 +4,56 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
-最新 source checkpoint 完成 **原始 successor 的 atomic generation transfer、
-有界 inventory、fresh host readiness 與獨立 guardian epoch helper**。契約見
-[DAILY-GENERATION-SUCCESSOR.md](DAILY-GENERATION-SUCCESSOR.md)。原始已完成 retirement
-是唯一交接起點；SEALED row、複製物件或重開 process handle 不能重建權限。
+最新 source checkpoint 已接通 **原始 successor startup、guardian 的完整歷史
+驗證與註冊、父程序重試，以及跨世代共用歷史計帳**。契約見
+[DAILY-GENERATION-SUCCESSOR.md](DAILY-GENERATION-SUCCESSOR.md)。
+本批分為 `7451329`（history）、`d3c000b`（startup）、`a573f8e`（registration）。
 
-- 在同一 POLICY／transaction 重新驗證完整 inventory，原子追加 immutable
-  succession archive、移除舊 fence、替換 generation；保留普通 queue、worker、
-  reservation、exemption 與 terminal／experiment 歷史。每個 SQL acquisition
-  在開啟前保留原始 owner；未知開啟、rollback、close 會保留責任並拒絕另開重試。
-- prepare／transfer／nonce-clear ACK loss 使用同一 owner 與 transition 做確切
-  reconciliation。Metadata ACK 仍不能授予 readiness；必須由原始 fresh host
-  實際保留並發布 listener、service、thread 與 registry。舊 connection 不能跟隨
-  新 generation，舊 host 已退休也不能冒充整條 successor chain 已清理。
-- startup inventory 對照原始 seal preimage、實際 receipts／journals，再捕捉
-  現在普通資料列並在最後 transaction 驗證完全相同。Epoch helper 使用另一個
-  原始 POLICY，保留新 startup instance lease，原子寫入 immutable audit 並 CAS
-  epoch／logon／revision；共用 4,096 history observations／16 MiB 限制。
-  Audit validator 是 data-only，不能單獨授予 guardian Create 或 registration。
+- startup 在 identity、SQL 或 instance lease 取得前，先綁定原始 owner；
+  prepare、acquire、fresh-check 與 initial Create 的 SQL 都保留確切責任。
+  未知開啟、rollback、close 不會被當成已釋放，也不能用另一個 owner 重試。
+- 新 guardian 以自己的原始 registration、self handle、POLICY 與 journal，
+  讀取完整有界 current history。最後 transaction 驗證原始 preimage，執行
+  insertion／revision CAS，再驗證精確 postimage；不在該驗證中做 native 或
+  filesystem I/O。合法普通資料列可在提交後變動，但仍需重新驗證上限及
+  managed aliases；adaptive history、原始 receipts 與 revision 不能漂移。
+- nonce-clear 的 COMMIT ACK 遺失，必須由原始 guard 的正面 native 退出證據，
+  加上完整 readback／Store／readiness context 正面關閉才能收尾；不偽造
+  原始 guard 的 ACK。Unknown close 保留 quarantine，不授予完成或重試權限。
+- supervisor 使用原始 successor Store／journal，先完成 epoch publication，
+  每次真正 Create 前再核對完整 startup inventory。原始 child 註冊造成合法
+  revision +1 後，父程序可以續用既有 creation operation；不重發 epoch、
+  不重複 Create。Generic cold adoption 的拒絕仍保留。
+- experiments、succession archives 與 guardian epoch audits 共用 4,096 history
+  observations／16 MiB 上限。每筆 epoch audit 必須對應其 immutable succession、
+  generation 與 POLICY；後續 retirement 保留並驗證完整歷史，不重算成新權限。
 
-**這是可 review 的 source checkpoint，完整 fresh-generation restart 尚未完成。**
-`supervisor_host.py`／`supervisor_startup.py` 的 successor 接線草稿仍留在本機，
-不在本次 source commit。Generic cold-start 拒絕仍保留；CLI／installer 尚未加入
-restart 入口。尚需補齊 startup 取得 lease 前的 SQL custody、guardian registration
-自己的完整 current-history 證據與 epoch route、installer／CLI 的 chain exit，以及
-後續 retirement 對 epoch audit 的完整 shared-budget 驗證。這些是 source 待辦，
-不能全部歸因為 Windows capability gate。S2／P4、剩餘 S3 與 P6 A/B 工作也仍未完成。
+**完整 fresh-generation restart 仍未完成。** 本批已提交 supervisor／startup
+接線，不再把它們列為本機草稿；尚需 installer／CLI 的明確 restart 入口、
+chain exit 接線及完整連續兩代 retire／restart 驗證。S2／P4 actual aggregate
+provider、storage／overhead、其餘 S3 driver／140 次 orchestration、P6 actual A/B
+與 A0 等價性也仍有 source 工作。Items 5/6 未完成，不能說只剩 Windows gate。
 
-最終 **25 模組、696 PASS，0 failures／errors／skips，unittest 127.459 秒**。
-從暫存 index tree `413c0c8f1a8dd4d35a9606c4a93e2be4998f2ac6` 以 `git archive` 獨立匯出驗證，
-沒有複製受保護 dirty source、runtime 或 config；准入仍使用正常 daily wrapper。
-其後僅更新這份 README，沒有改變受測 source。
-隔離真實 SQLite／receipts／journals，明確 synthetic native peers 及 thread fixture；
-不代表 Windows native capability／recovery／overhead／A/B gate 或完整套件通過。
-私人原始日誌 `.local-adaptive/successor-checkpoint-export-20260924-2/test.log`。
+最終 **31 模組、796 PASS，0 failures／errors／skips，runner 182.288 秒**。
+測試使用 Windows／`C:\Python313\python.exe`，經日常 wrapper 的正常
+HEAVY／P2／1 CPU／1 GiB／0 I/O 准入。將精確 staged tree
+`a31e712e18ef30afb074589e2f1f2a9db22886ac` 用 `git archive` 匯出到獨立目錄，
+清除 `PYTHONPATH`，確認 source commit `a573f8e` 的 tree 完全相同。
+本批不依賴原有 protected dirty files；中間兩個小 commits 沒有各自獨立執行
+整批測試，commit messages 已揭露它們是在最終合併 source tree 中驗證。
+這是 source／isolated SQLite、journal 及明確 synthetic native fixtures 的證據，
+不是完整套件、實機 CPU control、P3–P6 native recovery／overhead／A/B gate 通過。
+私人逐例日誌：`.local-adaptive/successor-startup-export-20260924-1/test.log`。
 
-先前 dirty-tree foundation 的 11 errors、inventory 的 7 errors 已修正並納入
-本次匯出驗證：absent successor lookup 不再讀取 fixture 不存在的 db_path；
-unknown-close fixture 使用真正 SQLite Connection；inventory 只接受原始 connection
-上的精確 TEMP nonce guard。後續 28-test batch 有 3 failures，屬新 fixture 預期錯誤：
-experiment verifier 的 runtime revision 也占一筆 history observation；首次 readonly
-open 的 owner 是原始 readiness reader。現在驗證完整 additive 計帳，並分開測試
-readiness 與 Store 的未知開啟都保留確切 owner、錯誤與禁止重試，不放寬 production。
-較早的 278／38／114 PASS 批次與本次範圍重疊，不能加總。
+本輪先前批次與修正：startup/history 的 32 tests 有 1 failure／1 error，分別
+是錯誤的 SQL 注入 matcher 與 fixture 在 POLICY 收尾時仍留下 SEALED transaction；
+修正後 85 PASS。Registration 的 37 tests 有 1 failure：trigger 使用不存在的
+execution，先被真實 Store foreign key 拒絕；改用真實 terminal fixture，最終
+匯出測試直接驗證合法 history mutation 被 postimage check 拒絕並完整 rollback。
+父程序／epoch 的 18 tests 亦通過。以上批次與最終 796 重疊，不得加總。
+上一批 25 模組／696 PASS 是較早的 successor transfer/readiness 基準。
 
-第一次 25 模組匯出測試為 696 tests／2 failures：startup lost-open fixture
-正確保留未知 readiness scope，卻污染後續測試的共用 registry，造成 pool 9／8
-及等待超時。獨立 14-case 診斷證明唯一新增 scope 來自該案例。現在每個此類
-fixture 使用獨立 registry，並直接驗證原始未知 scope／error 仍保留；清理後才
-還原測試 registry，沒有更改 production 限額、close 認定或舊測試預期。
-
-在包含本次提交的乾淨 checkout，使用正常准入重現：
+在包含本批 source commits 的乾淨 checkout，以正常准入重現相同 31 模組：
 
 ```powershell
 $sentinelSuccessorTests = @(
@@ -83,13 +82,19 @@ $sentinelSuccessorTests = @(
     'tests.test_adaptive_daily_source_install'
     'tests.test_adaptive_supervisor_startup'
     'tests.test_adaptive_supervisor_host'
+    'tests.test_adaptive_daily_successor_startup'
+    'tests.test_adaptive_daily_retirement_successor_history'
+    'tests.test_adaptive_daily_successor_registration_inventory'
+    'tests.test_adaptive_daily_successor_host_registration'
+    'tests.test_adaptive_guardian_registration'
+    'tests.test_adaptive_guardian_host'
 )
 $sentinelSuccessorCommand = 'C:\Python313\python.exe -m unittest ' + ($sentinelSuccessorTests -join ' ') + ' -q'
 powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command $sentinelSuccessorCommand -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
 ```
 
 日常 source、config、Scheduled Task 與全域啟動入口均未修改，adaptive 保持 off。
-沒有執行 native 限速、kill、trim 或工作程序故障測試，沒有待撤回的測試 Job 限制。
+沒有執行使用者程序的限速、kill、trim 或故障注入，沒有待撤回的測試 Job 限制。
 
 前一批 S1 source 實作與驗證如下。
 
@@ -906,7 +911,7 @@ loader error 或未跑的 native gate 算成 pass。
 | 2. 裁決 ④ | 契約與 source 完成；最後完整 adaptive 2,127 tests 通過。沒有舊 witness 的 cold adoption 仍不支援；native recovery 未驗證。 |
 | 3. helper sender | Source 接線、獨立 review 與完整 2,298 tests 通過。後續 original launch/stdio provenance、guardian scope 比對與 helper proposal adapter 已接線，344 targeted tests 通過（30.960 秒，含 30 個專用 scope tests）。實際 S2 topology producer／native bundle／新增採集成本仍未驗證，缺證據不啟用控制。 |
 | 4. release／CLI | Source 整合與完整 2,800 tests 通過；包含 exact discovery、typed operator transport、原子 off／audit、同 owner 收尾與三個 host 的 drain。後續 rootless C2 post-close receipt 已補上，保持原 terminal state，不偽造 FINISHED；新增 29 個案例。232 targeted tests 中 231 通過，唯一錯誤文字預期修正後單獨重跑通過，production 未因該失敗改動。沒有原始 close 證據的舊歷史仍 unknown。Native 操作通訊、控制及恢復仍未驗證。 |
-| 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport](P2-DAILY-ACTIVATION.md)、typed daily release、queued／rejected cleanup、原始 scope／wrapper／probe 與 [serial S1 provider](S1-SERIAL-PROVIDER.md) 已有 source 與隔離測試。最新 S1 measurement、bootstrap／v2 publication 與測試狀態見本頁頂端。Fresh-generation restart 仍是 source 缺口；尚未執行日常安裝或 native S1，不能宣稱 live grace 前提已解鎖。 |
+| 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport](P2-DAILY-ACTIVATION.md)、typed daily release、queued／rejected cleanup、原始 scope／wrapper／probe 與 [serial S1 provider](S1-SERIAL-PROVIDER.md) 已有 source 與隔離測試。最新 S1 measurement、bootstrap／v2 publication 與測試狀態見本頁頂端。Successor startup／registration 已接通；restart 的 installer／CLI、chain exit 與連續兩代驗證仍缺，尚未執行日常安裝或 native S1，不能宣稱 live grace 前提已解鎖。 |
 | 6. console 驗收命令 | [P6 矩陣與 raw reducer](P6-RUNNER-CONTRACT.md)、[S1/S2 bridge](S1-DAILY-BRIDGE-CONTRACT.md)、[S3 14×10 記錄器](S3-REAL-HOST-RECOVERY.md)、[P4 host 成本量測](P4-OVERHEAD-RUNNER.md) 已有 source。新增 S1 entry 與來源驗證路徑見本頁頂端。S2/P4 的 actual aggregate provider、部分 S3 故障 driver／完整 orchestration、P6 actual A/B 接線與 A0 等價性仍缺；§11.2 成本及所有 native gates 未驗證，不是只剩 console 執行。 |
 
 已提交的基礎：項目 5 的同帳本 demand 與 retirement fence 為 `1072786`／

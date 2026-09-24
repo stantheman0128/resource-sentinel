@@ -25,6 +25,22 @@ Items 5/6 仍有下述 source 缺口；日常 runtime、config、Scheduled Task 
 維持原狀，adaptive off。受保護 dirty baseline 仍未提交，測試依賴於 commit
 message 揭露；未宣稱 clean-checkout 或 full-suite 通過。
 
+另一次尚未通過的 bootstrap 草稿驗證，**不屬於以上已通過的切片**：
+4 模組、127 tests、30 failures（含 subtest failures）、0 errors／skips，
+runner 103.421 秒，私人日誌 `.local-adaptive/producer-bootstrap-commit-20260924-2.log`。
+共同失敗代碼為 `daily_loaded_code_generation_mismatch`；尚未確認造成差異的
+runtime function，不能略過這道檢查。較早 123 tests／22 failures／22.902 秒
+先被 Windows path-stat 與 fstat 的 ctime 差異擋住；修正後才到目前的來源核對。
+這些失敗不是 tree-ready 的回歸，也不是 native gate 的實測結果。
+
+`tests/windows/adaptive_producer_bootstrap.py`、其 test module，以及尚無測試的
+`adaptive_s1_measurements.py` 草稿均留在本機，未納入本次提交。前兩者的 review
+已修正 imported binding 與 runtime parent alias 漏檢，但仍未通過執行驗證。
+下一步先用隔離 source fixture 找到 loaded function／compiled code 的具體差異，
+保留完整 source attestation，再驗證 helper；實際四模組 closure、entry、
+capture/admission 與 v2 publication 接線也尚未完成。沒有新增 native 控制，
+不需要撤回 Job CPU 限制。
+
 ### Serial provider checkpoint（歷史驗證）
 
 Serial S1 provider 的原始 case／daily demand／admission／cleanup 接線已實作。

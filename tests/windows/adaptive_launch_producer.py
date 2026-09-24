@@ -7,6 +7,7 @@ No synthetic collaborator can turn an incomplete matrix into a native pass.
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 import hashlib
 import json
 import os
@@ -23,7 +24,8 @@ from sentinel.adaptive.capability_evidence import S2_CASES, _s2
 ROOT = Path(__file__).resolve().parents[2]
 CHILD = ROOT / "tests" / "fixtures" / "adaptive_launch_producer_child.py"
 _PENDING_PROCESSES = []
-PS_BRIDGE = r'''param([string]$Payload, [string]$PayloadFile, [string]$PythonPath, [string]$FixturePath)
+_CASE_ATTEMPTS = {}
+PS_BRIDGE = r'''param([string]$Payload, [string]$PayloadFile, [string]$PythonPath, [string]$FixturePath, [string]$SourcePin)
 $ErrorActionPreference = 'Stop'
 if ($PayloadFile) {
   $spec = [IO.File]::ReadAllText($PayloadFile, [Text.Encoding]::UTF8) | ConvertFrom-Json
@@ -36,7 +38,7 @@ if ($spec.mode -eq 'baseline') {
   & "$env:SystemRoot\System32\cmd.exe" /d /s /c $spec.command
   exit $LASTEXITCODE
 }
-& $PythonPath $FixturePath wrapper $Payload
+& $PythonPath -I $FixturePath --source-pin $SourcePin wrapper $Payload
 exit $LASTEXITCODE
 '''
 
@@ -49,17 +51,178 @@ class S2Unavailable(RuntimeError):
 
 class S2CustodyPending(S2Unavailable):
     """Caller must keep these original subprocess objects, never reopen PIDs."""
-    def __init__(self, reason, processes=(), *, threads=(), native_uncertainties=()):
+    def __init__(self, reason, processes=(), *, threads=(), native_uncertainties=(), attempts=()):
         self.pending_processes = tuple(processes)
         self.pending_threads = tuple(threads)
         self.native_uncertainties = tuple(native_uncertainties)
+        self.case_attempts = tuple(attempts)
         super().__init__(reason)
 
     def observe_settled(self):
         # Only positive exit of the same objects ends local observer custody.
         # This does not certify the S2 matrix or substitute for guardian audit.
         return (not self.native_uncertainties and not any(thread.is_alive() for thread in self.pending_threads)
-                and all(process.poll() is not None for process in self.pending_processes))
+                and all(attempt.observe_local_settlement() for attempt in self.case_attempts)
+                and all(any(process is attempt.process for attempt in self.case_attempts) or
+                        process.poll() is not None for process in self.pending_processes))
+
+
+def _original_process_exit_code(handle):
+    """Query the retained native object, never Popen's cached returncode or PID."""
+    import _winapi
+    observed = _winapi.WaitForSingleObject(handle, 0)
+    if observed == _winapi.WAIT_TIMEOUT:
+        return None
+    if observed != _winapi.WAIT_OBJECT_0:
+        raise S2Unavailable("s2_original_process_wait_unverified")
+    code = _winapi.GetExitCodeProcess(handle)
+    if type(code) is not int or not 0 <= code <= 0xffffffff:
+        raise S2Unavailable("s2_original_process_exit_unverified")
+    return code
+
+
+@dataclass(frozen=True)
+class S2CaseDeclaration:
+    attempt_id: str
+    directory: str
+    token: str
+    case: str
+    mode: str
+    stdio_profile: str
+    source_pin_json: str
+
+
+class S2CaseAttempt:
+    """Original parent-local custody; never whole-scope release authority.
+
+    Published before observer start or console creation. No serialized record,
+    callback or successful driver exit can certify guardian/workload retirement.
+    An ambiguous creation/close is sticky, including an interrupted close ACK.
+    """
+    def __init__(self, declaration):
+        if type(self) is not S2CaseAttempt or type(declaration) is not S2CaseDeclaration:
+            raise S2Unavailable("s2_original_case_declaration_required")
+        self.declaration = self._declaration = declaration
+        self._thread, self._pid = threading.current_thread(), os.getpid()
+        self.driver_args = self._driver_args = None
+        self.observer = self._observer = None
+        self.observer_errors = self._observer_errors = None
+        self._observer_terminal_errors = None
+        self.process = self._process = None
+        self._process_handle = self._original_process_handle = None
+        self._handle_bound = False
+        self.native_exit_code = None
+        self.start_entered = self.start_returned = self.create_entered = False
+        self.close_state = "not_entered"
+        self.local_settled = False
+        self.errors = []
+        if declaration.attempt_id in _CASE_ATTEMPTS:
+            raise S2Unavailable("s2_case_attempt_reused")
+        _CASE_ATTEMPTS[declaration.attempt_id] = self
+
+    def _original(self):
+        if (type(self) is not S2CaseAttempt or self.declaration is not self._declaration or
+                _CASE_ATTEMPTS.get(self.declaration.attempt_id) is not self or
+                self._thread is not threading.current_thread() or self._pid != os.getpid() or
+                self.driver_args is not self._driver_args or self.process is not self._process or
+                self.observer is not self._observer or self.observer_errors is not self._observer_errors):
+            raise S2Unavailable("s2_original_case_attempt_required")
+        if self.process is not None:
+            try:
+                current_handle = self.process._handle
+            except BaseException as error:
+                self.remember(error)
+                raise S2Unavailable("s2_original_process_handle_unverified") from error
+            if (not self._handle_bound or self._process_handle is not self._original_process_handle or
+                    current_handle is not self._original_process_handle):
+                raise S2Unavailable("s2_original_process_handle_unverified")
+
+    def pin_launch(self, driver_args, observer, observer_errors=None):
+        self._original()
+        if self._driver_args is not None or self.create_entered or self.start_entered or self.local_settled:
+            raise S2Unavailable("s2_case_launch_already_bound")
+        self.driver_args = self._driver_args = tuple(driver_args)
+        self.observer = self._observer = observer
+        if observer_errors is not None and type(observer_errors) is not list:
+            raise S2Unavailable("s2_observer_channel_invalid")
+        self.observer_errors = self._observer_errors = [] if observer_errors is None else observer_errors
+
+    def bind_process(self, process):
+        self._original()
+        if not self.create_entered or self._process is not None or process is None:
+            raise S2Unavailable("s2_case_process_already_bound")
+        self.process = self._process = process
+        # Bind before timestamps, diagnostics, communication or any later poll.
+        # If access is interrupted the process is already retained, but its
+        # original handle is unverified and cannot be adopted on a later tick.
+        handle = process._handle
+        if handle is None:
+            raise S2Unavailable("s2_original_process_handle_unverified")
+        self._process_handle = self._original_process_handle = handle
+        self._handle_bound = True
+
+    def remember(self, error):
+        if len(self.errors) < 16 and not any(item is error for item in self.errors):
+            self.errors.append(error)
+
+    def observe_local_settlement(self):
+        try:
+            self._original()
+        except S2Unavailable as error:
+            if error.reason != "s2_original_process_handle_unverified":
+                raise
+            self.remember(error)
+            return False
+        if (self.start_entered and not self.start_returned or
+                self.observer is not None and self.observer.is_alive()):
+            return False
+        # A timeout can precede the observer's finally/CloseHandle. Keep the
+        # original channel, then inspect it after thread exit before discharge.
+        current_errors = tuple(self.observer_errors or ())
+        if self._observer_terminal_errors is None:
+            self._observer_terminal_errors = current_errors
+        elif (len(current_errors) != len(self._observer_terminal_errors) or
+                any(current is not original for current, original in
+                    zip(current_errors, self._observer_terminal_errors))):
+            return False  # A terminal observer channel cannot lose its custody.
+        for error in self._observer_terminal_errors:
+            self.remember(error)
+            if isinstance(error, S2CustodyPending) and not error.observe_settled():
+                return False
+        if self.local_settled:
+            return True
+        if not self.create_entered:
+            self.local_settled = True
+            return True
+        if self.process is None or self.close_state in {"entered", "unknown"}:
+            return False
+        if self.close_state == "closed":
+            self.local_settled = True
+            return True
+        handle = self._original_process_handle
+        try:
+            exit_code = _original_process_exit_code(handle)
+        except BaseException as error:
+            self.remember(error)
+            return False
+        if exit_code is None:
+            return False
+        # Popen owns this original Windows process handle; never reopen a PID.
+        self._original()
+        self.native_exit_code = exit_code
+        self.process.returncode = exit_code  # Actual native result before close.
+        self.close_state = "entered"
+        try:
+            handle.Close()
+        except BaseException as error:
+            self.remember(error)
+            self.close_state = "unknown"
+            return False
+        self.close_state = "closed"
+        if any(process is self.process for process in _PENDING_PROCESSES):
+            _PENDING_PROCESSES.remove(self.process)
+        self.local_settled = True
+        return True
 
 
 def _close_observers(handles):
@@ -71,6 +234,16 @@ def _close_observers(handles):
             failures.append((handle, error))
     if failures:
         raise S2CustodyPending("s2_native_observer_close_unknown", native_uncertainties=failures)
+
+
+def _open_observer(native, pid, birth=None, *, terminate=False):
+    try:
+        return native.ProcessHandle.open(pid, birth, terminate=terminate)
+    except native.RetainedProcessOpenError as error:
+        # Validation failed and its native cleanup was uncertain. Do not call
+        # close again or turn the exception into an ordinary failed observation.
+        raise S2CustodyPending("s2_native_observer_open_cleanup_unknown",
+            native_uncertainties=((error.owner, error),)) from error
 
 
 def canonical(value):
@@ -118,6 +291,15 @@ def _tick():
 
 def _encode(value):
     return base64.b64encode(canonical(value)).decode("ascii")
+
+
+def _source_pin(bootstrap):
+    from tests.windows.adaptive_producer_bootstrap import ProducerBootstrap
+    if (type(bootstrap) is not ProducerBootstrap or
+            bootstrap.entry != "tests/windows/run_adaptive_s2.py" or
+            bootstrap.modules.get(__name__) is not sys.modules.get(__name__)):
+        raise S2Unavailable("s2_original_producer_bootstrap_required")
+    return bootstrap.source_pin()
 
 
 def _hidden_console_startup():
@@ -183,8 +365,9 @@ def _retired(data_dir, guardian, execution_id, timeout=30):
     raise S2Unavailable("s2_terminal_custody_receipt_unverified")
 
 
-def _fixture_command(python, directory, token, case, managed):
-    args = [str(python), str(CHILD), "workload", "--directory", str(directory), "--token", token]
+def _fixture_command(python, directory, token, case, managed, source_pin):
+    args = [str(python), "-I", str(CHILD), "--source-pin", _encode(source_pin),
+            "workload", "--directory", str(directory), "--token", token]
     if managed:
         args.append("--managed")
     modes = {"stdin": "io", "parallel_stdout_stderr": "io", "unicode_space": "io",
@@ -232,7 +415,7 @@ def _collector_fault(directory, descriptor, *, managed):
     result = {}
     try:
         def hold(identity, *, terminate=False):
-            process = native.ProcessHandle.open(identity["pid"], identity["created_filetime_100ns"], terminate=terminate)
+            process = _open_observer(native, identity["pid"], identity["created_filetime_100ns"], terminate=terminate)
             handles.append(process)
             if process.wait(0):
                 raise S2Unavailable("s2_fault_target_not_live")
@@ -280,22 +463,71 @@ def _collector_fault(directory, descriptor, *, managed):
             scheduler_workload_kills=0, taskkill_implementation_validated=False)
         return result
     finally:
-        _write(directory / "collector-fault.json", result)
-        _close_observers(handles + ([] if job is None else [job]))
+        primary = sys.exception()
+        try:
+            try:
+                _write(directory / "collector-fault.json", result)
+            except BaseException as diagnostic:
+                if not isinstance(primary, S2CustodyPending):
+                    raise
+                # A failing artifact cannot replace an original uncertain
+                # observer-open owner with an ordinary diagnostic exception.
+                primary.diagnostic_errors = (*getattr(primary, "diagnostic_errors", ()), diagnostic)
+        finally:
+            # A diagnostic failure cannot skip cleanup. If close is unknown,
+            # its S2CustodyPending retains the originals and chains the write
+            # or fault exception for the attempt's original observer channel.
+            _close_observers(handles + ([] if job is None else [job]))
 
 
 def _run_case(host, bridge, directory, token, case, mode, data_dir, descriptor, python, *, probe_null=False,
-              coverage=None, stdio_profile="pipes"):
+              coverage=None, stdio_profile="pipes", bootstrap=None):
+    source_pin = _source_pin(bootstrap)
+    declaration = S2CaseDeclaration(str(uuid.uuid4()), str(directory), token, case, mode, stdio_profile,
+                                   canonical(source_pin).decode("utf-8"))
+    attempt = S2CaseAttempt(declaration)
+    try:
+        result = _run_case_owned(host, bridge, directory, token, case, mode, data_dir, descriptor, python,
+            probe_null=probe_null, coverage=coverage, stdio_profile=stdio_profile, bootstrap=bootstrap,
+            source_pin=source_pin, attempt=attempt)
+        if not attempt.observe_local_settlement():
+            raise S2CustodyPending("s2_parent_local_cleanup_pending", attempts=(attempt,))
+        return result
+    except BaseException as error:
+        attempt.remember(error)
+        try:
+            settled = attempt.observe_local_settlement()
+        except BaseException as cleanup:
+            attempt.remember(cleanup)
+            settled = False
+        if isinstance(error, S2CustodyPending):
+            if not any(item is attempt for item in error.case_attempts):
+                error.case_attempts += (attempt,)
+            raise
+        if not settled:
+            pending = S2CustodyPending("s2_original_case_custody_pending",
+                () if attempt.process is None else (attempt.process,),
+                threads=() if attempt.observer is None else (attempt.observer,), attempts=(attempt,))
+            pending.primary_error = error
+            raise pending from error
+        error.s2_case_attempt = attempt
+        raise
+
+
+def _run_case_owned(host, bridge, directory, token, case, mode, data_dir, descriptor, python, *, probe_null,
+                    coverage, stdio_profile, bootstrap, source_pin, attempt):
     guardian = descriptor.guardian
     launch = _endpoint(guardian, "launch")
     spec = {"directory": str(directory), "token": token, "case": case, "mode": mode,
-            "data_dir": str(data_dir), "command": _fixture_command(python, directory, token, case, mode == "managed"),
+            "data_dir": str(data_dir), "source_pin": source_pin,
+            "command": _fixture_command(python, directory, token, case, mode == "managed", source_pin),
             "probe_null_stdio": probe_null,
             "guardian": {"epoch": guardian.guardian_epoch, "pid": guardian.host_identity.pid,
                          "birth": str(guardian.host_identity.created_filetime_100ns),
                          "endpoint_instance_id": launch.instance_id}}
     args = [str(host), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(bridge),
-            "-Payload", _encode(spec), "-PythonPath", str(python), "-FixturePath", str(CHILD)]
+            "-Payload", _encode(spec), "-PythonPath", str(python), "-FixturePath", str(CHILD),
+            "-SourcePin", _encode(source_pin)]
     if len(subprocess.list2cmdline(args).encode("utf-16-le")) // 2 + 1 >= 32767:
         raise S2Unavailable("s2_fixture_transport_too_large")
     env = dict(os.environ, SENTINEL_S2_PERCENT="percent-value", SENTINEL_S2_BANG="bang-value")
@@ -311,7 +543,7 @@ def _run_case(host, bridge, directory, token, case, mode, data_dir, descriptor, 
                 if root["live_child_count_after_root"] < 1:
                     raise S2Unavailable("s2_no_live_child_after_root")
                 child = _read(directory / "child.ready.json")
-                retained_child = native.ProcessHandle.open(child["identity"]["pid"], child["identity"]["created_filetime_100ns"])
+                retained_child = _open_observer(native, child["identity"]["pid"], child["identity"]["created_filetime_100ns"])
                 if retained_child.wait(0):
                     raise S2Unavailable("s2_child_already_exited")
                 _write(directory / "release-child.json", {"observed_tick": _tick()})
@@ -351,28 +583,37 @@ def _run_case(host, bridge, directory, token, case, mode, data_dir, descriptor, 
         payload_path = directory / "baseline-synthetic-payload.json"
         _write(payload_path, spec)
         args = [str(host), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(bridge),
-                "-PayloadFile", str(payload_path), "-PythonPath", str(python), "-FixturePath", str(CHILD)]
+                "-PayloadFile", str(payload_path), "-PythonPath", str(python), "-FixturePath", str(CHILD),
+                "-SourcePin", _encode(source_pin)]
         # The original inner PS→cmd invocation is unchanged. An outer admitted
         # WrapperHost encloses its whole lifetime. This is a semantics baseline
         # with extra containment, explicitly not an A0 performance baseline.
         holder = dict(spec, command=subprocess.list2cmdline(args), case="baseline_holder", mode="managed")
-        args = [str(python), str(CHILD), "wrapper", _encode(holder)]
+        args = [str(python), "-I", str(CHILD), "--source-pin", _encode(source_pin), "wrapper", _encode(holder)]
     # Every canonical case uses the same actual wrapper pipe handles and a
     # fresh hidden console. A Ctrl+C observation must not lend its different
     # console/stdio topology to the remaining cases' qualification.
     startup = _hidden_console_startup()
-    driver_args = [str(python), str(CHILD), "console", _encode({
+    driver_args = [str(python), "-I", str(CHILD), "--source-pin", _encode(source_pin), "console", _encode({
         "directory": str(directory), "token": token, "shell_args": args,
+        "source_pin": source_pin,
         "signal": case == "ctrl_c", "stdio_profile": stdio_profile,
         "input_b64": base64.b64encode(b"stdin payload\r\nsecond line\r\n" if case == "stdin" else b"").decode("ascii")})]
     if len(subprocess.list2cmdline(driver_args).encode("utf-16-le")) // 2 + 1 >= 32767:
         raise S2Unavailable("s2_driver_transport_too_large")
+    if _source_pin(bootstrap) != source_pin:
+        raise S2Unavailable("s2_producer_source_changed")
+    attempt.pin_launch(driver_args, observer, observer_error)
     if observer is not None:
+        attempt.start_entered = True
         observer.start()
+        attempt.start_returned = True
+    attempt.create_entered = True
     process = subprocess.Popen(driver_args, cwd=directory, env=env,
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         creationflags=0x10, startupinfo=startup)  # CREATE_NEW_CONSOLE, no breakaway/suspension.
     if process is not None:
+        attempt.bind_process(process)
         _PENDING_PROCESSES.append(process)
         try:
             stdout, stderr = process.communicate(timeout=110)
@@ -401,8 +642,6 @@ def _run_case(host, bridge, directory, token, case, mode, data_dir, descriptor, 
             except BaseException as diagnostic:
                 pending.diagnostic_errors.append(diagnostic)
             raise pending from error
-        else:
-            _PENDING_PROCESSES.remove(process)
         exit_code = process.returncode
     if observer is not None:
         observer.join(timeout=1)
@@ -526,13 +765,14 @@ def build_case_record(case, iteration, baseline, managed):
             "cleanup": cleanup, "topology_sha256": topology}
 
 
-def produce_s2(coverage, evidence_directory, context):
+def produce_s2(coverage, evidence_directory, context, *, bootstrap=None):
     """Execute a bounded matrix, retaining raw failure evidence before raising.
 
     ``coverage`` is the genuine owner returned by the shared provider in the
     parent runner. It must remain alive through all original wrapper recovery.
     """
     coverage.authority.assert_ready()
+    _source_pin(bootstrap)
     data_dir = Path(coverage.coordinator.db_path).resolve(strict=True).parent
     if os.name != "nt":
         raise S2Unavailable("s2_windows_required")
@@ -565,7 +805,7 @@ def produce_s2(coverage, evidence_directory, context):
                         "token": rejected_token, "deadline_unix": time.time() + 115})
                     rejected = _run_case(host, bridge, rejected_dir, rejected_token,
                         "exit_0" if case == "null_stdio" else "infra_exit_125", "managed", data_dir,
-                        descriptor, python, probe_null=case == "null_stdio", coverage=coverage)
+                        descriptor, python, probe_null=case == "null_stdio", coverage=coverage, bootstrap=bootstrap)
                     if (rejected["exit_code"] != 125 or rejected["wrapper"]["launches"] != 0 or
                             rejected["wrapper"]["local_cleanup_closed"] is not True or
                             rejected["wrapper"]["infrastructure_failure"] is None or "workload" in rejected):
@@ -581,7 +821,7 @@ def produce_s2(coverage, evidence_directory, context):
                     token = uuid.uuid4().hex
                     _write(case_dir / "fixture-authorization.json", {"token": token, "deadline_unix": time.time() + 115})
                     pair[mode] = _run_case(host, bridge, case_dir, token, case, mode, data_dir, descriptor, python,
-                                           coverage=coverage)
+                                           coverage=coverage, bootstrap=bootstrap)
                 record = build_case_record(case, iteration, pair.get("baseline"), pair["managed"])
                 version = pair["managed"]["shell"]["version"]
                 if name == "powershell51" and not version.startswith("5.1."):
@@ -599,7 +839,8 @@ def produce_s2(coverage, evidence_directory, context):
                         _write(secondary_dir / "fixture-authorization.json", {
                             "token": secondary_token, "deadline_unix": time.time() + 115})
                         secondary[mode] = _run_case(host, bridge, secondary_dir, secondary_token, case, mode,
-                            data_dir, descriptor, python, coverage=coverage, stdio_profile=alternate)
+                            data_dir, descriptor, python, coverage=coverage, stdio_profile=alternate,
+                            bootstrap=bootstrap)
                     diagnostic = build_case_record(case, iteration, secondary["baseline"], secondary["managed"])
                     records.append(diagnostic)
                     topologies[diagnostic["topology_sha256"]] = secondary["managed"]["wrapper"]["launch_provenance"]["topology"]

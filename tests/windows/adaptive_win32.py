@@ -39,6 +39,15 @@ class UnsupportedCapability(RuntimeError):
         super().__init__(f"{reason}; win32_error={win32_error}")
 
 
+class RetainedProcessOpenError(RuntimeError):
+    """Validation failed and the same opened observer's cleanup is unknown."""
+    def __init__(self, owner, primary, cleanup_error):
+        self.owner, self.primary, self.cleanup_error = owner, primary, cleanup_error
+        self.cleanup_state = "unknown"
+        self.reason = "s2_observer_open_cleanup_unknown"
+        super().__init__(self.reason)
+
+
 LaunchOutcomeUnknown = _launcher.LaunchOutcomeUnknown
 
 
@@ -345,8 +354,16 @@ class ProcessHandle:
             ):
                 raise ValueError("exact process identity mismatch; PID may have been reused")
             return process
-        except BaseException:
-            process.close()
+        except BaseException as primary:
+            try:
+                process.close()
+            except BaseException as cleanup_error:
+                # No PID reopen and no blind retry: a failed CloseHandle or an
+                # interrupted acknowledgement can refer to an already closed,
+                # subsequently reused numeric handle. Keep the original owner
+                # and both errors on the typed exception consumed by callers.
+                process._s2_observer_open_close_unknown = True
+                raise RetainedProcessOpenError(process, primary, cleanup_error) from primary
             raise
 
     @classmethod
@@ -412,6 +429,8 @@ class ProcessHandle:
         return int(result.value)
 
     def close(self):
+        if getattr(self, "_s2_observer_open_close_unknown", False):
+            raise RuntimeError("s2_observer_open_cleanup_unknown")
         from sentinel.adaptive.identity import retry_identity_cleanup
 
         for error in self._identity_cleanup:

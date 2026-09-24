@@ -1,4 +1,4 @@
-"""Original, source-only S1 producer imports; no admission or native authority.
+"""Original, source-only capability imports; no admission or native authority.
 
 The isolated console loads this stdlib-only module as
 ``_sentinel_producer_bootstrap`` using compile/exec, then calls ``bootstrap()``
@@ -35,6 +35,22 @@ _MODULES = (
 _NAMESPACES = ("tests", "tests.windows", "tests.fixtures", "tests.benchmarks")
 _EXTRA_FILES = (_ENTRY, "tests/windows/adaptive_producer_bootstrap.py",
                 "tests/windows/adaptive_scope_wrapper.py", "tests/fixtures/adaptive_scope_cpu_worker.py")
+_S2_CHILD = "tests/fixtures/adaptive_launch_producer_child.py"
+_S2_ENTRY = "tests/windows/run_adaptive_s2.py"
+_S2_CHILD_MODULES = (
+    ("tests.windows.adaptive_win32", "tests/windows/adaptive_win32.py"),
+)
+_S2_MODULES = (*_S2_CHILD_MODULES,
+    ("tests.fixtures.adaptive_launch_producer_child", _S2_CHILD),
+    ("tests.windows.adaptive_launch_producer", "tests/windows/adaptive_launch_producer.py"),
+)
+# Entry selection comes only from the original executing module frame. Neither
+# argv, a source digest, nor a payload may widen this finite import closure.
+_PROFILES = {
+    _ENTRY: (_MODULES, _EXTRA_FILES),
+    _S2_CHILD: (_S2_CHILD_MODULES, (_S2_CHILD, "tests/windows/adaptive_producer_bootstrap.py")),
+    _S2_ENTRY: (_S2_MODULES, (_S2_ENTRY, "tests/windows/adaptive_producer_bootstrap.py")),
+}
 _MAX_FILE_BYTES = 1024 * 1024
 _ORIGINAL = None
 
@@ -286,18 +302,23 @@ class ProducerBootstrap:
         entry_path = _safe(Path(entry_frame.f_code.co_filename))
         self.producer_root = _safe(Path(__file__).parents[2], directory=True)
         self.runtime_root = _safe(Path.home() / "Projects" / "resource-sentinel", directory=True)
-        if entry_path != self.producer_root / _ENTRY:
+        entries = [relative for relative in _PROFILES if entry_path == self.producer_root / relative]
+        if len(entries) != 1:
             _fail("entry_path_invalid")
+        self.entry = entries[0]
+        self._modules, extras = _PROFILES[self.entry]
+        self._profile = self.entry, self._modules, extras
+        self._python = _Source(_safe(Path(sys.executable).resolve(strict=True)))
         self._roots = {path: _identity(path) for path in (self.producer_root, self.runtime_root)}
         self._directories = {self.producer_root / name.replace(".", "/"): None for name in _NAMESPACES}
         for directory in self._directories:
             self._directories[directory] = _identity(_safe(directory, directory=True))
         self._layout()
         sources = {relative: _Source(self.producer_root / relative)
-                   for relative in (*_EXTRA_FILES, *(relative for _, relative in _MODULES))}
+                   for relative in (*extras, *(relative for _, relative in self._modules))}
         self._sources = sources
-        self._fixture_sources = {name: sources[relative] for name, relative in _MODULES}
-        self._entry_record = _Module("__main__", self._entry_module, sources[_ENTRY], entry_frame.f_code)
+        self._fixture_sources = {name: sources[relative] for name, relative in self._modules}
+        self._entry_record = _Module("__main__", self._entry_module, sources[self.entry], entry_frame.f_code)
         self._bootstrap_record = _Module(_PRIVATE_NAME, self._bootstrap_module,
             sources["tests/windows/adaptive_producer_bootstrap.py"], _BOOTSTRAP_CODE)
         self._namespaces = {}
@@ -340,9 +361,9 @@ class ProducerBootstrap:
         generation = importlib.import_module("sentinel.adaptive.daily_generation")
         self.manifest = generation.SourceManifest.capture(self.runtime_root)
         binding_module = importlib.import_module("sentinel.adaptive.capability_build")
-        for name, _ in _MODULES:
+        for name, _ in self._modules:
             importlib.import_module(name)
-        self.modules = MappingProxyType({name: sys.modules[name] for name, _ in _MODULES} |
+        self.modules = MappingProxyType({name: sys.modules[name] for name, _ in self._modules} |
                                        {_PUBLIC_NAME: self._bootstrap_module})
         self.source_binding = binding_module.SourceBinding(1, "canonical_runtime_fixture_inventory",
             str(self.runtime_root), str(self.producer_root), self.manifest.digest)
@@ -366,6 +387,10 @@ class ProducerBootstrap:
             _fail("original_bootstrap_required")
         if tuple(sys.path) != self._path or not sys.meta_path or sys.meta_path[0] is not self._finder:
             _fail("import_path_changed")
+        self._python.verify()
+        if (self.entry != self._profile[0] or self._modules is not self._profile[1] or
+                _PROFILES.get(self.entry) != self._profile[1:]):
+            _fail("entry_profile_changed")
         for path, identity in self._roots.items():
             if _identity(_safe(path, directory=True)) != identity:
                 _fail("root_changed")
@@ -417,6 +442,29 @@ class ProducerBootstrap:
         if self.build_source() != self._build:
             _fail("build_changed")
         return self._build
+
+    def source_pin(self):
+        """Serializable consistency data only; never native/admission authority."""
+        import hashlib
+        build = self.assert_unchanged()
+        return dict(schema_version=1, source_binding=self.source_binding.to_dict(),
+                    build=dict(runtime_sha256=build.runtime_sha256, producer_sha256=build.producer_sha256),
+                    python_sha256=hashlib.sha256(self._python.data).hexdigest())
+
+    def verify_pin(self, value):
+        import json
+        if type(value) is not dict:
+            _fail("source_pin_invalid")
+        # Canonical JSON distinguishes bool from int and rejects non-finite
+        # values; dict equality alone would accept True for schema version 1.
+        try:
+            observed = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        except (TypeError, ValueError):
+            _fail("source_pin_invalid")
+        expected = json.dumps(self.source_pin(), sort_keys=True, separators=(",", ":"), allow_nan=False)
+        if observed != expected:
+            _fail("source_pin_changed")
+        return value
 
 
 def bootstrap():

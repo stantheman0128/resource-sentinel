@@ -123,6 +123,14 @@ class S2ProducerReducerTests(unittest.TestCase):
 
 
 class S2ProducerOwnershipTests(unittest.TestCase):
+    def setUp(self):
+        self.source_pin = {"schema_version": 1, "fixture": "explicit portable pin model"}
+        for replacement in (patch.object(producer, "_source_pin", return_value=self.source_pin),
+                            patch.object(producer, "_original_process_exit_code", return_value=None),
+                            patch.dict(producer._CASE_ATTEMPTS, {}, clear=True)):
+            replacement.start()
+            self.addCleanup(replacement.stop)
+
     def test_failing_real_coverage_precedes_discovery_and_native_launch(self):
         coverage = SimpleNamespace(authority=SimpleNamespace(assert_ready=Mock(side_effect=RuntimeError("cohort_missing"))))
         with patch.object(producer, "_discover") as discovery, patch.object(producer, "_run_case") as launch:
@@ -161,6 +169,7 @@ class S2ProducerOwnershipTests(unittest.TestCase):
     def test_timeout_retains_wrapper_without_termination(self):
         process = Mock()
         process.pid = 700
+        process.poll.return_value = None
         process.communicate.side_effect = subprocess.TimeoutExpired("fixture", 100)
         guardian = SimpleNamespace(guardian_epoch="epoch", host_identity=SimpleNamespace(
             pid=10, created_filetime_100ns=100))
@@ -187,6 +196,7 @@ class S2ProducerOwnershipTests(unittest.TestCase):
         for case in ("exit_0", "null_stdio", "ctrl_c"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as temporary:
                 process = Mock(pid=700)
+                process.poll.return_value = None
                 process.communicate.side_effect = subprocess.TimeoutExpired("fixture", 110)
                 directory = Path(temporary)
                 with patch.object(producer, "_endpoint", return_value=SimpleNamespace(instance_id="endpoint")), \
@@ -232,6 +242,7 @@ class S2ProducerOwnershipTests(unittest.TestCase):
 
     def test_interrupted_observation_retains_driver_when_stop_write_fails(self):
         process = Mock(pid=702)
+        process.poll.return_value = None
         interrupted = KeyboardInterrupt()
         process.communicate.side_effect = interrupted
         guardian = SimpleNamespace(guardian_epoch="epoch", host_identity=SimpleNamespace(
@@ -253,6 +264,246 @@ class S2ProducerOwnershipTests(unittest.TestCase):
                 finally:
                     producer._PENDING_PROCESSES.remove(process)
 
+    def test_unknown_creation_retains_original_attempt_before_popen(self):
+        guardian = SimpleNamespace(guardian_epoch="epoch", host_identity=SimpleNamespace(
+            pid=10, created_filetime_100ns=100))
+        failure = KeyboardInterrupt()
+        def interrupted(*args, **kwargs):
+            self.assertEqual(len(producer._CASE_ATTEMPTS), 1)
+            original = next(iter(producer._CASE_ATTEMPTS.values()))
+            self.assertTrue(original.create_entered)
+            self.assertEqual(tuple(args[0]), original.driver_args)
+            raise failure
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with patch.object(producer, "_endpoint", return_value=SimpleNamespace(instance_id="endpoint")), \
+                    patch.object(producer, "_tick", return_value=1), \
+                    patch.object(producer, "_hidden_console_startup", return_value=Mock()), \
+                    patch.object(producer.subprocess, "Popen", side_effect=interrupted):
+                with self.assertRaises(producer.S2CustodyPending) as raised:
+                    producer._run_case(Path("powershell.exe"), directory / "bridge.ps1", directory,
+                        "token", "exit_0", "managed", directory, SimpleNamespace(guardian=guardian), Path("python.exe"))
+                attempt, = raised.exception.case_attempts
+                self.assertIs(raised.exception.primary_error, failure)
+                self.assertIs(producer._CASE_ATTEMPTS[attempt.declaration.attempt_id], attempt)
+                self.assertIsNone(attempt.process)
+                self.assertFalse(raised.exception.observe_settled())
+
+    def test_interrupted_observer_start_is_retained_before_creation(self):
+        guardian = SimpleNamespace(guardian_epoch="epoch", host_identity=SimpleNamespace(
+            pid=10, created_filetime_100ns=100))
+        observer = Mock(spec_set=["start", "is_alive"])
+        observer.start.side_effect = KeyboardInterrupt()
+        observer.is_alive.return_value = False
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with patch.object(producer, "_endpoint", return_value=SimpleNamespace(instance_id="endpoint")), \
+                    patch.object(producer, "_tick", return_value=1), \
+                    patch.object(producer, "_hidden_console_startup", return_value=Mock()), \
+                    patch.object(producer.threading, "Thread", return_value=observer), \
+                    patch.object(producer.subprocess, "Popen") as popen:
+                with self.assertRaises(producer.S2CustodyPending) as raised:
+                    producer._run_case(Path("powershell.exe"), directory / "bridge.ps1", directory,
+                        "token", "root_child_survival", "managed", directory,
+                        SimpleNamespace(guardian=guardian), Path("python.exe"))
+                attempt, = raised.exception.case_attempts
+                self.assertIs(attempt.observer, observer)
+                self.assertFalse(attempt.observe_local_settlement())
+                popen.assert_not_called()
+
+    def test_timeout_retains_late_observer_unknown_close_channel(self):
+        guardian = SimpleNamespace(guardian_epoch="epoch", host_identity=SimpleNamespace(
+            pid=10, created_filetime_100ns=100))
+        observer = Mock(spec_set=["start", "is_alive"])
+        observer.is_alive.return_value = True
+        process = Mock(pid=701)
+        process.poll.return_value = None
+        process.communicate.side_effect = subprocess.TimeoutExpired("fixture", 110)
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            with patch.object(producer, "_endpoint", return_value=SimpleNamespace(instance_id="endpoint")), \
+                    patch.object(producer, "_tick", return_value=1), \
+                    patch.object(producer, "_hidden_console_startup", return_value=Mock()), \
+                    patch.object(producer.threading, "Thread", return_value=observer), \
+                    patch.object(producer.subprocess, "Popen", return_value=process):
+                try:
+                    with self.assertRaises(producer.S2CustodyPending) as raised:
+                        producer._run_case(Path("powershell.exe"), directory / "bridge.ps1", directory,
+                            "token", "root_child_survival", "managed", directory,
+                            SimpleNamespace(guardian=guardian), Path("python.exe"))
+                    pending = raised.exception
+                    attempt, = pending.case_attempts
+                    original_handle, close_error = object(), OSError("unknown observer close")
+                    late = producer.S2CustodyPending("late_native_close",
+                        native_uncertainties=((original_handle, close_error),))
+                    attempt.observer_errors.append(late)
+                    observer.is_alive.return_value = False
+                    process.poll.return_value = 0
+                    self.assertFalse(pending.observe_settled())
+                    self.assertFalse(pending.observe_settled())
+                    self.assertIs(attempt.observer_errors[0].native_uncertainties[0][0], original_handle)
+                    process._handle.Close.assert_not_called()
+                finally:
+                    producer._PENDING_PROCESSES.remove(process)
+
+    def test_collector_diagnostic_failure_cannot_skip_original_observer_close(self):
+        from tests.windows import adaptive_win32 as native
+        identity = {"pid": 11, "created_filetime_100ns": "100"}
+        process = Mock(spec_set=["wait", "close"])
+        process.wait.return_value = True  # Stop before any fault mutation.
+        for close_fails in (False, True):
+            with self.subTest(close_fails=close_fails):
+                process.reset_mock()
+                process.close.side_effect = OSError("unknown close") if close_fails else None
+                write_error = OSError("diagnostic unavailable")
+                with patch.object(producer, "_read", side_effect=[{"identity": identity}, {"identity": identity}]), \
+                        patch.object(native.ProcessHandle, "open", return_value=process), \
+                        patch.object(producer, "_write", side_effect=write_error):
+                    expected = producer.S2CustodyPending if close_fails else OSError
+                    with self.assertRaises(expected) as raised:
+                        producer._collector_fault(Path("isolated"), object(), managed=False)
+                process.close.assert_called_once()
+                if close_fails:
+                    self.assertIs(raised.exception.native_uncertainties[0][0], process)
+                    self.assertIs(raised.exception.__context__, write_error)
+                else:
+                    self.assertIs(raised.exception, write_error)
+
+    def test_all_python_and_powershell_hops_carry_same_source_pin(self):
+        guardian = SimpleNamespace(guardian_epoch="epoch", host_identity=SimpleNamespace(
+            pid=10, created_filetime_100ns=100))
+        for mode in ("managed", "baseline"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                process = Mock(pid=700)
+                process.poll.return_value = None
+                process.communicate.side_effect = subprocess.TimeoutExpired("fixture", 110)
+                with patch.object(producer, "_endpoint", return_value=SimpleNamespace(instance_id="endpoint")), \
+                        patch.object(producer, "_tick", return_value=1), \
+                        patch.object(producer, "_hidden_console_startup", return_value=Mock()), \
+                        patch.object(producer.subprocess, "Popen", return_value=process) as popen:
+                    try:
+                        with self.assertRaises(producer.S2CustodyPending):
+                            producer._run_case(Path("powershell.exe"), directory / "bridge.ps1", directory,
+                                "token", "exit_0", mode, directory, SimpleNamespace(guardian=guardian),
+                                Path("python.exe"), coverage=object())
+                        args = popen.call_args.args[0]
+                        self.assertEqual(args[1], "-I")
+                        self.assertEqual(json.loads(base64.b64decode(args[4])), self.source_pin)
+                        console = json.loads(base64.b64decode(args[-1]))
+                        self.assertEqual(console["source_pin"], self.source_pin)
+                        shell = console["shell_args"]
+                        if mode == "baseline":
+                            self.assertEqual(shell[1], "-I")
+                            holder = json.loads(base64.b64decode(shell[-1]))
+                            self.assertEqual(holder["source_pin"], self.source_pin)
+                            self.assertIn("-SourcePin", holder["command"])
+                        else:
+                            self.assertEqual(json.loads(base64.b64decode(shell[-1])), self.source_pin)
+                            spec = json.loads(base64.b64decode(shell[shell.index("-Payload") + 1]))
+                            self.assertIn(" -I ", spec["command"])
+                            self.assertIn("--source-pin " + producer._encode(self.source_pin), spec["command"])
+                    finally:
+                        producer._PENDING_PROCESSES.remove(process)
+
+
+class S2CaseAttemptTests(unittest.TestCase):
+    def setUp(self):
+        replacement = patch.dict(producer._CASE_ATTEMPTS, {}, clear=True)
+        replacement.start()
+        self.addCleanup(replacement.stop)
+        query = patch.object(producer, "_original_process_exit_code", return_value=0)
+        self.native_exit = query.start()
+        self.addCleanup(query.stop)
+        self.owner = producer.S2CaseAttempt(producer.S2CaseDeclaration(
+            "unique-attempt", "isolated", "token", "exit_0", "managed", "pipes", "{}"))
+        self.process = Mock(spec_set=["poll", "_handle", "returncode"])
+        self.process.poll.return_value = 0
+        self.owner.pin_launch(("fixed", "arguments"), None)
+        self.owner.create_entered = True
+        self.owner.bind_process(self.process)
+
+    def test_local_settlement_closes_original_handle_once(self):
+        self.assertTrue(self.owner.observe_local_settlement())
+        self.assertTrue(self.owner.observe_local_settlement())
+        self.process._handle.Close.assert_called_once()
+        self.assertIs(self.owner.process, self.process)
+
+    def test_ambiguous_close_remains_owned_without_retry(self):
+        self.process._handle.Close.side_effect = KeyboardInterrupt()
+        self.assertFalse(self.owner.observe_local_settlement())
+        self.assertFalse(self.owner.observe_local_settlement())
+        self.process._handle.Close.assert_called_once()
+        self.assertFalse(self.owner.local_settled)
+
+    def test_live_original_process_cannot_settle(self):
+        self.process.poll.return_value = None
+        self.native_exit.return_value = None
+        self.assertFalse(self.owner.observe_local_settlement())
+        self.process._handle.Close.assert_not_called()
+
+    def test_cached_exit_does_not_replace_positive_original_native_exit(self):
+        self.process.poll.return_value = 0
+        self.native_exit.return_value = None
+        original = self.process._handle
+        self.assertFalse(self.owner.observe_local_settlement())
+        self.native_exit.assert_called_once_with(original)
+        original.Close.assert_not_called()
+        self.process.poll.assert_not_called()
+
+    def test_same_popen_replaced_handle_stays_pending_without_query_or_close(self):
+        original = self.process._handle
+        replacement = Mock(spec_set=["Close"])
+        self.process._handle = replacement
+        self.process.poll.return_value = 0
+        pending = producer.S2CustodyPending("original_handle_changed",
+            processes=(self.process,), attempts=(self.owner,))
+        self.assertFalse(pending.observe_settled())
+        self.assertFalse(pending.observe_settled())
+        self.assertIs(self.owner.process, self.process)
+        self.assertIs(self.owner._original_process_handle, original)
+        self.assertFalse(self.owner.local_settled)
+        self.native_exit.assert_not_called()
+        self.process.poll.assert_not_called()
+        original.Close.assert_not_called()
+        replacement.Close.assert_not_called()
+
+    def test_native_wait_failure_keeps_original_handle_open(self):
+        self.native_exit.side_effect = OSError("native wait unknown")
+        self.assertFalse(self.owner.observe_local_settlement())
+        self.assertIs(self.owner._original_process_handle, self.process._handle)
+        self.process._handle.Close.assert_not_called()
+
+    def test_original_native_exit_is_recorded_before_close_without_repoll(self):
+        self.native_exit.return_value = 7
+        pending = producer.S2CustodyPending("finishing", processes=(self.process,), attempts=(self.owner,))
+        self.assertTrue(pending.observe_settled())
+        self.assertEqual(self.process.returncode, 7)
+        self.assertEqual(self.owner.native_exit_code, 7)
+        self.process.poll.assert_not_called()
+        self.process._handle.Close.assert_called_once()
+
+    def test_terminal_observer_custody_cannot_disappear_from_original_channel(self):
+        error = producer.S2CustodyPending("unknown_observer_close", native_uncertainties=((object(), OSError()),))
+        self.owner.observer_errors.append(error)
+        self.assertFalse(self.owner.observe_local_settlement())
+        self.owner.observer_errors.clear()
+        self.assertFalse(self.owner.observe_local_settlement())
+        self.assertIs(self.owner._observer_terminal_errors[0], error)
+        self.native_exit.assert_not_called()
+        self.process._handle.Close.assert_not_called()
+
+    def test_replaced_process_and_declaration_are_not_adopted(self):
+        self.owner.process = Mock()
+        with self.assertRaisesRegex(producer.S2Unavailable, "original_case_attempt"):
+            self.owner.observe_local_settlement()
+        self.process._handle.Close.assert_not_called()
+
+    def test_serialized_source_pin_is_not_a_producer_bootstrap(self):
+        with self.assertRaisesRegex(producer.S2Unavailable, "original_producer_bootstrap"):
+            producer._source_pin(SimpleNamespace(entry="tests/windows/run_adaptive_s2.py",
+                modules={producer.__name__: producer}, source_pin=lambda: {}))
+
 
 class ConsoleCustodyTests(unittest.TestCase):
     """Portable ownership models; no actual console, child, wait or close."""
@@ -263,16 +514,21 @@ class ConsoleCustodyTests(unittest.TestCase):
         self.native = SimpleNamespace(console_process_ids=Mock(return_value=[os.getpid()]))
         self.shell = SimpleNamespace(poll=Mock(return_value=0), _handle=Mock(),
             stdin=None, stdout=None, stderr=None, kill=Mock(), terminate=Mock())
+        query = patch.object(child_fixture, "_original_shell_exit_code", return_value=0)
+        self.native_exit = query.start()
+        self.addCleanup(query.stop)
         self.owner = child_fixture._ConsoleCustody(self.directory, self.native, [], [])
         self.owner.console_verified = self.owner.creation_started = True
-        self.owner.shell = self.shell
+        self.owner.bind_shell(self.shell)
 
     def test_live_original_shell_cannot_finish_even_when_console_snapshot_is_empty(self):
         self.shell.poll.return_value = None
+        self.native_exit.return_value = None
         self.assertFalse(self.owner.step())
         self.shell._handle.Close.assert_not_called()
         self.assertIs(self.owner.shell, self.shell)
         self.shell.poll.return_value = 0
+        self.native_exit.return_value = 0
         self.assertTrue(self.owner.step())
         self.shell._handle.Close.assert_called_once()
         self.shell.kill.assert_not_called()
@@ -322,6 +578,7 @@ class ConsoleCustodyTests(unittest.TestCase):
 
     def test_evidence_failure_while_child_lives_does_not_exit_resident_cleanup(self):
         self.shell.poll.return_value = None
+        self.native_exit.return_value = None
         raw = {}
         publish = Mock(side_effect=[OSError("evidence full"), None])
         def child_exits(_):
@@ -329,6 +586,7 @@ class ConsoleCustodyTests(unittest.TestCase):
             self.assertIs(self.owner.shell, self.shell)
             self.shell._handle.Close.assert_not_called()
             self.shell.poll.return_value = 0
+            self.native_exit.return_value = 0
         with patch.object(child_fixture, "tick", return_value=1), \
                 patch.object(child_fixture.time, "sleep", side_effect=child_exits) as sleep:
             self.owner.finish(raw, publish)
@@ -342,13 +600,16 @@ class ConsoleCustodyTests(unittest.TestCase):
     def test_driver_timeout_waits_resident_for_actual_shell_exit(self):
         from tests.windows import adaptive_win32 as native
         self.shell.poll.return_value = None
+        self.native_exit.return_value = None
         self.shell.communicate = Mock(side_effect=subprocess.TimeoutExpired("shell", 95))
-        payload = base64.b64encode(json.dumps({"directory": str(self.directory), "token": "token",
+        payload = base64.b64encode(json.dumps({"directory": str(self.directory), "token": "token", "source_pin": {},
             "shell_args": ["fixture"], "stdio_profile": "pipes"}).encode()).decode()
         def release(_):
             self.shell._handle.Close.assert_not_called()
             self.shell.poll.return_value = 0
+            self.native_exit.return_value = 0
         with patch.object(child_fixture, "authorize", return_value=(self.directory, {})), \
+                patch.object(child_fixture, "assert_source"), \
                 patch.object(child_fixture, "tick", return_value=1), \
                 patch.object(native, "console_process_ids", return_value=[os.getpid()]), \
                 patch.object(child_fixture.subprocess, "Popen", return_value=self.shell), \
@@ -359,6 +620,163 @@ class ConsoleCustodyTests(unittest.TestCase):
         sleep.assert_called_once_with(.25)
         self.assertTrue(json.loads((self.directory / "console-result.json").read_text("utf-8"))["cleanup_verified"])
         self.shell._handle.Close.assert_called_once()
+
+    def test_same_shell_handle_substitution_cannot_close_foreign_or_original(self):
+        original = self.shell._handle
+        replacement = Mock(spec_set=["Close"])
+        self.shell._handle = replacement
+        self.assertFalse(self.owner.step())
+        self.assertFalse(self.owner.step())
+        self.assertTrue(self.owner.quarantined)
+        self.assertIs(self.owner._original_shell_handle, original)
+        self.native_exit.assert_not_called()
+        self.shell.poll.assert_not_called()
+        original.Close.assert_not_called()
+        replacement.Close.assert_not_called()
+
+    def test_replaced_shell_object_cannot_be_adopted_even_with_same_handle(self):
+        original = self.shell
+        self.owner.shell = SimpleNamespace(poll=Mock(return_value=0), _handle=original._handle,
+                                          stdin=None, stdout=None, stderr=None)
+        self.assertFalse(self.owner.step())
+        self.assertIs(self.owner._original_shell, original)
+        self.native_exit.assert_not_called()
+        original._handle.Close.assert_not_called()
+
+    def test_cached_shell_exit_cannot_replace_native_exit_observation(self):
+        self.shell.poll.return_value = 7
+        self.native_exit.return_value = None
+        self.assertFalse(self.owner.step())
+        self.native_exit.assert_called_once_with(self.owner._original_shell_handle)
+        self.shell.poll.assert_not_called()
+        self.shell._handle.Close.assert_not_called()
+
+    def test_native_exit_is_recorded_and_queried_once_before_original_close(self):
+        self.native_exit.return_value = 7
+        self.assertTrue(self.owner.step())
+        self.assertTrue(self.owner.step())
+        self.assertEqual(self.shell.returncode, 7)
+        self.native_exit.assert_called_once_with(self.owner._original_shell_handle)
+        self.shell.poll.assert_not_called()
+        self.shell._handle.Close.assert_called_once()
+
+
+class S2ObserverAndAncestryTests(unittest.TestCase):
+    def setUp(self):
+        replacement = patch.object(child_fixture, "_OBSERVER_OPEN_CUSTODY", [])
+        replacement.start()
+        self.addCleanup(replacement.stop)
+
+    def test_producer_retains_exact_failed_open_owner_as_pending(self):
+        from tests.windows import adaptive_win32 as native
+        owner, primary, cleanup = Mock(), ValueError("validation failed"), OSError("close unknown")
+        error = native.RetainedProcessOpenError(owner, primary, cleanup)
+        with patch.object(native.ProcessHandle, "open", side_effect=error):
+            with self.assertRaises(producer.S2CustodyPending) as raised:
+                producer._open_observer(native, 700, "100")
+        self.assertIs(raised.exception.native_uncertainties[0][0], owner)
+        self.assertIs(raised.exception.native_uncertainties[0][1], error)
+        self.assertFalse(raised.exception.observe_settled())
+        owner.close.assert_not_called()
+
+    def test_collector_diagnostic_failure_cannot_hide_retained_open_owner(self):
+        from tests.windows import adaptive_win32 as native
+        owner = Mock()
+        native_error = native.RetainedProcessOpenError(owner, ValueError("validation"), OSError("close"))
+        diagnostic = OSError("artifact unavailable")
+        identity = {"pid": 700, "created_filetime_100ns": "100"}
+        with patch.object(producer, "_read", side_effect=[{"identity": identity}, {"identity": identity}]), \
+                patch.object(native.ProcessHandle, "open", side_effect=native_error), \
+                patch.object(producer, "_write", side_effect=diagnostic):
+            with self.assertRaises(producer.S2CustodyPending) as raised:
+                producer._collector_fault(Path("isolated"), object(), managed=False)
+        pending = raised.exception
+        self.assertIs(pending.native_uncertainties[0][0], owner)
+        self.assertIs(pending.native_uncertainties[0][1], native_error)
+        self.assertEqual(pending.diagnostic_errors, (diagnostic,))
+        self.assertFalse(pending.observe_settled())
+        owner.close.assert_not_called()
+
+    def test_child_retains_previous_and_failed_observer_without_retry_close(self):
+        from tests.windows import adaptive_win32 as native
+        previous, owner = Mock(), Mock()
+        error = native.RetainedProcessOpenError(owner, ValueError("validation"), OSError("close unknown"))
+        held = [previous]
+        with patch.object(native.ProcessHandle, "open", side_effect=error):
+            with self.assertRaises(child_fixture.S2ObserverOpenPending) as raised:
+                child_fixture._open_observer(native, held, 700, "100")
+        pending = raised.exception
+        self.assertEqual(pending.original_observers, (previous, owner))
+        self.assertIs(child_fixture._OBSERVER_OPEN_CUSTODY[0], pending)
+        self.assertIs(pending.native_uncertainties[0][0], owner)
+        previous.close.assert_not_called()
+        owner.close.assert_not_called()
+        with tempfile.TemporaryDirectory() as directory:
+            custody = child_fixture._ConsoleCustody(Path(directory), native, held, [])
+            custody.remember("primary", pending)
+            self.assertFalse(custody.step())
+            self.assertTrue(custody.quarantined)
+        owner.close.assert_not_called()
+
+    def test_workload_entry_cannot_exit_on_retained_observer_open_failure(self):
+        from tests.windows import adaptive_win32 as native
+        owner = Mock()
+        pending = child_fixture.S2ObserverOpenPending((owner,),
+            native.RetainedProcessOpenError(owner, ValueError("validation"), OSError("close")))
+        with patch.object(child_fixture, "assert_source"), \
+                patch.object(child_fixture, "workload", side_effect=pending), \
+                patch.object(child_fixture, "_retain_observer_open_failure") as retain:
+            with self.assertRaisesRegex(RuntimeError, "custody_returned_without_completion"):
+                child_fixture.main(["--source-pin", "e30=", "workload", "--directory", "isolated", "--token", "test"])
+        retain.assert_called_once_with(pending)
+        owner.close.assert_not_called()
+
+    def test_ancestry_retains_first_handle_before_its_first_identity_read(self):
+        from tests.windows import adaptive_win32 as native
+        held, owner = [], Mock()
+        def fail():
+            self.assertEqual(held, [owner])
+            raise OSError("identity unavailable")
+        owner.identity.side_effect = fail
+        with patch.object(native.ProcessHandle, "open", return_value=owner), \
+                patch.object(native, "current_identity") as ambient:
+            with self.assertRaisesRegex(OSError, "identity unavailable"):
+                child_fixture._owned_console_ancestry(native, held, {"pid": 700, "created_filetime_100ns": "100"})
+        self.assertEqual(held, [owner])
+        ambient.assert_not_called()
+
+    def test_ancestry_bound_retains_twelve_and_does_not_open_thirteenth(self):
+        from tests.windows import adaptive_win32 as native
+        held, owners = [], []
+        for index in range(12):
+            owner = Mock(spec_set=["identity", "wait", "parent_pid", "close"])
+            owner.identity.return_value = {"pid": 700 + index, "created_filetime_100ns": str(100 - index)}
+            owner.wait.return_value = False
+            owner.parent_pid.return_value = 701 + index
+            owners.append(owner)
+        with patch.object(native.ProcessHandle, "open", side_effect=owners) as opened, \
+                patch.object(child_fixture.os, "getpid", return_value=999):
+            with self.assertRaisesRegex(RuntimeError, "ancestry_not_owned"):
+                child_fixture._owned_console_ancestry(native, held, {"pid": 700, "created_filetime_100ns": "100"})
+        self.assertEqual(opened.call_count, 12)
+        self.assertEqual(held, owners)
+        owners[-1].parent_pid.assert_not_called()
+
+    def test_bounded_ancestry_returns_only_retained_original_identities(self):
+        from tests.windows import adaptive_win32 as native
+        held = []
+        first, parent = Mock(), Mock()
+        first.identity.return_value = {"pid": 700, "created_filetime_100ns": "100"}
+        first.wait.return_value = False
+        first.parent_pid.return_value = 999
+        parent.identity.return_value = {"pid": 999, "created_filetime_100ns": "90"}
+        parent.wait.return_value = False
+        with patch.object(native.ProcessHandle, "open", side_effect=[first, parent]), \
+                patch.object(child_fixture.os, "getpid", return_value=999):
+            result = child_fixture._owned_console_ancestry(native, held, first.identity.return_value)
+        self.assertEqual(set(result), {700, 999})
+        self.assertEqual(held, [first, parent])
+        parent.parent_pid.assert_not_called()
 
 
 if __name__ == "__main__":

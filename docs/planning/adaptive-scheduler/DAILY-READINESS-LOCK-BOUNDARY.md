@@ -196,3 +196,31 @@ lock；中途沒有額外 RPC；daily transaction 在持有 isolated／Job 時�
 替換 file identity、partial second acquisition、原 owner close 不明及 native-only
 restore 均有明確拒絕／保留原 custody 的案例。這段仍只做 source／isolated tests，
 不執行 native experiment，也不改另一 worker 的 demand cleanup state machine。
+
+### 原 native-only restore 的 custody 容量獨立性
+
+實作 review 發現：若所有 observation 共用 daily 的八份 pending custody
+名額，八個其他 daily cleanup 不明會連帶拒絕 isolated-only restore，與既有
+恢復契約不符。因此增加只會縮小權限的明確參數：
+
+`readiness_scopes(paths, absent_paths=(original_isolated_path,))`
+
+`absent_paths` 必須是本次最多兩個 exact existing paths 的子集合。被列出的
+原 ledger 使用另一個 **最多八份** pending absence observation pool；在開始
+讀取以前就保留其原 owner，未知 read/close 繼續佔用原名額。此 pool 不能
+取得 readiness RPC、native authority 或 daily capacity UDF；首次或後續同一
+consumer connection 看到任何 generation row，都必須拒絕（包括原 local
+owner 也不能特例通過）。它仍需原 file identity、相同 SQLite connection 的
+absence 重驗、thread／lexical owner、正面 cleanup 和自己 pool 的容量限制。
+把 daily path 宣告為 absent 不會得到豁免，只會在 generation 存在時更早拒絕。
+
+沒有宣告 absent 的 path 仍使用原 daily readiness pool 與原所有檢查。
+`ExperimentNativeScope._scope()` 在 daily=True 與 daily=False 時，都只把其
+**原 isolated path** 宣告為 absent；daily=False 完全不進入 daily pool。
+不是依 subclass、檔名、status、boolean readiness 或「native-only」標籤跳過
+檢查，也不因其他 pool 已滿就改選 pool。兩個 pools 都保存原清理義務且不替換
+未知 owner；這只移除本次修補引入的無關 daily custody 容量依賴。
+
+回歸必須實際填滿 daily pending pool，證明 isolated-only observation／POLICY
+仍可完成；填滿 absence pool 時自己仍拒絕，任何 active generation 被標為
+absent 都不發 RPC且拒絕，generation 中途出現也不安裝或借用 daily UDF。

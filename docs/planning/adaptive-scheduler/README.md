@@ -2,7 +2,86 @@
 
 日期：2026-09-19。狀態：**正式計畫已入庫，分階段實作進行中；production adaptive 維持 off。**
 
-## 2026-09-25 aggregate parent/child custody checkpoint（目前狀態）
+## 2026-09-25 partition admission checkpoint（目前狀態）
+
+Source commit `86184c2250a8937c156c98125b6875f35e7613e5` 完成隔離 partition
+的實際 admission adapter、不可變來源綁定與 ordinary host 的拒絕邊界：
+
+- 使用原始 child binding、ManagedAdmission、daily backing 與兩份帳本的
+  readiness/POLICY scopes。Isolated reservation 沿用原始 daily intent 的 ID、
+  demand 與期限，不重新取得整機容量，也不延長 daily allocation。
+- 同一 isolated transaction 先讀 preimage，再建立 reservation、managed row
+  與不可變 backing link；已有普通 execution 卻缺 link 時禁止補寫升級。
+  COMMIT ACK 遺失後保留原始操作，重試不重複配置；local cancel 保留 link
+  與原始 daily floor。這是共用計帳契約的補強，58/4/4/3 政策維持。
+- 三個 ordinary HostAuthority 入口都拒絕 experiment-backed execution。
+  初始化 anchor 留在 managed_executions 上，因此 link table 整張遺失仍會
+  被辨識為不完整 schema；普通 migration 不會清除這項證據。既有 ordinary
+  非 UUID ID 契約保留。原始 partition 專用的 launch authority 尚待接入。
+- 250 ms 共用預算只縮短這次操作的 SQL/native lock 等待；ordinary defaults
+  不變，逾時仍可嘗試零等待清理。這不是整個 RPC/filesystem 操作的耗時保證。
+  未確認原始 native release 時，在新的 readiness acquisition 前拒絕准入。
+  唯讀 reconcile 可回報 RESERVED，但 allowed/launch_authorized 都是 false，
+  不取代保留中的原始清理責任。
+
+Windows／Python 3.13.3，正常 daily HEAVY/P2/CPU1/RAM1GiB/IO0 准入，
+將精確 staged tree `e3c70fbb879e24b1bab96639e206d473a3d96718` 以
+`git archive` 匯出、清除 PYTHONPATH 後驗證十五個模組：
+**387 PASS，0 failures／errors／skips，runner 80.945 秒**。
+Source commit tree 與測試 tree 相同；原始證據留在本機
+`.local-adaptive/partition-admission-export-20260925-7/`。
+
+這批涵蓋真實隔離 SQLite、原始 transaction／guard、原子 rollback/replay、
+不可變 INSERT/UPDATE/DELETE/REPLACE、schema 損失、bounded readers、取消後
+歷史保留，以及 Coordinator、POLICY、launcher、wrapper/guardian consumers。
+新 partition/link tests 的 native/readiness collaborators 明確使用 fixtures；
+既有測試另包含隔離 process identity/POLICY smoke。這些結果沒有替代實際
+Job launch/control/recovery、P4 成本或 P6 A/B gate。
+
+本輪早期失敗也保留在本機 export 1–3：新增 fixture 原先省略真實雙帳本
+readiness 群組，以及新增測試誤認唯讀 reconcile 必須拋錯。修正後驗證原始
+pending scopes、native guard 與拒絕新 admission 的行為；未改既有 baseline
+測試的預期。Export 4–6 是中間版本的通過結果，不與最終 387 加總。
+
+乾淨 checkout 可透過相同 daily admission 重現這十五個模組：
+
+```powershell
+$sentinelPartitionTests = @(
+    'tests.test_adaptive_experiment_partition_admission'
+    'tests.test_adaptive_experiment_local_backing'
+    'tests.test_adaptive_host_authority'
+    'tests.test_adaptive_guardian_launch'
+    'tests.test_adaptive_wrapper_host'
+    'tests.test_adaptive_launcher'
+    'tests.test_adaptive_managed_admission'
+    'tests.test_adaptive_policy_scope'
+    'tests.test_adaptive_policy_cleanup_custody'
+    'tests.test_adaptive_policy_fencing'
+    'tests.test_adaptive_experiment_host_backing'
+    'tests.test_adaptive_experiment_host_transport'
+    'tests.test_adaptive_coordinator'
+    'tests.test_coordinator'
+    'tests.test_adaptive_daily_activation_host'
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command ('C:\Python313\python.exe -m unittest -v ' + ($sentinelPartitionTests -join ' ')) -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
+**完整 provider 與 P3–P6 驗收仍未完成。** Parent 的實際 backing publication
+service、固定 child bootstrap、typed wrapper/guardian 接入、aggregate
+completion/history/daily release 仍有 source 缺口；正常 S2 入口仍拒絕缺少
+原始 production host scope。P4 真實 overhead、剩餘 S3 drivers／140-case
+orchestration、P6 actual A/B/A0 與必要 native gates 也仍未完成。
+
+`experiment_backing_transport.py` 與其測試是本機未提交草稿，尚缺實際 parent
+方法及 provider phase 整合，不算本批交付。下次從原始 parent 的固定 backing
+publication 接線繼續，再接 typed wrapper/guardian；普通 host 的拒絕不能用
+旗標略過。先前六檔 partition 草稿已由本批取代，下面保留的是歷史狀態。
+
+十四個 protected tracked files hash 一致，原有 untracked files 保留。
+沒有部署、修改日常 config／Scheduled Task／全域入口或啟用 adaptive control；
+沒有施加測試 Job 限制，也沒有待撤回的限速。
+
+## 2026-09-25 aggregate parent/child custody checkpoint（前一批）
 
 Source commit `51238fec7547ca8bd18d490d5e3908b7ce97f92c` 提交原始
 aggregate parent scope、child creation/transport 與 daily admission backing：

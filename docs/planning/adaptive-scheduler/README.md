@@ -4,7 +4,48 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
-最新 source checkpoint 為 **P4 daily monitor 成本 witness 與原始 handle 保留**，
+最新 source checkpoint 為 **S2 來源驗證啟動鏈與原始程序收尾責任**，
+source commit `ee874a2ffd971db9001f20f5ff3f6f63ac69b18e`：
+
+- 固定的 parent／child bootstrap profiles 驗證 canonical runtime、producer
+  及 base interpreter，透過實際 parent → console → PowerShell → wrapper →
+  workload／child 鏈傳遞同一 source pin。Pin 只是來源一致性資料，不授予准入權限。
+- Parent 在 observer／Popen 啟動前保留原始 attempt；console 與 parent 都固定
+  原始 Popen／handle，直接查詢該 handle 的退出狀態，不能用快取 returncode 或
+  替代 handle 宣告收尾。Local settlement 也不能代替 aggregate completion。
+- Wrapper constructor／native launch、observer open 與 diagnostic write 的失敗
+  都保留原始責任。未知 close 不會重試；console ancestry 每次開啟後立即保留，
+  最多十二個 handle。獨立 review 發現的三個 handle 保留／收尾缺口已修正並複查。
+
+精確 staged tree `02d3690b44ba6f5e2a59333f060365f6f8639f8b` 經 `git archive`
+匯出、清除 `PYTHONPATH` 後，七模組 **177 PASS，0 failures／errors／skips，
+runner 239.698 秒**；source commit 的 tree 完全相同。沒有依賴 protected dirty
+files 或未提交的 host ledger。測試包含實際隔離來源驗證子程序及明確 synthetic
+native custody fixtures；不是 S2 launch compatibility 或其他 native gate 證據。
+較早四模組 90 PASS 與本批重疊，不得加總。
+本機原始證據：`.local-adaptive/s2-source-export-20260924-2/`。
+
+在包含本批 source commit 的乾淨 checkout，以正常日常准入重現：
+
+```powershell
+$sentinelS2SourceTests = @(
+    'tests.test_adaptive_producer_bootstrap'
+    'tests.test_adaptive_s2_bootstrap'
+    'tests.test_adaptive_launch_producer'
+    'tests.test_adaptive_s2_wrapper_custody'
+    'tests.test_adaptive_s2_observer_open'
+    'tests.test_adaptive_created_identity'
+    'tests.test_adaptive_native_launcher'
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command ('C:\Python313\python.exe -m unittest -v ' + ($sentinelS2SourceTests -join ' ')) -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
+[S2-SOURCE-BOOTSTRAP.md](S2-SOURCE-BOOTSTRAP.md) 記錄契約與仍缺的 provider。
+`run_adaptive_s2.py --check-source` 只驗證來源；正常入口明確拒絕
+`s2_original_production_host_scope_unavailable`，不建立 native work 或發布 S2。
+需要完成 aggregate provider source，不能把這項缺口轉交為只需使用者跑 console。
+
+同批已提交 **P4 daily monitor 成本 witness 與原始 handle 保留**，
 source commit `c571b89f3443c306c44345993c6baa9412bd9a6e`：
 
 - 使用真正 readiness client 驗證 daily generation，再保留原始 authenticated

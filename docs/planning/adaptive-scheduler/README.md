@@ -54,6 +54,20 @@ bootstrap／v2 publication、fresh-generation restart、P4／S3／P6 仍有 sour
 Items 5/6 未完成；舊 common admission placeholder 繼續拒絕。未部署或變更日常
 config／Scheduled Task／啟動入口，adaptive off，沒有施加或需撤回的實際 Job CPU cap。
 
+成功准入的最終回覆若遺失，現在可用原始已保管的 submission tuple 做唯讀 settlement。
+已清除的 guard 不重建、不重設；原始 POLICY／store／guard／binding／nonce、SQL
+transaction 與正面 native／nonce cleanup 必須保持一致，否則繼續 HOLD。既有 pending
+guard 路徑不變。契約見 [S1-SERIAL-PROVIDER.md](S1-SERIAL-PROVIDER.md) 的 result
+handoff 段落。`tests.test_adaptive_experiment_admission_settlement` **32 PASS**
+（10 個新案例），0 failures／errors／skips，runner 8.087 秒；日誌
+`.local-adaptive/admission-return-20260924-1.log`。涵蓋成功 admitted／queued／第二次
+queue poll、零持久寫入／新 native wait／nonce clear，以及替換或缺少原始證據的拒絕。
+同樣使用正常 wrapper、隔離 SQL 與明確 native fixtures，仍非 native gate。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command 'C:\Python313\python.exe -m unittest tests.test_adaptive_experiment_admission_settlement -q' -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
 ### Mixed-source reader checkpoint（歷史驗證）
 
 Mixed-source build reader／v2 consumer 已完成。契約見

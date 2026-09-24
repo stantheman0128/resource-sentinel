@@ -131,6 +131,45 @@ class ExperimentAdmissionSettlementTests(unittest.TestCase):
         self.assertIs(self.guard._native_no_entry_confirmed, False)
         return caught.exception
 
+    def _completed_admission(self, *, queued=False, repoll=False):
+        if queued:
+            self.fixture.publish_status(commit=94)
+        result = self.coordinator.admit_experiment(self.demand)
+        self.assertIs(result["allowed"], not queued)
+        if repoll:
+            self.assertTrue(queued)
+            previous, previous_transaction = self.demand._submission_original, self.inner._submission_transaction
+            self.fixture.publish_status(now=self.fixture.clock.return_value + 1, commit=94)
+            result = self.coordinator.admit_experiment(self.demand)
+            self.assertIs(result["allowed"], False)
+            self.assertIsNot(self.demand._submission_original, previous)
+            self.assertIsNot(self.demand._submission_original[2], previous[2])
+            self.assertIsNot(self.inner._submission_transaction, previous_transaction)
+            self.assertIs(previous[2]._nonce_clear_confirmed, True)
+            self.assertIs(previous_transaction["connection_closed"], True)
+            self.assertIs(self.inner._submission_transaction["first_submission"], False)
+        self.assertIsNone(self.inner._submission_guard)
+        self.assertIsNone(self.inner._submission_policy_error)
+        original = self.demand._submission_original
+        self.assertIs(type(original), tuple)
+        self.policy, store, self.guard, binding, nonce = original
+        self.assertIs(store, self.policy.store)
+        self.assertIs(binding, self.guard.binding)
+        self.assertEqual(nonce, self.guard.nonce)
+        self.original_error = None
+        self.transaction = self.inner._submission_transaction
+        self.assertIs(self.transaction["connection_closed"], True)
+        self.assertIs(self.transaction["commit_attempted"], True)
+        self.assertIs(self.transaction["rolled_back"], False)
+        self.assertIs(self.guard._nonce_clear_attempted, True)
+        self.assertIs(self.guard._nonce_clear_confirmed, True)
+        self.assertIs(self.guard._native_exit_confirmed, True)
+        self.assertIs(self.guard._native_no_entry_confirmed, False)
+        self._install_generation()
+        self.before = _capacity_rows(self.db)
+        self.runtime_before = self.runtime()
+        return original
+
     def runtime(self):
         return _rows(self.db, "adaptive_runtime")[0]
 
@@ -211,6 +250,147 @@ class ExperimentAdmissionSettlementTests(unittest.TestCase):
         self.assertEqual(len(_rows(self.db, "executions")), 1)
         self.assertTrue(self.demand._closed)
         self.assertEqual(self.backend.closed, [700])
+
+    def _settle_completed_read_only(self, *, queued=False, repoll=False):
+        original = self._completed_admission(queued=queued, repoll=repoll)
+        connect, writes, opened, closed = sqlite3.connect, [], [], []
+        inner_setattr = type(self.inner).__setattr__
+
+        class ReadOnlySuccessfulReturn(sqlite3.Connection):
+            def execute(self, sql, parameters=()):
+                if sql.lstrip().upper().startswith(("INSERT ", "UPDATE ", "DELETE ", "REPLACE ")):
+                    writes.append(sql)
+                    raise AssertionError("completed admission settlement attempted a persistent write")
+                return super().execute(sql, parameters)
+
+            def close(self):
+                super().close()
+                closed.append(self)
+
+        def connect_read(*args, **kwargs):
+            conn = connect(*args, **kwargs, factory=ReadOnlySuccessfulReturn)
+            opened.append(conn)
+            return conn
+
+        def preserve_cleared_slots(instance, name, value):
+            if instance is self.inner and name in {"_submission_guard", "_submission_policy_error"}:
+                raise AssertionError("completed admission settlement rewrote cleared bookkeeping")
+            return inner_setattr(instance, name, value)
+
+        with patch.object(sqlite3, "connect", side_effect=connect_read), \
+                patch.object(self.policy, "_clear", side_effect=AssertionError("successful return cleared again")), \
+                patch.object(type(self.inner), "__setattr__", new=preserve_cleared_slots):
+            first = self.settle()
+            operation = self.demand._admission_settlement
+            second = self.settle()
+        self.assertEqual(first, second)
+        self.assertTrue(opened)
+        self.assertEqual(opened, closed)
+        self.assertEqual(writes, [])
+        self.assertIs(operation._submission_original, original)
+        self.assertIs(operation._guard, original[2])
+        self.assertIs(operation._completed_return, True)
+        self.assertEqual(operation._phases, frozenset({"READ"}))
+        self.assert_settled(second, "QUEUED" if queued else "RESERVED")
+
+    def test_successful_admission_return_settles_original_tuple_by_read_only_replay(self):
+        self._settle_completed_read_only()
+
+    def test_successful_queued_return_settles_without_cancelling_or_adopting_capacity(self):
+        self._settle_completed_read_only(queued=True)
+
+    def test_successful_second_queued_attempt_settles_its_latest_original_tuple(self):
+        self._settle_completed_read_only(queued=True, repoll=True)
+
+    def test_completed_return_cannot_enter_nonce_clear_phase(self):
+        self._completed_admission()
+        operation = self._pin_before_read()
+        with patch.object(sqlite3, "connect", side_effect=AssertionError("read-only route opened write SQL")):
+            with self.assertRaisesRegex(cleanup.ExperimentReleaseError, "phase_invalid"):
+                with operation._scope("CLEAR"):
+                    self.fail("completed return acquired a nonce-clear phase")
+        self.assert_preserved()
+
+    def test_completed_return_rejects_replaced_equal_original_tuple_before_sql(self):
+        original = self._completed_admission()
+        operation = self._pin_before_read()
+        replacement = tuple(list(original))
+        self.assertEqual(replacement, original)
+        self.assertIsNot(replacement, original)
+        self.demand._submission_original = replacement
+        with patch.object(sqlite3, "connect", side_effect=AssertionError("replacement tuple opened SQL")):
+            with self.assertRaisesRegex(cleanup.ExperimentReleaseError, "original_completed_submission_changed"):
+                self.settle()
+        self.assertIs(operation._submission_original, original)
+        self.demand._submission_original = original
+        self.assert_preserved()
+
+    def test_completed_return_without_retained_tuple_cannot_adopt_runtime_nonce(self):
+        self._completed_admission()
+        self.demand._submission_original = None
+        with patch.object(sqlite3, "connect", side_effect=AssertionError("missing original tuple read a replacement")):
+            with self.assertRaisesRegex(cleanup.ExperimentReleaseError, "admission_cleanup_unverified"):
+                self.settle()
+        operation = self.demand._admission_settlement
+        self.assertIsNone(operation._guard)
+        self.assertIsNone(operation._submission_original)
+        self.assert_preserved()
+
+    def test_completed_return_rejects_missing_or_nonpositive_cleanup_facts_before_sql(self):
+        self._completed_admission()
+        self._pin_before_read()
+        for name, value in (("_nonce_clear_attempted", False), ("_nonce_clear_attempted", 1),
+                ("_nonce_clear_confirmed", False), ("_nonce_clear_confirmed", 1),
+                ("_native_exit_confirmed", False), ("_native_exit_confirmed", 1),
+                ("_native_no_entry_confirmed", True)):
+            with self.subTest(name=name, value=value), patch.object(self.guard, name, value), \
+                    patch.object(sqlite3, "connect", side_effect=AssertionError("incomplete cleanup opened SQL")):
+                with self.assertRaisesRegex(cleanup.ExperimentReleaseError,
+                        "original_(completed_submission|native_cleanup)_unverified"):
+                    self.settle()
+        self.assertIsNone(self.inner._submission_guard)
+        self.assert_preserved()
+
+    def test_completed_return_rejects_original_transaction_replacement_and_mutation(self):
+        self._completed_admission()
+        operation = self._pin_before_read()
+        with patch.object(self.inner, "_submission_transaction", dict(self.transaction)), \
+                patch.object(sqlite3, "connect", side_effect=AssertionError("replacement transaction opened SQL")):
+            with self.assertRaisesRegex(cleanup.ExperimentReleaseError, "original_transaction_changed"):
+                self.settle()
+        for name, value in (("connection_closed", False), ("commit_attempted", False),
+                ("rolled_back", True), ("first_submission", 1), ("connection", None)):
+            with self.subTest(name=name), patch.dict(self.transaction, {name: value}), \
+                    patch.object(sqlite3, "connect", side_effect=AssertionError("mutated transaction opened SQL")):
+                with self.assertRaisesRegex(cleanup.ExperimentReleaseError,
+                        "original_(transaction_changed|sql_cleanup_unverified|completed_submission_unverified)"):
+                    self.settle()
+        self.assertIs(operation._transaction, self.transaction)
+        self.assert_preserved()
+
+    def test_completed_return_requires_pending_guard_and_error_to_remain_none(self):
+        self._completed_admission()
+        operation = self._pin_before_read()
+        for name, value in (("_submission_guard", self.guard),
+                ("_submission_policy_error", OSError("synthetic revived policy error"))):
+            with self.subTest(name=name), patch.object(self.inner, name, value), \
+                    patch.object(sqlite3, "connect", side_effect=AssertionError("revived pending owner opened SQL")):
+                with self.assertRaisesRegex(cleanup.ExperimentReleaseError, "original_completed_submission_changed"):
+                    self.settle()
+        self.assertIs(operation._guard, self.guard)
+        self.assertIsNone(self.inner._submission_guard)
+        self.assertIsNone(self.inner._submission_policy_error)
+        self.assert_preserved()
+
+    def test_completed_return_refuses_returned_original_nonce_without_clearing_it(self):
+        self._completed_admission()
+        self.change("adaptive_runtime", "policy_entry_nonce", self.guard.nonce)
+        with patch.object(self.policy, "_clear", side_effect=AssertionError("completed return cleared a returned nonce")):
+            with self.assertRaisesRegex(cleanup.ExperimentReleaseError, "original_nonce_returned"):
+                self.settle()
+        self.assertEqual(self.runtime()["policy_entry_nonce"], self.guard.nonce)
+        self.assertIsNone(self.inner._submission_guard)
+        self.assert_preserved()
 
     def test_expiry_hold_and_draining_preserve_original_capacity_and_allow_later_release(self):
         self._pending_admission()

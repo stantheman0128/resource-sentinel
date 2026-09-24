@@ -849,6 +849,16 @@ class ExperimentAdmissionSettlement(_OriginalCleanupAccess):
         self.policy = self.inner._submission_policy
         self.store = None if self.policy is None else self.policy.store
         self._guard = self.inner._submission_guard
+        # A successful public admission can lose its caller-side reply after
+        # clearing the inner pending slot. Only its already-retained tuple can
+        # supply that original guard; no current ledger observation can do so.
+        self._completed_return = self._guard is None
+        self._submission_original = demand._submission_original if self._completed_return else None
+        if self._completed_return:
+            self._phases = frozenset({"READ"})
+            original = self._submission_original
+            if type(original) is tuple and len(original) == 5:
+                self._guard = original[2]
         self._policy_binding = self._guard.binding if type(self._guard) is PolicyGuard else None
         self._nonce = self._guard.nonce if type(self._guard) is PolicyGuard else None
         self._generation = demand._generation_original
@@ -865,7 +875,7 @@ class ExperimentAdmissionSettlement(_OriginalCleanupAccess):
         self._retained = (coordinator, demand, self.inner, self.snapshot, self._process, self.policy,
             self.store, self._guard, self._policy_binding, self._nonce, self._generation,
             self._transaction, self._prior_error, self.thread, self.pid, self.operation_id,
-            self.ledger_path, self.ledger_identity)
+            self.ledger_path, self.ledger_identity, self._completed_return, self._submission_original)
         _OPERATIONS[self.operation_id] = self
 
     def _original(self):
@@ -877,13 +887,15 @@ class ExperimentAdmissionSettlement(_OriginalCleanupAccess):
                 (self.coordinator, self.demand, self.inner, self.snapshot, self._process, self.policy,
                  self.store, self._guard, self._policy_binding, self._nonce, self._generation,
                  self._transaction, self._prior_error, self.thread, self.pid, self.operation_id,
-                 self.ledger_path, self.ledger_identity) != self._retained or
+                 self.ledger_path, self.ledger_identity, self._completed_return, self._submission_original) != self._retained or
+                type(self._completed_return) is not bool or
                 self.thread is not threading.current_thread() or self.pid != os.getpid()):
             _fail("original_settlement_changed", self)
         exact = (self.coordinator, self.demand, self.inner, self.snapshot, self._process,
             self.policy, self.store, self._guard)
         if (any(value is not self._retained[index] for index, value in enumerate(exact)) or
-                self._transaction is not self._retained[11] or self._prior_error is not self._retained[12]):
+                self._transaction is not self._retained[11] or self._prior_error is not self._retained[12] or
+                self._submission_original is not self._retained[19]):
             _fail("original_settlement_changed", self)
         self.demand._static_original()
         if (self._quarantine is not None or type(self.coordinator) is not Coordinator or
@@ -926,7 +938,24 @@ class ExperimentAdmissionSettlement(_OriginalCleanupAccess):
         elif self.inner._submitted:
             _fail("original_transaction_required", self)
         pending_guard, pending_error = self.inner._submission_guard, self.inner._submission_policy_error
-        if (pending_guard is not self._guard and not (self._cleared and pending_guard is None) or
+        if self._completed_return:
+            original = self._submission_original
+            if (type(original) is not tuple or len(original) != 5 or
+                    self.demand._submission_original is not original or
+                    any(value is not original[index] for index, value in
+                        enumerate((self.policy, self.store, self._guard, self._policy_binding))) or
+                    self._guard.binding is not self._policy_binding or self._nonce != original[4] or
+                    self._phases != frozenset({"READ"}) or
+                    pending_guard is not None or pending_error is not None or self._prior_error is not None):
+                _fail("original_completed_submission_changed", self)
+            if (self._guard._nonce_clear_attempted is not True or self._guard._nonce_clear_confirmed is not True or
+                    self._native_facts != (True, False) or self.inner._submission_policy_entered is not True or
+                    self.inner._submitted is not True or type(self._transaction) is not dict or
+                    self._transaction.get("commit_attempted") is not True or
+                    self._transaction.get("rolled_back") is not False or
+                    type(self._transaction.get("first_submission")) is not bool):
+                _fail("original_completed_submission_unverified", self)
+        elif (pending_guard is not self._guard and not (self._cleared and pending_guard is None) or
                 pending_error is not self._prior_error and not (self._cleared and pending_error is None) or
                 self._settled and (pending_guard is not None or pending_error is not None)):
             _fail("original_submission_changed", self)
@@ -1016,7 +1045,7 @@ class ExperimentAdmissionSettlement(_OriginalCleanupAccess):
                 self._retain(self._prior_error)
                 self._original()
             _, nonce = self._read()
-            if self._cleared:
+            if self._completed_return or self._cleared:
                 if nonce == self._nonce:
                     _fail("original_nonce_returned", self)
             elif nonce == self._nonce:
@@ -1033,8 +1062,9 @@ class ExperimentAdmissionSettlement(_OriginalCleanupAccess):
             # resume through the same original read/clear owner and full checks.
             self._cleared = True
             try:
-                self.inner._submission_guard = None
-                self.inner._submission_policy_error = None
+                if not self._completed_return:
+                    self.inner._submission_guard = None
+                    self.inner._submission_policy_error = None
                 self._settled = True
             except BaseException as error:
                 self._local_error = error

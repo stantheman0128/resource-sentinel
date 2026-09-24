@@ -13,11 +13,11 @@ from contextlib import contextmanager, ExitStack
 import hashlib
 import inspect
 import json
-import marshal
 import os
 from pathlib import Path, PurePosixPath
 import sqlite3
 import stat
+import struct
 import sys
 import threading
 import types
@@ -689,24 +689,73 @@ class SourceManifest:
         return root
 
 
-def _code_hash(code):
-    # Paths differ in staged copies. The bytecode/constants/name/line structure
-    # still has to match; no symbol-name-only or file-hash-only loaded check.
-    constants = tuple(_normalize_code(c) if isinstance(c, types.CodeType) else c
-                      for c in code.co_consts)
-    return _hash(marshal.dumps(code.replace(co_filename="<daily-source>", co_consts=constants)))
+_CODE_ATTRIBUTES = frozenset({
+    "co_argcount", "co_posonlyargcount", "co_kwonlyargcount", "co_nlocals",
+    "co_stacksize", "co_flags", "co_code", "co_consts", "co_names", "co_varnames",
+    "co_freevars", "co_cellvars", "co_name", "co_qualname", "co_filename",
+    "co_firstlineno", "co_linetable", "co_exceptiontable",
+    # Derived views: represented already by the persisted fields above.
+    "co_lines", "co_positions", "co_lnotab",
+})
+_CODE_LAYOUT_VERIFIED = False
 
 
-def _normalize_code(code):
-    return code.replace(co_filename="<daily-source>", co_consts=tuple(
-        _normalize_code(c) if isinstance(c, types.CodeType) else c for c in code.co_consts))
+def _constant_key(value):
+    """Typed immutable compiler constants, preserving IEEE sign/payload bits."""
+    kind = type(value)
+    if value is None:
+        return ("none",)
+    if value is Ellipsis:
+        return ("ellipsis",)
+    if kind is bool:
+        return ("bool", value)
+    if kind is int:
+        return ("int", value)
+    if kind is str:
+        return ("str", value)
+    if kind is bytes:
+        return ("bytes", value)
+    if kind is float:
+        return ("float", struct.pack(">d", value))
+    if kind is complex:
+        return ("complex", struct.pack(">d", value.real), struct.pack(">d", value.imag))
+    if kind is tuple:
+        return ("tuple", tuple(_constant_key(item) for item in value))
+    if kind is frozenset:
+        counts = {}
+        for item in value:
+            key = _constant_key(item)
+            counts[key] = counts.get(key, 0) + 1
+        return ("frozenset", frozenset(counts.items()))
+    if kind is types.CodeType:
+        return _code_key(value)
+    _reject("daily_loaded_code_unverified")
 
 
-def _compiled_hashes(code):
-    result = {_code_hash(code)}
+def _code_key(code):
+    # Bare CodeType equality omits stacksize/qualname; marshal additionally
+    # encodes reference sharing. Preserve every persisted structural field,
+    # excluding only filename (the loaded function's exact origin is checked
+    # separately). Nested code/constants receive the same complete comparison.
+    global _CODE_LAYOUT_VERIFIED
+    if type(code) is not types.CodeType:
+        _reject("daily_loaded_code_unverified")
+    if not _CODE_LAYOUT_VERIFIED:
+        if frozenset(name for name in dir(types.CodeType) if name.startswith("co_")) != _CODE_ATTRIBUTES:
+            _reject("daily_loaded_code_unverified")
+        _CODE_LAYOUT_VERIFIED = True
+    return ("code", code.co_argcount, code.co_posonlyargcount, code.co_kwonlyargcount,
+            code.co_nlocals, code.co_stacksize, code.co_flags, code.co_code,
+            code.co_names, code.co_varnames, code.co_freevars, code.co_cellvars,
+            code.co_name, code.co_qualname, code.co_firstlineno, code.co_linetable,
+            code.co_exceptiontable, tuple(_constant_key(value) for value in code.co_consts))
+
+
+def _compiled_code_keys(code):
+    result = {_code_key(code)}
     for value in code.co_consts:
         if isinstance(value, types.CodeType):
-            result.update(_compiled_hashes(value))
+            result.update(_compiled_code_keys(value))
     return result
 
 
@@ -742,7 +791,7 @@ def verify_loaded_source(manifest, root, *, modules=None):
             _reject("daily_loaded_source_unreviewed")
         try:
             compiled = compile(_read_source(root, relative), str(path), "exec", dont_inherit=True)
-            hashes = _compiled_hashes(compiled)
+            codes = _compiled_code_keys(compiled)
             for value in tuple(vars(module).values()):
                 # Dataclasses/Enum generate methods whose filename is <string>
                 # or the stdlib definition. Their Python source is pinned; the
@@ -752,7 +801,7 @@ def verify_loaded_source(manifest, root, *, modules=None):
                     origin = function.__code__.co_filename
                     if origin.startswith("<"):
                         continue
-                    if origin != str(path) or _code_hash(function.__code__) not in hashes:
+                    if origin != str(path) or _code_key(function.__code__) not in codes:
                         _reject("daily_loaded_code_generation_mismatch")
         except (SyntaxError, ValueError, TypeError):
             _reject("daily_loaded_code_unverified")

@@ -9,6 +9,7 @@ security sandbox; an adversarial process in the same user is outside scope.
 from __future__ import annotations
 
 from pathlib import Path
+import struct
 import sys
 import threading
 import types
@@ -24,17 +25,73 @@ class ImportProvenanceUnavailable(RuntimeError):
     pass
 
 
-def _normal(code):
-    return code.replace(co_filename="<source-generation>", co_consts=tuple(
-        _normal(item) if isinstance(item, types.CodeType) else item for item in code.co_consts))
+# Intentional stdlib-only duplication of daily_generation's structural schema:
+# this observer executes before the runtime can be imported and attested.
+# Keep the producer bootstrap's independent pre-import copy in agreement too.
+_CODE_ATTRIBUTES = frozenset({
+    "co_argcount", "co_posonlyargcount", "co_kwonlyargcount", "co_nlocals",
+    "co_stacksize", "co_flags", "co_code", "co_consts", "co_names", "co_varnames",
+    "co_freevars", "co_cellvars", "co_name", "co_qualname", "co_filename",
+    "co_firstlineno", "co_linetable", "co_exceptiontable",
+    "co_lines", "co_positions", "co_lnotab",
+})
+_CODE_LAYOUT_VERIFIED = False
+
+
+def _constant_key(value):
+    kind = type(value)
+    if value is None:
+        return ("none",)
+    if value is Ellipsis:
+        return ("ellipsis",)
+    if kind is bool:
+        return ("bool", value)
+    if kind is int:
+        return ("int", value)
+    if kind is str:
+        return ("str", value)
+    if kind is bytes:
+        return ("bytes", value)
+    if kind is float:
+        return ("float", struct.pack(">d", value))
+    if kind is complex:
+        return ("complex", struct.pack(">d", value.real), struct.pack(">d", value.imag))
+    if kind is tuple:
+        return ("tuple", tuple(_constant_key(item) for item in value))
+    if kind is frozenset:
+        counts = {}
+        for item in value:
+            key = _constant_key(item)
+            counts[key] = counts.get(key, 0) + 1
+        return ("frozenset", frozenset(counts.items()))
+    if kind is types.CodeType:
+        return _code_key(value)
+    raise ImportProvenanceUnavailable("daily_import_code_unverified")
+
+
+def _code_key(code):
+    global _CODE_LAYOUT_VERIFIED
+    if type(code) is not types.CodeType:
+        raise ImportProvenanceUnavailable("daily_import_code_unverified")
+    if not _CODE_LAYOUT_VERIFIED:
+        if frozenset(name for name in dir(types.CodeType) if name.startswith("co_")) != _CODE_ATTRIBUTES:
+            raise ImportProvenanceUnavailable("daily_import_code_unverified")
+        _CODE_LAYOUT_VERIFIED = True
+    # Filename is normalized only after the caller checks the exact origin.
+    # co_lines/co_positions/co_lnotab are derived from these persisted fields.
+    return ("code", code.co_argcount, code.co_posonlyargcount, code.co_kwonlyargcount,
+            code.co_nlocals, code.co_stacksize, code.co_flags, code.co_code,
+            code.co_names, code.co_varnames, code.co_freevars, code.co_cellvars,
+            code.co_name, code.co_qualname, code.co_firstlineno, code.co_linetable,
+            code.co_exceptiontable, tuple(_constant_key(value) for value in code.co_consts))
 
 
 class ImportObserver:
     """Original in-process observed code; no JSON or environment constructor."""
     def __init__(self, root, *, initial_code):
         self.root = Path(root).resolve(strict=True)
-        self._code = {str(self.root / "sentinel/__init__.py"): _normal(initial_code),
-                      str(self.root / "sentinel_daily_bootstrap.py"): _normal(_BOOTSTRAP_CODE)}
+        self._code = {str(self.root / "sentinel/__init__.py"): _code_key(initial_code),
+                      str(self.root / "sentinel_daily_bootstrap.py"): _code_key(_BOOTSTRAP_CODE)}
         self._failed = False
         self._probe = object()
         self._probe_seen = False
@@ -62,7 +119,11 @@ class ImportObserver:
             if len(self._code) >= MAX_MODULES and key not in self._code:
                 self._failed = True
                 return
-            observed = _normal(code)
+            try:
+                observed = _code_key(code)
+            except ImportProvenanceUnavailable:
+                self._failed = True
+                raise
             previous = self._code.get(key)
             if previous is not None and previous != observed:
                 self._failed = True
@@ -75,7 +136,7 @@ class ImportObserver:
         modules = sys.modules if modules is None else modules
         with self._lock:
             bootstrap = sources.get("sentinel_daily_bootstrap.py")
-            if bootstrap is None or _normal(compile(bootstrap, "<pin>", "exec", dont_inherit=True)) != \
+            if bootstrap is None or _code_key(compile(bootstrap, "<pin>", "exec", dont_inherit=True)) != \
                     self._code[str(self.root / "sentinel_daily_bootstrap.py")]:
                 raise ImportProvenanceUnavailable("daily_bootstrap_generation_mismatch")
             for name, module in tuple(modules.items()):
@@ -93,7 +154,7 @@ class ImportObserver:
                 observed = self._code.get(str(path))
                 if data is None or observed is None:
                     raise ImportProvenanceUnavailable("daily_loaded_import_unobserved")
-                expected = _normal(compile(data, str(path), "exec", dont_inherit=True))
+                expected = _code_key(compile(data, str(path), "exec", dont_inherit=True))
                 if expected != observed:
                     raise ImportProvenanceUnavailable("daily_executed_module_generation_mismatch")
 

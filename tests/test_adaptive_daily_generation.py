@@ -1,7 +1,9 @@
 """Isolated source/generation invariants, with explicit synthetic identity."""
 import json
+import marshal
 from pathlib import Path
 import sqlite3
+import struct
 import tempfile
 from types import SimpleNamespace, ModuleType
 import unittest
@@ -142,6 +144,140 @@ class DailyGenerationTests(unittest.TestCase):
         manifest = generation.SourceManifest.capture(self.root)
         self.assertEqual(generation.verify_loaded_source(manifest, self.root,
             modules={module.__name__: module}), self.root.resolve())
+
+    def test_equal_loaded_code_with_different_reference_serialization_is_accepted(self):
+        path = self.root / "sentinel/coordinator.py"
+        source = ("def admit():\n"
+                  "    return ('same literal with spaces!', 'same literal with spaces!')\n")
+        module = ModuleType("sentinel.coordinator")
+        module.__file__ = str(path)
+        exec(compile(source, str(path), "exec"), module.__dict__)
+        original = module.admit.__code__
+        shared = original.co_consts[1]
+        self.assertIs(shared[0], shared[1])
+        # Equal immutable strings with distinct identities deterministically
+        # change marshal's reference encoding, without changing Python code.
+        first = shared[0].encode("utf-8").decode("utf-8")
+        second = shared[1].encode("utf-8").decode("utf-8")
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)
+        changed_sharing = original.replace(co_consts=(None, (first, second)))
+        self.assertEqual(generation._code_key(original), generation._code_key(changed_sharing))
+        self.assertNotEqual(marshal.dumps(original), marshal.dumps(changed_sharing))
+        module.admit.__code__ = changed_sharing
+        path.write_text(source)
+        manifest = generation.SourceManifest.capture(self.root)
+        self.assertEqual(generation.verify_loaded_source(manifest, self.root,
+            modules={module.__name__: module}), self.root.resolve())
+
+    def test_loaded_bytecode_constant_and_nested_code_changes_still_refuse(self):
+        path = self.root / "sentinel/coordinator.py"
+        cases = (
+            ("bytecode", "def admit(value):\n    return value + 1\n",
+             "def admit(value):\n    return value - 1\n"),
+            ("constant", "def admit():\n    return 1\n", "def admit():\n    return 2\n"),
+            ("nested", "def admit():\n    def child():\n        return 1\n    return child\n",
+             "def admit():\n    def child():\n        return 2\n    return child\n"),
+        )
+        for label, source, executed in cases:
+            module = ModuleType("sentinel.coordinator")
+            module.__file__ = str(path)
+            exec(compile(executed, str(path), "exec"), module.__dict__)
+            path.write_text(source)
+            manifest = generation.SourceManifest.capture(self.root)
+            with self.subTest(change=label), self.assertRaisesRegex(
+                    generation.DailyGenerationUnavailable, "loaded_code_generation_mismatch"):
+                generation.verify_loaded_source(manifest, self.root, modules={module.__name__: module})
+
+    def test_equal_loaded_function_code_at_different_filename_still_refuses(self):
+        path = self.root / "sentinel/coordinator.py"
+        source = "def admit():\n    return 42\n"
+        module = ModuleType("sentinel.coordinator")
+        module.__file__ = str(path)
+        exec(compile(source, str(path.with_name("foreign.py")), "exec"), module.__dict__)
+        path.write_text(source)
+        manifest = generation.SourceManifest.capture(self.root)
+        with self.assertRaisesRegex(generation.DailyGenerationUnavailable, "loaded_code_generation_mismatch"):
+            generation.verify_loaded_source(manifest, self.root, modules={module.__name__: module})
+
+    def test_loaded_stacksize_and_qualname_metadata_changes_refuse(self):
+        path = self.root / "sentinel/coordinator.py"
+        source = "def admit():\n    return 42\n"
+        path.write_text(source)
+        manifest = generation.SourceManifest.capture(self.root)
+        for field in ("co_stacksize", "co_qualname"):
+            module = ModuleType("sentinel.coordinator")
+            module.__file__ = str(path)
+            exec(compile(source, str(path), "exec"), module.__dict__)
+            original = module.admit.__code__
+            value = original.co_stacksize + 1 if field == "co_stacksize" else "different.admit"
+            module.admit.__code__ = original.replace(**{field: value})
+            with self.subTest(field=field), self.assertRaisesRegex(
+                    generation.DailyGenerationUnavailable, "loaded_code_generation_mismatch"):
+                generation.verify_loaded_source(manifest, self.root, modules={module.__name__: module})
+
+    def test_loaded_nested_code_metadata_changes_refuse(self):
+        path = self.root / "sentinel/coordinator.py"
+        source = "def admit():\n    def child():\n        return 42\n    return child\n"
+        path.write_text(source)
+        manifest = generation.SourceManifest.capture(self.root)
+        for field in ("co_stacksize", "co_qualname"):
+            module = ModuleType("sentinel.coordinator")
+            module.__file__ = str(path)
+            exec(compile(source, str(path), "exec"), module.__dict__)
+            original = module.admit.__code__
+            child = next(value for value in original.co_consts if type(value) is type(original))
+            value = child.co_stacksize + 1 if field == "co_stacksize" else "different.child"
+            changed = child.replace(**{field: value})
+            module.admit.__code__ = original.replace(co_consts=tuple(
+                changed if item is child else item for item in original.co_consts))
+            with self.subTest(field=field), self.assertRaisesRegex(
+                    generation.DailyGenerationUnavailable, "loaded_code_generation_mismatch"):
+                generation.verify_loaded_source(manifest, self.root, modules={module.__name__: module})
+
+    def test_typed_code_constants_preserve_ieee_bits_and_container_types(self):
+        nan_one = struct.unpack(">d", bytes.fromhex("7ff8000000000001"))[0]
+        nan_two = struct.unpack(">d", bytes.fromhex("7ff8000000000002"))[0]
+        pairs = ((None, Ellipsis), (True, 1), (1, 1.0), ("literal", b"literal"),
+                 (0.0, -0.0), (nan_one, nan_two), (complex(1, 0.0), complex(1, -0.0)),
+                 ((1, 2), frozenset({1, 2})))
+        for first, second in pairs:
+            with self.subTest(first_type=type(first).__name__, second_type=type(second).__name__):
+                self.assertNotEqual(generation._constant_key(first), generation._constant_key(second))
+        self.assertEqual(generation._constant_key(nan_one), generation._constant_key(nan_one))
+        self.assertEqual(generation._constant_key(frozenset({1, 2})),
+                         generation._constant_key(frozenset({2, 1})))
+
+    def test_unreviewed_loaded_constant_type_refuses(self):
+        path = self.root / "sentinel/coordinator.py"
+        source = "def admit():\n    return 42\n"
+        module = ModuleType("sentinel.coordinator")
+        module.__file__ = str(path)
+        exec(compile(source, str(path), "exec"), module.__dict__)
+        module.admit.__code__ = module.admit.__code__.replace(co_consts=(None, object()))
+        path.write_text(source)
+        manifest = generation.SourceManifest.capture(self.root)
+        with self.assertRaisesRegex(generation.DailyGenerationUnavailable, "loaded_code_unverified"):
+            generation.verify_loaded_source(manifest, self.root, modules={module.__name__: module})
+
+    def test_frozenset_constant_key_preserves_equal_nan_payload_multiplicity(self):
+        bits = bytes.fromhex("7ff8000000000001")
+        first, second = (struct.unpack(">d", bits)[0] for _ in range(2))
+        single, double = frozenset((first,)), frozenset((first, second))
+        self.assertEqual(len(single), 1)
+        self.assertEqual(len(double), 2)
+        self.assertNotEqual(generation._constant_key(single), generation._constant_key(double))
+        self.assertEqual(generation._constant_key(double), generation._constant_key(frozenset((second, first))))
+
+    def test_unknown_or_missing_code_attribute_inventory_refuses(self):
+        code = compile("pass\n", "<fixture>", "exec")
+        for attributes in (generation._CODE_ATTRIBUTES | {"co_future_field"},
+                           generation._CODE_ATTRIBUTES - {"co_qualname"}):
+            with self.subTest(attributes=attributes), \
+                    patch.object(generation, "_CODE_LAYOUT_VERIFIED", False), \
+                    patch.object(generation, "_CODE_ATTRIBUTES", attributes), \
+                    self.assertRaisesRegex(generation.DailyGenerationUnavailable, "loaded_code_unverified"):
+                generation._code_key(code)
 
     def test_matching_file_at_foreign_loaded_origin_refuses(self):
         module = ModuleType("sentinel.other")

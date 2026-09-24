@@ -1,6 +1,7 @@
 """Complete executed-code provenance; fixtures never install a global audit hook."""
 from importlib.machinery import ModuleSpec
 from pathlib import Path
+import struct
 import tempfile
 from types import ModuleType
 import unittest
@@ -20,7 +21,7 @@ class DailyBootstrapTests(unittest.TestCase):
         self.observer.audit("resource_sentinel.import_provenance", (self.observer._probe,))
         self.sources = {"sentinel_daily_bootstrap.py": Path(bootstrap.__file__).read_bytes()}
 
-    def module(self, source, *, name="sentinel.example", observe=True):
+    def module(self, source, *, name="sentinel.example", observe=True, transform=None):
         path = self.root / (name.replace(".", "/") + ".py")
         path.write_text(source)
         module = ModuleType(name)
@@ -28,6 +29,8 @@ class DailyBootstrapTests(unittest.TestCase):
         module.__spec__ = ModuleSpec(name, loader=None, origin=str(path))
         module.__spec__._initializing = False
         code = compile(source, str(path), "exec", dont_inherit=True)
+        if transform is not None:
+            code = transform(code)
         if observe:
             self.observer.audit("exec", (code,))
         exec(code, module.__dict__)
@@ -84,6 +87,54 @@ class DailyBootstrapTests(unittest.TestCase):
         module = self.module("VALUE = 1\n")
         self.observer.audit("exec", (compile("VALUE = 1\n", module.__file__, "exec"),))
         self.assertIsNone(self.verify(module))
+
+    def test_actual_executed_module_stacksize_and_qualname_changes_refuse(self):
+        for field in ("co_stacksize", "co_qualname"):
+            def changed(code):
+                value = code.co_stacksize + 1 if field == "co_stacksize" else "different.module"
+                return code.replace(**{field: value})
+            module = self.module("VALUE = 1\n", name="sentinel." + field, transform=changed)
+            with self.subTest(field=field), self.assertRaisesRegex(
+                    bootstrap.ImportProvenanceUnavailable, "executed_module_generation_mismatch"):
+                self.verify(module)
+
+    def test_actual_executed_nested_metadata_changes_refuse(self):
+        for field in ("co_stacksize", "co_qualname"):
+            def changed(code):
+                child = next(item for item in code.co_consts if type(item) is type(code))
+                value = child.co_stacksize + 1 if field == "co_stacksize" else "different.admit"
+                replaced = child.replace(**{field: value})
+                return code.replace(co_consts=tuple(replaced if item is child else item for item in code.co_consts))
+            module = self.module("def admit():\n    return 1\n", name="sentinel.nested_" + field,
+                                 transform=changed)
+            with self.subTest(field=field), self.assertRaisesRegex(
+                    bootstrap.ImportProvenanceUnavailable, "executed_module_generation_mismatch"):
+                self.verify(module)
+
+    def test_frozenset_nan_constant_multiplicity_is_retained(self):
+        first, second = (struct.unpack(">d", bytes.fromhex("7ff8000000000001"))[0] for _ in range(2))
+        self.assertEqual(len(frozenset((first, second))), 2)
+        self.assertNotEqual(bootstrap._constant_key(frozenset((first,))),
+                            bootstrap._constant_key(frozenset((first, second))))
+
+    def test_unknown_or_missing_code_attribute_inventory_refuses(self):
+        for attributes in (bootstrap._CODE_ATTRIBUTES | {"co_future_field"},
+                           bootstrap._CODE_ATTRIBUTES - {"co_qualname"}):
+            with self.subTest(attributes=attributes), \
+                    patch.object(bootstrap, "_CODE_LAYOUT_VERIFIED", False), \
+                    patch.object(bootstrap, "_CODE_ATTRIBUTES", attributes), \
+                    self.assertRaisesRegex(bootstrap.ImportProvenanceUnavailable, "code_unverified"):
+                bootstrap._code_key(self.initial)
+
+    def test_unknown_audited_constant_type_keeps_failure_sticky(self):
+        module = self.module("VALUE = 1\n")
+        original = compile("VALUE = 1\n", module.__file__, "exec")
+        changed = original.replace(co_consts=(object(), None))
+        with self.assertRaisesRegex(bootstrap.ImportProvenanceUnavailable, "code_unverified"):
+            self.observer.audit("exec", (changed,))
+        self.observer.audit("exec", (original,))
+        with self.assertRaisesRegex(bootstrap.ImportProvenanceUnavailable, "provenance_unavailable"):
+            self.verify(module)
 
     def test_bootstrap_source_itself_is_pinned(self):
         module = self.module("VALUE = 1\n")

@@ -205,15 +205,21 @@ class NativeChildren:
 
     def spawn(self, command, owner):
         info = self.Info()
-        entry = {"info": info, "state": "creation_unknown", "closed": set(), "closing": None,
+        entry = {"info": info, "state": "not_attempted", "closed": set(), "closing": None,
                  "verified": None, "identity": None}
         owner.children.append(entry)  # Publication precedes the native call.
         startup = self.Startup()
         startup.cb = self.c.sizeof(startup)
+        arguments = (command[0], self.c.create_unicode_buffer(subprocess.list2cmdline(command)),
+                     None, None, False, 0x08000000, None, str(owner.directory),
+                     self.c.byref(startup), self.c.byref(info))
+        # Argument preparation consumes the original shared clock. A refusal
+        # here owns only these original empty output cells, not a Create attempt.
+        if time.monotonic_ns() >= owner.deadline:
+            raise FixtureError("fixture_stopped_before_child")
+        entry["state"] = "creation_unknown"
         try:
-            ok = self.create(command[0], self.c.create_unicode_buffer(subprocess.list2cmdline(command)),
-                             None, None, False, 0x08000000, None, str(owner.directory),
-                             self.c.byref(startup), self.c.byref(info))
+            ok = self.create(*arguments)
         except BaseException as error:
             owner.errors.append(error)
             raise RetainedOwnerError("fixture_child_create_unknown", owner) from error
@@ -233,7 +239,7 @@ class NativeChildren:
         return entry
 
     def alive(self, child):
-        if child["state"] == "absent":
+        if child["state"] in {"not_attempted", "absent"}:
             return False
         if child["state"] != "owned" or child["closing"] is not None:
             raise FixtureError("fixture_child_custody_unknown")
@@ -246,7 +252,7 @@ class NativeChildren:
         return result == 258
 
     def close_child(self, child):
-        if child["state"] in {"absent", "closed"}:
+        if child["state"] in {"not_attempted", "absent", "closed"}:
             return
         if self.alive(child):
             raise FixtureError("fixture_child_still_alive")

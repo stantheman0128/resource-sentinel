@@ -4,6 +4,20 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
+S1 CPU fixture 的 child Create 邊界已補上原始 deadline 檢查：先保管尚未進入
+Create 的 output cells，完成 command buffer／startup 參數後再查原期限，最後
+才標記 Create 已進入。準備期間到期不建立 child，也不把它記成未知建立結果。
+`tests.test_adaptive_scope_cpu_worker` **41 tests 全過，0 failures／errors／skips**
+（runner 0.308 秒），私人日誌 `.local-adaptive/scope-child-deadline-20260924-1.log`。
+新增案例在 buffer 準備耗盡期限，確認零 Create／duplicate／child wait／native
+close，並正面清理原有 Job／self fixture owners。這不是 native 實測；完整 root／
+child scope-bound protocol 仍待接線。Reopened probe 的先行契約已入庫為
+[`c59376a`](EXPERIMENT-REOPENED-PROBE.md)，source／整合測試進行中。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command 'C:\Python313\python.exe -m unittest tests.test_adaptive_scope_cpu_worker -q' -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
 原始 experiment scope 的 remote readiness 接線已完成並驗證。Helper 只使用
 鎖外已取得的原始 lexical scope／group member，不在鎖內開 SQL／RPC 或取得
 替代 owner。Local owner 在同一次證明中固定；remote 分支不採用稍後出現的

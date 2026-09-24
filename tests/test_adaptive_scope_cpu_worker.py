@@ -343,6 +343,9 @@ class WorkloadTests(unittest.TestCase):
 
     def raw_native(self):
         """Only Python fake calls and local ctypes output cells; no Win32 API."""
+        clock = patch.object(worker.time, "monotonic_ns", return_value=NOW)
+        clock.start()
+        self.addCleanup(clock.stop)
         native = worker.NativeChildren.__new__(worker.NativeChildren)
         class Startup(ctypes.Structure):
             _fields_ = [("cb", ctypes.c_uint32)]
@@ -365,6 +368,47 @@ class WorkloadTests(unittest.TestCase):
             return 1
         native.create.side_effect = created
         return native, owner, verified
+
+    def test_child_deadline_expiring_during_buffer_preparation_never_enters_create(self):
+        native, owner, verified = self.raw_native()
+        original_deadline = owner.deadline
+        original_job, original_process = owner.job, owner.process
+        original_buffer = ctypes.create_unicode_buffer
+        clock = {"now": NOW}
+
+        def consume_remaining_time(value):
+            self.assertEqual(len(owner.children), 1)
+            self.assertEqual(owner.children[0]["state"], "not_attempted")
+            buffer = original_buffer(value)
+            clock["now"] = original_deadline
+            return buffer
+
+        with patch.object(worker.time, "monotonic_ns", side_effect=lambda: clock["now"]), \
+                patch.object(native.c, "create_unicode_buffer", side_effect=consume_remaining_time):
+            with self.assertRaisesRegex(worker.FixtureError, "fixture_stopped_before_child") as caught:
+                native.spawn(["python.exe", "-I", "fixture.py"], owner)
+        owner.errors.append(caught.exception)  # The same error retained by run().
+        self.assertEqual(owner.deadline, original_deadline)
+        self.assertEqual(len(owner.children), 1)
+        child = owner.children[0]
+        self.assertEqual(child["state"], "not_attempted")
+        self.assertFalse(any((child["info"].hProcess, child["info"].hThread,
+                              child["info"].dwProcessId, child["info"].dwThreadId)))
+        self.assertIsNone(child["verified"])
+        native.create.assert_not_called()
+        owner.modules.identity.VerifiedProcess.duplicate_from_handle.assert_not_called()
+        self.assertIn(owner, worker._RETAINED)
+        self.assertTrue(owner.settle())
+        self.assertIs(owner.children[0], child)
+        self.assertIs(owner.job, original_job)
+        self.assertIs(owner.process, original_process)
+        self.assertFalse(owner.quarantined)
+        self.assertNotIn(owner, worker._RETAINED)
+        native.wait.assert_not_called()
+        native.close.assert_not_called()
+        verified.close.assert_not_called()
+        original_job.close.assert_called_once()
+        original_process.close.assert_called_once()
 
     def test_native_create_retains_outputs_before_call_and_only_inherits_job(self):
         native, owner, verified = self.raw_native()

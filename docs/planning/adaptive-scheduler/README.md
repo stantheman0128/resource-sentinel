@@ -2,7 +2,75 @@
 
 日期：2026-09-19。狀態：**正式計畫已入庫，分階段實作進行中；production adaptive 維持 off。**
 
-## 2026-09-25 process duplicate custody checkpoint（目前狀態）
+## 2026-09-25 aggregate parent/child custody checkpoint（目前狀態）
+
+Source commit `51238fec7547ca8bd18d490d5e3908b7ce97f92c` 提交原始
+aggregate parent scope、child creation/transport 與 daily admission backing：
+
+- Parent 先保留原始 owner，再取得 readiness、POLICY、SQLite 或 native 資源。
+  Daily 與 isolated SQL 選取同一預先取得群組的正確成員；原始 ledger file
+  identity 在群組、connection acquisition 及最後 Create gate 都要一致。
+  SQL 不跨 native creation/IPC；失敗的原始 connection/guard/attempt 保留。
+- 新 Create 必須另外通過原始 allocation 的新工作檢查；既有 member 的唯讀
+  replay 不能跳過 HOLD/expiry。保留原始 wall-clock 截止與 monotonic 界線，
+  backend setup 耗時或時鐘回跳不能延長期限。最後一道 native gate 拒絕時，
+  原 attempt 可證明未建立並收尾，仍不能重試或釋放整份 daily demand。
+- 固定 BindExperimentChild 協議先驗證 native peer，再處理有界 manifest；
+  MAC domain、原始 process/handle、scope/source/ledger/role/permission 全部
+  綁定。成功 JSON、receipt 和 binding 都不能取代 admission、readiness 或 release。
+- 一個 workload partition 固定一份 isolated execution/reservation/request
+  binding。Backing 是 immutable daily intent，納入相同 4,096 列/16 MiB
+  與十個 managed Job 上限；它本身不建立 isolated reservation、不提供第二份
+  機器容量，也不因 timeout、cancel 或 ACK 遺失而釋放原始 floor。
+
+Windows／Python 3.13.3，以正常 daily HEAVY/P2/CPU1/RAM1GiB/IO0 准入，
+在 `git archive` 匯出的独立 source、清除 `PYTHONPATH` 後驗證：
+
+- 第一輪 tree `f3b5cdeb1c7e6fb78525ade58520e5e86d4832c0`：新增四模組與
+  受影響的十七個既有模組共 **467 PASS，0 failures/errors/skips**，
+  runner 188.592 秒。本機證據 `.local-adaptive/host-scope-export-20260925-1/`。
+- 最後只修改 Create 最末 gate 前的狀態標記，新增其回歸並清理 EOF 空行。
+  最終 tree `fd84898fd466178022d0ba434883428c1973126f` 重跑四個受影響
+  新模組：**79 PASS，0 failures/errors/skips**，runner 21.573 秒。
+  Source commit tree 與這次匯出相同；證據在 `host-scope-export-20260925-2/`。
+  兩輪有重疊，不相加，也不把第一輪說成最終 tree 的完整重跑。
+
+測試使用真實隔離 SQLite 與明確 synthetic native/pipe collaborators；
+涵蓋 ACTIVE daily + isolated absence、DB 替換、HOLD/expiry、未知 cleanup、
+immutable backing、原始 custody 與零 native-entry 的拒絕情境。
+獨立 source review 的具體 findings 已修正並複查；這些仍不是 Windows
+capability、真實 launch/recovery、overhead 或 A/B gate 證據。
+
+最終四模組可在乾淨 checkout 重現；十七模組清單保留於下面 aggregate ledger
+checkpoint 的 `$sentinelHostLedgerTests`：
+
+```powershell
+$sentinelHostScopeTests = @(
+    'tests.test_adaptive_experiment_host_scope'
+    'tests.test_adaptive_experiment_host_backing'
+    'tests.test_adaptive_experiment_host_creation'
+    'tests.test_adaptive_experiment_host_transport'
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command ('C:\Python313\python.exe -m unittest -v ' + ($sentinelHostScopeTests -join ' ')) -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
+**完整 provider 尚未接通，P3–P6 不因此完成。** 固定的
+`scripts/adaptive-experiment-child.py` bootstrap 仍未實作；來源 gate 保持拒絕，
+正常 S2 入口仍拒絕 `s2_original_production_host_scope_unavailable`。
+Parent backing 與 child binding 尚未接上完整 wrapper/guardian lifecycle。
+Aggregate completion/history/daily release、P4 真實 overhead、剩餘 S3 drivers/
+140-case orchestration、P6 actual A/B/A0 與必要 native gates 仍未完成。
+
+另一組六檔 partition admission/wait-budget 草稿留在本機，**未驗證、未提交**：
+`experiment_partition_admission.py`、`operation_waits.py`、其測試與 Coordinator/
+Policy/Store 的窄改。下一步先透過日常准入跑該十四個 focused cases 及相關
+managed admission/policy 回歸，通過後才提交；不能把草稿算成已交付。
+
+本批保留十四個 protected tracked files 與原有 untracked files。
+日常 runtime/config/Scheduled Task/全域入口未變更；production adaptive off。
+沒有施加測試 Job 限制，也沒有待撤回的限速。
+
+## 2026-09-25 process duplicate custody checkpoint（前一批）
 
 Source commit `f395d035bc088d29d2dc446e7dafb06154d93b4e` 修補原始
 process handle 的 duplicate capture：先保留 native output cell，再呼叫

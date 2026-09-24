@@ -97,6 +97,14 @@ class PolicyCoordinator:
         """
         return getattr(self._held, "guard", None)
 
+    def current_cleanup_guard(self):
+        """Exact current-thread nonce cleanup, after native scope release.
+
+        This grants no POLICY borrowing or capacity authority. Daily retirement
+        uses it only to recognize the original _clear connection opener.
+        """
+        return getattr(self._held, "cleanup_guard", None)
+
     def assert_held(self, guard=None):
         current = self.current_guard()
         if current is None or (guard is not None and current is not guard):
@@ -174,12 +182,18 @@ class PolicyCoordinator:
         return row
 
     def _clear(self, guard):
-        with self.store._transaction() as conn:
-            self.revalidate(conn, guard)
-            if conn.execute("""UPDATE adaptive_runtime SET policy_entry_nonce=NULL
-                WHERE singleton=1 AND policy_instance_id=? AND policy_logon_id=? AND policy_entry_nonce=?""",
-                (guard.binding.instance_id, guard.binding.logon_id, guard.nonce)).rowcount != 1:
-                raise PolicyError("policy_entry_changed")
+        if self.current_guard() is not None or self.current_cleanup_guard() is not None:
+            raise PolicyError("policy_cleanup_scope_nested")
+        self._held.cleanup_guard = guard
+        try:
+            with self.store._transaction() as conn:
+                self.revalidate(conn, guard)
+                if conn.execute("""UPDATE adaptive_runtime SET policy_entry_nonce=NULL
+                    WHERE singleton=1 AND policy_instance_id=? AND policy_logon_id=? AND policy_entry_nonce=?""",
+                    (guard.binding.instance_id, guard.binding.logon_id, guard.nonce)).rowcount != 1:
+                    raise PolicyError("policy_entry_changed")
+        finally:
+            self._held.cleanup_guard = None
 
     def record_recovery_hold(self, guard):
         with self.store._transaction() as conn:

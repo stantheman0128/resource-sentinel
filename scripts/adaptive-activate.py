@@ -26,6 +26,8 @@ def main(argv=None):
     parser.add_argument("--backup-directory", type=Path)
     parser.add_argument("--apply-daily-accounting-handoff", action="store_true",
                         help="explicitly apply reviewed source and remain its original resident owner")
+    parser.add_argument("--retire-generation-after-drain", action="store_true",
+                        help="explicitly request freeze, drain and retirement; daily admission stays fenced")
     args = parser.parse_args(argv)
     operation = None
     try:
@@ -34,6 +36,8 @@ def main(argv=None):
             candidate_root=Path(__file__).resolve().parents[1], approved_digest=args.manifest_sha256,
             approved_preparation_digest=args.preparation_sha256)
         if not args.apply_daily_accounting_handoff:
+            if args.retire_generation_after_drain:
+                parser.error("--retire-generation-after-drain requires the separately authorized apply action")
             print(json.dumps({"status": "source_review_verified", "manifest_sha256": plan.digest,
                               "files": len(plan.baseline), "runtime_mutations": 0,
                               "activation_authorized": False}, sort_keys=True))
@@ -42,10 +46,9 @@ def main(argv=None):
             parser.error("--backup-directory is required for explicit apply")
         operation = SourceInstallation(plan, args.backup_directory)
         operation.apply()
-        operation.enter_daily_host()
-        # An active generation is a retained service obligation. Returning from
-        # its keeper is not a successful handoff or clean process termination.
-        raise RuntimeError("daily_generation_keeper_returned_without_retirement")
+        operation.enter_daily_host(retire_after_drain=args.retire_generation_after_drain)
+        operation.assert_runtime_retired()
+        return 0
     except BaseException as error:
         if operation is None and isinstance(error, (SystemExit, GeneratorExit)):
             raise

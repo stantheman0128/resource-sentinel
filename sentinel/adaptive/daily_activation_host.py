@@ -9,9 +9,10 @@ Original cohort, process, POLICY and SQL custody supply that authority.
 One non-daemon thread serves read-only readiness in this same process so a child
 can authenticate its original keeper during supervisor startup. Its one-resource
 pipe registry is strongly owned independently of the supervisor's pipe registry.
-No clean process exit is implemented for an activated generation: draining CPU
-control alone cannot retire the daily accounting obligations. Until a positive
-generation-retirement protocol exists the keeper remains resident after drain.
+Draining CPU control alone cannot retire daily accounting obligations. Only an
+explicit retirement request on this original host, its acknowledged freeze and
+seal, and positive cleanup of every retained owner permit a clean process exit.
+Retirement leaves daily admission fenced; it is not an automatic restart path.
 """
 from __future__ import annotations
 
@@ -39,6 +40,7 @@ _PRELOAD = (
     "recovery_journal", "supervisor_reconcile", "supervisor_startup",
     "host_discovery", "operator_transport", "supervisor_operations",
     "recovery_owner", "supervisor", "supervisor_epoch",
+    "daily_retirement",
 )
 _EMPTY_TABLES = ("reservations", "worker_reservations", "queue", "managed_executions")
 
@@ -80,12 +82,14 @@ class _ConnectionCustody:
 class DailyActivationHost:
     """Single original keeper; no authority callbacks or alternate locations."""
 
-    def __init__(self, manifest, expected_config_digest, expected_ledger_identity):
+    def __init__(self, manifest, expected_config_digest, expected_ledger_identity, *, retire_after_drain=False):
         if type(manifest) is not generation.SourceManifest:
             raise DailyActivationError("daily_activation_manifest_required")
         _hex(expected_config_digest)
         if type(expected_ledger_identity) is not LedgerFileIdentity:
             raise DailyActivationError("daily_activation_ledger_identity_required")
+        if type(retire_after_drain) is not bool:
+            raise DailyActivationError("daily_activation_retirement_intent_invalid")
         self.manifest = manifest
         self.expected_config_digest = expected_config_digest
         self.expected_ledger_identity = expected_ledger_identity
@@ -99,9 +103,19 @@ class DailyActivationHost:
         self._start_attempted = self._supervisor_attempted = False
         self._failure = self._readiness_failure = None
         self._thread = self._listener = self._service = self._registry = None
+        self._readiness_original_thread = self._readiness_original_listener = None
+        self._readiness_original_registry = None
         self._listener_ready = threading.Event()
         self._thread_stopped = threading.Event()
         self._readiness_start_attempted = False
+        self._readiness_stop = threading.Event()
+        self._readiness_joined = self._readiness_listener_closed = False
+        self._readiness_close_unknown = self._readiness_cleanup_complete = False
+        self._readiness_close_attempted = False
+        self._retirement_cleanup_error = None
+        self._retirement = None
+        self._retirement_creation_attempted = False
+        self._retire_after_drain = retire_after_drain
         self._native_custody_possible = False
         self._supervisor_closed = False
         self._generation_settled = False
@@ -278,9 +292,11 @@ class DailyActivationHost:
             raise DailyActivationError("daily_activation_readiness_start_already_attempted", self)
         self.owner.assert_ready()
         self._registry = NativePipeRegistry(max_resources=1)
+        self._readiness_original_registry = self._registry
         self._service = DailyReadinessService(self.owner.readiness_endpoint, self.owner)
         self._thread = threading.Thread(target=self._serve_readiness,
             name="sentinel-daily-readiness", daemon=False)
+        self._readiness_original_thread = self._thread
         self._readiness_start_attempted = True
         self._thread.start()
 
@@ -288,8 +304,9 @@ class DailyActivationHost:
         """Same original process, read-only service, no automatic retirement."""
         try:
             self._listener = NativePipeListener(self.owner.readiness_endpoint, registry=self._registry)
+            self._readiness_original_listener = self._listener
             self._listener_ready.set()
-            while True:
+            while not self._readiness_stop.is_set():
                 try:
                     self._service.serve_once(self._listener, timeout_ms=1000)
                 except Exception as error:
@@ -317,9 +334,113 @@ class DailyActivationHost:
             except BaseException as error:
                 self._retain_failure(error)
 
+    def request_retirement(self):
+        """Explicit intent on this original host, distinct from ordinary drain."""
+        from .daily_retirement import DailyRetirementOperation
+        if (self._generation_settled is not True or self.owner is None or
+                self.supervisor is None or self._supervisor_attempted is not True):
+            raise DailyActivationError("daily_retirement_host_not_ready", self)
+        if self._retirement is not None:
+            if type(self._retirement) is not DailyRetirementOperation or self._retirement.host is not self:
+                raise DailyActivationError("daily_retirement_operation_changed", self)
+            return self._retirement
+        if self._retirement_creation_attempted:
+            raise DailyActivationError("daily_retirement_creation_unverified", self)
+        self._retirement_creation_attempted = True
+        self._retirement = DailyRetirementOperation(self)
+        return self._retirement
+
+    def _original_retirement(self, operation):
+        from .daily_retirement import DailyRetirementOperation
+        if (operation is not self._retirement or type(operation) is not DailyRetirementOperation or
+                operation.host is not self):
+            raise DailyActivationError("daily_retirement_original_operation_required", self)
+        return operation
+
+    def _retirement_complete(self):
+        if self._retirement is None:
+            return False
+        operation = self._original_retirement(self._retirement)
+        return (operation.complete is True and self._readiness_cleanup_complete is True and
+                self._readiness_close_unknown is False)
+
+    def _tick_retirement(self):
+        operation = self._original_retirement(self._retirement)
+        try:
+            operation.tick()
+        except BaseException as error:
+            # Its original operation owns failed SQL/POLICY work. Independent
+            # supervisor recovery still gets its tick while that work settles.
+            self._retain_failure(error)
+        if operation.freeze_acknowledged is True:
+            self.request_drain()
+        if operation.sealed is True:
+            self.shutdown_native_retirement(operation)
+
+    def shutdown_native_retirement(self, operation):
+        """Close only this exact sealed operation's original native keeper."""
+        operation = self._original_retirement(operation)
+        if operation.sealed is not True or operation.freeze_acknowledged is not True:
+            raise DailyActivationError("daily_retirement_seal_unacknowledged", self)
+        if operation.complete is True:
+            if not self._retirement_complete():
+                raise DailyActivationError("daily_retirement_cleanup_unverified", self)
+            return True
+        self._phase = "generation_keeper_retiring"
+        self._readiness_stop.set()
+        if self._readiness_close_unknown:
+            return False
+        if self._thread is None or not self._thread_stopped.is_set():
+            return False
+        try:
+            if (self._thread is not self._readiness_original_thread or
+                    self._listener is not self._readiness_original_listener or
+                    self._registry is not self._readiness_original_registry):
+                raise DailyActivationError("daily_retirement_keeper_owner_changed", self)
+            if not self._readiness_joined:
+                # The worker's finally signal alone is not a join receipt. The
+                # original Thread must also complete its own bounded join.
+                self._thread.join(timeout=0)
+                if self._thread.is_alive() is not False:
+                    return False
+                self._readiness_joined = True
+            if any(item.closed is not True or item.close_unknown is not False for item in self._connections):
+                return False
+            if self._listener is None or self._registry is None:
+                return False
+            if not self._readiness_listener_closed:
+                if self._readiness_close_attempted:
+                    return False
+                self._readiness_close_attempted = True
+                # Set before the native boundary. An exception can never
+                # become authority to retry the same numeric handle as fresh.
+                self._readiness_close_unknown = True
+                self._listener.close()
+                self._readiness_listener_closed = True
+                self._readiness_close_unknown = False
+            status = self._registry.status()
+            if (type(status.resources) is not int or status.resources != 0 or
+                    type(status.pending) is not int or status.pending != 0 or
+                    type(status.quarantined) is not int or status.quarantined != 0):
+                return False
+            self._readiness_cleanup_complete = True
+            operation.close_owner()
+            if self._retirement_complete():
+                self._phase = "generation_retired"
+                return True
+            return False
+        except BaseException as error:
+            if self._retirement_cleanup_error is None:
+                self._retirement_cleanup_error = error
+            self._retain_failure(error)
+            return False
+
     def run_once(self):
         if not self._start_attempted:
             raise DailyActivationError("daily_activation_not_started", self)
+        if self._retirement_complete():
+            return self.status()
+        supervisor_closed_before = self._supervisor_closed
         if self._failure is not None and self.supervisor is None:
             return self.status()
         if self._waiting_for_cohort:
@@ -334,6 +455,12 @@ class DailyActivationHost:
                     return self.status()
                 self._retain_failure(error)
                 raise
+        retirement_ticked = False
+        if self._retirement is not None:
+            self._tick_retirement()
+            retirement_ticked = True
+            if self._retirement_complete() or self._retirement.sealed is True:
+                return self.status()
         if self._readiness_failure is not None or self._thread_stopped.is_set():
             self._phase = "readiness_custody_retained"
             # Stop new managed launches while preserving existing guardian
@@ -353,6 +480,13 @@ class DailyActivationHost:
                 # Preserve any child creation witnesses on this exact host.
                 self.request_drain()
                 raise
+        if self._retire_after_drain and self._retirement is None and self.supervisor is not None:
+            self.request_retirement()
+        if self._retirement is not None and not retirement_ticked:
+            self._tick_retirement()
+            retirement_ticked = True
+            if self._retirement_complete() or self._retirement.sealed is True:
+                return self.status()
         if self.supervisor is not None and not self._supervisor_closed:
             try:
                 if self._draining:
@@ -371,18 +505,26 @@ class DailyActivationHost:
                 self._draining = True
                 self.supervisor.begin_drain()
                 raise
+        if self._retirement is not None and self._supervisor_closed and not supervisor_closed_before:
+            self._tick_retirement()
         return self.status()
 
     def status(self):
+        complete = self._retirement_complete()
         return {"event": "daily_activation_host", "phase": self._phase,
                 "generation_activation_acknowledged": self._generation_settled,
                 "readiness_listener_started": self._listener_ready.is_set(),
+                "readiness_listener_closed": self._readiness_listener_closed,
                 "supervisor_state": self._supervisor_state,
                 "supervisor_closed": self._supervisor_closed, "drain_requested": self._draining,
-                "clean_exit_allowed": False,
-                "reason": (_reason(self._failure) if self._failure is not None else
+                "retirement_requested": self._retirement is not None,
+                "retirement_phase": None if self._retirement is None else self._retirement.phase,
+                "retirement_reason": None if self._retirement is None or self._retirement.reason is None else
+                    _reason_text(self._retirement.reason),
+                "clean_exit_allowed": complete,
+                "reason": (None if complete else _reason(self._failure) if self._failure is not None else
                     _reason(self._readiness_failure) if self._readiness_failure is not None else
-                    "daily_generation_retirement_not_implemented" if self._supervisor_closed else
+                    "daily_generation_retirement_required" if self._supervisor_closed and self._retirement is None else
                     "cohort_ambiguous_consumers_still_alive" if self._waiting_for_cohort else
                     self._supervisor_reason)}
 
@@ -401,6 +543,8 @@ class DailyActivationHost:
         previous = None
         while True:
             previous = self._retained_tick(previous)
+            if self._retirement_complete():
+                return self.status()
 
     def _retain_interruption(self, error):
         if not isinstance(error, KeyboardInterrupt):
@@ -443,6 +587,8 @@ def main(argv=None):
     parser.add_argument("--config-digest", required=True)
     parser.add_argument("--ledger-device", required=True)
     parser.add_argument("--ledger-inode", required=True)
+    parser.add_argument("--retire-generation-after-drain", action="store_true",
+        help="explicitly request freeze, supervisor drain and generation retirement after activation")
     options = parser.parse_args(argv)
     # A manifest file is bounded public comparison data. It never substitutes
     # for canonical provenance, exact file binding, or native original owners.
@@ -453,9 +599,13 @@ def main(argv=None):
     from .contracts import strict_json_loads
     manifest = generation.SourceManifest.from_dict(strict_json_loads(payload))
     ledger = LedgerFileIdentity.from_dict({"st_dev": options.ledger_device, "st_ino": options.ledger_inode})
-    DailyActivationHost(manifest, options.config_digest, ledger).run_forever()
-    raise DailyActivationError("daily_activation_unexpected_return")
+    host = DailyActivationHost(manifest, options.config_digest, ledger,
+                               retire_after_drain=options.retire_generation_after_drain)
+    result = host.run_forever()
+    if not host._retirement_complete():
+        raise DailyActivationError("daily_activation_unexpected_return", host)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

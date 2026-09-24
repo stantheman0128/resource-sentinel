@@ -96,6 +96,29 @@ class Owner:
             raise DailyReadinessError("daily_generation_not_activated")
 
 
+class Retirement:
+    """Explicit synthetic operation; this is never a production seal receipt."""
+    def __init__(self, host):
+        self.host = host
+        self.freeze_acknowledged = self.sealed = self.complete = False
+        self.phase, self.reason = "freeze_pending", None
+        self.tick_calls = self.close_calls = 0
+        self.on_tick = self.close_error = None
+
+    def tick(self):
+        self.tick_calls += 1
+        if self.on_tick is not None:
+            self.on_tick()
+
+    def close_owner(self):
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
+        if not self.host._readiness_cleanup_complete:
+            raise AssertionError("owner closed before keeper cleanup")
+        self.complete, self.phase = True, "retired_admission_fenced"
+
+
 class DailyActivationHostTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -183,6 +206,28 @@ class DailyActivationHostTests(unittest.TestCase):
         for replacement in replacements:
             replacement.start()
             self.addCleanup(replacement.stop)
+
+    def retirement_fixture(self, *, sealed=True, stopped=True):
+        from sentinel.adaptive import daily_retirement
+        replacement = patch.object(daily_retirement, "DailyRetirementOperation", Retirement)
+        replacement.start()
+        self.addCleanup(replacement.stop)
+        self.host._start_attempted = self.host._supervisor_attempted = True
+        self.host._generation_settled = True
+        if self.host.supervisor is None:
+            self.host.supervisor = Mock()
+            self.host.supervisor._custody_snapshot.return_value = {"settled": False}
+        self.host._thread = self.host._readiness_original_thread = Mock()
+        self.host._thread.is_alive.return_value = False
+        self.host._listener = self.host._readiness_original_listener = Mock()
+        self.host._registry = self.host._readiness_original_registry = Mock()
+        self.host._registry.status.return_value = SimpleNamespace(resources=0, pending=0, quarantined=0)
+        self.host._listener_ready.set()
+        if stopped:
+            self.host._thread_stopped.set()
+        operation = self.host.request_retirement()
+        operation.freeze_acknowledged = operation.sealed = sealed
+        return operation
 
     def test_constructor_rejects_bare_manifest_or_ledger_boolean(self):
         with self.assertRaises(activation.DailyActivationError):
@@ -357,7 +402,7 @@ class DailyActivationHostTests(unittest.TestCase):
         self.host.request_drain()
         result = self.host.run_once()
         self.assertEqual(result["phase"], "generation_keeper_resident")
-        self.assertEqual(result["reason"], "daily_generation_retirement_not_implemented")
+        self.assertEqual(result["reason"], "daily_generation_retirement_required")
         self.assertFalse(result["clean_exit_allowed"])
         self.assertTrue(self.owner._activated)
         self.owner.close_unactivated.assert_not_called()
@@ -618,6 +663,222 @@ class DailyActivationHostTests(unittest.TestCase):
         self.assertIsNone(self.host._failure)
         self.assertEqual(self.supervisor.run_once.call_count, before + 2)
         self.owner.close_unactivated.assert_not_called()
+
+    def test_retirement_intent_requires_actual_boolean(self):
+        for value in (1, "yes", None):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                    activation.DailyActivationError, "retirement_intent_invalid"):
+                activation.DailyActivationHost(MANIFEST, DIGEST, self.ledger, retire_after_drain=value)
+
+    def test_retirement_request_requires_existing_activated_supervisor(self):
+        with self.assertRaisesRegex(activation.DailyActivationError, "host_not_ready"):
+            self.host.request_retirement()
+        self.assertIsNone(self.host._retirement)
+        self.assertFalse(self.host._retirement_creation_attempted)
+
+    def test_repeated_retirement_request_reuses_original_operation(self):
+        operation = self.retirement_fixture()
+        self.assertIs(self.host.request_retirement(), operation)
+        self.assertIs(self.host.request_retirement(), operation)
+        self.assertEqual(operation.tick_calls, 0)
+
+    def test_ordinary_drain_never_creates_retirement_request(self):
+        self.start_fixture()
+        self.host.start()
+        self.host.request_drain()
+        self.host.run_once()
+        self.assertIsNone(self.host._retirement)
+        self.assertFalse(self.host._readiness_stop.is_set())
+
+    def test_keeper_cleanup_rejects_different_operation_and_serialized_claim(self):
+        operation = self.retirement_fixture()
+        for other in (Retirement(self.host), SimpleNamespace(host=self.host, sealed=True,
+                                                            freeze_acknowledged=True, complete=False)):
+            with self.subTest(other=type(other).__name__), self.assertRaisesRegex(
+                    activation.DailyActivationError, "original_operation_required"):
+                self.host.shutdown_native_retirement(other)
+        self.assertEqual(operation.close_calls, 0)
+        self.host._listener.close.assert_not_called()
+
+    def test_unsealed_or_truthy_claim_does_not_stop_readiness(self):
+        operation = self.retirement_fixture(sealed=False)
+        for freeze, seal in ((False, False), (True, False), (1, True), (True, 1)):
+            operation.freeze_acknowledged, operation.sealed = freeze, seal
+            with self.subTest(freeze=freeze, seal=seal), self.assertRaisesRegex(
+                    activation.DailyActivationError, "seal_unacknowledged"):
+                self.host.shutdown_native_retirement(operation)
+        self.assertFalse(self.host._readiness_stop.is_set())
+        self.host._thread.join.assert_not_called()
+
+    def test_sealed_retirement_waits_for_original_thread_then_closes_in_order(self):
+        operation = self.retirement_fixture(stopped=False)
+        events = []
+        self.host._thread.join.side_effect = lambda **_: events.append("joined")
+        self.host._listener.close.side_effect = lambda: events.append("listener_closed")
+        original_close = operation.close_owner
+        def close_owner():
+            events.append("owner_closed")
+            original_close()
+        operation.close_owner = close_owner
+        self.assertFalse(self.host.shutdown_native_retirement(operation))
+        self.assertTrue(self.host._readiness_stop.is_set())
+        self.assertEqual(events, [])
+        self.host._thread_stopped.set()
+        self.assertTrue(self.host.shutdown_native_retirement(operation))
+        self.assertEqual(events, ["joined", "listener_closed", "owner_closed"])
+        self.host._thread.join.assert_called_once_with(timeout=0)
+        self.assertTrue(self.host.status()["clean_exit_allowed"])
+
+    def test_finally_signal_without_positive_join_and_death_is_insufficient(self):
+        operation = self.retirement_fixture()
+        self.host._thread.is_alive.return_value = True
+        self.assertFalse(self.host.shutdown_native_retirement(operation))
+        self.host._listener.close.assert_not_called()
+        self.assertFalse(self.host._readiness_joined)
+        self.assertEqual(operation.close_calls, 0)
+
+    def test_join_exception_retains_original_thread_without_listener_close(self):
+        operation = self.retirement_fixture()
+        original = self.host._thread
+        failure = RuntimeError("synthetic interrupted join")
+        original.join.side_effect = failure
+        self.assertFalse(self.host.shutdown_native_retirement(operation))
+        self.assertIs(self.host._thread, original)
+        self.assertIs(self.host._retirement_cleanup_error, failure)
+        self.host._listener.close.assert_not_called()
+        self.assertEqual(operation.close_calls, 0)
+
+    def test_replaced_keeper_thread_cannot_retire_original_operation(self):
+        operation = self.retirement_fixture()
+        self.host._thread = Mock()
+        self.host._thread.is_alive.return_value = False
+        self.assertFalse(self.host.shutdown_native_retirement(operation))
+        self.host._thread.join.assert_not_called()
+        self.host._listener.close.assert_not_called()
+        self.assertEqual(operation.close_calls, 0)
+
+    def test_unknown_listener_close_is_never_reissued(self):
+        operation = self.retirement_fixture()
+        failure = RuntimeError("synthetic unknown native close")
+        self.host._listener.close.side_effect = failure
+        self.assertFalse(self.host.shutdown_native_retirement(operation))
+        self.assertFalse(self.host.shutdown_native_retirement(operation))
+        self.assertTrue(self.host._readiness_close_unknown)
+        self.host._listener.close.assert_called_once_with()
+        self.assertEqual(operation.close_calls, 0)
+        self.assertFalse(self.host.status()["clean_exit_allowed"])
+
+    def test_unsettled_sql_connection_blocks_native_keeper_close(self):
+        operation = self.retirement_fixture()
+        custody = activation._ConnectionCustody(Connection("still owned", self.events))
+        self.host._connections.append(custody)
+        self.assertFalse(self.host.shutdown_native_retirement(operation))
+        self.host._listener.close.assert_not_called()
+        self.assertEqual(operation.close_calls, 0)
+        custody.close()
+        self.assertTrue(self.host.shutdown_native_retirement(operation))
+
+    def test_registry_obligation_blocks_owner_close_without_reclosing_listener(self):
+        operation = self.retirement_fixture()
+        self.host._registry.status.return_value = SimpleNamespace(resources=1, pending=1, quarantined=0)
+        self.assertFalse(self.host.shutdown_native_retirement(operation))
+        self.assertEqual(operation.close_calls, 0)
+        self.host._registry.status.return_value = SimpleNamespace(resources=0, pending=0, quarantined=0)
+        self.assertTrue(self.host.shutdown_native_retirement(operation))
+        self.host._listener.close.assert_called_once_with()
+
+    def test_boolean_registry_counts_are_not_cleanup_evidence(self):
+        operation = self.retirement_fixture()
+        self.host._registry.status.return_value = SimpleNamespace(resources=False, pending=False, quarantined=False)
+        self.assertFalse(self.host.shutdown_native_retirement(operation))
+        self.assertFalse(self.host._readiness_cleanup_complete)
+        self.assertEqual(operation.close_calls, 0)
+
+    def test_original_operation_owner_close_failure_does_not_claim_completion(self):
+        operation = self.retirement_fixture()
+        operation.close_error = RuntimeError("synthetic cohort cleanup unknown")
+        self.assertFalse(self.host.shutdown_native_retirement(operation))
+        self.assertTrue(self.host._readiness_cleanup_complete)
+        self.assertFalse(self.host.status()["clean_exit_allowed"])
+        self.assertFalse(operation.complete)
+        self.assertIs(self.host._retirement, operation)
+        self.assertFalse(self.host.shutdown_native_retirement(operation))
+        self.host._listener.close.assert_called_once_with()
+
+    def test_readiness_thread_finishes_current_rpc_then_stops_without_closing(self):
+        self.host._registry = Mock()
+        self.host._service = Mock()
+        self.host._service.serve_once.side_effect = lambda *_args, **_kwargs: self.host._readiness_stop.set()
+        listener = Mock()
+        with patch.object(activation, "NativePipeListener", return_value=listener):
+            self.host._serve_readiness()
+        self.host._service.serve_once.assert_called_once_with(listener, timeout_ms=1000)
+        self.assertTrue(self.host._thread_stopped.is_set())
+        listener.close.assert_not_called()
+
+    def test_freeze_acknowledgement_precedes_supervisor_drain(self):
+        operation = self.retirement_fixture(sealed=False, stopped=False)
+        events = []
+        def freeze():
+            events.append("freeze_ack")
+            operation.freeze_acknowledged = True
+        operation.on_tick = freeze
+        self.host.supervisor.request_local_drain.side_effect = lambda: events.append("drain")
+        self.host.run_once()
+        self.assertEqual(events[0], "freeze_ack")
+        self.assertIn("drain", events[1:])
+        self.assertEqual(operation.tick_calls, 1)
+
+    def test_pending_freeze_does_not_request_retirement_drain(self):
+        operation = self.retirement_fixture(sealed=False, stopped=False)
+        self.host.run_once()
+        self.host.supervisor.request_local_drain.assert_not_called()
+        self.assertFalse(self.host._draining)
+        self.assertEqual(operation.tick_calls, 1)
+
+    def test_freeze_failure_preserves_independent_supervisor_recovery(self):
+        operation = self.retirement_fixture(sealed=False, stopped=False)
+        failure = RuntimeError("synthetic freeze uncertainty")
+        def fail():
+            raise failure
+        operation.on_tick = fail
+        self.host.run_once()
+        self.assertIs(self.host._failure, failure)
+        self.host.supervisor.run_once.assert_called_once_with()
+        self.assertIs(self.host._retirement, operation)
+
+    def test_full_retirement_stops_queries_after_seal_and_allows_resident_return(self):
+        operation = self.retirement_fixture(sealed=False, stopped=False)
+        self.host.supervisor._custody_snapshot.return_value = {"settled": True}
+        self.host.supervisor.close.return_value = {"cleanup_errors": [], "guardian_left_running": False}
+        def advance():
+            if not operation.freeze_acknowledged:
+                operation.freeze_acknowledged = True
+            elif self.host._supervisor_closed:
+                operation.sealed = True
+        operation.on_tick = advance
+        first = self.host.run_once()
+        self.assertTrue(self.host._supervisor_closed)
+        self.assertTrue(operation.sealed)
+        self.assertFalse(first["clean_exit_allowed"])
+        self.host._thread_stopped.set()
+        with patch.object(activation, "emit", return_value=True), patch.object(activation.time, "sleep"):
+            result = self.host.run_forever()
+        self.assertTrue(result["clean_exit_allowed"])
+        self.assertTrue(operation.complete)
+        self.host.supervisor._custody_snapshot.assert_called_once_with()
+        self.host.supervisor.close.assert_called_once_with()
+        self.host._listener.close.assert_called_once_with()
+
+    def test_explicit_constructor_intent_requests_retirement_after_supervisor_start(self):
+        from sentinel.adaptive import daily_retirement
+        self.start_fixture()
+        self.host._retire_after_drain = True
+        with patch.object(daily_retirement, "DailyRetirementOperation", Retirement):
+            self.host.start()
+            self.assertIsInstance(self.host._retirement, Retirement)
+            self.assertEqual(self.host._retirement.tick_calls, 1)
+            self.supervisor.start.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -161,6 +161,94 @@ class DailyGenerationTests(unittest.TestCase):
         self.assertEqual(self.conn.total_changes, before)
         self.assertIsNone(generation.read_generation(self.conn))
 
+    def test_readiness_success_releases_original_reader_custody(self):
+        self.install()
+        with patch.object(generation, "verify_import_provenance", return_value=self.root):
+            self.owner.assert_ready()
+        self.owner.assert_readiness_readers_settled()
+        self.assertEqual(self.owner._readiness_readers, {})
+        self.assertIsNone(self.owner._readiness_cleanup_error)
+
+    def test_unknown_readiness_reader_close_is_retained_and_never_reopened(self):
+        self.install()
+        original_connect = sqlite3.connect
+        opened = []
+        class UnknownClose(sqlite3.Connection):
+            closes = 0
+            def close(connection):
+                connection.closes += 1
+                super().close()
+                raise OSError("unit readiness close acknowledgement lost")
+        def connect(*args, **kwargs):
+            connection = original_connect(*args, **kwargs, factory=UnknownClose)
+            opened.append(connection)
+            return connection
+        with patch.object(generation, "verify_import_provenance", return_value=self.root), \
+                patch.object(generation.sqlite3, "connect", side_effect=connect):
+            with self.assertRaises(OSError) as failed:
+                self.owner.assert_ready()
+            with self.assertRaisesRegex(generation.DailyGenerationUnavailable, "readiness_cleanup_unknown"):
+                self.owner.assert_ready()
+        self.assertEqual(len(opened), 1)
+        self.assertEqual(opened[0].closes, 1)
+        readers = list(self.owner._readiness_readers.values())
+        self.assertEqual(len(readers), 1)
+        self.assertIs(readers[0].connection, opened[0])
+        self.assertTrue(readers[0].close_unknown)
+        self.assertIs(failed.exception.daily_generation_readiness_reader, readers[0])
+        with self.assertRaisesRegex(generation.DailyGenerationUnavailable, "readiness_cleanup_unknown"):
+            self.owner.assert_readiness_readers_settled()
+
+    def test_pending_original_readiness_reader_prevents_owner_retirement(self):
+        reader = generation._ReadinessReader()
+        reader.connection = Mock()
+        self.owner._readiness_readers[id(reader)] = reader
+        with self.assertRaisesRegex(generation.DailyGenerationUnavailable, "readers_pending"):
+            self.owner.assert_readiness_readers_settled()
+        reader.connection.close.assert_not_called()
+
+    def test_readiness_acquisition_retains_pending_owner_before_connect(self):
+        self.install()
+        def interrupted_connect(*args, **kwargs):
+            readers = list(self.owner._readiness_readers.values())
+            self.assertEqual(len(readers), 1)
+            self.assertTrue(readers[0].open_attempted)
+            self.assertIsNone(readers[0].connection)
+            raise KeyboardInterrupt("unit connect outcome unavailable")
+        with patch.object(generation, "verify_import_provenance", return_value=self.root), \
+                patch.object(generation.sqlite3, "connect", side_effect=interrupted_connect) as connect:
+            with self.assertRaises(KeyboardInterrupt) as failed:
+                self.owner.assert_ready()
+            with self.assertRaisesRegex(generation.DailyGenerationUnavailable, "readiness_cleanup_unknown"):
+                self.owner.assert_ready()
+        connect.assert_called_once()
+        reader = next(iter(self.owner._readiness_readers.values()))
+        self.assertIs(failed.exception.daily_generation_readiness_reader, reader)
+        self.assertTrue(reader.open_attempted)
+        self.assertIsNone(reader.connection)
+        with self.assertRaisesRegex(generation.DailyGenerationUnavailable, "readiness_cleanup_unknown"):
+            self.owner.assert_readiness_readers_settled()
+
+    def test_readiness_reader_construction_fails_before_sql_acquisition(self):
+        self.install()
+        with patch.object(generation, "verify_import_provenance", return_value=self.root), \
+                patch.object(generation, "_ReadinessReader", side_effect=MemoryError("unit construction")), \
+                patch.object(generation.sqlite3, "connect") as connect:
+            with self.assertRaises(MemoryError):
+                self.owner.assert_ready()
+        connect.assert_not_called()
+
+    def test_readiness_query_failure_with_positive_close_remains_retryable(self):
+        self.install()
+        with patch.object(generation, "verify_import_provenance", return_value=self.root):
+            with patch.object(generation, "read_generation", side_effect=sqlite3.OperationalError("unit query")):
+                with self.assertRaisesRegex(sqlite3.OperationalError, "unit query"):
+                    self.owner.assert_ready()
+            self.owner.assert_readiness_readers_settled()
+            self.assertIsNone(self.owner._readiness_cleanup_error)
+            self.owner.assert_ready()
+        self.owner.assert_readiness_readers_settled()
+
     def test_connection_preparation_inside_transaction_is_rejected(self):
         self.conn.execute("BEGIN")
         with self.assertRaisesRegex(generation.DailyGenerationUnavailable, "scope_invalid"):

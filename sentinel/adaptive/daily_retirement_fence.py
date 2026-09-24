@@ -70,7 +70,7 @@ _CORE = {
         "allocatable_cpu", "allocatable_ram_gib", "max_concurrency", "observed_at",
         "probe_expires_at", "updated_at", "writer_protocol", "writer_revision"},
     "managed_executions": {"execution_id", "allocation_kind", "reservation_id", "state",
-        "state_revision", "job_name", "job_nonce", "guardian_epoch", "claim_consumed",
+        "state_revision", "coverage", "job_name", "job_nonce", "guardian_epoch", "claim_consumed",
         "claim_token_hash", "launch_in_flight", "launch_sealed", "root_pid",
         "root_created_filetime_100ns", "heartbeat_at", "hold_reason", "root_outcome",
         "finished_at", "cancel_requested_at", *{prefix + resource for prefix in ("requested_", "floor_")
@@ -199,6 +199,25 @@ def _definitions(conn):
         "finished_at", "cancel_requested_at", "launch_in_flight", "launch_sealed", "claim_consumed",
         "claim_token_hash", "root_pid", "root_created_filetime_100ns",
         "floor_cpu_units", "floor_physical_bytes", "floor_commit_bytes", "floor_io_slots"}
+    scope_fields = {"job_name", "job_nonce", "guardian_epoch"}
+    # A pre-freeze wrapper's delayed Prepare can acquire only a never-created,
+    # irrevocably sealed cleanup scope. Native ownership is proved by the store's
+    # retained guardian evidence; SQL independently prevents any capacity or
+    # launch transition from being bundled with this metadata registration.
+    cleanup_scope = (
+        "OLD.state IS 'RESERVED' AND NEW.state IS 'RESERVED' "
+        "AND OLD.allocation_kind IN ('direct','routed') AND OLD.coverage IS 'unmanaged' "
+        "AND OLD.job_name IS NULL AND OLD.job_nonce IS NULL AND OLD.guardian_epoch IS '' "
+        "AND OLD.launch_sealed IS 0 AND NEW.launch_sealed IS 1 "
+        "AND OLD.claim_consumed IS 0 AND OLD.launch_in_flight IS 0 "
+        "AND OLD.root_pid IS NULL AND OLD.root_created_filetime_100ns IS NULL AND OLD.root_outcome IS NULL "
+        "AND typeof(NEW.job_nonce)='text' AND length(NEW.job_nonce)=32 AND NEW.job_nonce NOT GLOB '*[^0-9a-f]*' "
+        "AND NEW.job_name IS ('Local\\ResourceSentinel.Job.' || OLD.execution_id || '.' || NEW.job_nonce) "
+        "AND typeof(NEW.guardian_epoch)='text' AND length(NEW.guardian_epoch) BETWEEN 1 AND 128 "
+        "AND instr(NEW.guardian_epoch,char(0))=0 "
+        "AND NEW.guardian_epoch NOT GLOB ('*[' || char(1) || '-' || char(31) || ']*') "
+        "AND NEW.state_revision IS OLD.state_revision+1 "
+        f"AND ({_changed(columns['managed_executions'], scope_fields | {'launch_sealed', 'state_revision'})}) IS 0")
     terminal_seal = (f"(NEW.state IN {_TERMINAL} AND NEW.launch_sealed IS 1 "
                      "AND NEW.launch_in_flight IS 0 AND NEW.claim_consumed IS 1 AND NEW.claim_token_hash IS '')")
     bind_root = ("(OLD.state IN ('LAUNCHING','START_UNKNOWN') AND OLD.launch_in_flight IS 1 "
@@ -206,7 +225,9 @@ def _definitions(conn):
                  "AND NEW.state IS 'RUNNING' AND NEW.launch_in_flight IS 0 AND NEW.launch_sealed IS 1 "
                  "AND typeof(NEW.root_pid)='integer' AND NEW.root_pid>0 "
                  "AND typeof(NEW.root_created_filetime_100ns)='text' AND length(NEW.root_created_filetime_100ns)>0)")
-    predicates = ["NEW.rowid IS NOT OLD.rowid", _changed(columns["managed_executions"], mutable),
+    scope_changed = " OR ".join(f"NEW.{name} IS NOT OLD.{name}" for name in sorted(scope_fields))
+    predicates = ["NEW.rowid IS NOT OLD.rowid", _changed(columns["managed_executions"], mutable | scope_fields),
+        f"({scope_changed}) AND ({cleanup_scope}) IS NOT 1",
         "NEW.launch_in_flight IS 1 AND OLD.launch_in_flight IS NOT 1",
         "OLD.launch_sealed IS 1 AND NEW.launch_sealed IS NOT 1",
         "OLD.claim_consumed IS 1 AND NEW.claim_consumed IS NOT 1",

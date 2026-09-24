@@ -486,6 +486,10 @@ class Maintainer:
                 local_frames[observed_worker["id"]] = (snapshot, config, frame)
         with self._db() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            # Freeze admission and read-only reservation reuse together. Normal
+            # heartbeat/release use separate methods and retain their authority.
+            from sentinel.adaptive.daily_retirement_fence import assert_new_capacity_allowed
+            assert_new_capacity_allowed(conn)
             self._cleanup_locked(conn, now)
             legacy_blocker = legacy_lifecycle_blocker(conn)
             existing = conn.execute("SELECT * FROM worker_reservations WHERE task_id=?", (t.id,)).fetchone()

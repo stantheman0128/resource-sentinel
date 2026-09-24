@@ -313,6 +313,27 @@ class DailySourceInstallTests(unittest.TestCase):
             operation.enter_daily_host()
         self.assertFalse(operation.runtime_started)
 
+    def test_retirement_intent_must_be_explicit_boolean(self):
+        operation = self.operation()
+        with self.assertRaisesRegex(install.SourceInstallRefused, "retirement_intent_invalid"):
+            operation.enter_daily_host(retire_after_drain="yes")
+        self.assertFalse(operation.runtime_started)
+
+    def test_retirement_result_requires_original_runtime_started(self):
+        operation = self.operation()
+        operation.host = SimpleNamespace(_retirement_complete=lambda: True)
+        with self.assertRaisesRegex(install.SourceInstallRefused, "original_host_required"):
+            operation.assert_runtime_retired()
+
+    def test_serialized_or_duck_typed_retirement_cannot_allow_installer_exit(self):
+        operation = self.operation()
+        operation.runtime_started = operation.source_complete = operation.settled = True
+        for value in ({"complete": True}, SimpleNamespace(_retirement_complete=lambda: True)):
+            operation.host = value
+            with self.subTest(value=type(value)), self.assertRaisesRegex(
+                    install.SourceInstallRefused, "without_retirement"):
+                operation.assert_runtime_retired()
+
     def test_prewrite_refusal_can_release_exact_file_owners(self):
         operation = self.operation()
         operation.owners = {"one": self.factory.open_existing(self.daily / "sentinel/coordinator.py",

@@ -572,10 +572,19 @@ def _admission_result(row: Mapping[str, Any], request_key: str, *, reused: bool)
     return result
 
 
+def _assert_daily_new_capacity(conn):
+    from .daily_retirement_fence import DailyRetirementError, assert_new_capacity_allowed
+    try:
+        assert_new_capacity_allowed(conn)
+    except DailyRetirementError as error:
+        raise LifecycleError(error.reason) from error
+
+
 def retry_managed_admission(conn: sqlite3.Connection, admission, *, local_context) -> dict[str, Any] | None:
     """Replay an exact self-owned admission; never mint a token or renew a lease."""
     if not conn.in_transaction:
         raise LifecycleError("transaction_required")
+    _assert_daily_new_capacity(conn)
     _check_version(conn)
     row = conn.execute("SELECT * FROM managed_executions WHERE execution_id=?", (admission.execution_id,)).fetchone()
     if row is None:
@@ -610,6 +619,7 @@ def commit_managed_admission(conn: sqlite3.Connection, admission, reservation_id
     """
     if not conn.in_transaction:
         raise LifecycleError("transaction_required")
+    _assert_daily_new_capacity(conn)
     from .policy import PolicyCoordinator, PolicyError
     if type(policy_coordinator) is not PolicyCoordinator:
         raise LifecycleError("policy_scope_not_held")
@@ -1866,6 +1876,7 @@ class LifecycleStore:
                 raw_token = secrets.token_urlsafe(32)
                 row["claim_token_hash"] = hashlib.sha256(raw_token.encode("ascii")).hexdigest()
                 with self._publication_transaction(*publication) as conn:
+                    _assert_daily_new_capacity(conn)
                     previous = conn.execute("SELECT * FROM managed_executions WHERE execution_id=?", (spec.execution_id,)).fetchone()
                     if previous is not None:
                         immutable = [key for key in row if key not in {"created_at", "heartbeat_at", "state", "state_revision", "claim_token_hash"} and not key.startswith("floor_")]
@@ -1989,11 +2000,24 @@ class LifecycleStore:
                     proof.guardian_epoch != guardian_epoch or not proof.job_creation_never_attempted or
                     proof.root is not None or proof.active_process_count is not None or proof.process_ids is not None):
                 raise LifecycleError("job_scope_registration_unverified")
+            # The retained guardian may need a named scope solely to retire an
+            # authenticated Prepare first delivered after drain. Its native
+            # creation fence is already sealed; this is not a new launch grant.
+            retirement_scope = (expected_auth is not None and proof.launch_sealed and
+                job_name == f"Local\\ResourceSentinel.Job.{execution_id}.{job_nonce}")
             # Evidence is bounded and acquired outside SQLite. Both the same
             # POLICY ownership and the native creation fence survive this CAS.
             self._policy.assert_held(guard)
             with self._transaction() as conn:
                 runtime = self._policy.revalidate(conn, guard)
+                if retirement_scope:
+                    from .daily_retirement_fence import DailyRetirementError, read_retirement
+                    try:
+                        read_retirement(conn)  # A malformed freeze is never a cleanup exception.
+                    except DailyRetirementError as error:
+                        raise LifecycleError(error.reason) from error
+                else:
+                    _assert_daily_new_capacity(conn)
                 if expected_auth is not None:
                     _revalidate_launch_auth(conn, execution_id, caller, expected_auth)
                 row = self._get(conn, execution_id)
@@ -2001,11 +2025,12 @@ class LifecycleStore:
                 self._caller(row, caller)
                 if (row["state"] != "RESERVED" or row["allocation_kind"] == "parent" or
                         row["coverage"] != "unmanaged" or row["claim_consumed"] or row["launch_sealed"] or
-                        row["launch_in_flight"] or row["root_pid"] is not None or row["root_outcome"] is not None):
+                        row["launch_in_flight"] or row["root_pid"] is not None or
+                        row["root_created_filetime_100ns"] is not None or row["root_outcome"] is not None):
                     raise LifecycleError("invalid_lifecycle_transition")
                 if row["job_name"] is not None or row["job_nonce"] is not None or row["guardian_epoch"]:
                     raise LifecycleError("job_scope_already_registered")
-                if runtime["admission_barrier"] != "NONE":
+                if runtime["admission_barrier"] != "NONE" and not retirement_scope:
                     raise LifecycleError("launch_barrier_active")
                 if (runtime["active_logon_id"] not in {"", row["logon_id"]} or
                         runtime["guardian_epoch"] not in {"", guardian_epoch}):
@@ -2021,8 +2046,10 @@ class LifecycleStore:
                     raise LifecycleError("managed_job_limit_reached")
                 conn.execute("UPDATE adaptive_runtime SET active_logon_id=?,guardian_epoch=? WHERE singleton=1",
                              (row["logon_id"], guardian_epoch))
-                return self._launch_ack(self._cas(conn, execution_id, expected_revision,
-                    {"job_name": job_name, "job_nonce": job_nonce, "guardian_epoch": guardian_epoch}), expected_auth)
+                updates = {"job_name": job_name, "job_nonce": job_nonce, "guardian_epoch": guardian_epoch}
+                if retirement_scope:
+                    updates["launch_sealed"] = 1
+                return self._launch_ack(self._cas(conn, execution_id, expected_revision, updates), expected_auth)
 
     def mark_prepared(self, execution_id: str, *, caller: ProcessIdentity, expected_revision: int,
                       expected_auth: _IpcAuthRecord | None = None) -> dict[str, Any]:
@@ -2144,6 +2171,7 @@ class LifecycleStore:
                     if row["claim_consumed"]:
                         result = self._launch_ack(row, expected_auth, duplicate=True)
                     else:
+                        _assert_daily_new_capacity(conn)
                         self._require_revision(row, expected_revision)
                         if row["state"] != "PREPARED" or row["launch_sealed"]:
                             raise LifecycleError("invalid_lifecycle_transition")
@@ -2271,6 +2299,7 @@ class LifecycleStore:
                                 decision_error = error
                                 raise
                             if result is None:
+                                _assert_daily_new_capacity(conn)
                                 self._require_allocation(conn, execution_id)
                                 updated = self._cas(conn, execution_id, expected_revision,
                                     {"state": "LAUNCHING", "claim_consumed": 1, "launch_in_flight": 1})

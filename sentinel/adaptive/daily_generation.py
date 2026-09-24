@@ -18,6 +18,7 @@ from pathlib import Path, PurePosixPath
 import sqlite3
 import stat
 import sys
+import threading
 import types
 import uuid
 
@@ -44,6 +45,25 @@ REQUIRED_PATHS = frozenset({
 _TABLE = "adaptive_daily_generation"
 _TOKEN = object()
 _LOCAL_GENERATIONS = {}
+
+
+class _ReadinessReader:
+    """One original read connection; an uncertain close is never retried."""
+    def __init__(self):
+        self.connection = None
+        self.open_attempted = False
+        self.closed = self.close_unknown = False
+
+    def close(self):
+        if self.closed:
+            return
+        if self.close_unknown:
+            _reject("daily_generation_readiness_cleanup_unknown")
+        if self.connection is None:
+            _reject("daily_generation_readiness_acquisition_unknown")
+        self.close_unknown = True
+        self.connection.close()
+        self.closed, self.close_unknown = True, False
 
 
 def _ledger_identity(path):
@@ -422,7 +442,10 @@ def prepare_connection(conn, *, role, db_path):
     row = read_generation(conn)
     if row is None:
         return None
-    if row["state"] != "ACTIVE":
+    local = _LOCAL_GENERATIONS.get(row["generation"])
+    retirement = getattr(local, "_retirement_operation", None)
+    retirement_cleanup = row["state"] == "DRAINING" and role == "lifecycle" and retirement is not None
+    if row["state"] != "ACTIVE" and not retirement_cleanup:
         _reject("daily_generation_draining")
     _assert_daily_locations(row["source_root"], db_path)
     if not _ledger_matches(conn, db_path) or Path(db_path).resolve() != Path(row["ledger_path"]):
@@ -433,7 +456,12 @@ def prepare_connection(conn, *, role, db_path):
     if _fixed_policy_digest(db_path) != row["config_digest"]:
         _reject("daily_config_changed")
     verify_import_provenance(manifest, row["source_root"])
-    local = _LOCAL_GENERATIONS.get(row["generation"])
+    if retirement_cleanup:
+        from .daily_retirement import DailyRetirementOperation
+        if type(retirement) is not DailyRetirementOperation or retirement.owner is not local:
+            _reject("daily_retirement_cleanup_not_owned")
+        retirement.authorize_nonce_cleanup(conn, row)
+        return None
     if (local is not None and role == "lifecycle" and not local._activated and
             getattr(local, "_install_attempted", False)):
         local._assert_owner()
@@ -521,6 +549,9 @@ class DailyGenerationOwner:
         self._activated = False
         self._closed = False
         self._install_policy = self._install_guard = None
+        self._readiness_reader_lock = threading.Lock()
+        self._readiness_readers = {}
+        self._readiness_cleanup_error = None
 
     @classmethod
     def capture(cls, *, manifest, source_root, ledger_path):
@@ -550,6 +581,8 @@ class DailyGenerationOwner:
     def _assert_owner(self):
         if self._closed:
             _reject("daily_generation_owner_closed")
+        if self._readiness_cleanup_error is not None:
+            _reject("daily_generation_readiness_cleanup_unknown")
         observation = self.process.observe()
         if observation.status is not IdentityStatus.ALIVE or observation.identity != self.process.identity:
             _reject("daily_generation_owner_unavailable")
@@ -690,18 +723,70 @@ class DailyGenerationOwner:
             _reject("daily_config_changed")
         verify_import_provenance(self.manifest, self.source_root)
         self.cohort.assert_retained_retired()
-        conn = sqlite3.connect(self.ledger_path.as_uri() + "?mode=ro", uri=True, timeout=.25)
+        # Retain before SQL use. Readiness can be queried by the resident
+        # service and original keeper concurrently, so registry changes share
+        # a bounded in-process lock; this lock grants no POLICY authority.
+        with self._readiness_reader_lock:
+            if self._readiness_cleanup_error is not None:
+                _reject("daily_generation_readiness_cleanup_unknown")
+            if len(self._readiness_readers) >= 4:
+                _reject("daily_generation_readiness_readers_pending")
+            reader = None
+            try:
+                # Publish a pending original owner before acquiring SQL. If
+                # connect is interrupted before returning a connection, the
+                # attempt itself remains retained and blocks final retirement.
+                reader = _ReadinessReader()
+                self._readiness_readers[id(reader)] = reader
+                reader.open_attempted = True
+                reader.connection = sqlite3.connect(
+                    self.ledger_path.as_uri() + "?mode=ro", uri=True, timeout=.25)
+            except BaseException as error:
+                # A failed registry update happens before connect. An unknown
+                # connect result cannot certify that no SQL owner existed.
+                self._readiness_cleanup_error = error
+                error.daily_generation_readiness_reader = reader
+                error.add_note("daily_generation_readiness_cleanup_unknown")
+                raise
+        primary = None
         try:
-            row = read_generation(conn)
+            row = read_generation(reader.connection)
             if not self._matches_generation(row):
                 _reject("daily_generation_changed")
+        except BaseException as error:
+            primary = error
+            raise
         finally:
-            conn.close()
+            try:
+                reader.close()
+            except BaseException as cleanup:
+                # Keep both original connection and first close failure. A
+                # successful future read can never settle this custody.
+                with self._readiness_reader_lock:
+                    if self._readiness_cleanup_error is None:
+                        self._readiness_cleanup_error = cleanup
+                target = primary if primary is not None else cleanup
+                target.daily_generation_readiness_reader = reader
+                target.add_note("daily_generation_readiness_cleanup_unknown")
+                if primary is None:
+                    raise
+            else:
+                with self._readiness_reader_lock:
+                    self._readiness_readers.pop(id(reader))
         return None
+
+    def assert_readiness_readers_settled(self):
+        """Retirement checks actual readers after joining the original service."""
+        with self._readiness_reader_lock:
+            if self._readiness_cleanup_error is not None:
+                _reject("daily_generation_readiness_cleanup_unknown")
+            if self._readiness_readers:
+                _reject("daily_generation_readiness_readers_pending")
 
     def close_unactivated(self):
         if self._activated or getattr(self, "_install_attempted", False):
             _reject("daily_generation_custody_required")
+        self.assert_readiness_readers_settled()
         if self.cohort is not None:
             self.cohort.close()
         self.process.close()

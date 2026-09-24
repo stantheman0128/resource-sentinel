@@ -2,7 +2,14 @@
 
 日期：2026-09-19。狀態：**正式計畫已入庫，分階段實作進行中；production adaptive 維持 off。**
 
-## 2026-09-22 Codex 實作 checkpoint（目前狀態）
+## 2026-09-24 Codex 實作 checkpoint（目前狀態）
+
+最新完成 generation 正面退場整合：**654 tests 全過，94.827 秒，
+0 failures／errors／skips**。包含固定凍結下的收尾、完整歷史與 journal inventory、
+原始 SQL／POLICY／readiness／native owner 的正面 cleanup，以及 Windows
+檔案身分修正。不是 native acceptance 或日常 activation；remote readiness 鎖外
+驗證、fresh restart、真正 native provider 與下述 P4/P6 source 缺口仍待完成。
+完整私人日誌為 `.local-adaptive/retirement-integration-20260924-1.log`。
 
 接手時 Coordinator 的既存 freshness／共用計帳修正已獨立提交為 `6abadba`。
 裁決 ② 的[退場契約](P3-PRELAUNCH-RETIREMENT.md)先於程式提交為 `8cd06e7`。
@@ -71,7 +78,7 @@ loader error 或未跑的 native gate 算成 pass。
 | 2. 裁決 ④ | 契約與 source 完成；最後完整 adaptive 2,127 tests 通過。沒有舊 witness 的 cold adoption 仍不支援；native recovery 未驗證。 |
 | 3. helper sender | Source 接線、獨立 review 與完整 2,298 tests 通過。後續 original launch/stdio provenance、guardian scope 比對與 helper proposal adapter 已接線，344 targeted tests 通過（30.960 秒，含 30 個專用 scope tests）。實際 S2 topology producer／native bundle／新增採集成本仍未驗證，缺證據不啟用控制。 |
 | 4. release／CLI | Source 整合與完整 2,800 tests 通過；包含 exact discovery、typed operator transport、原子 off／audit、同 owner 收尾與三個 host 的 drain。後續 rootless C2 post-close receipt 已補上，保持原 terminal state，不偽造 FINISHED；新增 29 個案例。232 targeted tests 中 231 通過，唯一錯誤文字預期修正後單獨重跑通過，production 未因該失敗改動。沒有原始 close 證據的舊歷史仍 unknown。Native 操作通訊、控制及恢復仍未驗證。 |
-| 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport 與接線](P2-DAILY-ACTIVATION.md)已完成 installer、常駐 owner 與日常 consumers 接線，279 tests 通過（10.587 秒）。同帳本 demand／retirement fence 已提交，與 P6 合跑 308 tests 通過（21.977 秒）。真正 native experiment provider、generation 完整退場與 fresh restart 仍待整合；未執行日常安裝，grace 前提未解鎖。 |
+| 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport 與接線](P2-DAILY-ACTIVATION.md)已完成 installer、常駐 owner 與日常 consumers 接線，279 tests 通過（10.587 秒）。同帳本 demand／retirement fence 已提交，與 P6 合跑 308 tests 通過（21.977 秒）。Generation 正面退場整合最新 654 tests 通過（94.827 秒）；remote readiness 鎖外驗證、真正 native experiment provider 與 fresh restart 仍待完成。未執行日常安裝，grace 前提未解鎖。 |
 | 6. console 驗收命令 | [P6 矩陣編排與 raw reducer](P6-RUNNER-CONTRACT.md)、[S1/S2 bridge 契約](S1-DAILY-BRIDGE-CONTRACT.md)、[S3 精確故障點與 14×10 記錄器](S3-REAL-HOST-RECOVERY.md)、[P4 實際 host 成本量測](P4-OVERHEAD-RUNNER.md)已提交。最新 P4 155 tests 通過（12.967 秒）；S3／memory／helper 在 459 合跑中通過，唯一 P4 fixture error 已修正並重跑。Actual provider、部分 S3 故障 driver／完整 orchestration、A0 等價性與 bounded telemetry／非阻塞 operator source 仍缺；不是只剩 console 執行。 |
 
 最新追加：項目 5 的同帳本 demand 與 retirement fence 已提交為 `1072786`／
@@ -86,7 +93,7 @@ reducer 已提交為 `ff6f31b`，S3 原始 action cutpoints／三個實際故障
 P3–P6 都尚未通過。日常 config／Scheduled Task／啟動入口未修改。
 
 下一步是項目 5 同一日常帳本的 native evidence fixture 全程容量覆蓋，以及
-generation 的正面退場實作與驗證。新增測試將繼續使用隔離帳本；任何實際
+remote readiness 鎖外驗證與 fresh-generation restart。新增測試將繼續使用隔離帳本；任何實際
 日常 source activation 都需要獨立授權，不因 commit/push 自動執行。項目 6
 尚未完成的內容不能以 mock、空 provider、另外一個 DB 或假量測取代。
 
@@ -145,13 +152,17 @@ C:\Python313\python.exe -m unittest tests.test_adaptive_runner tests.test_adapti
 ```
 
 後續 retirement／policy／guardian／transport 整合跑了 **653 tests，92.604 秒，
-1 failure／26 errors**，尚未當成通過。問題包含 nonce fixture 缺少 singleton、
+1 failure／26 errors**，保留為初次失敗證據。問題包含 nonce fixture 缺少 singleton、
 prelaunch fixture 的 current-wrapper 身分範圍、renewal fixture 未走到預期分支、
 host telemetry fixture 缺少 emit，以及 Windows journal inventory 的真正相容性
 錯誤：`DirEntry.stat()` 在 Windows 的 device／inode／link count 為零，不能拿來
 通過檔案身分檢查。本機唯讀比對已確認 `os.stat(..., follow_symlinks=False)`
 提供真實值；[Python 官方契約](https://docs.python.org/3.13/library/os.html#os.DirEntry.stat)
-亦如此規定。修正將保留原本的檔案／reparse 安全檢查，不能接受零身分來換取通過。
+亦如此規定。修正保留原本的檔案／reparse 安全檢查，不能接受零身分來換取通過。
+2026-09-24 修正後重跑 **654 tests 全過（94.827 秒）**，新增 Windows metadata
+回歸案例；fixture 修正保留原 current-wrapper 身分與真正連續 renewal 時間窗。
+測試含受保護 dirty baseline、相鄰未提交 telemetry／experiment exclusion，不能
+視為乾淨 checkout 或 native gate 已驗證。
 
 原始 nonblocking pipe／operator core 則已獨立驗證：**205 tests 通過，16.096 秒，
 0 failures／errors／skips**，已提交為 `c0d4edd`。範圍包含 pipe Windows／async、

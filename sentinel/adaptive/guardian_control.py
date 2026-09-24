@@ -556,6 +556,14 @@ class GuardianControl:
 
     def _apply_locked(self, proposal, entry, episode, now, helper_identity, assessment_error):
         guard = self.store._policy.assert_held()
+        from .daily_retirement_fence import DailyRetirementError, assert_tightening_allowed
+        with self.store._connection() as conn:
+            conn.execute("BEGIN")
+            self.store._policy.revalidate(conn, guard)
+            try:
+                assert_tightening_allowed(conn)
+            except DailyRetirementError as error:
+                raise LifecycleError(error.reason) from error
         runtime = self._runtime()
         row = self.store.query(proposal.execution_id, existing_path=True)
         self._eligible(proposal, entry, row, runtime, guard)

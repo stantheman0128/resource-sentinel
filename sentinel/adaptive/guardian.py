@@ -803,6 +803,8 @@ class GuardianLaunchOwner:
                 excluded = True
             if operation in {"prepare", "claim"}:
                 self._verify_prepared(entry, row)
+            if operation == "register_scope":
+                entry.assert_job_creation_unattempted()
             if operation == "bind_root":
                 if entry.root is None:
                     raise LifecycleError("guardian_root_unverified")
@@ -810,7 +812,8 @@ class GuardianLaunchOwner:
             yield LifecycleEvidence(operation, entry.execution_id, row["state_revision"], uuid4().hex,
                 caller, guardian_epoch=self.guardian_epoch, job_name=entry.job_name,
                 job_nonce=entry.creation_nonce, root=None if entry.root is None else entry.root.identity,
-                active_process_count=count, process_ids=members, launch_sealed=entry.root is not None,
+                active_process_count=count, process_ids=members,
+                launch_sealed=entry.retirement_sealed or entry.root is not None,
                 original_cpu_disabled=disabled, durable_manifest=durable, legacy_exclusion=excluded,
                 current_cpu_disabled=disabled, recovery_manifest_settled=durable,
                 job_creation_never_attempted=not entry.create_attempted)

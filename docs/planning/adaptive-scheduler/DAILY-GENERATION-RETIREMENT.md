@@ -29,6 +29,15 @@ of already issued launches, terminal proof, release and user exemption storage
 remain possible. No grant is issued, renewed, revoked or deleted by retirement.
 Pending queue records remain evidence; retirement does not cancel them.
 
+A pre-freeze wrapper may have sent Prepare before the guardian receives it.
+After drain, its retained guardian can register only an exact authenticated,
+never-created cleanup scope: the original RESERVED row stays rootless and
+unclaimed, receives its canonical Job name/nonce, and becomes irrevocably launch
+sealed. This preserves the existing C2 cancellation and custody receipt path.
+It does not permit Create, Claim or BindRoot. The frozen SQL guard allows only
+those scope fields, the seal and one revision increment; normal enrollment and
+any bundled demand, identity or launch change remain refused.
+
 After positive freeze acknowledgement the original supervisor performs its
 existing off/drain operation. Retirement does not invent a second recovery HOLD
 or infer that a mode change restored an OS limit. The frozen state remains even
@@ -67,12 +76,27 @@ the immutable seal. Only this original seal operation may open a lifecycle
 connection that clears its exact POLICY nonce. That connection receives a
 nonce-only SQLite authorizer and no capacity-generation function. A different
 request, connection role or nonce cannot use that path.
+The writer opener must be inside `PolicyCoordinator._clear()` for that exact
+original guard on the original thread. A temporary execution-time SQL guard
+permits only its original nonce becoming NULL; cached statements and retained
+connections lose permission when the cleanup scope ends. The original seal
+tick may also open read-only lifecycle connections to reconcile a lost ACK and
+revalidate its retained POLICY scope. Those connections cannot clear the nonce.
 
 The seal is acknowledged only after original transaction, POLICY and connection
 cleanup and separate bound readback. Then the same readiness thread stops,
 joins and positively closes its original listener/registry; the retained cohort
 and current-process handles close last. Unknown cleanup stays resident. Only
 the complete original operation may allow `run_forever()` to return normally.
+Readiness SQL readers publish their pending original owner before connection
+acquisition and remain retained until close returns. An interrupted acquisition
+or uncertain reader close quarantines the original generation owner permanently;
+a later successful read does not settle that connection. An ordinary query
+failure with a positively completed close may be retried.
+The durable row's `SEALED` phase records the ledger boundary, not the final
+keeper-handle closure. Final `retired_admission_fenced` is an observation of
+the retained original operation after that closure. It cannot be reconstructed
+from `SEALED` plus a dead PID.
 
 ## Meaning of clean exit and restart gap
 
@@ -102,3 +126,29 @@ P4 must charge the generation keeper/readiness thread and repeated source/import
 verification to monitoring cost. A one-second RPC deadline is not proof that
 full-source verification meets that deadline. A future optimization needs an
 original retained-source proof; mtime-only caching is insufficient.
+
+The first central integration run on Windows/Python 3.13 completed 653 tests
+with one failure and 26 errors. It exposed a real journal-enumeration API
+compatibility defect alongside incomplete portable fixtures: `DirEntry.stat()`
+returned zero device, inode and link-count fields, while `os.stat()` on the same
+path returned actual identity values. This matches the documented Windows
+behavior in [Python 3.13's DirEntry.stat reference](https://docs.python.org/3.13/library/os.html#os.DirEntry.stat).
+Enumeration now obtains metadata with `os.stat(exact_path,
+follow_symlinks=False)`. The existing positive-identity, file-type, reparse and
+directory-consistency checks remain mandatory. A regression reproduces the
+zero-valued DirEntry metadata without accepting it as valid file identity.
+The corrected central rerun on 2026-09-24 passed **654 tests in 94.827 seconds,
+zero failures/errors/skips**. The admitted command covered retirement, daily
+activation/generation, policy fencing, guardian/prelaunch custody, Coordinator,
+Maintainer and pipe/operator/control/readiness integration. Its complete private
+log is `.local-adaptive/retirement-integration-20260924-1.log`. This verification
+uses the protected dirty baseline plus adjacent uncommitted helper telemetry and
+experiment-exclusion code; it is not a clean-clone or native acceptance result.
+The remote readiness-under-POLICY integration and fresh-generation successor
+remain explicit source gaps. No daily installation or runtime mutation ran.
+
+Equivalent test command (run through the documented normal admission wrapper):
+
+```text
+C:\Python313\python.exe -m unittest tests.test_adaptive_daily_retirement_fence tests.test_adaptive_daily_retirement tests.test_adaptive_daily_retirement_inventory tests.test_adaptive_daily_retirement_policy tests.test_adaptive_daily_retirement_consumers tests.test_adaptive_daily_retirement_integration tests.test_adaptive_daily_retirement_prelaunch tests.test_adaptive_daily_activation_host tests.test_adaptive_daily_source_install tests.test_adaptive_daily_generation tests.test_adaptive_daily_connection_hooks tests.test_adaptive_policy_scope tests.test_adaptive_policy_mutex tests.test_adaptive_policy_fencing tests.test_adaptive_guardian_retirement tests.test_adaptive_guardian_launch_drain tests.test_adaptive_prelaunch_retirement_store tests.test_adaptive_prelaunch_receipt tests.test_coordinator tests.test_maintainer tests.test_adaptive_daily_readiness_transport tests.test_adaptive_control_transport tests.test_adaptive_launch_transport tests.test_adaptive_helper_operator_host tests.test_adaptive_pipe_windows tests.test_adaptive_pipe_async tests.test_adaptive_operator_transport -q
+```

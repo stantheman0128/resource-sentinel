@@ -238,15 +238,28 @@ refuses new capacity; stopping the owner or turning adaptive off does not remove
 the compatibility fence. Availability and monitoring cost must be measured in
 the required gates. No ordinary user work may be killed to satisfy the cohort.
 
-Generation retirement is a required promotion contract, not implemented by
-closing the supervisor: stop new admission while preserving cleanup authority,
-retain original Job/cap/ledger and pipe witnesses, positively settle every
-allocation and native restriction, publish the exact fenced terminal state,
-then close the readiness service and source owner. Until that sequence exists
-and passes native recovery gates, completed CPU-control drain leaves the source
-accounting keeper resident and reports `daily_generation_retirement_not_implemented`.
-It does not delete compatibility triggers, discard witnesses, or claim a clean
-process exit. Daily adaptive mode stays off.
+Generation retirement has a separate original-owner source path described in
+[DAILY-GENERATION-RETIREMENT.md](DAILY-GENERATION-RETIREMENT.md). Ordinary Ctrl+C
+drains CPU control and leaves the accounting keeper resident with
+`daily_generation_retirement_required`. Explicit `host.request_retirement()` on
+that original host, or the separately authorized activation command's
+`--retire-generation-after-drain`, records a different intention: freeze new
+admission, retain cleanup authority, complete the existing off/drain operation,
+verify the full historical custody inventory, seal the generation, then close
+the original readiness/cohort/process owners. The flag requests immediate
+retirement after successful activation; it does not connect to or adopt an
+already running keeper. A row, timeout or caller-provided receipt cannot make
+the host exit.
+
+The durable `SEALED` row establishes ledger settlement; only the original
+operation reaches in-process retirement after its own final native cleanup.
+**Daily admission remains fenced after clean exit.** This is not restored
+admission-only service. Fresh-generation restart from positive retirement is a
+separate implementation gap, so this activation command is not reusable after
+retirement. Every current experiment-demand row blocks retirement until its
+native release receipt is implemented. Native activation and retirement remain
+unverified and have not been executed against daily state. Daily adaptive mode
+stays off.
 
 Python's official [audit-event table](https://docs.python.org/3/library/audit_events.html)
 documents the `exec` event's code-object argument.

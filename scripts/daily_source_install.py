@@ -395,7 +395,9 @@ class SourceInstallation:
         # closed handles or an elapsed interval completed rollback.
         self._write_report("source_rollback_requires_reconciliation")
 
-    def enter_daily_host(self):
+    def enter_daily_host(self, *, retire_after_drain=False):
+        if type(retire_after_drain) is not bool:
+            _reject("daily_retirement_intent_invalid")
         if not self.source_complete or not self.settled:
             _reject("daily_install_source_unsettled")
         assert_no_sentinel_imports()
@@ -412,9 +414,21 @@ class SourceInstallation:
         from sentinel.adaptive.daily_readiness_transport import LedgerFileIdentity
         host = DailyActivationHost(SourceManifest.from_dict(self.plan.manifest),
             expected_config_digest=self.plan.config_digest,
-            expected_ledger_identity=LedgerFileIdentity(*self.plan.ledger_identity))
+            expected_ledger_identity=LedgerFileIdentity(*self.plan.ledger_identity),
+            retire_after_drain=retire_after_drain)
         self.host = host
         host.run_forever()
+        if type(host) is not DailyActivationHost or host._retirement_complete() is not True:
+            _reject("daily_generation_keeper_returned_without_retirement")
+
+    def assert_runtime_retired(self):
+        # Lazy import only after this exact operation imported the daily host.
+        # A JSON return value or a caller boolean cannot replace its owners.
+        if not self.runtime_started or not self.source_complete or not self.settled:
+            _reject("daily_retirement_original_host_required")
+        from sentinel.adaptive.daily_activation_host import DailyActivationHost
+        if type(getattr(self, "host", None)) is not DailyActivationHost or self.host._retirement_complete() is not True:
+            _reject("daily_generation_keeper_returned_without_retirement")
 
 
 def _source_custody_tick(operation):

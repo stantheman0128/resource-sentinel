@@ -571,6 +571,15 @@ provider 必須接上這些原始 API，不延長一秒 window 或重建已凍�
 日常 source activation 都需要獨立授權，不因 commit/push 自動執行。項目 6
 尚未完成的內容不能以 mock、空 provider、另外一個 DB 或假量測取代。
 
+Serial provider 的接線另有兩個具體 source 前提：`CurrentBuildSource` 目前將
+runtime 與 tests inventory 都綁在 production module 的 `_ROOT`。Canonical
+production 與已審核 worktree fixture 分置時，必須對實際載入的 fixture closure
+計算 producer digest，不能發布另一個目錄的 hash。另 `NativeJob` 確實在原始
+handle 上驗證 DACL，但沒有公開 S1 evidence 所需的實際 protected-DACL／ACE-count
+observation；須保留原查詢／descriptor 正面 cleanup 後的 bounded 結果，不能從舊
+`OwnedJob.security` 預設值或固定常數製造實測欄位。這兩項是 provider 接線工作，
+不是 Windows capability 已失敗，也不需要放寬既有安全條件。
+
 同帳本 experiment demand 的新增契約已先以 `ed0c2cf` 提交；
 [generation 正面退場契約](DAILY-GENERATION-RETIREMENT.md)為 `b281fd3`。
 日常 retirement fence 已實作並提交為 `a48925a`；同帳本 demand source 為

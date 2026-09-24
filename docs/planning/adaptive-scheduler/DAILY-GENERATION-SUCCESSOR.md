@@ -126,6 +126,35 @@ this exact current generation/transition/archive/POLICY/epoch/revision plus
 complete obligation checks and its own original live self handle; ambiguous
 audit routes refuse. The generic fresh and ordinary rollover paths stay intact.
 
+Retain the exact fresh SupervisorStartup before its first identity, SQL or
+instance-mutex acquisition. Its acquisition and freshness inspection use a
+tracking-only lexical SQL owner, including initial binding reads and justified
+original retries. This owner does not bypass normal readiness or POLICY checks.
+Unknown SQL acquisition/close cannot become a clean startup close or authorize
+a new owner merely because no acquired instance lease was returned.
+
+The new guardian validates current historical data under its own original live
+self witness, registration operation and POLICY guard. It does not reconstruct
+the predecessor's retired native custody from the audit. Before its final short
+transaction, retain a complete bounded schema/ledger/receipt/journal observation
+through original tracked readers; bind the opaque snapshot to the exact guardian,
+registration, guard, thread/process, ledger and journal identities. Revalidate
+the full SQL observation in the final transaction without native or filesystem
+I/O there. Capture validates canonical archive/audit links, terminal and closed
+experiment receipts, restored control/action history and absence of managed
+obligations. Ordinary nonmanaged allocations and queued work remain untouched.
+
+Lost registration COMMIT acknowledgement uses the same original snapshot and
+preminted publication images. Validate only its exact guardian infrastructure
+insertion, one registry revision increment, and original nonce or positively
+cleared nonce as the owned postimage changes. Preserve exact adaptive historical
+evidence; separately bound ordinary nonmanaged rows again, allowing their
+independent legitimate postcommit changes because registration never writes
+them. No changed adaptive history, unknown SQL owner or reconstructed snapshot
+can substitute for original settlement. The prepublication epoch validator
+continues to require its exact audit revision; the registration's +1 postimage
+is a separate original-operation check, never a global revision relaxation.
+
 Fresh readiness construction has a private original-host bootstrap check;
 public/local admission stays fenced until that exact retained listener is
 published with its serving thread, service and registry positively bound.

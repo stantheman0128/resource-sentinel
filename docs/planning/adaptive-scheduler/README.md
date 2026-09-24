@@ -4,7 +4,47 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
-最新已補齊 **restart 的 installer／CLI、完整 chain exit 與兩代收尾驗證**：
+最新 source checkpoint 為 **P4 daily monitor 成本 witness 與原始 handle 保留**，
+source commit `c571b89f3443c306c44345993c6baa9412bd9a6e`：
+
+- 使用真正 readiness client 驗證 daily generation，再保留原始 authenticated
+  peer 的獨立 query handle；短期 readiness authority 必須正面關閉。長期
+  witness 只供成本計量，不能延長 readiness 或提供准入、啟動、控制、釋放權限。
+- 原始 process、backend、lock、handle、identity 與 transfer output 分別固定；
+  已知 close 失敗與未知結果分開保留。修改 owner 欄位不能消除 unknown，也不能
+  讓替代 handle 被關閉或當成原始 owner。Daily demand 釋放後仍可驗證原始收尾。
+- Overhead setup 使用已驗證的同一個 monitor／keeper；session property 在
+  setup 前換值會被拒絕。獨立 review 發現的 property 換值與底層 handle 替換
+  兩個缺口均已修正、補回歸測試並複查。
+
+精確 staged tree `c1f59bc7354488d10c1e60f4adc9e223b430c350` 經 `git archive`
+匯出、清除 `PYTHONPATH` 後，四模組 **126 PASS，0 failures／errors／skips，
+runner 6.040 秒**。Commit tree 與該測試 tree 相同，不依賴 protected dirty
+files、S2 草稿或尚未提交的 host ledger 草稿。測試使用真實隔離 SQLite 與明確
+synthetic native collaborators；沒有量測實機 overhead，也沒有通過 P4 gate。
+本機完整證據：`.local-adaptive/p4-monitor-export-20260924-1/`。
+
+在包含本批 source commit 的乾淨 checkout，以正常日常准入重現：
+
+```powershell
+$sentinelMonitorTests = @(
+    'tests.test_adaptive_daily_monitor'
+    'tests.test_adaptive_overhead_runner'
+    'tests.test_adaptive_daily_readiness_transport'
+    'tests.test_adaptive_identity'
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command ('C:\Python313\python.exe -m unittest -v ' + ($sentinelMonitorTests -join ' ')) -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
+S2/P4 共用 daily demand 與隔離 production host 的橋接契約已提交為 `9f1989b`：
+[S2-P4-PRODUCTION-HOST-SCOPE.md](S2-P4-PRODUCTION-HOST-SCOPE.md)。
+**契約不是 provider 實作或 native 證據。** Aggregate host launch/adoption、
+authenticated transport、完整原始 completion 與 daily release 接線仍未完成；
+新的 host ledger／legacy writer／release guard 草稿尚未驗證，留在本機未提交。
+Items 5/6 與 P3–P6 native gates 仍未完成。日常 runtime、config、Scheduled Task
+和啟動入口均未變更，adaptive off；本批沒有施加任何測試 Job 限制。
+
+上一個 checkpoint 已補齊 **restart 的 installer／CLI、完整 chain exit 與兩代收尾驗證**：
 
 - 兩個 console 入口新增明確的 `--restart-after-retirement`，預設 off，必須同時
   要求 retirement；installer 還須另有 apply 與 backup directory。參數不完整時，

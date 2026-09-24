@@ -419,14 +419,30 @@ def _validate_completion(record):
     completion, kind = record["completion"], record["disposition"]
     demand = completion.get("demand") if type(completion) is dict else None
     _validate_demand(demand)
+    version = completion.get("schema_version")
+    if type(version) is not int or version not in {1, 2}:
+        _fail("completion_version_invalid")
+    if version == 2:
+        if kind not in {"NEVER_LAUNCHED", "FINISHED"}:
+            _fail("probe_disposition_invalid")
+        probes = completion.get("probe_custody")
+        if type(probes) is not list or not 1 <= len(probes) <= 2:
+            _fail("probe_custody_invalid")
+        for ordinal, probe in enumerate(probes, 1):
+            _shape(probe, {"ordinal", "outcome"})
+            if (type(probe["ordinal"]) is not int or probe["ordinal"] != ordinal or
+                    type(probe["outcome"]) is not str or
+                    probe["outcome"] not in {"opened_closed", "failed_closed"}):
+                _fail("probe_custody_invalid")
     if kind == "BEFORE_NATIVE":
         _shape(completion, {"schema_version", "disposition", "demand", "reservation_id", "daily_binding_sha256", "native_preparation"})
         if completion["native_preparation"] is not None:
             _fail("completion_invalid")
         digest = _digest("experiment-before-native-v1", completion)
     else:
-        _shape(completion, {"schema_version", "disposition", "demand", "binding", "terminal", "scope_id",
-            "isolated_ledger_path", "deadline_monotonic_ns", "acquisitions", "reservation_id", "daily_binding_sha256"})
+        fields = {"schema_version", "disposition", "demand", "binding", "terminal", "scope_id",
+            "isolated_ledger_path", "deadline_monotonic_ns", "acquisitions", "reservation_id", "daily_binding_sha256"}
+        _shape(completion, fields | ({"probe_custody"} if version == 2 else set()))
         _uuid(completion["scope_id"])
         _integer(completion["deadline_monotonic_ns"], 1)
         _text(completion["isolated_ledger_path"], 32768)
@@ -520,8 +536,7 @@ def _validate_completion(record):
         if terminal["state"] != kind or terminal["scope_id"] != completion["scope_id"]:
             _fail("completion_invalid")
         digest = hashlib.sha256(_canonical(completion).encode()).hexdigest()
-    if (type(completion["schema_version"]) is not int or completion["schema_version"] != 1 or
-            completion["disposition"] != kind or digest != record["completion_digest"]):
+    if completion["disposition"] != kind or digest != record["completion_digest"]:
         _fail("completion_digest_changed")
     if kind != "PREPARATION_CLOSED" or completion["reservation_id"] is not None:
         if completion["reservation_id"] != record["reservation_id"] or completion["daily_binding_sha256"] != record["demand_binding_sha256"]:

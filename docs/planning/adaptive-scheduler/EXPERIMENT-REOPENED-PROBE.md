@@ -1,6 +1,8 @@
 # Original S1 scope: reopened Job probe and restore
 
-Status: contract before implementation, after `178c2e4`. This closes a concrete
+Status: source implemented with synthetic-backend regression evidence; native
+acceptance remains unverified. The prior contract was committed as `c59376a`,
+after `178c2e4`. This closes a concrete
 serial-provider prerequisite: S1 must actually reopen a Job handle and restore
 through that handle. The original principal remains retained throughout. No
 production activation, new restrictive actuator, or native gate is granted.
@@ -87,3 +89,17 @@ release/history/readiness and native Job tests through normal daily admission.
 These tests prove source contracts only. Real reopened-handle CPU effect,
 serial-provider integration, root/child deadlines, S1-S3, overhead and P6 A/B
 remain unverified or unfinished until their actual evidence exists.
+
+Implementation review additionally found that a retained factory exception can
+carry multiple owners. Validation now compares its entire matching CONTROL-owner
+graph to the original failed attempts, rejects extra/duplicate owners even on
+completion replay, and allows one exception reused by two original failed opens.
+Probe-native errors are retained before isolated lock cleanup and deferred until
+positive scope exit; genuine POLICY/Job-lock cleanup failures still propagate.
+This preserves principal-only restore without treating unknown cleanup as done.
+
+The two new test files contain 30 cases. Initial history/consumer verification
+passed 50 tests; the focused seven-module scope/history/native Job run passed
+158 tests, with zero failures, errors or skips. Final shared regression and the
+reproducible admitted command are recorded in the planning README. Tests use the
+protected local dirty baseline; they are not a clean-checkout full-suite claim.

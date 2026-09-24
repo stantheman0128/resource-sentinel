@@ -146,12 +146,23 @@ class NativeScopeCompletion:
             separators=(",", ":"), allow_nan=False))
 
 
+class _ProbeAttempt:
+    """One original open attempt, retained before the native factory is entered."""
+    def __init__(self, ordinal, binding):
+        self.ordinal, self.binding = ordinal, binding
+        self._immutable = (ordinal, binding)
+        self.owner = self._original_owner = None
+        self.factory_error = self._original_factory_error = None
+        self.outcome = "entered"
+        self.probe_error = self.close_error = None
+
+
 class ExperimentNativeScope:
     """One actual guardian, independent wrapper, Job and immutable demand owner.
 
-    The current same-process generation owner is required until the readiness
-    layer offers retained remote connection ownership outside POLICY. Reopening
-    a readiness pipe while holding POLICY is deliberately not an alternative.
+    Daily readiness is retained outside POLICY and revalidated within its exact
+    lexical scope. Reopened control probes belong to this original scope; they
+    neither replace the retained principal nor acquire daily capacity authority.
     """
     def __init__(self, *, _token=None):
         if _token is not _NEW:
@@ -176,6 +187,8 @@ class ExperimentNativeScope:
         self._preparation_closed = False
         self._partial_job = self._partial_job_error = None
         self._mutex_construction_error = None
+        self._probe_attempts, self._original_probe_attempts = [], ()
+        self._probe_attempt_count = 0
 
     @classmethod
     def prepare(cls, demand, command, *, scope_id=None, creation_nonce=None):
@@ -517,6 +530,7 @@ class ExperimentNativeScope:
                 any(source["floor"][key] < amount for key, amount in self.demand.declaration.requested.to_dict().items())):
             _fail("unused_daily_claim_changed", self)
         if restrictive:
+            self._assert_probe_work_allowed()
             if self.demand._native_preparation_sealed:
                 _fail("preparation_sealed", self)
             assert_new_capacity_allowed(conn)
@@ -649,6 +663,7 @@ class ExperimentNativeScope:
                 not self._registered):
             _fail("only_explicit_s1_rate", self)
         with self._scope(daily=True):
+            self._assert_probe_work_allowed()
             with self.daily_store._transaction() as conn:
                 self._coverage_locked(conn, restrictive=True)
             self._verify_job()
@@ -675,21 +690,228 @@ class ExperimentNativeScope:
                 self.journal.acknowledge_control_locked(conn, observed)
             return observed
 
-    def restore(self):
-        """Withdraw only this original scope's exact cap; no daily prerequisite."""
+    def _probe_binding(self):
+        return (self.scope_id, self.job, self.job_name, self.creation_nonce, self.guardian.identity.logon_id)
+
+    def _probe_graph(self):
+        """Pure original-object accounting; never query or adopt a named Job."""
+        if (type(self._probe_attempt_count) is not int or not 0 <= self._probe_attempt_count <= 2 or
+                type(self._probe_attempts) is not list or type(self._original_probe_attempts) is not tuple or
+                len(self._probe_attempts) != self._probe_attempt_count or
+                len(self._original_probe_attempts) != self._probe_attempt_count):
+            _fail("probe_custody_changed", self)
+        seen = set()
+        for index, (attempt, original) in enumerate(zip(self._probe_attempts, self._original_probe_attempts), 1):
+            if (type(attempt) is not _ProbeAttempt or attempt is not original or
+                    type(attempt.ordinal) is not int or attempt.ordinal != index or
+                    attempt._immutable != (index, self._probe_binding()) or attempt.binding != attempt._immutable[1] or
+                    not self._registered or self.job is not self._original_job or
+                    attempt.owner is not attempt._original_owner or
+                    attempt.factory_error is not attempt._original_factory_error or
+                    attempt.outcome not in {"entered", "returned", "failed_retained"}):
+                _fail("probe_custody_changed", self)
+            owner = attempt.owner
+            if owner is None:
+                if attempt.outcome != "entered":
+                    _fail("probe_custody_changed", self)
+                continue
+            if (type(owner) is not NativeJob or owner is self.job or id(owner) in seen or
+                    (owner.name, owner.nonce, owner.logon_sid, owner.access) !=
+                    (self.job_name, self.creation_nonce, self.guardian.identity.logon_id, JobAccess.CONTROL)):
+                _fail("probe_owner_changed", self)
+            seen.add(id(owner))
+            if attempt.outcome == "returned":
+                if attempt.factory_error is not None:
+                    _fail("probe_custody_changed", self)
+            elif attempt.outcome == "failed_retained":
+                error = attempt.factory_error
+                if not isinstance(error, BaseException):
+                    _fail("probe_factory_custody_changed", self)
+                matching = tuple(value for value in getattr(error, "_native_job_initialization_owners", ())
+                    if type(value) is NativeJob and value.name == self.job_name and
+                    value.nonce == self.creation_nonce and value.logon_sid == self.guardian.identity.logon_id and
+                    value.access is JobAccess.CONTROL)
+                accounted = tuple(value.owner for value in self._probe_attempts
+                    if value.outcome == "failed_retained" and value.factory_error is error)
+                # A reused exception may retain both original failed attempts;
+                # every matching owner must belong to that exact recorded graph.
+                if (len(matching) != len(accounted) or
+                        any(sum(value is original for value in matching) != 1 for original in accounted)):
+                    _fail("probe_factory_custody_changed", self)
+            else:
+                _fail("probe_custody_changed", self)
+        return tuple(self._probe_attempts)
+
+    def _assert_probe_work_allowed(self):
+        for attempt in self._probe_graph():
+            owner = attempt.owner
+            if owner is None or (not owner.closed and (attempt.outcome != "returned" or
+                    attempt.probe_error is not None or attempt.close_error is not None or not owner._ready)):
+                _fail("probe_cleanup_unverified", self)
+
+    def _returned_probe(self, probe, *, live=False):
+        matches = [attempt for attempt in self._probe_graph()
+                   if attempt.outcome == "returned" and attempt.owner is probe]
+        if len(matches) != 1 or type(probe) is not NativeJob:
+            _fail("original_probe_required", self)
+        if live and (probe.closed or not probe._ready or matches[0].close_error is not None):
+            _fail("probe_unavailable", self)
+        return matches[0]
+
+    def _verify_probe(self, probe):
+        self._returned_probe(probe, live=True)
+        if probe.handle == self.job.handle:
+            _fail("probe_handle_not_distinct", self)
+        principal_limits = self.job.query_limits()
+        if probe.query_limits() != principal_limits:
+            _fail("probe_limits_changed", self)
+        principal_cpu, observed = _cpu(self.job.query_cpu()), _cpu(probe.query_cpu())
+        if principal_cpu != observed:
+            _fail("probe_cpu_changed", self)
+        return observed
+
+    def open_probe(self):
+        """Open one CONTROL handle for this retained principal; never admission."""
+        failure = None
+        with self._lock:
+            if (not self._registered or self._close_started or self._job_close_started or
+                    self._job_closed or self._native_closed):
+                _fail("probe_open_unavailable", self)
+            attempts = self._probe_graph()
+            if self._probe_attempt_count >= 2:
+                _fail("probe_attempt_limit", self)
+            if any(attempt.owner is None or not attempt.owner.closed for attempt in attempts):
+                _fail("probe_cleanup_unverified", self)
+            with self._scope(daily=False):
+                self._verify_job()
+                # Sequence/count are published before any factory side effect.
+                attempt = _ProbeAttempt(self._probe_attempt_count + 1, self._probe_binding())
+                self._probe_attempt_count += 1
+                self._probe_attempts.append(attempt)
+                self._original_probe_attempts = (*self._original_probe_attempts, attempt)
+                try:
+                    try:
+                        probe = NativeJob.open(self.job_name, self.creation_nonce,
+                            self.guardian.identity.logon_id, access=JobAccess.CONTROL)
+                    except BaseException as error:
+                        attempt.factory_error = attempt._original_factory_error = error
+                        prior = tuple(value.owner for value in attempts if value.owner is not None)
+                        candidates = tuple(value for value in getattr(error, "_native_job_initialization_owners", ())
+                            if type(value) is NativeJob and value.name == self.job_name and
+                            value.nonce == self.creation_nonce and value.logon_sid == self.guardian.identity.logon_id and
+                            value.access is JobAccess.CONTROL and not any(value is owned for owned in prior))
+                        if len(candidates) == 1 and candidates[0] is not self.job:
+                            attempt.owner = attempt._original_owner = candidates[0]
+                            attempt.outcome = "failed_retained"
+                        raise
+                    attempt.owner = attempt._original_owner = probe
+                    attempt.outcome = "returned"
+                    self._verify_probe(probe)
+                except BaseException as error:
+                    failure = attempt.probe_error = self._retain(error)
+                # Probe-native failure is raised only after these original
+                # locks/SQL have positively exited. It does not poison an
+                # otherwise usable isolated principal-only restore context.
+            if failure is not None:
+                raise failure
+            return probe
+
+    def _close_probe_owner(self, attempt):
+        owner = attempt.owner
+        try:
+            if owner is None:
+                _fail("probe_acquisition_unknown", self)
+            if owner.closed:
+                return None
+            if (owner._job.state == "owned" and self.job._job.state == "owned" and
+                    owner._job.value == self.job._job.value):
+                _fail("probe_handle_not_distinct", self)
+            if any(resource.state in {"allocation_unknown", "close_unknown"} for resource in owner._resources):
+                _fail("probe_cleanup_unknown", self)
+            owner.close()
+            if not owner.closed:
+                _fail("probe_cleanup_unverified", self)
+        except BaseException as error:
+            if attempt.close_error is None:
+                attempt.close_error = error
+            self._retain(error)
+            return error
+        return None
+
+    def close_probe(self, probe):
+        """Close only the exact returned owner; a positive close is idempotent."""
+        with self._lock:
+            self._assert_original_native_owners()
+            if _OWNERS.get(self.scope_id) is not self:
+                _fail("original_binding_changed", self)
+            self.demand._assert_native_preparation(self)
+            attempt = self._returned_probe(probe)
+            if probe.closed:
+                return
+            if self._job_closed or self._job_close_started or self._native_closed:
+                _fail("probe_principal_unavailable", self)
+            with self._scope(daily=False):
+                self._verify_job()
+                failure = self._close_probe_owner(attempt)
+            if failure is not None:
+                raise failure
+
+    def _closed_probe_custody(self):
+        result = []
+        for attempt in self._probe_graph():
+            if attempt.owner is None or not attempt.owner.closed:
+                _fail("probe_cleanup_unverified", self)
+            result.append(dict(ordinal=attempt.ordinal,
+                outcome="opened_closed" if attempt.outcome == "returned" else "failed_closed"))
+        return result
+
+    def _close_all_probes(self):
+        attempts = self._probe_graph()
+        if not attempts or all(attempt.owner is not None and attempt.owner.closed for attempt in attempts):
+            return
+        failure = None
         with self._scope(daily=False):
             self._verify_job()
-            observed = _cpu(self.job.query_cpu())
-            with self.store._transaction() as conn:
-                self.journal.begin_restore_locked(conn, observed)
-            if observed != _DISABLED:
-                self.job.disable()
-            observed = _cpu(self.job.query_cpu())
-            if observed != _DISABLED:
-                _fail("restore_readback_mismatch", self)
-            with self.store._transaction() as conn:
-                self.journal.acknowledge_control_locked(conn, observed)
-            return observed
+            for attempt in attempts:
+                failure = self._close_probe_owner(attempt)
+                if failure is not None:
+                    break
+        if failure is not None:
+            raise failure
+        self._closed_probe_custody()
+
+    def restore(self, through=None):
+        """Withdraw only this original scope's exact cap; no daily prerequisite."""
+        failure = None
+        with self._scope(daily=False):
+            self._verify_job()
+            attempt = None if through is None else self._returned_probe(through, live=True)
+            target = self.job if attempt is None else attempt.owner
+            try:
+                observed = _cpu(self.job.query_cpu()) if attempt is None else self._verify_probe(target)
+            except BaseException as error:
+                if attempt is None:
+                    raise
+                failure = attempt.probe_error = self._retain(error)
+            if failure is None:
+                with self.store._transaction() as conn:
+                    self.journal.begin_restore_locked(conn, observed)
+                try:
+                    if observed != _DISABLED:
+                        target.disable()
+                    observed = _cpu(target.query_cpu())
+                    if observed != _DISABLED or attempt is not None and _cpu(self.job.query_cpu()) != _DISABLED:
+                        _fail("restore_readback_mismatch", self)
+                except BaseException as error:
+                    if attempt is None:
+                        raise
+                    failure = attempt.probe_error = self._retain(error)
+                if failure is None:
+                    with self.store._transaction() as conn:
+                        self.journal.acknowledge_control_locked(conn, observed)
+        if failure is not None:
+            raise failure
+        return observed
 
     def observe_control(self):
         """Owning guardian sweep; grant-after-cap restores the entire Job."""
@@ -773,6 +995,7 @@ class ExperimentNativeScope:
                         self._actors_closed = True
                     # A later clean lock timeout resumes here. Never query or
                     # close the already positively settled process witnesses.
+                    self._close_all_probes()
                     with self._scope(daily=False):
                         if not self._job_close_started:
                             self._verify_job(empty=True)
@@ -808,13 +1031,19 @@ class ExperimentNativeScope:
                 job_name=self.job_name, creation_nonce=self.creation_nonce,
                 guardian_identity=self.guardian.identity.to_dict(), command_sha256=self.command.sha256,
                 isolated_ledger_identity=getattr(self, "isolated_identity", None), wrapper_creation="never_created"))
-        return dict(schema_version=1, disposition=self._terminal_record["state"], binding=binding,
+        probes = self._closed_probe_custody()
+        if probes and self._terminal_record["state"] not in {"NEVER_LAUNCHED", "FINISHED"}:
+            _fail("probe_completion_invalid", self)
+        result = dict(schema_version=2 if probes else 1, disposition=self._terminal_record["state"], binding=binding,
             demand=json.loads(self.demand._native_preparation_binding), terminal=self._terminal_record,
             scope_id=self.scope_id, isolated_ledger_path=str(self.ledger_path),
             deadline_monotonic_ns=int(self.deadline * 1_000_000_000),
             acquisitions=dict(self._preparation_acquisitions),
             reservation_id=getattr(self, "reservation_id", None),
             daily_binding_sha256=getattr(self, "_daily_binding_sha256", None))
+        if probes:
+            result["probe_custody"] = probes
+        return result
 
     def _closure_digest(self):
         return hashlib.sha256(json.dumps(self._completion_record(), sort_keys=True,
@@ -980,6 +1209,7 @@ class ExperimentNativeScope:
     def _validate_closed_custody(self):
         self._assert_original_native_owners()
         self.demand._assert_native_preparation(self)
+        self._closed_probe_custody()
         if not self.demand._native_preparation_sealed or self._preparation_pending:
             _fail("native_cleanup_unverified", self)
         if self._preparation_closed:

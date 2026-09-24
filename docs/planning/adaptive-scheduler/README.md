@@ -4,6 +4,55 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
+原始 scope 的 reopened CONTROL probe／restore 已實作，契約見
+[EXPERIMENT-REOPENED-PROBE.md](EXPERIMENT-REOPENED-PROBE.md)。Principal 始終保留；
+每個 scope 最多兩次原始 open attempt、同時一個未收尾 probe。開啟失敗也保留
+原始 factory owner；撤回限制使用指定 probe，principal／probe 都讀回 disabled
+才 ACK。Probe 清理未知會阻止新限制與容量釋放，但不阻止有效的 principal restore。
+所有 probe 正面關閉後才關 principal；沒有 probe 的 completion v1 保持原形狀，
+使用 probe 的 v2 加入受 digest 保護的有界 custody 摘要，history 不取得 release 權限。
+
+新增兩個測試檔共 30 個案例。History 初測 **50 PASS**（runner 9.756 秒），
+scope／history／native Job 七模組 **158 PASS**（runner 30.993 秒），均無
+failures／errors／skips。獨立 review 找到共用 factory exception 可能夾帶未記帳
+owner，已修成核對完整 matching-owner 集合；涵蓋額外／重複 owner 拒絕及兩次合法
+failed open 共用同一 exception。最後 read-only review 沒有其他 actionable finding。
+
+最終共用回歸 **15 模組、288 PASS，0 failures／errors／skips**（unittest
+64.815 秒／runner 65.095 秒），私人日誌
+`.local-adaptive/scope-probes-shared-20260924-1.log`。涵蓋 probe／history、scope／
+journal／preparation、release／custody／hooks、remote readiness、native deadline、
+daily retirement 與 native Job 路徑。從 implementation worktree 執行等價命令：
+
+```powershell
+$sentinelProbeTests = @(
+    'tests.test_adaptive_experiment_probes'
+    'tests.test_adaptive_experiment_probe_history'
+    'tests.test_adaptive_experiment_history'
+    'tests.test_adaptive_experiment_history_consumers'
+    'tests.test_adaptive_experiment_scope'
+    'tests.test_adaptive_experiment_scope_journal'
+    'tests.test_adaptive_experiment_preparation'
+    'tests.test_adaptive_experiment_release_native'
+    'tests.test_adaptive_experiment_release'
+    'tests.test_adaptive_experiment_release_custody'
+    'tests.test_adaptive_experiment_release_hooks'
+    'tests.test_adaptive_experiment_remote_readiness'
+    'tests.test_adaptive_experiment_native_deadlines'
+    'tests.test_adaptive_daily_retirement_integration'
+    'tests.test_adaptive_native_job'
+)
+$sentinelProbeCommand = 'C:\Python313\python.exe -m unittest ' + ($sentinelProbeTests -join ' ') + ' -q'
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command $sentinelProbeCommand -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
+本批使用 Windows／`C:\Python313\python.exe`、正常日常 wrapper 的
+`HEAVY / P2 / CPU 1 / RAM 1 GiB / I/O 0`，沒有豁免。測試使用實際隔離 SQLite
+和明確 synthetic native／transport fixtures；不代表實際 CPU 效果、P3–P6 native
+gate 或 clean-clone full-suite 通過。受保護 dirty baseline 未納入提交，測試依賴會
+在 commit message 揭露。日常 runtime／config／Scheduled Task／啟動入口未改，
+adaptive 維持 off；沒有實際 Job cap 需要撤回。
+
 S1 CPU fixture 的 child Create 邊界已補上原始 deadline 檢查：先保管尚未進入
 Create 的 output cells，完成 command buffer／startup 參數後再查原期限，最後
 才標記 Create 已進入。準備期間到期不建立 child，也不把它記成未知建立結果。
@@ -12,7 +61,7 @@ Create 的 output cells，完成 command buffer／startup 參數後再查原期�
 新增案例在 buffer 準備耗盡期限，確認零 Create／duplicate／child wait／native
 close，並正面清理原有 Job／self fixture owners。這不是 native 實測；完整 root／
 child scope-bound protocol 仍待接線。Reopened probe 的先行契約已入庫為
-[`c59376a`](EXPERIMENT-REOPENED-PROBE.md)，source／整合測試進行中。
+[`c59376a`](EXPERIMENT-REOPENED-PROBE.md)，source／整合測試已完成如上。
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command 'C:\Python313\python.exe -m unittest tests.test_adaptive_scope_cpu_worker -q' -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
@@ -40,7 +89,7 @@ fixture 未建立正式 exemption binding；改用原 POLICY 下的 `bind_policy
 未更改 production disable 行為或豁免檢查。最後獨立 review 無 actionable finding。
 
 父程序的一秒 readiness window 仍不代表稍後 wrapper root Create 的新鮮度。
-Actual serial provider、reopened-handle restore、canonical fixture bootstrap、
+Actual serial provider、canonical fixture bootstrap、
 完整 root／child deadline 與 fresh-generation restart 仍是 source 缺口；P3–P6
 尚未通過 native 驗收。日常 runtime／config／Scheduled Task／啟動入口未改，
 adaptive 維持 off；本批沒有對實際工作施加 Job 限制，沒有需撤回的測試 cap。

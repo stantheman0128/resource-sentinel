@@ -8,6 +8,7 @@ this singleton protocol are excluded by the separate complete empty-state check.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 import re
 import threading
@@ -225,6 +226,27 @@ class SupervisorStartup:
             raise
 
     def acquire(self):
+        with self._successor_sql_scope(acquiring=True, fresh=True):
+            return self._acquire()
+
+    @contextmanager
+    def _successor_sql_scope(self, *, acquiring=False, fresh=False):
+        successor = getattr(self, "_daily_successor_operation", None)
+        if successor is None:
+            yield
+            return
+        from .daily_successor import DailySuccessorOperation
+        if type(successor) is not DailySuccessorOperation:
+            raise self._error("daily_successor_original_operation_required")
+        supervisor = getattr(self, "_daily_successor_supervisor", None)
+        if supervisor is None or supervisor.startup is not self:
+            raise self._error("daily_successor_original_supervisor_required")
+        if fresh:
+            successor.bind_startup(supervisor, self)
+        with successor.startup_sql_scope(supervisor, acquiring=acquiring):
+            yield
+
+    def _acquire(self):
         if self._attempted or self._closed:
             raise self._error("supervisor_startup_acquire_repeated")
         self._attempted = True
@@ -244,6 +266,10 @@ class SupervisorStartup:
             raise
 
     def retry_acquire(self):
+        with self._successor_sql_scope(acquiring=True):
+            return self._retry_acquire()
+
+    def _retry_acquire(self):
         """Resume only a retained pre-mutex POLICY attempt, once this tick."""
         if not self.can_retry_acquire:
             raise self._error("supervisor_startup_acquire_retry_unavailable")
@@ -292,6 +318,15 @@ class SupervisorStartup:
         guard = self.store._policy.assert_held()
         if guard.binding != self.binding:
             raise self._error("supervisor_startup_binding_changed")
+        successor = getattr(self, "_daily_successor_operation", None)
+        if successor is not None:
+            from .daily_successor import DailySuccessorOperation
+            if type(successor) is not DailySuccessorOperation:
+                raise self._error("daily_successor_original_operation_required")
+            supervisor = getattr(self, "_daily_successor_supervisor", None)
+            if supervisor is None or supervisor.startup is not self:
+                raise self._error("daily_successor_original_supervisor_required")
+            return successor.inspect_startup_locked(supervisor, guard)
         initialize_registry_locked(self.store)
         with self.store._connection() as conn:
             self._bound_read(conn)
@@ -349,6 +384,10 @@ class SupervisorStartup:
         return runtime
 
     def assert_fresh(self):
+        with self._successor_sql_scope():
+            return self._assert_fresh()
+
+    def _assert_fresh(self):
         """One bounded attempt, resuming its exact guard after SQL failure.
 
         No old empty snapshot is a launch permit. After lost cleanup ACK with
@@ -387,6 +426,9 @@ class SupervisorStartup:
         """Release once and close known owners; ambiguous native results hold."""
         if self._closed:
             return
+        successor = getattr(self, "_daily_successor_operation", None)
+        if successor is not None:
+            successor.assert_startup_cleanup(getattr(self, "_daily_successor_supervisor", None), self)
         if self._attempted and (self._thread is not threading.current_thread() or
                                self._native_thread != threading.get_native_id() or self._pid != os.getpid()):
             raise self._error("supervisor_startup_foreign_owner")

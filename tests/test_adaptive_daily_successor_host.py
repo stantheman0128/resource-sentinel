@@ -164,7 +164,27 @@ class DailySuccessorHostTests(unittest.TestCase):
         supervisor.startup = startup
         startup._daily_successor_operation = self.operation
         startup._daily_successor_supervisor = supervisor
-        self.addCleanup(startup.close)
+        def release_fixture_startup():
+            # Fault cases deliberately retain unknown SQL/POLICY custody.
+            # Keep the production refusal and all flags, while disposing only
+            # these explicitly synthetic native collaborators after assertions.
+            try:
+                startup.close()
+            except Exception:
+                epoch = self.operation._guardian_epoch_operation
+                pending = (self.operation._quarantine is not None or
+                    any(not item.closed or item.close_unknown for item in self.operation._connections) or
+                    epoch is not None and (epoch._quarantine is not None or epoch._policy_operation.pending))
+                if not pending:
+                    raise
+                if startup._acquired and startup._scope is not None:
+                    startup._scope.__exit__(None, None, None)
+                if startup._mutex is not None:
+                    startup._mutex.close()
+                if startup._current is not None:
+                    startup._current.close()
+
+        self.addCleanup(release_fixture_startup)
         startup.acquire()
         self.operation.assert_supervisor(supervisor)
         return supervisor

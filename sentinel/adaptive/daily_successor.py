@@ -65,6 +65,7 @@ class DailySuccessorOperation:
         self._host_pins = self._readiness_pins = self._supervisor_pins = None
         self._guardian_epoch_operation = None
         self._pending_supervisor = None
+        self._startup_pins = None
         self._capture_attempted = self._transition_attempted = False
         self._complete = False
         self._quarantine = self._error = None
@@ -98,6 +99,8 @@ class DailySuccessorOperation:
             self._assert_owner_binding()
         if self._host_pins is not None:
             self._assert_host_binding()
+        if self._startup_pins is not None:
+            self._assert_startup_binding(self._pending_supervisor)
         if self._quarantine is not None or any(item.close_unknown for item in self._connections):
             self._fail("custody_unsettled")
 
@@ -521,6 +524,7 @@ class DailySuccessorOperation:
                 supervisor.startup.store is not self.store or supervisor.startup.journal is not supervisor.journal):
             self._fail("original_supervisor_required")
         startup = supervisor.startup
+        self._assert_startup_binding(supervisor)
         startup.assert_held()
         if startup.binding != self.guard.binding:
             self._fail("supervisor_binding_changed")
@@ -546,6 +550,50 @@ class DailySuccessorOperation:
             self._fail("original_supervisor_already_present")
         self._pending_supervisor = supervisor
 
+    def bind_startup(self, supervisor, startup):
+        """Retain the fresh startup before identity, SQL or native acquisition."""
+        from .supervisor_startup import SupervisorStartup
+        self._source()
+        self.assert_readiness_published(self.owner)
+        if (supervisor is not self._pending_supervisor or self._readiness_host.supervisor is not supervisor or
+                type(startup) is not SupervisorStartup or supervisor.startup is not startup or
+                supervisor.store is not self.store or supervisor.journal is not self.retirement.journal or
+                startup.store is not self.store or startup.journal is not supervisor.journal or
+                getattr(startup, "_daily_successor_operation", None) is not self or
+                getattr(startup, "_daily_successor_supervisor", None) is not supervisor or
+                startup._attempted or startup._closed or startup._current is not None or
+                startup._mutex is not None or startup._scope is not None or startup._lease is not None or
+                startup.binding is not None or startup.instance_binding is not None or
+                self._startup_pins is not None):
+            self._fail("fresh_startup_required")
+        self._startup_pins = (supervisor, startup, startup.store, startup.journal,
+            startup._binding_operation, startup._fresh_operation, startup._current_source, startup._mutex_factory)
+
+    def _assert_startup_binding(self, supervisor):
+        pins = self._startup_pins
+        if pins is None or supervisor is not self._pending_supervisor or supervisor is not pins[0]:
+            self._fail("original_startup_required")
+        startup = supervisor.startup
+        if (startup is not pins[1] or getattr(startup, "_daily_successor_operation", None) is not self or
+                getattr(startup, "_daily_successor_supervisor", None) is not supervisor or
+                any(left is not right for left, right in zip((startup.store, startup.journal,
+                    startup._binding_operation, startup._fresh_operation,
+                    startup._current_source, startup._mutex_factory), pins[2:]))):
+            self._fail("original_startup_changed")
+
+    def assert_startup_cleanup(self, supervisor, startup):
+        self._source()
+        self._assert_startup_binding(supervisor)
+        if startup is not self._startup_pins[1] or any(
+                not item.closed or item.close_unknown for item in self._connections):
+            self._fail("startup_sql_custody_unsettled")
+        epoch = self._guardian_epoch_operation
+        if epoch is not None:
+            epoch._original()
+            epoch._settled_connections()
+            if epoch._policy_operation.pending:
+                self._fail("startup_epoch_custody_unsettled")
+
     def inspect_startup_locked(self, supervisor, guard):
         self.assert_supervisor(supervisor)
         self.policy.assert_held(guard)
@@ -565,9 +613,16 @@ class DailySuccessorOperation:
         return revalidate_startup_inventory(conn, self, supervisor, guard, snapshot)
 
     @contextmanager
-    def startup_sql_scope(self, supervisor):
+    def startup_sql_scope(self, supervisor, *, acquiring=False):
         from .daily_successor_epoch import current_sql_owner
-        self.assert_supervisor(supervisor)
+        if type(acquiring) is not bool:
+            self._fail("startup_scope_invalid")
+        if acquiring:
+            self._source()
+            self.assert_readiness_published(self.owner)
+            self._assert_startup_binding(supervisor)
+        else:
+            self.assert_supervisor(supervisor)
         previous = getattr(_SQL_CURRENT, "operation", None)
         if (current_operation() is not None or current_sql_owner() is not None or
                 previous is not None and previous is not self):
@@ -575,6 +630,9 @@ class DailySuccessorOperation:
         _SQL_CURRENT.operation = self
         try:
             yield
+        except BaseException as error:
+            self._retain_error(error)
+            raise
         finally:
             _SQL_CURRENT.operation = previous
 

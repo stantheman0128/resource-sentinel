@@ -959,7 +959,9 @@ class LifecycleStore:
         target = self.db_path if pinned is None else pinned.as_uri() + "?mode=rw"
         acquisition = None if successor is None else successor.begin_sql_acquisition()
         try:
-            conn = sqlite3.connect(target, uri=pinned is not None, timeout=5, isolation_level=None)
+            from .operation_waits import sqlite_options
+            conn = sqlite3.connect(target, uri=pinned is not None, isolation_level=None,
+                                   **sqlite_options(timeout=5))
         except BaseException as error:
             if successor is not None:
                 successor.sql_acquisition_failed(acquisition, error)

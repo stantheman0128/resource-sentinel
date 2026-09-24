@@ -220,7 +220,8 @@ class Coordinator:
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path, timeout=10, isolation_level=None)
+        from .adaptive.operation_waits import sqlite_options
+        conn = sqlite3.connect(self.db_path, isolation_level=None, **sqlite_options(timeout=10))
         try:
             conn.row_factory = sqlite3.Row
             from .adaptive.daily_generation import prepare_connection
@@ -368,7 +369,8 @@ class Coordinator:
         experiment = getattr(context, "_experiment_demand", None)
         if experiment is not None:
             experiment._check_previous_submission_guard()
-        deadline = time.monotonic() + 1.0
+        from sentinel.adaptive.operation_waits import remaining_timeout_ms
+        deadline = time.monotonic() + remaining_timeout_ms(1000) / 1000
         while True:
             try:
                 context._submission_prepare_unknown = True
@@ -384,7 +386,8 @@ class Coordinator:
                 if getattr(error, "__notes__", ()) or time.monotonic() >= deadline:
                     raise
                 # No native scope or database connection survives this wait.
-                time.sleep(min(.01, max(0, deadline - time.monotonic())))
+                time.sleep(min(.01, max(0, deadline - time.monotonic()),
+                               remaining_timeout_ms(1000) / 1000))
             except BaseException:
                 # prepare may have committed its nonce before failing. Without
                 # a returned original guard its publication cannot be adopted.

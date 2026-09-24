@@ -266,7 +266,8 @@ class PolicyCoordinator:
             raise PolicyError("policy_scope_nested")
         guard._native_exit_confirmed = False
         guard._native_no_entry_confirmed = False
-        scope = self.provider.hold(guard.binding, timeout_ms=250)
+        from .operation_waits import remaining_timeout_ms
+        scope = self.provider.hold(guard.binding, timeout_ms=remaining_timeout_ms(250))
         enter, leave = getattr(type(scope), "__enter__", None), getattr(type(scope), "__exit__", None)
         if not callable(enter) or not callable(leave):
             raise PolicyError("invalid_policy_scope")

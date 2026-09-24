@@ -220,6 +220,7 @@ class HostAuthority:
         path = _ledger_path(self.store)
         try:
             with _coverage_read_transaction(path) as conn:
+                self._ordinary_execution(conn, execution_id, HostAuthorityError)
                 live = self._live_row(conn, execution_id, HostAuthorityError,
                                       "host_coverage_execution_missing")
                 self._match(row, live, HostAuthorityError, "host_coverage_row_mismatch")
@@ -252,6 +253,7 @@ class HostAuthority:
         if not isinstance(row, dict) and not hasattr(row, "keys"):
             raise HostAuthorityError("host_exclusion_row_invalid")
         execution_id = self._execution_id(row, HostAuthorityError, "host_exclusion_row_invalid")
+        self._ordinary_execution_at_path(_ledger_path(self.store), execution_id, HostAuthorityError)
         job_name = row["job_name"] if "job_name" in row else None
         job_nonce = row["job_nonce"] if "job_nonce" in row else None
         if (type(job_name) is not str or type(job_nonce) is not str or
@@ -308,6 +310,7 @@ class HostAuthority:
         if execution_id != snapshot.execution_id:
             raise HostReadinessError("host_readiness_row_mismatch")
         self._endpoint(endpoint, snapshot)
+        self._ordinary_execution_at_path(_ledger_path(self.store), execution_id, HostReadinessError)
         try:
             live = self.store.query(execution_id, existing_path=True)
         except LifecycleError as error:
@@ -322,6 +325,26 @@ class HostAuthority:
                                   "host_readiness_coverage_unverified") from None
 
     # Shared helpers -------------------------------------------------------
+
+    @staticmethod
+    def _ordinary_execution_at_path(path, execution_id, error_type):
+        try:
+            with _coverage_read_transaction(path) as conn:
+                HostAuthority._ordinary_execution(conn, execution_id, error_type)
+        except error_type:
+            raise
+        except (LifecycleError, sqlite3.Error, OSError, ValueError):
+            raise error_type("host_experiment_link_unavailable") from None
+
+    @staticmethod
+    def _ordinary_execution(conn, execution_id, error_type):
+        from .experiment_local_backing import LocalBackingError, assert_ordinary_execution
+        try:
+            assert_ordinary_execution(conn, execution_id)
+        except LocalBackingError as error:
+            raise error_type(error.reason) from None
+        except (sqlite3.Error, ValueError, TypeError):
+            raise error_type("host_experiment_link_unavailable") from None
 
     @staticmethod
     def _execution_id(row, error_type, reason):

@@ -47,6 +47,7 @@ _PRELOAD = (
     "daily_successor_registration_inventory",
     "experiment_host_ledger", "experiment_host_backing",
     "experiment_host_scope", "experiment_host_creation", "experiment_host_transport",
+    "operation_waits", "experiment_partition_admission", "experiment_local_backing",
 )
 _EMPTY_TABLES = ("reservations", "worker_reservations", "queue", "managed_executions")
 

@@ -136,6 +136,7 @@ class _TransferDuplicate(_DuplicateCleanup):
                                          source_process=source_process)
         except BaseException as error:
             if (getattr(error, "_native_duplicate_failed", False) is True
+                    and not getattr(error, "_native_duplicate_outcome_unknown", False)
                     and self._output.value is None):
                 self._duplicate_outcome_unknown = False
             else:
@@ -244,8 +245,15 @@ class _WindowsBackend:
         source = current if source_process is None else source_process
         # Explicit bounded query rights; no inherited handle, SAME_ACCESS,
         # CLOSE_SOURCE or remote target handle is ever requested.
-        result = self.kernel.DuplicateHandle(source, locator, current,
-            C.byref(output), _PROCESS_ACCESS, False, 0)
+        try:
+            result = self.kernel.DuplicateHandle(source, locator, current,
+                C.byref(output), _PROCESS_ACCESS, False, 0)
+        except BaseException as error:
+            # Even an existing failure-shaped exception cannot establish the
+            # result of THIS native invocation. Preserve the owned output cell.
+            error._native_duplicate_failed = False
+            error._native_duplicate_outcome_unknown = True
+            raise
         if not result:
             error = IdentityUnavailable("process_duplicate_unavailable", C.get_last_error())
             error._native_duplicate_failed = True
@@ -525,21 +533,37 @@ class VerifiedProcess:
         if match is None or any(int(value) > 0xFFFFFFFF for value in match.groups()):
             raise ValueError("invalid_expected_logon_id")
         backend = _backend()
-        handle = backend.duplicate_process(source_handle)
-        owner = _DuplicateCleanup(backend, handle)
+        # Retain the actual native output cell before DuplicateHandle. A local
+        # output hidden in duplicate_process loses custody if native completion
+        # is interrupted before that helper returns.
+        owner = _TransferDuplicate(backend)
+        result = None
         try:
-            observed = backend.identity(handle)
+            owner.acquire(source_handle)
+            observed = backend.identity(owner._handle)
             if (observed.pid != expected_pid or
                     observed.logon_id != expected_logon_id):
                 raise IdentityUnavailable("identity_mismatch")
-            result = cls(backend, handle, observed)
+            result = cls(backend, owner._handle, observed)
             owner._handle = None  # ownership transfers only after verification
             return result
         except BaseException as error:
-            try:
-                owner.close()
-            except BaseException:
-                _retain_cleanup(error, owner)
+            # An interruption after construction/transfer but before return
+            # must retain/close the resulting owner, not the now-empty cell.
+            retained = result if result is not None and owner._handle is None else owner
+            error._identity_capture_cleanup_complete = False
+            # identity() can itself fail while closing a token. Closing this
+            # process duplicate says nothing about that separate native owner.
+            error._identity_capture_nested_cleanup_unsettled = (
+                getattr(error, "_native_close_outcome_unknown", False) or
+                getattr(error, "_native_close_failed", False) or _known_close_failure(error))
+            _transfer_cleanup(error, retained)
+            # Positive local evidence, not the mere absence of attached owners.
+            # Callers interrupted outside this helper cannot infer this receipt.
+            error._identity_capture_cleanup_complete = (
+                retained._handle is None and not retained._close_outcome_unknown and
+                not getattr(retained, "_duplicate_outcome_unknown", False) and
+                not error._identity_capture_nested_cleanup_unsettled)
             raise
 
     def observe(self) -> IdentityObservation:

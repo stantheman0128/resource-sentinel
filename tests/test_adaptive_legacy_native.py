@@ -34,6 +34,14 @@ class IdentityBackend:
             raise IdentityUnavailable("fixture_duplicate_failed")
         return 800
 
+    def duplicate_into(self, source, output, *, source_process=None):
+        if source_process is not None:
+            raise AssertionError("legacy fixture only duplicates local handles")
+        self.calls.append(("duplicate", source))
+        if self.failure == "duplicate":
+            raise IdentityUnavailable("fixture_duplicate_failed")
+        output.value = 800
+
     def identity(self, handle):
         self.calls.append(("identity", handle))
         if self.failure == "identity":

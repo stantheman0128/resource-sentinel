@@ -42,6 +42,14 @@ class Backend:
             raise self.duplicate_error
         return 900
 
+    def duplicate_into(self, source, output, *, source_process=None):
+        if source_process is not None:
+            raise AssertionError("unexpected remote source")
+        self.duplicates.append(source)
+        if self.duplicate_error:
+            raise self.duplicate_error
+        output.value = 900
+
     def identity(self, handle):
         self.queries.append(handle)
         if self.identity_error:
@@ -167,7 +175,9 @@ class CreatedIdentityTests(unittest.TestCase):
         backend = object.__new__(identities._WindowsBackend)
         backend.kernel = SimpleNamespace(GetCurrentProcess=lambda: -1,
                                          DuplicateHandle=duplicate)
-        self.assertEqual(backend.duplicate_process(800), 901)
+        output = identities._HANDLE()
+        backend.duplicate_into(800, output)
+        self.assertEqual(output.value, 901)
         self.assertEqual(calls, [(-1, 800, -1, 0x1000 | 0x100000, False, 0)])
 
     def test_failed_native_duplicate_ignores_unusable_output_and_preserves_source(self):
@@ -179,7 +189,94 @@ class CreatedIdentityTests(unittest.TestCase):
                                          DuplicateHandle=duplicate)
         with patch.object(identities.C, "get_last_error", return_value=5, create=True), \
                 self.assertRaisesRegex(IdentityUnavailable, "process_duplicate_unavailable"):
-            backend.duplicate_process(800)
+            backend.duplicate_into(800, identities._HANDLE())
+
+    def test_duplicate_output_written_then_interrupted_retains_preowned_cell(self):
+        def interrupted(source, output, *, source_process=None):
+            output.value = 901
+            raise KeyboardInterrupt()
+        self.backend.duplicate_into = interrupted
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            self.capture()
+        error = raised.exception
+        self.assertFalse(error._identity_capture_cleanup_complete)
+        owner, = error._identity_handle_cleanup
+        self.assertEqual(owner._output.value, 901)
+        self.assertTrue(owner._duplicate_outcome_unknown)
+        with self.assertRaises(IdentityUnavailable):
+            retry_identity_cleanup(error)
+        self.assertEqual(self.backend.closes, [])
+
+    def test_explicit_duplicate_false_requires_untouched_output(self):
+        for output_value in (None, 901):
+            with self.subTest(output=output_value):
+                def failed(source, output, *, source_process=None):
+                    output.value = output_value
+                    error = IdentityUnavailable("process_duplicate_unavailable", 5)
+                    error._native_duplicate_failed = True
+                    raise error
+                self.backend.duplicate_into = failed
+                with self.assertRaises(IdentityUnavailable) as raised:
+                    self.capture()
+                self.assertEqual(raised.exception._identity_capture_cleanup_complete,
+                                 output_value is None)
+                if output_value is not None:
+                    self.assertTrue(raised.exception._identity_handle_cleanup)
+        self.assertEqual(self.backend.closes, [])
+
+    def test_failure_reason_without_positive_native_false_stays_unknown(self):
+        self.backend.duplicate_error = IdentityUnavailable("process_duplicate_unavailable", 5)
+        with self.assertRaises(IdentityUnavailable) as raised:
+            self.capture()
+        self.assertFalse(raised.exception._identity_capture_cleanup_complete)
+        self.assertTrue(raised.exception._identity_handle_cleanup)
+        self.assertEqual(self.backend.closes, [])
+
+    def test_native_invocation_exception_overrides_preexisting_false_marker(self):
+        failure = IdentityUnavailable("process_duplicate_unavailable", 5)
+        failure._native_duplicate_failed = True
+        backend = object.__new__(identities._WindowsBackend)
+        backend.kernel = SimpleNamespace(GetCurrentProcess=lambda: -1,
+                                         DuplicateHandle=Mock(side_effect=failure))
+        with self.assertRaises(IdentityUnavailable) as raised:
+            backend.duplicate_into(800, identities._HANDLE())
+        self.assertIs(raised.exception, failure)
+        self.assertFalse(failure._native_duplicate_failed)
+        self.assertTrue(failure._native_duplicate_outcome_unknown)
+
+    def test_outer_duplicate_cleanup_cannot_settle_nested_token_close_failure(self):
+        for known in (False, True):
+            with self.subTest(known_false=known):
+                failure = IdentityUnavailable("process_handle_close_failed", 6)
+                failure._native_close_failed = known
+                failure._native_close_outcome_unknown = not known
+                self.backend.identity_error = failure
+                with self.assertRaises(IdentityUnavailable) as raised:
+                    self.capture()
+                self.assertFalse(raised.exception._identity_capture_cleanup_complete)
+                self.assertTrue(raised.exception._identity_capture_nested_cleanup_unsettled)
+        self.assertEqual(self.backend.closes, [900, 900])
+
+    def test_interruption_after_result_transfer_closes_result_owner(self):
+        # A trace exception at the final return models interruption after the
+        # temporary owner transferred its handle, before the caller receives it.
+        method = VerifiedProcess.duplicate_from_handle.__func__
+        previous = sys.gettrace()
+        def interrupt(frame, event, _argument):
+            if (frame.f_code is method.__code__ and event == "line" and
+                    frame.f_locals.get("result") is not None and
+                    frame.f_locals.get("owner")._handle is None):
+                sys.settrace(None)
+                raise KeyboardInterrupt()
+            return interrupt
+        try:
+            sys.settrace(interrupt)
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                self.capture()
+        finally:
+            sys.settrace(previous)
+        self.assertEqual(self.backend.closes, [900])
+        self.assertTrue(raised.exception._identity_capture_cleanup_complete)
 
 
 class LaunchApi:

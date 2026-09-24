@@ -43,6 +43,12 @@ class IdentityBackend:
         self.calls.append(("duplicate", source))
         return IDENTITY_HANDLE
 
+    def duplicate_into(self, source, output, *, source_process=None):
+        if source_process is not None:
+            raise AssertionError("launcher fixture only duplicates local handles")
+        self.calls.append(("duplicate", source))
+        output.value = IDENTITY_HANDLE
+
     def identity(self, handle):
         self.calls.append(("identity", handle))
         if self.failure is not None:

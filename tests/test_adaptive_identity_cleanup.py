@@ -46,6 +46,12 @@ class BackendFixture(identities._WindowsBackend):
         self.duplicated.append(source)
         return 900
 
+    def duplicate_into(self, source, output, *, source_process=None):
+        if source_process is not None:
+            raise AssertionError("cleanup fixture only duplicates local handles")
+        self.duplicated.append(source)
+        output.value = 900
+
     def identity(self, handle):
         self.queries.append(("identity", handle))
         if self.identity_error is not None:

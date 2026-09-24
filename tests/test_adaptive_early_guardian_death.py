@@ -28,6 +28,11 @@ class CreationBackend(ProcessBackend):
         self.events.append(("duplicate_creation", handle, duplicate))
         return duplicate
 
+    def duplicate_into(self, handle, output, *, source_process=None):
+        super().duplicate_into(handle, output, source_process=source_process)
+        if source_process is None:
+            self.events.append(("duplicate_creation", handle, output.value))
+
     def open_process(self, pid):
         raise AssertionError("early recovery must never reopen a PID")
 

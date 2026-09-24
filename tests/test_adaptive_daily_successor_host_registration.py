@@ -25,6 +25,10 @@ class CreationBackend(ProcessBackend):
     def duplicate_process(self, handle):
         return self.new_handle(self.state(handle))
 
+    def duplicate_into(self, handle, output, *, source_process=None):
+        # Preserve the shared fixture's object mapping and duplicate events.
+        super().duplicate_into(handle, output, source_process=source_process)
+
 
 class Creation:
     """One synthetic Create result; retain the raw handle until fixture exit."""

@@ -260,6 +260,7 @@ class DailyExperimentDemand:
         self._generation_original = None
         self._policy_original = None
         self._release_operation = None
+        self._admission_settlement = None
         self._original_admission = None
         self._errors = []
         self._quarantine = None
@@ -525,7 +526,8 @@ class DailyExperimentDemand:
                     self._quarantine = (self._admission, error)
                 return
             pending.extend(cause for cause in (getattr(current, "__cause__", None),
-                getattr(current, "__context__", None), getattr(current, "_daily_readiness_cause", None))
+                getattr(current, "__context__", None), getattr(current, "_daily_readiness_cause", None),
+                getattr(current, "_policy_entry_cleanup_error", None))
                 if isinstance(cause, BaseException))
 
     def _static_original(self):

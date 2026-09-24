@@ -28,6 +28,37 @@ class PolicyBusy(PolicyError):
     pass
 
 
+def _cleanup_outcome_unverified(error, *, local_only=False):
+    """Bounded inspection of retained cleanup failures, never new authority."""
+    pending, seen = [error], set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if (len(seen) > 32 or
+                not isinstance(current, Exception) and not (local_only and current is error) or
+                any(note != "policy_entry_cleanup_failed" for note in getattr(current, "__notes__", ())) or
+                any(getattr(current, name, None) for name in (
+                    "_sentinel_connection_cleanup", "_identity_handle_cleanup", "_policy_mutex_cleanup",
+                    "_native_close_outcome_unknown", "_native_duplicate_outcome_unknown", "io_pending",
+                    "_daily_readiness_cleanup_pending", "daily_readiness_current_process",
+                    "_daily_readiness_connection", "_daily_readiness_owner", "daily_readiness_scope",
+                    "_daily_readiness_authority", "experiment_connection_owner", "experiment_scope_sql_owner"))):
+            return True
+        pending.extend(value for value in (getattr(current, "__cause__", None),
+            getattr(current, "__context__", None), getattr(current, "_daily_readiness_cause", None),
+            getattr(current, "_policy_entry_cleanup_error", None)) if isinstance(value, BaseException))
+    return False
+
+
+def _retain_clear_failure(primary, cleanup_error):
+    primary._policy_entry_cleanup_error = cleanup_error
+    primary.add_note("policy_entry_cleanup_failed")
+    if _cleanup_outcome_unverified(cleanup_error):
+        primary.add_note("policy_entry_cleanup_unverified")
+
+
 def _uuid(value):
     try:
         parsed = UUID(value) if isinstance(value, str) else None
@@ -248,8 +279,8 @@ class PolicyCoordinator:
                 guard._native_no_entry_confirmed = True
                 try:
                     self._clear(guard)
-                except BaseException:
-                    error.add_note("policy_entry_cleanup_failed")
+                except BaseException as cleanup_error:
+                    _retain_clear_failure(error, cleanup_error)
             raise
         safe_to_clear = False
         try:
@@ -295,8 +326,8 @@ class PolicyCoordinator:
                 if safe_to_clear or (guard.clean_rejection and not notes):
                     try:
                         self._clear(guard)
-                    except BaseException:
-                        primary.add_note("policy_entry_cleanup_failed")
+                    except BaseException as cleanup_error:
+                        _retain_clear_failure(primary, cleanup_error)
             raise
         else:
             # The production provider returns only after ReleaseMutex and

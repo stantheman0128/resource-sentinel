@@ -33,8 +33,9 @@ Unknown native/SQL/self close retains the original owner and refuses reopening.
 A documented final CloseHandle FALSE may retry only that same original owner
 after full readback; positive close followed by interrupted local bookkeeping
 resumes without another native call. Initial admission uncertainty before a
-completion can be minted remains a separate pending source item: an irreversibly
-sealed demand currently lacks a public original-admission settlement route.
+completion can be minted now has a separate original-only settlement route,
+described below. It clears the original pending guard after positive cleanup;
+it grants neither completion nor capacity-release authority.
 
 The separate `experiment_history` module implements the closed, bounded data
 validator. It validates the immutable admission metadata, exact terminal managed
@@ -463,7 +464,7 @@ original source manifest may require a bounded 2 MiB receipt_json cell; the
 retirement reader allows that exact canonical column while preserving
 its 64 KiB default cell bound and shared 16 MiB aggregate inventory limit.
 
-## Original admission settlement before completion (next source slice)
+## Original admission settlement before completion (implemented source)
 
 An initial admission may commit successfully and then lose its COMMIT or nonce
 clear acknowledgement. `seal_without_native()` seals future work before checking
@@ -472,7 +473,7 @@ there must be a distinct way to settle its retained original admission guard.
 No completion can be required as input: minting that completion is the operation
 currently blocked by the unfinished admission guard.
 
-Add `Coordinator.settle_experiment_admission(demand)` for the exact original
+`Coordinator.settle_experiment_admission(demand)` accepts only the exact original
 `DailyExperimentDemand`. Retain a separate concrete settlement operation before
 its first SQL acquisition. Seal further admission/native preparation without
 resetting any existing seal. It owns only bounded reads and exact original nonce
@@ -516,3 +517,28 @@ actually admitted unused claim and use the already implemented release route.
 Repeat settlement must not reacquire/re-publish a nonce, renew capacity, or
 replace any original owner. This amendment adds no native acceptance evidence
 and does not activate the daily source/configuration.
+
+Implementation boundary: shared cleanup access accepts only the two concrete
+retained operation types. Settlement can enter READ/CLEAR only; release retains
+its separate completion-bound publication authority. A cycle-safe 32-node error
+graph preserves nested original clear failures. A positive SQL close followed
+by a lost clear acknowledgement can retire its original readiness authority;
+unknown close or native cleanup retains that authority and forbids reacquisition.
+Partial local bookkeeping after confirmed cleanup may resume on the same owner,
+without another nonce write, fresh guard or native call.
+
+The two new test files contain 30 cases using actual isolated SQLite flows and
+explicit synthetic identity/native/transport fixtures. The focused six-module
+run passed 92 tests in 29.889 seconds with zero failures/errors/skips. The first
+84-test run had one fixture error: the original quarantined demand correctly
+refused before creating a settlement operation. The repaired assertion checks
+the retained original failed connection and repeated refusal without SQL.
+These are source/custody tests, not native acceptance. Queued/rejected final
+context cleanup remains separate work; settlement never cancels those rows.
+The final 25-module consumer regression passed 607 tests in 88.498 seconds,
+zero failures/errors/skips (88.753 seconds including runner overhead). It covers
+readiness, generation/retirement, POLICY, guardian, native identity smoke,
+original experiment scope/release and managed admission. The planning README
+records the exact equivalent command. Tests rely on the protected dirty
+baseline; this is neither a clean-clone full-suite result nor native control
+acceptance. No daily configuration, Scheduled Task or global startup changed.

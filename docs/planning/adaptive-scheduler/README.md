@@ -4,6 +4,78 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
+原始 initial admission 的 sealed cleanup 入口已實作：
+`Coordinator.settle_experiment_admission(demand)` 只接受同一 retained demand，
+使用原始 generation／POLICY／nonce／transaction／process witness 做有界
+READ／CLEAR。它不重新准入、不取得新 readiness／native mutex、不釋放容量，
+也不製造 completion。原始 SQL 與 native cleanup 都正面確認後，才清除 pending
+guard；之後原有 `seal_without_native()`／typed release 可繼續處理已准入需求。
+重試仍綁定同一 owner；未知 close 保留原始物件並拒絕重新開啟。
+
+同時補上 POLICY timeout／body failure 中被忽略的 nonce-clear exception，
+以有界 error graph 保留確切 SQL／native owner。Readiness 只將「clear ACK 遺失、
+但原始 SQL 已正面關閉」視為可收尾；未知清理仍保持隔離。兩個新增檔共 30 個
+案例，涵蓋原始 SQLite admission／settlement／completion／release、DRAINING、
+HOLD、複製物件拒絕、清理結果未知與本機 bookkeeping 中斷。
+
+首次新增案例批次 84 tests 有 1 error：原 demand 已隔離，程式會在建立 settlement
+前拒絕，但 fixture 仍讀取不存在的 operation。修正 fixture 為核對原始 exception／
+connection 保留及重試無 SQL；沒有放寬 source 檢查。後續六模組 **92 tests 全過，
+29.889 秒，0 failures／errors／skips**；私人日誌為
+`.local-adaptive/admission-settlement-20260924-2.log`。獨立 review 完成，修正後
+沒有其他 actionable finding。
+
+最終共用 consumer 回歸 **25 模組、607 tests 全過，88.498 秒，
+0 failures／errors／skips**（runner 88.753 秒），私人日誌為
+`.local-adaptive/admission-settlement-final-20260924-1.log`。範圍包括 readiness、
+generation／retirement、POLICY、guardian、native identity smoke、原始 experiment
+scope／release 與 managed admission。與上述批次重疊，不加總 distinct cases。
+使用 Windows／`C:\Python313\python.exe`、正常日常 wrapper 的
+`HEAVY / P2 / CPU 1 / RAM 1 GiB / I/O 0`，沒有豁免。測試依賴受保護的未提交
+baseline；沒有宣稱 clean-clone 全套通過。沒有執行 native CPU cap／fault spikes，
+沒有修改日常 config、Scheduled Task 或全域啟動入口。
+
+從 implementation worktree 執行本批等價回歸命令：
+
+```powershell
+$sentinelSettlementTests = @(
+    'tests.test_adaptive_daily_connection_hooks'
+    'tests.test_adaptive_daily_generation'
+    'tests.test_adaptive_daily_readiness_lock_boundary'
+    'tests.test_adaptive_daily_readiness_transport'
+    'tests.test_adaptive_daily_retirement_integration'
+    'tests.test_adaptive_daily_retirement_policy'
+    'tests.test_adaptive_evidence_scope'
+    'tests.test_adaptive_experiment_demand'
+    'tests.test_adaptive_experiment_exclusion'
+    'tests.test_adaptive_experiment_preparation'
+    'tests.test_adaptive_experiment_scope'
+    'tests.test_adaptive_experiment_scope_journal'
+    'tests.test_adaptive_guardian_accounting'
+    'tests.test_adaptive_guardian_operations_host'
+    'tests.test_adaptive_guardian_startup_retention'
+    'tests.test_adaptive_native_job'
+    'tests.test_adaptive_policy_fencing'
+    'tests.test_adaptive_policy_scope'
+    'tests.test_adaptive_experiment_admission_settlement'
+    'tests.test_adaptive_policy_cleanup_custody'
+    'tests.test_adaptive_experiment_release'
+    'tests.test_adaptive_experiment_release_native'
+    'tests.test_adaptive_experiment_release_custody'
+    'tests.test_adaptive_experiment_release_hooks'
+    'tests.test_adaptive_managed_admission'
+)
+$sentinelSettlementCommand = 'C:\Python313\python.exe -m unittest ' + ($sentinelSettlementTests -join ' ') + ' -q'
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command $sentinelSettlementCommand -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
+Settlement 對 QUEUED／SUBMISSION_REJECTED／absence 只回報觀測狀態，不提供
+cancel、self close 或釋放權限。這些需求的原始 context 最終收尾、native scope
+remote owner、actual serial provider、fresh-generation restart，以及 P4／S3／P6
+下述缺口仍需 source 工作。Native gate 未通過，production adaptive 維持 off。
+
+### 先前原始 release checkpoint（歷史驗證）
+
 原始 experiment release 已實作：`Coordinator.release_experiment` 只接受原 demand
 保留的 typed operation，在同一交易發布 receipt、unused daily cancellation、
 archive、精確 reservation／queue 刪除、CLOSED exclusion 與 registry revision。
@@ -32,10 +104,10 @@ SQL／native POLICY 正面清理及完整歷史 readback 後，才關閉原始 s
 實際 Win32 I/O、source/readiness attestation 與 transport 使用明確 synthetic
 fixtures，尚未證明 fresh native admission／serial provider 或任何 native gate。
 測試仍依賴受保護的 dirty baseline；沒有修改日常 config、Scheduled Task、啟動
-入口，沒有對真實工作施加 Job 限制。**Initial admission 回覆遺失後的 sealed
-demand guard 收尾入口、remote scope owner、actual provider 與 fresh restart
-仍是 source 缺口。** 接下來先補原始 admission 的 cleanup-only settlement，
-不得以新 admission、重設 seal 或假的 completion 代替。
+入口，沒有對真實工作施加 Job 限制。當時尚缺的 initial admission sealed
+cleanup 入口已在上方最新 checkpoint 補上；remote scope owner、actual provider
+與 fresh restart 仍是 source 缺口，不能以新 admission、重設 seal 或假的
+completion 代替。
 
 本批 source 回歸可從 implementation worktree 以 PowerShell 執行下列等價命令。
 它不會執行 S1–S3 native acceptance；私密逐例日誌由本機 runner 另外保存。
@@ -74,8 +146,8 @@ production FINISHED／C2 的各自證據，從同一 snapshot 的原始 SQL rows
 UDF、舊拒絕位置／訊息預期，以及三個 C2 fixture 欄位引用錯誤；修正後仍保留
 拒絕、實際 INSERT 失敗 rollback 與歷史完整性斷言。這個 consumer 提交本身
 不提供原始 receipt publisher；原子 release 的後續驗證見上方最新 checkpoint。
-此外，initial admission 回覆遺失後若 completion seal 已生效，原 admission
-guard 的公開收尾入口仍需補上，不能將它列為只需外部 console 的缺口。
+此 consumer checkpoint 當時尚缺的 initial admission guard 公開收尾入口，
+已由上方最新 settlement source 補上；其驗證不等於 native provider 完成。
 
 Cleanup history 資料驗證器已完成：**9 模組、165 tests 全過，21.627 秒，
 0 failures／errors／skips**，包含 23 個 history 案例；完整私人日誌為
@@ -247,7 +319,7 @@ loader error 或未跑的 native gate 算成 pass。
 | 2. 裁決 ④ | 契約與 source 完成；最後完整 adaptive 2,127 tests 通過。沒有舊 witness 的 cold adoption 仍不支援；native recovery 未驗證。 |
 | 3. helper sender | Source 接線、獨立 review 與完整 2,298 tests 通過。後續 original launch/stdio provenance、guardian scope 比對與 helper proposal adapter 已接線，344 targeted tests 通過（30.960 秒，含 30 個專用 scope tests）。實際 S2 topology producer／native bundle／新增採集成本仍未驗證，缺證據不啟用控制。 |
 | 4. release／CLI | Source 整合與完整 2,800 tests 通過；包含 exact discovery、typed operator transport、原子 off／audit、同 owner 收尾與三個 host 的 drain。後續 rootless C2 post-close receipt 已補上，保持原 terminal state，不偽造 FINISHED；新增 29 個案例。232 targeted tests 中 231 通過，唯一錯誤文字預期修正後單獨重跑通過，production 未因該失敗改動。沒有原始 close 證據的舊歷史仍 unknown。Native 操作通訊、控制及恢復仍未驗證。 |
-| 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport 與接線](P2-DAILY-ACTIVATION.md)已完成 installer、常駐 owner 與日常 consumers 接線。Generation 正面退場整合 654 tests 通過（94.827 秒）；readiness／preparation 最終整合 493 tests 通過（55.779 秒）。Typed daily release／歷史重用已實作，最終原始 scope／POLICY／retirement 整合 322 tests 全過（85.971 秒），範圍見最新 checkpoint。Sealed demand 的 initial admission guard 收尾、native scope remote owner、真正 native provider 與 fresh restart 仍待完成。未執行日常安裝，grace 前提未解鎖。 |
+| 5. 全程容量覆蓋 | [Source generation／retained cohort／readiness transport 與接線](P2-DAILY-ACTIVATION.md)已完成 installer、常駐 owner 與日常 consumers 接線。Generation 正面退場整合 654 tests 通過（94.827 秒）；readiness／preparation 整合 493 tests 通過（55.779 秒）。Typed daily release／歷史重用已實作，原始 scope／POLICY／retirement 整合 322 tests 全過（85.971 秒）。Sealed demand 的 initial admission guard 收尾已實作，最新驗證見上方 checkpoint。Queued／rejected 原始 context 最終收尾、native scope remote owner、真正 native provider 與 fresh restart 仍待完成。未執行日常安裝，grace 前提未解鎖。 |
 | 6. console 驗收命令 | [P6 矩陣編排與 raw reducer](P6-RUNNER-CONTRACT.md)、[S1/S2 bridge 契約](S1-DAILY-BRIDGE-CONTRACT.md)、[S3 精確故障點與 14×10 記錄器](S3-REAL-HOST-RECOVERY.md)、[P4 實際 host 成本量測](P4-OVERHEAD-RUNNER.md)已提交。新 bounded telemetry／helper 非阻塞接線 276 tests 通過（8.418 秒）；P4 原 sink 與 v2 schema 最新 259 tests 通過（13.765 秒）。Actual provider、部分 S3 故障 driver／完整 orchestration、A0 等價性及 P4 native storage／overhead 證據仍缺；不是只剩 console 執行。 |
 
 最新追加：項目 5 的同帳本 demand 與 retirement fence 已提交為 `1072786`／
@@ -262,8 +334,8 @@ reducer 已提交為 `ff6f31b`，S3 原始 action cutpoints／三個實際故障
 以上是目前缺口；下列較早日期的段落保留其歷史測試範圍。Native S1–S3、完整
 P3–P6 都尚未通過。日常 config／Scheduled Task／啟動入口未修改。
 
-下一步是項目 5 原始 admission guard 的 sealed cleanup 入口、native provider
-接線與 fresh-generation restart。新增測試將繼續使用隔離帳本；任何實際
+下一步是項目 5 queued／rejected 原始 context 最終收尾、native provider／remote
+owner 接線與 fresh-generation restart。新增測試將繼續使用隔離帳本；任何實際
 日常 source activation 都需要獨立授權，不因 commit/push 自動執行。項目 6
 尚未完成的內容不能以 mock、空 provider、另外一個 DB 或假量測取代。
 

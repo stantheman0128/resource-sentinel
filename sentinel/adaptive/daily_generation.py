@@ -63,8 +63,20 @@ def _readiness_cleanup_unknown(error):
         if current is None or id(current) in seen:
             continue
         seen.add(id(current))
-        if (getattr(current, "__notes__", ()) or
+        notes = tuple(getattr(current, "__notes__", ()))
+        if notes:
+            from .policy import _cleanup_outcome_unverified
+            # A retained clear ACK failure with positively completed SQL close
+            # is not an outstanding readiness resource. Never infer this from
+            # the note alone, or hide any nested original cleanup obligation.
+            benign_clear_ack = (all(note == "policy_entry_cleanup_failed" for note in notes) and
+                isinstance(getattr(current, "_policy_entry_cleanup_error", None), BaseException) and
+                not _cleanup_outcome_unverified(current))
+            if not benign_clear_ack:
+                return True
+        if (len(seen) > 32 or
                 getattr(current, "_daily_readiness_cleanup_pending", False) or
+                getattr(current, "_sentinel_connection_cleanup", None) is not None or
                 getattr(current, "_identity_handle_cleanup", ()) or
                 getattr(current, "_policy_mutex_cleanup", ()) or
                 getattr(current, "experiment_scope_sql_owner", None) is not None or
@@ -74,7 +86,8 @@ def _readiness_cleanup_unknown(error):
                 getattr(current, "io_pending", False)):
             return True
         pending.extend((getattr(current, "_daily_readiness_cause", None),
-                        getattr(current, "__cause__", None)))
+                        getattr(current, "__cause__", None), getattr(current, "__context__", None),
+                        getattr(current, "_policy_entry_cleanup_error", None)))
     return False
 
 

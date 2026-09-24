@@ -683,6 +683,11 @@ class Coordinator:
             owner._retain_submission_error(error)
             raise
 
+    def settle_experiment_admission(self, owner):
+        """Settle one original sealed experiment admission without new work."""
+        from sentinel.adaptive.experiment_cleanup import settle_admission
+        return settle_admission(self, owner)
+
     def release_experiment(self, operation):
         """Release only a retained original experiment with positive cleanup.
 

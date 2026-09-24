@@ -431,6 +431,43 @@ class ExperimentHistoryTests(unittest.TestCase):
         with self.assertRaisesRegex(history.ExperimentHistoryError, "history_exceeded"):
             history._rows(rows, "bounded", ("value",), history._Budget(history.MAX_BYTES))
 
+    def test_remaining_row_budget_composes_all_tables_and_rejects_before_overflow_payload(self):
+        conn = self.database()
+        complete = history.verify_experiment_history_locked(conn)
+        self.assertEqual(history.verify_experiment_history_locked(conn, max_rows=complete.rows_used), complete)
+        with self.assertRaisesRegex(history.ExperimentHistoryError, "history_exceeded"):
+            history.verify_experiment_history_locked(conn, max_rows=complete.rows_used - 1)
+        marker = self.metadata["experiment_id"].encode()
+        def no_overflow_payload(value):
+            if value == marker:
+                raise AssertionError("zero row allowance materialized demand payload")
+            return value.decode("utf-8")
+        conn.text_factory = no_overflow_payload
+        with self.assertRaisesRegex(history.ExperimentHistoryError, "history_exceeded"):
+            history.verify_experiment_history_locked(conn, max_rows=0)
+        for invalid in (-1, history.MAX_ROWS + 1, True):
+            with self.subTest(max_rows=invalid), self.assertRaises(history.ExperimentHistoryError):
+                history.verify_experiment_history_locked(conn, max_rows=invalid)
+
+    def test_shared_4096_rows_are_not_a_per_table_allowance(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.execute("CREATE TABLE first_batch(value INTEGER)")
+        conn.execute("CREATE TABLE last_batch(value TEXT)")
+        conn.executemany("INSERT INTO first_batch VALUES(?)", ((number,) for number in range(history.MAX_HISTORY - 1)))
+        conn.executemany("INSERT INTO last_batch VALUES(?)", (("allowed",), ("overflow-payload",)))
+        def no_overflow_payload(value):
+            if value == b"overflow-payload":
+                raise AssertionError("4097th payload crossed the shared SQL read boundary")
+            return value.decode("utf-8")
+        conn.text_factory = no_overflow_payload
+        budget = history._Budget(history.MAX_BYTES)
+        self.assertEqual(len(history._rows(conn, "first_batch", ("value",), budget)), history.MAX_HISTORY - 1)
+        with self.assertRaisesRegex(history.ExperimentHistoryError, "history_exceeded"):
+            history._rows(conn, "last_batch", ("value",), budget)
+        self.assertEqual(budget.rows, history.MAX_HISTORY)
+        self.assertEqual(len(budget.observed), history.MAX_HISTORY)
+
     def test_duplicate_json_key_and_inconsistent_receipt_column_refused(self):
         for mutate in (lambda conn: conn.execute("UPDATE " + history.TABLE +
                 " SET receipt_json=?", ('{"schema_version":1,"schema_version":1}',)),

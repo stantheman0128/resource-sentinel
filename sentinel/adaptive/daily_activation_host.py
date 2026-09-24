@@ -45,6 +45,7 @@ _PRELOAD = (
     "daily_successor_history", "daily_successor_inventory",
     "daily_successor_epoch", "daily_successor_startup_inventory",
     "daily_successor_registration_inventory",
+    "experiment_host_ledger",
 )
 _EMPTY_TABLES = ("reservations", "worker_reservations", "queue", "managed_executions")
 

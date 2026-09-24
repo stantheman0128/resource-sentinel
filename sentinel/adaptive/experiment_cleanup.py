@@ -553,6 +553,7 @@ class ExperimentReleaseOperation(_OriginalCleanupAccess):
     def _prepare_publication(self, conn):
         from . import experiment_history as history
         from . import experiment_demand, experiment_exclusion
+        from .experiment_host_ledger import HostLedgerError, assert_release_unblocked_locked
         observed = history.verify_experiment_history_locked(conn)
         if self.snapshot.execution_id in observed.completed_execution_ids:
             self._verify_committed(conn)
@@ -568,6 +569,15 @@ class ExperimentReleaseOperation(_OriginalCleanupAccess):
         reservation_id = metadata["reservation_id"]
         if metadata != self.demand._binding(reservation_id):
             _fail("admission_binding_changed", self)
+        # S1/before-native completion cannot retire a separately registered
+        # production-host cohort. Its distinct original completion and full
+        # aggregate publication must exist before that release path can open.
+        try:
+            assert_release_unblocked_locked(conn,
+                experiment_id=self.demand.declaration.experiment_id,
+                execution_id=self.snapshot.execution_id, reservation_id=reservation_id)
+        except HostLedgerError as error:
+            raise ExperimentReleaseError("host_scope_cleanup_unverified", self) from error
         managed = history._one(conn, "managed_executions", history.MANAGED_FIELDS, budget,
             "execution_id=? OR reservation_id=?", (self.snapshot.execution_id, reservation_id))
         self.inner._validate_cancel_allocation(history._one(conn, "reservations", history.ALLOCATION_FIELDS,

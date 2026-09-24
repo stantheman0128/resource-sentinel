@@ -370,6 +370,19 @@ def read_locked(conn, *, policy, guard):
     history = _history_locked(conn)
     if not present:
         return ExclusionInventory((), frozenset(), ())
+    return _inventory_from_history_locked(conn, guard, history)
+
+
+def _inventory_from_history_locked(conn, guard, history):
+    """Convert this transaction's verified history without reading it twice.
+
+    Internal aggregate composition only. The caller owns the same daily POLICY
+    and SQL snapshot and ran the strict field precheck plus history verifier.
+    This returned inventory is observational, never native or release authority.
+    """
+    from .experiment_history import ExperimentHistory
+    if type(history) is not ExperimentHistory:
+        _fail("history_unverified")
     rows = [json.loads(value) for value in history.exclusions_json]
     active = [row for row in rows if row["phase"] != "CLOSED"]
     if len(active) > MAX_SCOPES:
@@ -387,22 +400,26 @@ def read_locked(conn, *, policy, guard):
     return ExclusionInventory(tuple(bindings), frozenset(identities), tuple(jobs))
 
 
+def _precheck_history_locked(conn):
+    # Preserve this consumer's narrower pre-materialization field bounds;
+    # the shared history reader's generic 64 KiB ceiling is not a substitute
+    # for NUL/type checks on actor and path metadata.
+    for table, fields, bounds in ((TABLE, _FIELDS, _BOUNDS),
+            (experiment_demand.TABLE, experiment_demand._FIELDS,
+             {name: (32768 if name == "scope_directory" else 2048)
+              for name in experiment_demand._FIELDS if name not in {"schema_version", "revision", "owner_pid"}})):
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+            if table == experiment_demand.TABLE:
+                experiment_demand._schema(conn)
+            if conn.execute("SELECT 1 FROM " + table + " WHERE (" +
+                    " AND ".join(_bounded_checks(fields, bounds)) + ") IS NOT 1 LIMIT 1").fetchone():
+                _fail("row_unverified")
+
+
 def _history_locked(conn):
     from .experiment_history import ExperimentHistoryError, verify_experiment_history_locked
     try:
-        # Preserve this consumer's narrower pre-materialization field bounds;
-        # the shared history reader's generic 64 KiB ceiling is not a substitute
-        # for NUL/type checks on actor and path metadata.
-        for table, fields, bounds in ((TABLE, _FIELDS, _BOUNDS),
-                (experiment_demand.TABLE, experiment_demand._FIELDS,
-                 {name: (32768 if name == "scope_directory" else 2048)
-                  for name in experiment_demand._FIELDS if name not in {"schema_version", "revision", "owner_pid"}})):
-            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
-                if table == experiment_demand.TABLE:
-                    experiment_demand._schema(conn)
-                if conn.execute("SELECT 1 FROM " + table + " WHERE (" +
-                        " AND ".join(_bounded_checks(fields, bounds)) + ") IS NOT 1 LIMIT 1").fetchone():
-                    _fail("row_unverified")
+        _precheck_history_locked(conn)
         return verify_experiment_history_locked(conn)
     except ExperimentHistoryError:
         raise ExperimentExclusionError("history_unverified") from None

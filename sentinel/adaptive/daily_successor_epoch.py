@@ -166,14 +166,17 @@ def read_successor_guardian_epochs(conn, *, max_rows=MAX_ROWS, max_bytes=MAX_BYT
     if not _schema(conn):
         return SuccessorEpochHistory((), 0)
     # Classify SQLite cell types/sizes before fetching any text payload.
-    valid = " AND ".join(f"typeof({name})='text' AND length(CAST({name} AS BLOB))<={bound}"
+    valid = "_epoch_position<=" + str(max_rows) + " AND " + " AND ".join(f"typeof({name})='text' AND length(CAST({name} AS BLOB))<={bound}"
                          for name, bound in _TEXT_BOUNDS.items())
     valid += " AND " + " AND ".join(f"typeof({name})='integer'" for name in
         ("schema_version", "supervisor_pid", "previous_revision", "registry_revision"))
     projection = ",".join(f"CASE WHEN {valid} THEN {name} END" for name in _FIELDS)
     entries, total, transitions, epochs, revisions, generations = [], 0, set(), set(), set(), set()
+    # The overflow sentinel carries no payload into Python, even when the
+    # containing inventory has no rows remaining in its shared allowance.
     for row in conn.execute(f"SELECT {projection},CASE WHEN {valid} THEN 1 ELSE 0 END "
-                           f"FROM {TABLE} ORDER BY registry_revision LIMIT ?", (max_rows + 1,)):
+            f"FROM (SELECT {','.join(_FIELDS)},row_number() OVER (ORDER BY registry_revision) AS _epoch_position "
+            f"FROM {TABLE} ORDER BY registry_revision LIMIT ?) ORDER BY _epoch_position", (max_rows + 1,)):
         if len(entries) >= max_rows:
             _fail("rows_exceeded")
         if row[-1] != 1:

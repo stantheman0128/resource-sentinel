@@ -25,10 +25,12 @@ from .experiment_scope_journal import ScopeJournal, _BINDING as _SCOPE_BINDING, 
 
 
 TABLE = "adaptive_experiment_cleanup_receipts"
-# Match daily_retirement_inventory. Counts are per table; byte accounting is
-# additive across every projected row. Integrators must add bytes_used to their
-# existing inventory budget, not give this reader a separate 16 MiB allowance.
+# Preserve the existing metadata/per-table admission cap. The separate fixed
+# MAX_ROWS/MAX_BYTES bound the aggregate of every projected row in this reader.
+# Integrators pass their remaining allowances and charge rows_used/bytes_used
+# once to the enclosing inventory, rather than granting another full budget.
 MAX_HISTORY = 4096
+MAX_ROWS = 4096
 MAX_BYTES = 16 * 1024 * 1024
 MAX_RECEIPT_BYTES = 2 * 1024 * 1024
 MAX_CELL_BYTES = 65536
@@ -642,12 +644,16 @@ def schema_locked(conn, *, create=False):
 
 
 class _Budget:
-    def __init__(self, maximum):
+    def __init__(self, maximum, max_rows=MAX_ROWS):
         _integer(maximum, 0, MAX_BYTES)
+        _integer(max_rows, 0, MAX_ROWS)
         self.maximum, self.bytes, self.rows = maximum, 0, 0
+        self.max_rows = max_rows
         self.observed = []
 
     def add(self, value):
+        if self.rows >= self.max_rows:
+            _fail("history_exceeded")
         safe = {key: ({"blob_sha256": hashlib.sha256(item).hexdigest()} if type(item) is bytes else item)
                 for key, item in value.items()}
         self.bytes += len(_canonical(safe).encode("ascii"))
@@ -663,12 +669,19 @@ def _rows(conn, table, fields, budget, *, where="", parameters=(), limit=MAX_HIS
         _fail("row_schema_invalid")
     bounded = " AND ".join("(" + name + " IS NULL OR length(CAST(" + name + " AS BLOB))<=" +
         str(MAX_RECEIPT_BYTES if table == TABLE and name == "receipt_json" else MAX_CELL_BYTES) + ")" for name in fields)
-    projection = ",".join("CASE WHEN " + bounded + " THEN " + name + " END" for name in fields)
-    cursor = conn.execute("SELECT " + projection + ",CASE WHEN " + bounded + " THEN 1 ELSE 0 END FROM " + table +
-        (" WHERE " + where if where else "") + " ORDER BY rowid LIMIT ?", (*parameters, limit + 1))
+    allowance = min(limit, budget.max_rows - budget.rows)
+    # The one overflow row is a payload-free sentinel. Restrict the inner query
+    # as well, so a caller's remaining shared budget bounds every SQL read.
+    available = "_history_position<=" + str(allowance)
+    projection = ",".join("CASE WHEN " + available + " AND " + bounded + " THEN " + name + " END" for name in fields)
+    cursor = conn.execute("SELECT " + projection + ",CASE WHEN " + available + " AND " + bounded +
+        " THEN 1 ELSE 0 END FROM (SELECT " + ",".join(fields) +
+        ",row_number() OVER (ORDER BY rowid) AS _history_position FROM " + table +
+        (" WHERE " + where if where else "") + " ORDER BY rowid LIMIT ?) ORDER BY _history_position",
+        (*parameters, allowance + 1))
     result = []
     for values in cursor:
-        if len(result) >= limit:
+        if len(result) >= allowance:
             _fail("history_exceeded")
         if values[-1] != 1:
             _fail("cell_exceeded")
@@ -765,15 +778,15 @@ class ExperimentHistory:
     _sql_rows: tuple[_ObservedRow, ...]
 
 
-def verify_experiment_history_locked(conn, *, max_bytes=MAX_BYTES):
+def verify_experiment_history_locked(conn, *, max_rows=MAX_ROWS, max_bytes=MAX_BYTES):
     """Validate complete history on this snapshot; caller owns native POLICY.
 
-    max_bytes may only reduce the fixed budget, allowing retirement to pass its
-    remaining aggregate allowance. Return bytes_used must be charged once to
-    that parent inventory. No existence query or returned ID is native authority.
+    max_rows/max_bytes may only reduce the fixed budgets, allowing a containing
+    inventory to pass its remaining aggregate allowances. Returned rows_used and
+    bytes_used must be charged once. No returned ID is native authority.
     """
     _transaction(conn)
-    budget = _Budget(max_bytes)
+    budget = _Budget(max_bytes, max_rows)
     receipt_schema = schema_locked(conn)
     demand_schema = _schema_definition(conn, experiment_demand.TABLE, experiment_demand._TABLE_SQL,
         experiment_demand._FIELDS, experiment_demand._TRIGGER_SQL)

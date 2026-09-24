@@ -181,6 +181,7 @@ def unregister_dead_infrastructure_locked(store, role, process):
 
 def _registry_locked(store, guard, deadline, clock):
     from .experiment_exclusion import ExperimentExclusionError, read_locked
+    from .experiment_host_ledger import HostLedgerError, read_locked as read_host_experiments
     # No native query, second database or wait while this read transaction lives.
     with store._connection() as conn:
         # A lifecycle connection may permit pending-install nonce cleanup;
@@ -210,9 +211,18 @@ def _registry_locked(store, guard, deadline, clock):
             substr(logon_id,1,129) AS logon_id,schema_version
             FROM adaptive_infrastructure LIMIT ?""", (MAX_INFRASTRUCTURE + 1,)).fetchall()
         try:
-            experiment = read_locked(conn, policy=store._policy, guard=guard)
-        except ExperimentExclusionError as error:
-            raise LegacyMutationError("legacy_experiment_scope_unverified") from error
+            host_experiment = read_host_experiments(conn, policy=store._policy, guard=guard)
+        except HostLedgerError as error:
+            raise LegacyMutationError("legacy_host_experiment_scope_unverified") from error
+        # Aggregate validation already consumed the complete bounded history.
+        # Reuse its same-snapshot S1 inventory; only the absent host schema uses
+        # the old reader, so history is materialized and charged once per batch.
+        experiment = host_experiment.prior_exclusion
+        if experiment is None:
+            try:
+                experiment = read_locked(conn, policy=store._policy, guard=guard)
+            except ExperimentExclusionError as error:
+                raise LegacyMutationError("legacy_experiment_scope_unverified") from error
     if len(rows) > MAX_CANDIDATES or len(infrastructure) > MAX_INFRASTRUCTURE:
         raise LegacyMutationError("legacy_registry_too_large")
     identities, jobs = set(), []
@@ -241,7 +251,17 @@ def _registry_locked(store, guard, deadline, clock):
             "created_filetime_100ns": row["birth"], "logon_id": row["logon_id"]}))
     identities.update(experiment.identities)
     jobs.extend(experiment.job_names)
+    identities.update(host_experiment.identities)
+    jobs.extend(host_experiment.managed_job_names)
     if len(jobs) > 10 or len(set(jobs)) != len(jobs):
+        raise LegacyMutationError("legacy_job_scope_unknown")
+    # P4's additional query-only fixtures are excluded from old writers, but
+    # never become managed enrollment or CPU control authority. Keep the
+    # ordinary ten-Job check above, before appending their bounded inventory.
+    if len(host_experiment.query_job_names) > 40:
+        raise LegacyMutationError("legacy_query_fixture_scope_unknown")
+    jobs.extend(host_experiment.query_job_names)
+    if len(jobs) > 50 or len(set(jobs)) != len(jobs):
         raise LegacyMutationError("legacy_job_scope_unknown")
     return runtime["registry_revision"], identities, jobs
 

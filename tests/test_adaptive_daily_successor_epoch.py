@@ -68,6 +68,18 @@ class SuccessorEpochReaderTests(unittest.TestCase):
         with self.assertRaisesRegex(LifecycleError, "bytes_exceeded"):
             epoch.read_successor_guardian_epochs(self.conn, max_bytes=value.bytes_used - 1)
 
+    def test_exhausted_shared_rows_never_materialize_epoch_payload(self):
+        self.schema()
+        self.insert()
+        marker = self.row["attempt_id"].encode()
+        def no_overflow_payload(value):
+            if value == marker:
+                raise AssertionError("overflow epoch payload fetched")
+            return value.decode("utf-8")
+        self.conn.text_factory = no_overflow_payload
+        with self.assertRaisesRegex(LifecycleError, "rows_exceeded"):
+            epoch.read_successor_guardian_epochs(self.conn, max_rows=0)
+
     def test_mutations_replacements_and_missing_immutable_trigger_refuse(self):
         self.schema()
         self.insert()

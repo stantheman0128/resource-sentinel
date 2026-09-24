@@ -12,7 +12,8 @@ pipe registry is strongly owned independently of the supervisor's pipe registry.
 Draining CPU control alone cannot retire daily accounting obligations. Only an
 explicit retirement request on this original host, its acknowledged freeze and
 seal, and positive cleanup of every retained owner permit a clean process exit.
-Retirement leaves daily admission fenced; it is not an automatic restart path.
+Retirement leaves daily admission fenced. An explicit original-owner successor
+request retains a separate fresh keeper; it never resets this retired host.
 """
 from __future__ import annotations
 
@@ -40,7 +41,9 @@ _PRELOAD = (
     "recovery_journal", "supervisor_reconcile", "supervisor_startup",
     "host_discovery", "operator_transport", "supervisor_operations",
     "recovery_owner", "supervisor", "supervisor_epoch",
-    "daily_retirement",
+    "daily_retirement", "daily_successor", "daily_successor_scope",
+    "daily_successor_history", "daily_successor_inventory",
+    "daily_successor_epoch", "daily_successor_startup_inventory",
 )
 _EMPTY_TABLES = ("reservations", "worker_reservations", "queue", "managed_executions")
 
@@ -82,7 +85,8 @@ class _ConnectionCustody:
 class DailyActivationHost:
     """Single original keeper; no authority callbacks or alternate locations."""
 
-    def __init__(self, manifest, expected_config_digest, expected_ledger_identity, *, retire_after_drain=False):
+    def __init__(self, manifest, expected_config_digest, expected_ledger_identity, *,
+                 retire_after_drain=False, restart_after_retirement=False):
         if type(manifest) is not generation.SourceManifest:
             raise DailyActivationError("daily_activation_manifest_required")
         _hex(expected_config_digest)
@@ -90,6 +94,9 @@ class DailyActivationHost:
             raise DailyActivationError("daily_activation_ledger_identity_required")
         if type(retire_after_drain) is not bool:
             raise DailyActivationError("daily_activation_retirement_intent_invalid")
+        if (type(restart_after_retirement) is not bool or
+                (restart_after_retirement and not retire_after_drain)):
+            raise DailyActivationError("daily_activation_successor_intent_invalid")
         self.manifest = manifest
         self.expected_config_digest = expected_config_digest
         self.expected_ledger_identity = expected_ledger_identity
@@ -116,6 +123,7 @@ class DailyActivationHost:
         self._retirement = None
         self._retirement_creation_attempted = False
         self._retire_after_drain = retire_after_drain
+        self._restart_after_retirement = restart_after_retirement
         self._native_custody_possible = False
         self._supervisor_closed = False
         self._generation_settled = False
@@ -124,6 +132,69 @@ class DailyActivationHost:
         self._supervisor_state = self._supervisor_reason = None
         self._draining = False
         self._phase = "unstarted"
+        # The incoming operation and this host's optional next operation are
+        # distinct. Neither replaces any retired host/native owner in the chain.
+        self._successor_operation = None
+        self._successor = self._successor_host = None
+        self._successor_creation_attempted = self._successor_host_attempted = False
+        self._successor_drain_requested = False
+
+    @classmethod
+    def from_successor(cls, operation):
+        """Bind a fresh, unstarted keeper to one acknowledged original owner."""
+        from .daily_successor import DailySuccessorOperation
+        if cls is not DailyActivationHost or type(operation) is not DailySuccessorOperation:
+            raise DailyActivationError("daily_activation_original_successor_required")
+        operation._original()
+        if operation._complete is not True or type(operation.owner) is not generation.DailyGenerationOwner:
+            raise DailyActivationError("daily_activation_successor_unacknowledged")
+        if operation._readiness_host is not None:
+            raise DailyActivationError("daily_activation_successor_host_already_bound")
+        owner = operation.owner
+        host = cls(owner.manifest, owner._config_digest, LedgerFileIdentity(*owner.ledger_identity))
+        host.owner, host.store, host.guard = owner, operation.store, operation.guard
+        host.journal_dir = operation.retirement.host.journal_dir
+        host._successor_operation = operation
+        host._generation_settled = True
+        host._native_custody_possible = True  # The original fresh owner already exists.
+        host._phase = "successor_generation_ready"
+        # No listener/thread/supervisor factory may precede this registration.
+        operation.bind_readiness_host(host)
+        return host
+
+    def _original_successor_host(self):
+        from .daily_successor import DailySuccessorOperation
+        operation = self._successor_operation
+        if (type(self) is not DailyActivationHost or type(operation) is not DailySuccessorOperation or
+                operation._readiness_host is not self or self.owner is not operation.owner or
+                self.store is not operation.store or self.guard is not operation.guard or
+                self._generation_settled is not True or self.manifest is not operation.owner.manifest or
+                self.source_root != operation.owner.source_root or self.ledger_path != operation.owner.ledger_path or
+                self.journal_dir != operation.retirement.journal._directory or
+                self.expected_config_digest != operation.owner._config_digest or
+                self.expected_ledger_identity != LedgerFileIdentity(*operation.owner.ledger_identity)):
+            raise DailyActivationError("daily_activation_successor_host_changed", self)
+        operation._original()
+        return operation
+
+    def _start_successor(self):
+        self._original_successor_host()
+        if self._start_attempted:
+            raise DailyActivationError("daily_activation_start_already_attempted", self)
+        self._start_attempted = True
+        try:
+            if self._draining:
+                raise DailyActivationError("daily_activation_successor_draining", self)
+            for name in _PRELOAD:
+                importlib.import_module("sentinel.adaptive." + name)
+            self._assert_prepared_binding()
+            read_host_capability()
+            self._start_readiness()
+            self._listener_ready.wait(1.0)
+            return self.run_once()
+        except BaseException as error:
+            self._retain_failure(error)
+            raise
 
     def _retain_failure(self, error):
         self._waiting_for_cohort = False
@@ -261,6 +332,8 @@ class DailyActivationHost:
         self._phase = "generation_ready"
 
     def start(self):
+        if self._successor_operation is not None:
+            return self._start_successor()
         if self._start_attempted:
             raise DailyActivationError("daily_activation_start_already_attempted", self)
         self._start_attempted = True
@@ -290,14 +363,18 @@ class DailyActivationHost:
     def _start_readiness(self):
         if self._readiness_start_attempted:
             raise DailyActivationError("daily_activation_readiness_start_already_attempted", self)
-        self.owner.assert_ready()
+        if self._successor_operation is None:
+            self.owner.assert_ready()
+        else:
+            self._original_successor_host().assert_listener_start(self)
+        # A missing constructor return is not permission for a new acquisition.
+        self._readiness_start_attempted = True
         self._registry = NativePipeRegistry(max_resources=1)
         self._readiness_original_registry = self._registry
         self._service = DailyReadinessService(self.owner.readiness_endpoint, self.owner)
         self._thread = threading.Thread(target=self._serve_readiness,
             name="sentinel-daily-readiness", daemon=False)
         self._readiness_original_thread = self._thread
-        self._readiness_start_attempted = True
         self._thread.start()
 
     def _serve_readiness(self):
@@ -305,6 +382,10 @@ class DailyActivationHost:
         try:
             self._listener = NativePipeListener(self.owner.readiness_endpoint, registry=self._registry)
             self._readiness_original_listener = self._listener
+            if self._successor_operation is not None:
+                # This API checks the exact serving thread, not a serialized
+                # permit or the original owner's thread-local SQL scope.
+                self._successor_operation.publish_readiness_listener(self)
             self._listener_ready.set()
             while not self._readiness_stop.is_set():
                 try:
@@ -326,6 +407,17 @@ class DailyActivationHost:
             self._thread_stopped.set()
 
     def request_drain(self):
+        if self._successor is not None or self._successor_creation_attempted or self._restart_after_retirement:
+            self._successor_drain_requested = True
+            if self._successor_host is not None:
+                self._original_successor()
+                self._successor_host._original_successor_host()
+                self._successor_host.request_drain()
+        self._drain_current()
+
+    def _drain_current(self):
+        # The predecessor's required retirement drain is not a later Stop of
+        # its separately requested successor. Explicit request_drain is.
         self._draining = True
         if self.supervisor is not None and not self._supervisor_closed:
             self.supervisor.begin_drain()
@@ -364,6 +456,98 @@ class DailyActivationHost:
         return (operation.complete is True and self._readiness_cleanup_complete is True and
                 self._readiness_close_unknown is False)
 
+    def request_successor(self):
+        """Explicit intent on this exact positively retired keeper only."""
+        from .daily_successor import DailySuccessorOperation
+        if not self._retirement_complete():
+            raise DailyActivationError("daily_activation_successor_requires_retirement", self)
+        retirement = self._original_retirement(self._retirement)
+        retirement.assert_successor_predecessor()
+        registered = getattr(retirement, "_successor_operation", None)
+        if self._successor is not None:
+            return self._original_successor()
+        if registered is None:
+            if self._successor_creation_attempted:
+                raise DailyActivationError("daily_activation_successor_creation_unverified", self)
+            self._successor_creation_attempted = True
+            try:
+                registered = DailySuccessorOperation(retirement)
+            except BaseException as error:
+                self._retain_failure(error)
+                raise
+        # A constructor whose return was interrupted may already have retained
+        # its exact original operation on retirement. Never mint a replacement.
+        if type(registered) is not DailySuccessorOperation or registered.retirement is not retirement:
+            raise DailyActivationError("daily_activation_successor_operation_changed", self)
+        registered._original()
+        self._successor = registered
+        self._successor_creation_attempted = True
+        return registered
+
+    def _original_successor(self):
+        from .daily_successor import DailySuccessorOperation
+        operation = self._successor
+        retirement = self._original_retirement(self._retirement)
+        if (type(operation) is not DailySuccessorOperation or operation.retirement is not retirement or
+                getattr(retirement, "_successor_operation", None) is not operation):
+            raise DailyActivationError("daily_activation_successor_operation_changed", self)
+        operation._original()
+        return operation
+
+    def chain_retirement_complete(self):
+        """A retired predecessor alone cannot discharge its retained successor."""
+        host, seen = self, set()
+        while True:
+            if type(host) is not DailyActivationHost or id(host) in seen or len(seen) >= 4096:
+                raise DailyActivationError("daily_activation_successor_chain_changed", self)
+            seen.add(id(host))
+            if host._successor_operation is not None:
+                host._original_successor_host()
+            if not host._retirement_complete():
+                return False
+            if host._successor_operation is not None:
+                # The final host of a successor chain must also positively
+                # close its own original custody; its parent's proof is older.
+                host._original_retirement(host._retirement).assert_successor_predecessor()
+            registered = getattr(host._retirement, "_successor_operation", None)
+            if host._successor is None:
+                return (not host._successor_creation_attempted and registered is None and
+                        not host._restart_after_retirement)
+            operation = host._original_successor()
+            following = host._successor_host
+            if following is None:
+                return False
+            if following is not operation._readiness_host:
+                raise DailyActivationError("daily_activation_successor_host_changed", self)
+            host = following
+
+    def _tick_successor(self):
+        operation = self._original_successor()
+        try:
+            if operation._complete is not True:
+                operation.tick()
+            if operation._complete is not True:
+                return
+            host = operation._readiness_host
+            if host is None:
+                if self._successor_host_attempted:
+                    raise DailyActivationError("daily_activation_successor_host_unverified", self)
+                self._successor_host_attempted = True
+                host = DailyActivationHost.from_successor(operation)
+            if self._successor_host is not None and self._successor_host is not host:
+                raise DailyActivationError("daily_activation_successor_host_changed", self)
+            host._original_successor_host()
+            self._successor_host = host
+            if self._successor_drain_requested:
+                host.request_drain()
+            if not host._start_attempted:
+                host._start_successor()
+            else:
+                host.run_once()
+        except BaseException as error:
+            self._retain_failure(error)
+            raise
+
     def _tick_retirement(self):
         operation = self._original_retirement(self._retirement)
         try:
@@ -373,7 +557,7 @@ class DailyActivationHost:
             # supervisor recovery still gets its tick while that work settles.
             self._retain_failure(error)
         if operation.freeze_acknowledged is True:
-            self.request_drain()
+            self._drain_current()
         if operation.sealed is True:
             self.shutdown_native_retirement(operation)
 
@@ -436,9 +620,16 @@ class DailyActivationHost:
             return False
 
     def run_once(self):
+        if self._successor_operation is not None:
+            self._original_successor_host()
         if not self._start_attempted:
             raise DailyActivationError("daily_activation_not_started", self)
         if self._retirement_complete():
+            if (self._successor is None and
+                    (self._successor_creation_attempted or self._restart_after_retirement)):
+                self.request_successor()
+            if self._successor is not None:
+                self._tick_successor()
             return self.status()
         supervisor_closed_before = self._supervisor_closed
         if self._failure is not None and self.supervisor is None:
@@ -473,6 +664,8 @@ class DailyActivationHost:
                 journal_dir=self.journal_dir, child_cwd=self.source_root,
                 python_executable=str(_BASE_PYTHON), max_guardians=1,
                 guardian_iterations=0, helper_profile_path=None)
+            if self._successor_operation is not None:
+                self.supervisor._daily_successor_operation = self._successor_operation
             try:
                 self._observe_supervisor_record(self.supervisor.start())
             except BaseException as error:
@@ -490,7 +683,7 @@ class DailyActivationHost:
         if self.supervisor is not None and not self._supervisor_closed:
             try:
                 if self._draining:
-                    self.request_drain()
+                    self._drain_current()
                 self._observe_supervisor_record(self.supervisor.run_once())
                 if self._draining and self.supervisor._custody_snapshot()["settled"]:
                     result = self.supervisor.close()
@@ -510,7 +703,7 @@ class DailyActivationHost:
         return self.status()
 
     def status(self):
-        complete = self._retirement_complete()
+        complete = self.chain_retirement_complete()
         return {"event": "daily_activation_host", "phase": self._phase,
                 "generation_activation_acknowledged": self._generation_settled,
                 "readiness_listener_started": self._listener_ready.is_set(),
@@ -518,6 +711,9 @@ class DailyActivationHost:
                 "supervisor_state": self._supervisor_state,
                 "supervisor_closed": self._supervisor_closed, "drain_requested": self._draining,
                 "retirement_requested": self._retirement is not None,
+                "successor_requested": self._successor_creation_attempted,
+                "successor_phase": None if self._successor is None else self._successor.phase,
+                "successor_host_phase": None if self._successor_host is None else self._successor_host._phase,
                 "retirement_phase": None if self._retirement is None else self._retirement.phase,
                 "retirement_reason": None if self._retirement is None or self._retirement.reason is None else
                     _reason_text(self._retirement.reason),
@@ -543,7 +739,7 @@ class DailyActivationHost:
         previous = None
         while True:
             previous = self._retained_tick(previous)
-            if self._retirement_complete():
+            if self.chain_retirement_complete():
                 return self.status()
 
     def _retain_interruption(self, error):

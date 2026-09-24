@@ -72,7 +72,7 @@ _REQUIRED = frozenset({"adaptive_runtime", "managed_executions", "adaptive_contr
     "adaptive_launch_requests", "adaptive_launch_fences", "adaptive_retirement_requests",
     "adaptive_prelaunch_retirements", "adaptive_infrastructure", "queue"})
 _SPECIAL = frozenset({"adaptive_daily_generation", "adaptive_daily_retirement", "adaptive_experiment_demands",
-    "adaptive_experiment_exclusions", "adaptive_experiment_cleanup_receipts"})
+    "adaptive_experiment_exclusions", "adaptive_experiment_cleanup_receipts", "adaptive_generation_successions"})
 _EXPERIMENT_TABLES = frozenset({"adaptive_experiment_demands", "adaptive_experiment_exclusions",
     "adaptive_experiment_cleanup_receipts"})
 
@@ -261,6 +261,7 @@ def _validate_schemas(conn, columns):
 
 def _read_ledger(conn, store, guard, budget):
     from . import experiment_history
+    from . import daily_successor_history as successions
     store._policy.assert_held(guard)
     schema, columns = _schema(conn, budget)
     try:
@@ -270,6 +271,8 @@ def _read_ledger(conn, store, guard, budget):
             raise LifecycleError("daily_retirement_inventory_schema_unknown") from None
         raise LifecycleError("daily_retirement_inventory_experiment_history_unverified") from None
     budget.charge(history.bytes_used)
+    previous = successions.read_successor_history(conn, max_bytes=MAX_BYTES - budget.bytes)
+    budget.charge(previous.bytes_used)
     if history.active_experiment_ids:
         _refuse("experiment_obligation_remaining")
     # Consume the original bounded SQL rows from the verifier, including actual
@@ -278,10 +281,11 @@ def _read_ledger(conn, store, guard, budget):
     observed = {}
     for row in history._sql_rows:
         observed.setdefault(row.table, []).append(dict(zip(row.fields, row.values)))
+    observed[successions.TABLE] = [dict(zip(successions._FIELDS, entry._row)) for entry in previous.entries]
     completed = history.completed_execution_ids
     values = {}
     for name, fields in columns.items():
-        if name in _EXPERIMENT_TABLES:
+        if name in _EXPERIMENT_TABLES or name == successions.TABLE:
             values[name] = observed.get(name, [])
         elif name == "managed_executions":
             historical = observed.get(name, [])

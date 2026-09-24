@@ -941,14 +941,32 @@ class LifecycleStore:
             raise LifecycleError("coverage_registry_unavailable")
         from .experiment_cleanup import current_operation
         operation = current_operation(self.db_path if pinned is None else pinned)
+        from .daily_successor_scope import current_operation as successor_operation
+        successor = successor_operation(self.db_path if pinned is None else pinned)
+        from .daily_successor_scope import current_startup_operation
+        from .daily_successor_epoch import current_sql_owner
+        trackers = [item for item in (successor,
+            current_startup_operation(self.db_path if pinned is None else pinned),
+            current_sql_owner(self.db_path if pinned is None else pinned)) if item is not None]
+        if len(trackers) > 1:
+            raise LifecycleError("daily_successor_foreign_sql_scope")
+        successor = trackers[0] if trackers else None
+        if operation is not None and successor is not None:
+            raise LifecycleError("daily_successor_foreign_scope")
+        operation = successor if successor is not None else operation
         target = self.db_path if pinned is None else pinned.as_uri() + "?mode=rw"
+        acquisition = None if successor is None else successor.begin_sql_acquisition()
         try:
             conn = sqlite3.connect(target, uri=pinned is not None, timeout=5, isolation_level=None)
-        except sqlite3.Error:
-            if pinned is not None:
+        except BaseException as error:
+            if successor is not None:
+                successor.sql_acquisition_failed(acquisition, error)
+            if isinstance(error, sqlite3.Error) and pinned is not None:
                 raise LifecycleError("coverage_registry_unavailable") from None
             raise
         try:
+            if successor is not None:
+                successor.sql_acquired(acquisition, conn)
             conn.row_factory = sqlite3.Row
             # Daily readiness precedes BEGIN; a refusal still follows this
             # connection owner's existing cleanup path.
@@ -968,9 +986,14 @@ class LifecycleStore:
                     try:
                         operation.connection_closed(conn)
                     except BaseException as error:
-                        primary._experiment_release_operation = operation
-                        primary._experiment_release_connection_closed_error = error
-                        primary.add_note("experiment_release_connection_accounting_failed")
+                        if successor is not None:
+                            primary._daily_successor_operation = operation
+                            primary._daily_successor_connection_closed_error = error
+                            primary.add_note("daily_successor_connection_accounting_failed")
+                        else:
+                            primary._experiment_release_operation = operation
+                            primary._experiment_release_connection_closed_error = error
+                            primary.add_note("experiment_release_connection_accounting_failed")
             raise
         else:
             try:

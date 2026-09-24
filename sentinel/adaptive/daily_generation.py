@@ -171,6 +171,12 @@ class _ReadinessScope:
 @contextmanager
 def readiness_scope(db_path):
     """Acquire before any lock; nested exact-ledger users borrow, never refresh."""
+    from .daily_successor_scope import current_operation as successor_operation
+    successor = successor_operation(db_path)
+    if successor is not None:
+        with successor.connection_scope(db_path) as original:
+            yield original
+        return
     from .experiment_cleanup import current_operation
     operation = current_operation(db_path)
     if operation is not None:
@@ -396,6 +402,13 @@ def _revalidate_absent(conn, scope, db_path):
 @contextmanager
 def readiness_nonce_cleanup(policy, guard):
     """Only _clear after positive original native release may enter this seam."""
+    from .daily_successor_scope import current_operation as successor_operation
+    successor = successor_operation()
+    if successor is not None:
+        successor_operation(policy.store.db_path)
+        with successor.nonce_cleanup(policy, guard):
+            yield
+        return
     from .experiment_cleanup import current_operation
     operation = current_operation()
     if operation is not None:
@@ -902,6 +915,11 @@ def prepare_connection(conn, *, role, db_path):
     """Validate outside BEGIN and bind this connection, without installing schema."""
     if role not in ROLES or conn.in_transaction:
         _reject("daily_connection_scope_invalid")
+    from .daily_successor_scope import current_operation as successor_operation
+    successor = successor_operation(db_path)
+    if successor is not None:
+        successor.bind_connection(conn, role=role, db_path=db_path)
+        return None
     from .experiment_cleanup import current_operation
     operation = current_operation(db_path)
     if operation is not None:
@@ -1029,6 +1047,11 @@ def revalidate_transaction(conn, *, db_path):
     """Recheck on the actual acquired SQL snapshot, without acquiring authority."""
     if not conn.in_transaction:
         _reject("daily_connection_scope_invalid")
+    from .daily_successor_scope import current_operation as successor_operation
+    successor = successor_operation(db_path)
+    if successor is not None:
+        successor.revalidate_connection(conn, db_path=db_path)
+        return
     from .experiment_cleanup import current_operation
     operation = current_operation(db_path)
     if operation is not None:
@@ -1326,6 +1349,9 @@ class DailyGenerationOwner:
     def assert_ready(self):
         if not self._activated:
             _reject("daily_generation_not_activated")
+        successor = getattr(self, "_successor_operation", None)
+        if successor is not None:
+            successor.assert_readiness_published(self)
         self._assert_owner()
         _assert_daily_locations(self.source_root, self.ledger_path)
         if _ledger_identity(self.ledger_path) != self.ledger_identity:

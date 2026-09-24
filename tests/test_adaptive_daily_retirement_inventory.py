@@ -302,18 +302,13 @@ class DailyRetirementInventoryTests(unittest.TestCase):
         connect = inventory.sqlite3.connect
         opened = []
 
-        class CloseUnknown:
-            def __init__(self, actual):
-                object.__setattr__(self, "actual", actual)
-            def __getattr__(self, name):
-                return getattr(self.actual, name)
-            def __setattr__(self, name, value):
-                setattr(self.actual, name, value)
+        class CloseUnknown(sqlite3.Connection):
             def close(self):
                 raise OSError("fixture reader close acknowledgement unknown")
 
         def connecting(*args, **kwargs):
-            owner = CloseUnknown(connect(*args, **kwargs))
+            kwargs["factory"] = CloseUnknown
+            owner = connect(*args, **kwargs)
             opened.append(owner)
             return owner
 
@@ -326,7 +321,9 @@ class DailyRetirementInventoryTests(unittest.TestCase):
                 self.assertIn("daily_retirement_inventory_reader_cleanup_unverified", raised.exception.__notes__)
             finally:
                 for owner in opened:
-                    owner.actual.close()  # Explicit fixture-only cleanup, not a production retry.
+                    # Physically release only this isolated fixture resource;
+                    # the original unknown-close evidence is never cleared.
+                    sqlite3.Connection.close(owner)
 
 
 if __name__ == "__main__":

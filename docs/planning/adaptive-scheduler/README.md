@@ -2,9 +2,78 @@
 
 日期：2026-09-19。狀態：**正式計畫已入庫，分階段實作進行中；production adaptive 維持 off。**
 
-## 2026-09-24 Codex 實作 checkpoint（目前狀態）
+## 2026-09-25 Codex 實作 checkpoint（目前狀態）
 
-最新 source checkpoint 為 **S2 來源驗證啟動鏈與原始程序收尾責任**，
+最新 source checkpoint 為 **aggregate host ledger、共用歷史上限與實際 consumer 接線**，
+source commit `dd5cf3459a4e12188998bcfd8efed9d0629fdf8b`：
+
+- S2/P4 host scope 的 infrastructure／workload partitions 共用原始 daily demand，
+  不取得第二份容量。四個 immutable tables 的首次 INSERT 必須由同一 connection、
+  transaction、thread、held POLICY 與原始 publication object 授權；一次操作後撤回。
+  相同原始已提交操作可在 HOLD／expiry／DRAINING 後唯讀核對，新發布仍拒絕。
+- Legacy writer 使用同一 SQL snapshot 的完整驗證結果，排除精確 actor 與 Job。
+  未完成發布或無法確認 query Job 時整批拒絕；普通工作、S1 與 host 共用最多十個
+  managed Jobs，P4 額外最多四十個 query-only fixtures 不提供控制權，也不延長
+  原有 batch deadline。沒有重複讀取或重複計入原始 experiment history。
+- Experiment、succession、epoch、host 共用最多 4,096 列／16 MiB 的讀取預算。
+  剩餘額度向下傳遞，超限 sentinel 不把該列 payload 帶入 Python；超限直接拒絕。
+  `MAX_HISTORY` 保留既有 metadata／單表語義，獨立 `MAX_ROWS` 控制 aggregate。
+- 原始 S1／before-native release 路徑與 SQL guard 都拒絕釋放已註冊 host scope。
+  這是完整 aggregate completion 尚未接通時的保守防護，不是新的釋放實作。
+  Daily activation 只新增 module preload；沒有啟動或部署日常 runtime。
+
+精確 staged tree `d6de172ef3f6bcbf40beb19423505b14ce30ac9b` 經 `git archive`
+匯出、清除 `PYTHONPATH` 後，在 Windows／Python 3.13.3 驗證十七模組：
+**389 PASS，0 failures／errors／skips，runner 167.190 秒**。
+Source commit tree 與測試 tree 完全相同，不依賴 protected dirty files。
+使用實際隔離 SQLite、原始准入／legacy batch／release 操作與明確 synthetic
+native collaborators；不是 native launch、recovery、overhead 或 A/B gate 證據。
+原始證據留在本機 `.local-adaptive/host-ledger-export-20260925-2/`。
+
+第一輪同樣 389 tests 有三個 errors：兩個 HOLD fixture 缺少既有 SQL trigger
+所需的固定 deny UDF，另一個是新增 row-budget validation 與舊 metadata cap
+的常數語義衝突。修正沒有授予 release 權限，也沒有改舊 consumer 的測試預期；
+失敗紀錄保留於 `host-ledger-export-20260925-1/`。獨立靜態 review 的 INSERT
+authority、原始 replay 與 shared-budget 檢查沒有剩餘具體 finding。
+
+在包含本批 source commit 的乾淨 checkout，以正常日常准入重現：
+
+```powershell
+$sentinelHostLedgerTests = @(
+    'tests.test_adaptive_experiment_host_ledger'
+    'tests.test_adaptive_experiment_host_consumers'
+    'tests.test_adaptive_experiment_history'
+    'tests.test_adaptive_experiment_history_consumers'
+    'tests.test_adaptive_experiment_exclusion'
+    'tests.test_adaptive_experiment_release'
+    'tests.test_adaptive_experiment_release_custody'
+    'tests.test_adaptive_experiment_release_hooks'
+    'tests.test_adaptive_experiment_release_native'
+    'tests.test_adaptive_experiment_demand'
+    'tests.test_adaptive_legacy_writer'
+    'tests.test_adaptive_daily_successor_epoch'
+    'tests.test_adaptive_daily_retirement_inventory'
+    'tests.test_adaptive_daily_successor_inventory'
+    'tests.test_adaptive_daily_successor_registration_inventory'
+    'tests.test_adaptive_daily_successor_startup_inventory'
+    'tests.test_adaptive_daily_activation_host'
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command ('C:\Python313\python.exe -m unittest -v ' + ($sentinelHostLedgerTests -join ' ')) -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
+**仍缺 actual aggregate provider。** Parent host owner、authenticated child
+bootstrap、member 到 isolated admission 的原始綁定、guardian 的
+daily POLICY → isolated POLICY → Job 操作範圍，以及完整 aggregate completion／
+history／daily release 尚未接通。正常 S2 入口仍拒絕
+`s2_original_production_host_scope_unavailable`。P4 真實成本量測、剩餘 S3 drivers／
+140 次 orchestration、P6 actual A/B／A0 與必要 native gates 也仍未完成。
+Items 5/6 不得宣稱已完成或只剩人工 console 驗證。
+本批沒有施加測試 Job 限制；日常 runtime、config、Scheduled Task、全域入口均未
+變更，production adaptive 維持 off。十四個 protected tracked files 的雜湊未變。
+
+## 2026-09-24 Codex 實作 checkpoint（前一批）
+
+該批 source checkpoint 為 **S2 來源驗證啟動鏈與原始程序收尾責任**，
 source commit `ee874a2ffd971db9001f20f5ff3f6f63ac69b18e`：
 
 - 固定的 parent／child bootstrap profiles 驗證 canonical runtime、producer
@@ -81,7 +150,8 @@ S2/P4 共用 daily demand 與隔離 production host 的橋接契約已提交為 
 [S2-P4-PRODUCTION-HOST-SCOPE.md](S2-P4-PRODUCTION-HOST-SCOPE.md)。
 **契約不是 provider 實作或 native 證據。** Aggregate host launch/adoption、
 authenticated transport、完整原始 completion 與 daily release 接線仍未完成；
-新的 host ledger／legacy writer／release guard 草稿尚未驗證，留在本機未提交。
+當時的 host ledger／legacy writer／release guard 草稿已於上方 2026-09-25
+checkpoint 完成驗證並提交；完整 aggregate provider 仍缺。
 Items 5/6 與 P3–P6 native gates 仍未完成。日常 runtime、config、Scheduled Task
 和啟動入口均未變更，adaptive off；本批沒有施加任何測試 Job 限制。
 

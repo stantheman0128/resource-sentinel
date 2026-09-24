@@ -317,6 +317,51 @@ class NativeJobTests(unittest.TestCase):
         self.assertEqual(self.calls("LocalFree"), [])
         self.assertEqual(self.calls("CloseHandle"), [])
 
+    def test_failed_factory_retains_closed_original_without_pending_cleanup_or_query_rights(self):
+        self.kernel.create_handle, self.kernel.create_error = None, 6
+        self.kernel.open_handle = None
+        for operation in (self.create, self.open):
+            with self.subTest(operation=operation.__name__):
+                with self.assertRaises(native.NativeJobError) as failed:
+                    operation()
+                owner, = failed.exception._native_job_initialization_owners
+                self.assertIs(type(owner), native.NativeJob)
+                self.assertEqual((owner.name, owner.nonce, owner.logon_sid), (NAME, NONCE, LOGON))
+                self.assertTrue(owner.closed)
+                self.assertFalse(getattr(failed.exception, "_native_job_cleanup", ()))
+                before = list(self.kernel.calls)
+                native.retry_job_cleanup(failed.exception)
+                self.assertEqual(self.kernel.calls, before)
+                with self.assertRaisesRegex(native.NativeJobError, "native_job_handle_unavailable"):
+                    _ = owner.handle
+        self.assertEqual(self.calls("SetInformationJobObject"), [])
+
+    def test_failed_factory_keeps_original_uncertainty_distinct_from_positive_close(self):
+        original = self.kernel.create_exception = KeyboardInterrupt("fixture original acquisition")
+        with self.assertRaises(KeyboardInterrupt) as failed:
+            self.create()
+        self.assertIs(failed.exception, original)
+        owner, = original._native_job_initialization_owners
+        self.assertIs(original._native_job_cleanup[0], owner)
+        self.assertFalse(owner.closed)
+        before = list(self.kernel.calls)
+        with self.assertRaisesRegex(native.NativeJobError, "native_job_cleanup_outcome_unknown"):
+            native.retry_job_cleanup(original)
+        self.assertEqual(self.kernel.calls, before)
+
+    def test_reused_primary_preserves_each_original_factory_owner(self):
+        original = self.security.failure = RuntimeError("fixture same primary")
+        for _ in range(2):
+            with self.assertRaises(RuntimeError) as failed:
+                self.create()
+            self.assertIs(failed.exception, original)
+        first, second = original._native_job_initialization_owners
+        self.assertIsNot(first, second)
+        self.assertTrue(first.closed)
+        self.assertTrue(second.closed)
+        self.assertFalse(getattr(original, "_native_job_cleanup", ()))
+        self.assertEqual(self.calls("SetInformationJobObject"), [])
+
     def test_descriptor_exception_retains_uncertain_buffer_without_free_or_recreate(self):
         original = self.advapi.exception = RuntimeError("fixture_descriptor_exception")
         with self.assertRaises(RuntimeError) as failed:

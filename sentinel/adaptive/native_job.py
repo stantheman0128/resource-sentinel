@@ -503,6 +503,14 @@ class NativeJob:
                 raise primary
 
     def _failed_initialization(self, primary):
+        # Retain the actual acquisition even when its cleanup succeeds. A
+        # caller receiving no factory result must not infer either absence or
+        # unresolved custody from that fact alone. This observation is separate
+        # from _native_job_cleanup, which contains only still-unsettled owners.
+        # Reused exception objects must not overwrite an earlier original.
+        originals = getattr(primary, "_native_job_initialization_owners", ())
+        if not any(owner is self for owner in originals):
+            primary._native_job_initialization_owners = (*originals, self)
         try:
             self.close()
         except BaseException as cleanup:

@@ -2,7 +2,63 @@
 
 日期：2026-09-19。狀態：**正式計畫已入庫，分階段實作進行中；production adaptive 維持 off。**
 
-## 2026-09-25 partition admission checkpoint（目前狀態）
+## 2026-09-25 parent backing publication checkpoint（目前狀態）
+
+Source commit `78a162b07cf7752233826872efd41947de45b26c` 接上原始 parent 的
+backing publication 方法與固定 transport phase。只有已驗證並接受的 wrapper
+child 能為其宣告的 workload member 發布 backing；原始 request、snapshot 與
+publication operation 在第一次 SQL 前保留，COMMIT／response ACK 遺失後沿用
+同一操作。已存在普通 isolated admission／queue 時拒絕補寫 backing；SQL
+close 結果不明時保留原始 owner，拒絕重新開啟或盲目重試 close。
+
+這批新增 17 個 wire tests 與 15 個 connected publication tests。後者接上
+實際 parent scope、CreationAttempt、child acceptance、service 與隔離 SQLite；
+native creation、identity、POLICY/readiness 仍使用明確的 portable fixtures。
+它們驗證 publication 與 cleanup 契約，不能證明真實 Windows provider 的
+native／SQL 邊界或整場 launch/control/recovery gate 已通過。
+
+Windows／Python 3.13.3，正常 daily HEAVY/P2/CPU1/RAM1GiB/IO0 准入，
+由精確 staged tree `3b082787e52b9f3052fe8b591ea07aee9a70a3e3` 匯出，
+清除 PYTHONPATH 後執行下列六模組：**154 PASS，0 failures／errors／skips，
+runner 30.344 秒**。Source commit tree 與測試 tree 相同，沒有依賴未提交
+source；本機證據 `.local-adaptive/backing-publication-export-20260925-2/`。
+前一輪四模組 75 PASS 是較早的測試集合，與本輪重疊，不相加。
+
+```powershell
+$sentinelBackingTests = @(
+    'tests.test_adaptive_experiment_backing_publication'
+    'tests.test_adaptive_experiment_backing_transport'
+    'tests.test_adaptive_experiment_host_scope'
+    'tests.test_adaptive_experiment_host_backing'
+    'tests.test_adaptive_experiment_host_transport'
+    'tests.test_adaptive_daily_activation_host'
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command ('C:\Python313\python.exe -m unittest -v ' + ($sentinelBackingTests -join ' ')) -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
+**完整 provider 與 P3–P6 驗收仍未完成，也仍有可在 agent session 修復的 source
+缺口。** 固定 child bootstrap／Release dispatch、typed wrapper/guardian 接入、
+daily Job intent publication，以及 aggregate completion/history/daily release
+尚未接完。新 `experiment_host_authority.py`、`experiment_host_roles.py` 與其
+測試留在本機草稿，未納入本批測試或提交。S2 正常入口仍拒絕缺少原始
+production host scope；P4 真實 overhead、剩餘 S3 drivers／140-case orchestration、
+P6 actual A/B/A0 和必要 native gates 仍未完成。
+
+本輪另確認既有 shared source 的 promotion blocker：
+`PolicyCoordinator.prepare` 經 `LifecycleStore._transaction` 在 BEGIN 後呼叫
+`daily_generation.revalidate_transaction`，後者執行
+`SELECT sentinel_daily_generation()`；其 `current_generation` UDF 仍會做
+ledger/config/source 檔案檢查，並經 `DailyReadinessAuthority.revalidate` 觀察
+原始 native peer。這違反不得在 SQL transaction 內做 native／filesystem
+探測的契約。本批沒有修改該路徑，portable fixtures 的通過不能抵銷這項缺口。
+後續須修正並測試實際 shared source 邊界，再接 host/provider，不能只等待
+使用者從 app 外執行命令便視為可 promotion。
+
+十四個 protected tracked files hash 一致，原有修改與 untracked files 保留。
+日常 config hash 未變；沒有部署、修改正式 Scheduled Task／全域入口或啟用
+adaptive control。沒有施加測試 Job 限制，沒有待撤回的限速。
+
+## 2026-09-25 partition admission checkpoint（前一批）
 
 Source commit `86184c2250a8937c156c98125b6875f35e7613e5` 完成隔離 partition
 的實際 admission adapter、不可變來源綁定與 ordinary host 的拒絕邊界：

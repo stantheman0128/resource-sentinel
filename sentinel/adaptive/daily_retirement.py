@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
+import weakref
 from uuid import uuid4
 
 from . import daily_generation as generation
@@ -27,6 +29,53 @@ from .supervisor_reconcile import RetainedPolicyOperation
 
 _BINDINGS = ("generation", "source_digest", "config_digest", "source_root", "ledger_path",
              "owner_identity_json", "ledger_identity_json", "readiness_instance_id")
+_ORIGINAL_OPERATIONS = weakref.WeakSet()
+_MISSING = object()
+_SUPERVISOR_CUSTODY = ("guardian", "helper", "supervisor", "retired", "retired_helpers",
+    "unverified", "unsettled_captures", "_creation_records", "_creation_unknown", "_unknown_handles",
+    "_closed_handles", "_drain_closed_children", "_operator_cleanup_errors", "_registry_retirements",
+    "_registry_results", "_initial_start_operation", "_empty_check", "janitor", "_rollover",
+    "_operational_current", "operator_listener", "discovery", "operations", "_operator_closed",
+    "_discovery_closed", "_guardian_settled", "startup")
+
+
+def _canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+
+
+def _custody_pin(value, *, depth=0, budget=None):
+    """Bounded in-memory object/container binding; never serialized authority."""
+    from .identity import VerifiedProcess
+    from .recovery_owner import RetainedGuardianCreation
+    from .supervisor_host import _Guardian, _Helper
+    from .supervisor_startup import SupervisorStartup
+    budget = [0] if budget is None else budget
+    budget[0] += 1
+    if budget[0] > 16384 or depth > 12:
+        _reject("daily_retirement_custody_unbounded")
+    if type(value) in (str, bytes, int, bool, float, type(None)):
+        return type(value), value
+    if type(value) in (tuple, list, set, frozenset):
+        parts = [_custody_pin(item, depth=depth + 1, budget=budget) for item in value]
+        return type(value), frozenset(parts) if type(value) in (set, frozenset) else tuple(parts)
+    if type(value) is dict:
+        return dict, tuple((_custody_pin(key, depth=depth + 1, budget=budget),
+            _custody_pin(item, depth=depth + 1, budget=budget)) for key, item in value.items())
+    # Only actual native owner types expose fixed custody fields. In particular,
+    # an unchanged child wrapper cannot conceal a replaced process witness.
+    fields = {
+        VerifiedProcess: ("_identity", "_handle", "_close_outcome_unknown"),
+        RetainedGuardianCreation: ("_process", "_closed", "_construction_error", "_creator_pid", "_guardian_epoch"),
+        _Guardian: ("epoch", "pid", "creation_handle", "process", "creation_witness"),
+        _Helper: ("pid", "creation_handle", "process"),
+        SupervisorStartup: ("store", "journal", "_current", "_mutex", "_scope", "_lease", "_closed",
+            "_acquired", "_entry_unknown", "_release_unknown", "_close_unknown", "_construction_error",
+            "_acquire_error", "_binding_operation", "_fresh_operation", "_thread", "_native_thread", "_pid"),
+    }.get(type(value))
+    if fields is not None:
+        return (type(value), id(value), value, tuple(_custody_pin(getattr(value, name, _MISSING),
+            depth=depth + 1, budget=budget) for name in fields))
+    return type(value), id(value), value
 
 
 def _reject(reason):
@@ -52,8 +101,15 @@ class DailyRetirementOperation:
         self._freeze = RetainedPolicyOperation(self.store)
         self._seal = RetainedPolicyOperation(self.store)
         self._freeze_row = self._seal_row = self._generation_row = None
-        self._seal_guard = None
+        self._freeze_guard = self._seal_guard = None
+        self._freeze_guard_pin = self._seal_guard_pin = None
+        self._freeze_readback = self._seal_readback = None
+        self._generation_pin = self._freeze_row_pin = self._seal_row_pin = None
+        self._seal_inventory = self._seal_inventory_digest = self._seal_inventory_pin = None
+        self._supervisor_custody_pin = self._closed_custody_pin = None
+        self._supervisor_startup = getattr(self.supervisor, "startup", _MISSING)
         self._thread_id = threading.get_ident()
+        self._thread, self._pid = threading.current_thread(), os.getpid()
         self._seal_resume_active = False
         self._seal_attempted = False
         self._sealed = self._freeze_acknowledged = self._complete = False
@@ -62,6 +118,15 @@ class DailyRetirementOperation:
         self.phase = "freeze_pending"
         self.reason = None
         self.journal = RecoveryJournal(host.journal_dir)
+        self._original_objects = (self.host, self.owner, self.store, self.supervisor, self.policy,
+            self._freeze, self._seal, self.journal, self.owner.process, self.owner.cohort)
+        self._readiness_objects = tuple(getattr(host, name, _MISSING) for name in
+            ("_thread", "_listener", "_registry", "_service", "_thread_stopped", "_readiness_stop"))
+        self._readiness_native_owner = getattr(self._readiness_objects[1], "_owner", _MISSING)
+        self._owner_source_pin = tuple(getattr(self.owner, name, _MISSING) for name in
+            ("manifest", "source_root", "ledger_path", "ledger_identity", "generation", "readiness_endpoint"))
+        self._original_request = self.request_id
+        _ORIGINAL_OPERATIONS.add(self)
         # Retain the operation before any possible SQL or native side effect.
         self.owner._retirement_operation = self
 
@@ -149,6 +214,7 @@ class DailyRetirementOperation:
             if not self.owner._matches_generation(row):
                 _reject("daily_retirement_generation_changed")
             self._generation_row = dict(row)
+            self._generation_pin = self._generation_row, _canonical(self._generation_row)
         expected = dict(self._generation_row, state=state)
         if row != expected:
             _reject("daily_retirement_generation_changed")
@@ -167,9 +233,12 @@ class DailyRetirementOperation:
             self._binding(row, state="ACTIVE")
             frozen = read_retirement(conn)
             if frozen is None:
+                self._freeze_guard = guard
+                self._freeze_guard_pin = guard, guard.binding, guard.nonce
                 self._freeze_row = install_freeze_locked(conn,
                     owner_binding={name: row[name] for name in _BINDINGS},
                     request_id=self.request_id, guard=guard)
+                self._freeze_row_pin = self._freeze_row, _canonical(self._freeze_row)
                 conn.commit()
             else:
                 if self._freeze_row is None or frozen != self._freeze_row:
@@ -188,6 +257,12 @@ class DailyRetirementOperation:
             return False
         if frozen != self._freeze_row or runtime["policy_entry_nonce"] is not None:
             _reject("daily_retirement_freeze_unsettled")
+        if (self._freeze_guard is not None and
+                runtime["policy_instance_id"] == self._freeze_guard.binding.instance_id and
+                runtime["policy_logon_id"] == self._freeze_guard.binding.logon_id):
+            # _read returned only after closing its original SQL owner. This
+            # also retains positive clear readback after a lost clear ACK.
+            self._freeze_readback = self._freeze_guard, self._freeze_guard.nonce
         return True
 
     def _supervisor_settled(self):
@@ -204,6 +279,10 @@ class DailyRetirementOperation:
         if (not self.host._supervisor_closed or not self.supervisor.draining or
                 not self.supervisor._closed or not positive):
             _reject("daily_retirement_supervisor_unsettled")
+        self._supervisor_custody_pin = self._supervisor_custody()
+
+    def _supervisor_custody(self):
+        return _custody_pin(tuple(getattr(self.supervisor, name, _MISSING) for name in _SUPERVISOR_CUSTODY))
 
     def _seal_write(self):
         self._original()
@@ -249,9 +328,14 @@ class DailyRetirementOperation:
             revalidate_retirement_inventory(conn, self.store, snapshot)
             # Retain exact original operation/guard before the first seal write.
             self._seal_guard = self._seal.guard
+            self._seal_guard_pin = self._seal_guard, self._seal_guard.binding, self._seal_guard.nonce
+            from . import daily_retirement_inventory as inventory
+            self._seal_inventory = snapshot
+            self._seal_inventory_digest = retirement_inventory_digest(self.store, snapshot)
+            self._seal_inventory_pin = (snapshot, inventory._SNAPSHOTS[snapshot], self._seal_inventory_digest)
             digest = hashlib.sha256(json.dumps({"request_id": self.request_id,
                 "generation": self.owner.generation, "freeze": self._freeze_row,
-                "inventory_digest": retirement_inventory_digest(self.store, snapshot),
+                "inventory_digest": self._seal_inventory_digest,
                 "seal_nonce": self._seal_guard.nonce}, sort_keys=True,
                 separators=(",", ":"), allow_nan=False).encode()).hexdigest()
             self._seal_attempted = True
@@ -261,6 +345,7 @@ class DailyRetirementOperation:
             if changed != 1:
                 _reject("daily_retirement_generation_changed")
             self._seal_row = seal_freeze_locked(conn, self._freeze_row, digest, self._seal_guard)
+            self._seal_row_pin = self._seal_row, _canonical(self._seal_row)
             conn.commit()
         except (DailyRetirementError, LifecycleError) as error:
             self._close_write(custody)
@@ -287,6 +372,7 @@ class DailyRetirementOperation:
                 runtime["policy_instance_id"] != self._seal_guard.binding.instance_id or
                 runtime["policy_logon_id"] != self._seal_guard.binding.logon_id):
             _reject("daily_retirement_seal_unsettled")
+        self._seal_readback = self._seal_guard, self._seal_guard.nonce
         return True
 
     def authorize_nonce_cleanup(self, conn, row):
@@ -399,6 +485,13 @@ class DailyRetirementOperation:
                 self._freeze.pending or self._seal.pending):
             _reject("daily_retirement_policy_unsettled")
         self.owner.cohort.assert_retained_retired()
+        # Pin these original owners before the first native close. This never
+        # discovers a new process or adopts a previously missing acquisition.
+        if self._closed_custody_pin is None:
+            self._closed_custody_pin = (self.owner.process, self.owner.cohort,
+                getattr(self.owner.cohort, "_current", _MISSING),
+                tuple(getattr(self.owner.cohort, "_processes", ())),
+                tuple((item, item.connection) for item in self.host._connections))
         self._close_unknown = True
         try:
             if not self._cohort_closed:
@@ -415,3 +508,124 @@ class DailyRetirementOperation:
         self.owner._closed = True
         self._complete = True
         self.phase = "retired_admission_fenced"
+
+    def assert_successor_predecessor(self):
+        """Validate retained positive retirement without native or ledger I/O.
+
+        A distinct new POLICY guard is permitted. Old guards are inspected only
+        as completed original custody, never reused as a held capability.
+        """
+        from .daily_activation_host import DailyActivationHost, _ConnectionCustody
+        from .daily_cohort import RetainedCohort
+        from .identity import VerifiedProcess
+        from .pipe_windows import NativePipeListener, NativePipeRegistry
+        from .policy import PolicyCoordinator, PolicyGuard, _cleanup_outcome_unverified
+        from .supervisor_startup import SupervisorStartup
+        from . import daily_retirement_inventory as inventory
+        if (type(self) is not DailyRetirementOperation or self not in _ORIGINAL_OPERATIONS or
+                threading.current_thread() is not self._thread or threading.get_ident() != self._thread_id or
+                os.getpid() != self._pid or self.request_id != self._original_request):
+            _reject("daily_successor_original_retirement_required")
+        current = (self.host, self.owner, self.store, self.supervisor, self.policy,
+            self._freeze, self._seal, self.journal, self.owner.process, self.owner.cohort)
+        if (any(left is not right for left, right in zip(current, self._original_objects)) or
+                type(self.host) is not DailyActivationHost or type(self.policy) is not PolicyCoordinator or
+                self.host._retirement is not self or self.owner._retirement_operation is not self or
+                self.host.owner is not self.owner or self.host.store is not self.store or
+                self.host.supervisor is not self.supervisor or self.store._policy is not self.policy or
+                self.policy.store is not self.store or
+                self.store.db_path != self.owner.ledger_path or self.host.ledger_path != self.owner.ledger_path or
+                self.host.journal_dir != self.journal._directory):
+            _reject("daily_successor_predecessor_binding_changed")
+        if (tuple(getattr(self.owner, name, _MISSING) for name in
+                ("manifest", "source_root", "ledger_path", "ledger_identity", "generation", "readiness_endpoint")) !=
+                self._owner_source_pin or self.owner.manifest is not self._owner_source_pin[0] or
+                self.owner.readiness_endpoint is not self._owner_source_pin[5] or
+                not self.owner._matches_generation(self._generation_row)):
+            _reject("daily_successor_predecessor_binding_changed")
+        if (any(value is not True for value in (self._complete, self._sealed, self._freeze_acknowledged,
+                self._cohort_closed, self._process_closed, self.owner._closed, self.host._generation_settled,
+                self.host._supervisor_closed, self.supervisor._closed, self.supervisor.draining,
+                self.host._readiness_cleanup_complete, self.host._readiness_joined,
+                self.host._readiness_listener_closed)) or self._close_unknown is not False or
+                self.host._readiness_close_unknown is not False or self._seal_resume_active is not False or
+                self._quarantine is not None or self.supervisor._operational_error is not None or
+                self.phase != "retired_admission_fenced"):
+            _reject("daily_successor_predecessor_cleanup_unsettled")
+        for operation, guard, pin, readback in ((self._freeze, self._freeze_guard, self._freeze_guard_pin,
+                self._freeze_readback), (self._seal, self._seal_guard, self._seal_guard_pin, self._seal_readback)):
+            if (type(operation) is not RetainedPolicyOperation or operation.store is not self.store or
+                    operation._complete is not True or operation.pending or operation._quarantine is not None or
+                    type(guard) is not PolicyGuard or pin is None or guard is not pin[0] or
+                    guard.binding is not pin[1] or guard.nonce != pin[2] or readback is None or
+                    readback[0] is not guard or readback[1] != guard.nonce or
+                    guard._native_exit_confirmed is not True or guard._native_no_entry_confirmed is not False or
+                    guard._nonce_clear_attempted is not True or
+                    self.policy.current_guard() is guard or self.policy.current_cleanup_guard() is guard):
+                _reject("daily_successor_predecessor_policy_unsettled")
+        for error in (self._error, self._freeze._error, self._seal._error,
+                getattr(self.host, "_retirement_cleanup_error", None), getattr(self.host, "_readiness_failure", None)):
+            if error is not None and _cleanup_outcome_unverified(error):
+                _reject("daily_successor_predecessor_cleanup_unsettled")
+        readiness = tuple(getattr(self.host, name, _MISSING) for name in
+            ("_thread", "_listener", "_registry", "_service", "_thread_stopped", "_readiness_stop"))
+        if (any(left is not right or left is _MISSING for left, right in zip(readiness, self._readiness_objects)) or
+                type(readiness[0]) is not threading.Thread or type(readiness[1]) is not NativePipeListener or
+                type(readiness[2]) is not NativePipeRegistry or
+                self.host._thread is not self.host._readiness_original_thread or
+                self.host._listener is not self.host._readiness_original_listener or
+                self.host._registry is not self.host._readiness_original_registry or
+                not self.host._thread_stopped.is_set() or not self.host._readiness_stop.is_set() or
+                self.host._thread.is_alive() is not False):
+            _reject("daily_successor_predecessor_readiness_changed")
+        status = self.host._registry.status()
+        if (any(type(value) is not int or value != 0 for value in
+                (status.resources, status.pending, status.quarantined)) or
+                self.owner._readiness_cleanup_error is not None or self.owner._readiness_readers):
+            _reject("daily_successor_predecessor_readiness_unsettled")
+        native = self._readiness_native_owner
+        if (native is _MISSING or self.host._listener._owner is not native or
+                getattr(native, "_registry", None) is not self.host._registry or
+                any(getattr(native, name, _MISSING) is not None for name in
+                    ("_handle", "_operation", "_active", "_server_process", "_self_process", "_peer_process",
+                     "_accept_operation", "_accept_connection")) or
+                getattr(native, "_handle_close_unknown", None) is not False or
+                getattr(native, "_busy", None) is not False or getattr(native, "_proofs", None) != 0):
+            _reject("daily_successor_predecessor_readiness_unsettled")
+        pin = self._closed_custody_pin
+        if (pin is None or self.owner.process is not pin[0] or self.owner.cohort is not pin[1] or
+                type(self.owner.cohort) is not RetainedCohort or self.owner.cohort._current is not pin[2] or
+                len(self.owner.cohort._processes) != len(pin[3]) or
+                any(left is not right for left, right in zip(self.owner.cohort._processes, pin[3])) or
+                self.owner.cohort._closed is not True or self.owner.cohort._unresolved is not None or
+                len(self.host._connections) != len(pin[4]) or
+                any(left is not right[0] for left, right in zip(self.host._connections, pin[4])) or
+                self._supervisor_custody_pin is None or self._supervisor_custody() != self._supervisor_custody_pin):
+            _reject("daily_successor_predecessor_custody_changed")
+        startup = getattr(self.supervisor, "startup", _MISSING)
+        if startup is not self._supervisor_startup or startup is _MISSING:
+            _reject("daily_successor_predecessor_custody_changed")
+        if startup is not None and (type(startup) is not SupervisorStartup or startup._closed is not True or
+                startup._acquired is not False or startup._entry_unknown is not False or
+                startup._release_unknown is not False or startup._close_unknown is not False or
+                any(value is not None for value in (startup._current, startup._mutex, startup._scope, startup._lease)) or
+                startup.policy_pending or startup.policy_quarantined):
+            _reject("daily_successor_predecessor_startup_unsettled")
+        for process in (pin[0], pin[2], *pin[3]):
+            if (type(process) is not VerifiedProcess or process._handle is not None or
+                    process._close_outcome_unknown is not False):
+                _reject("daily_successor_predecessor_process_unsettled")
+        for connection, original in pin[4]:
+            if (type(connection) is not _ConnectionCustody or connection.connection is not original or
+                    connection.closed is not True or connection.close_unknown is not False):
+                _reject("daily_successor_predecessor_sql_unsettled")
+        for row, pin in ((self._generation_row, self._generation_pin),
+                (self._freeze_row, self._freeze_row_pin), (self._seal_row, self._seal_row_pin)):
+            if pin is None or row is not pin[0] or _canonical(row) != pin[1]:
+                _reject("daily_successor_predecessor_preimage_changed")
+        inventory._retired_inventory_parts(self)
+        expected = hashlib.sha256(_canonical(dict(request_id=self.request_id,
+            generation=self.owner.generation, freeze=self._freeze_row,
+            inventory_digest=self._seal_inventory_digest, seal_nonce=self._seal_guard.nonce))).hexdigest()
+        if self._seal_row != dict(self._freeze_row, phase="SEALED", seal_digest=expected):
+            _reject("daily_successor_predecessor_seal_changed")

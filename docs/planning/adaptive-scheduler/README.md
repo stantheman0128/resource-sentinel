@@ -4,6 +4,57 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
+最新提交完成 **fresh-generation restart 的原始 predecessor 證據保留**，契約見
+[DAILY-GENERATION-SUCCESSOR.md](DAILY-GENERATION-SUCCESSOR.md)。原始 seal 寫入前
+保留同一 inventory snapshot、digest 與 SQL/POLICY/native owners；完整退場後，
+`assert_successor_predecessor()` 核對同一操作、程序與 thread、原始 guards 的退出、
+readiness、supervisor startup／child witnesses、SQL connection、cohort／process
+的正面關閉結果。`retired_inventory_preimage()` 只回傳不可變的原始 ledger、
+receipt 與依 execution ID 排序的 journal bytes，不重新查詢 DB 或取得 native
+handle，也不授予重啟或准入權限。SEALED 紀錄及複製物件不能代替原始操作。
+
+**這只是 predecessor 證據這個 source slice，fresh-generation restart 仍未完成。**
+真正 successor transaction、immutable history transfer、host／CLI integration
+及 fresh readiness 尚待實作；未驗證的 archive 草稿留在本機，沒有納入提交。
+沒有部署日常 source、修改 config／Scheduled Task／啟動入口或啟用 adaptive。
+
+最終 **9 模組、210 PASS，0 failures／errors／skips，runner 29.072 秒**，包含
+12 個新增案例及既有 retirement／generation／activation 回歸。測試使用隔離的
+真實 SQLite、terminal receipt／journal 與明確 synthetic native collaborators；
+不代表 Windows native gate、完整套件或 clean-checkout 驗證。獨立 review 的
+journal key、startup／child witness 及底層 SQL connection binding 問題已修正。
+私人日誌 `.local-adaptive/successor-predecessor-final-20260924-1.log`。重現命令：
+
+```powershell
+$sentinelPredecessorTests = @(
+    'tests.test_adaptive_daily_successor_predecessor'
+    'tests.test_adaptive_daily_retirement'
+    'tests.test_adaptive_daily_retirement_inventory'
+    'tests.test_adaptive_daily_retirement_integration'
+    'tests.test_adaptive_daily_retirement_policy'
+    'tests.test_adaptive_daily_retirement_prelaunch'
+    'tests.test_adaptive_daily_retirement_consumers'
+    'tests.test_adaptive_daily_generation'
+    'tests.test_adaptive_daily_activation_host'
+)
+$sentinelPredecessorCommand = 'C:\Python313\python.exe -m unittest ' + ($sentinelPredecessorTests -join ' ') + ' -q'
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command $sentinelPredecessorCommand -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
+另有 **已確認的既有失敗，沒有列入上述通過數**：第一次 224-test batch 有
+2 failures／22 errors，全部來自 `test_adaptive_daily_retirement_fence` 的舊
+fixture 沒有建立 canonical generation guards，觸發
+`daily_generation_guards_unverified`。使用獨立 `git archive 2b3817b` 的已提交
+source 與原測試執行 `C:\Python313\python.exe -m unittest discover -s tests -p
+test_adaptive_daily_retirement_fence.py -q`，26 tests 同樣 2 failures／22 errors
+（0.249 秒）。沒有修改其測試預期或移除 guard；這項 fixture 缺口仍待修正。
+私人日誌 `successor-predecessor-existing-20260924-1.log` 與
+`fence-baseline-2b3817b-complete.log`。首次 12-case focused run 通過後出現一則
+Python DummyThread shutdown 警告，已修正 foreign-thread 測試的 lookup fixture；
+最後 210-test batch 正常退出，沒有該警告。
+
+前一批 S1 source 實作與驗證如下。
+
 S1 的 **serial measurement、受驗證來源 bootstrap、外部 console entry 與 v2
 publication source 已接通並通過隔離測試**。保留三個 prerequisites＋十回合、
 每回合三個完整 30 秒窗口、2500 rate、原始 115／120 秒期限；沒有缩短測試或

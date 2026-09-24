@@ -545,3 +545,53 @@ def retirement_inventory_digest(store, snapshot):
         digest.update(len(value).to_bytes(8, "big"))
         digest.update(value)
     return digest.hexdigest()
+
+
+def _retired_inventory_parts(operation):
+    """Recheck the original registered capture, without borrowing its old guard.
+
+    Internal to the completed-owner assertion; the public reader first calls
+    that assertion. Returned bytes are observations, never a POLICY capability.
+    """
+    from .daily_retirement import DailyRetirementOperation
+    if type(operation) is not DailyRetirementOperation:
+        _refuse("completed_retirement_required")
+    snapshot, pin = operation._seal_inventory, operation._seal_inventory_pin
+    captured = _SNAPSHOTS.get(snapshot) if type(snapshot) is RetirementInventorySnapshot else None
+    if (captured is None or type(pin) is not tuple or len(pin) != 3 or snapshot is not pin[0] or
+            captured is not pin[1] or operation._seal_inventory_digest != pin[2]):
+        _refuse("original_snapshot_required")
+    owner, journal, guard, path, pid, thread, ledger_bytes, receipt_bytes, records, directory, directory_ids = captured
+    if (owner is not operation.store or journal is not operation.journal or guard is not operation._seal_guard or
+            path != operation.owner.ledger_path or os.getpid() != pid or threading.get_ident() != thread or
+            journal._directory != directory or journal._directory_ids != directory_ids or
+            type(ledger_bytes) is not bytes or type(receipt_bytes) is not bytes or type(records) is not dict or
+            len(records) > MAX_HISTORY or any(type(key) is not str or type(record) is not RecoveryManifest or
+                key != record.execution_id
+                for key, record in records.items())):
+        _refuse("snapshot_scope_changed")
+    journals = tuple((key, records[key].to_json().encode("utf-8")) for key in sorted(records))
+    parts = (ledger_bytes, receipt_bytes, *(value for _, value in journals))
+    if sum(len(value) for value in parts) > MAX_BYTES:
+        _refuse("bytes_exceeded")
+    digest = hashlib.sha256(b"resource-sentinel.daily-retirement-inventory.v1\x00")
+    for value in parts:
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+    if digest.hexdigest() != pin[2]:
+        _refuse("snapshot_digest_changed")
+    return ledger_bytes, receipt_bytes, journals
+
+
+def retired_inventory_preimage(operation):
+    """Immutable source evidence from the exact positively retired original.
+
+    Returns ``(ledger_bytes, receipt_bytes, ((execution_id, manifest_bytes),
+    ...))`` in execution-ID order. No DB, journal, native handle or held guard
+    is consulted, and no mutation or authority is granted by these bytes.
+    """
+    from .daily_retirement import DailyRetirementOperation
+    if type(operation) is not DailyRetirementOperation:
+        _refuse("completed_retirement_required")
+    operation.assert_successor_predecessor()
+    return _retired_inventory_parts(operation)

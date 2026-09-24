@@ -4,6 +4,37 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
+Mixed-source build reader／v2 consumer 已完成。契約見
+[S1-SOURCE-BINDING.md](S1-SOURCE-BINDING.md)，serial custody 契約見
+[S1-SERIAL-PROVIDER.md](S1-SERIAL-PROVIDER.md)。`SourceBoundBuildSource` 分別讀取
+canonical runtime 與實際 fixture root，保留原始 SourceManifest、目錄 identity、
+完整有界 inventories 及相對路徑 digest。重新驗證 actual canonical import
+provenance；來源新增／移除／變動、目錄替換或意外 initializer 均拒絕。
+Bundle v2 增加封閉 source binding；consumer 自行建立 reader，拒絕初始或事後
+build callback 替換，v1 不變。磁碟來源核對不取代 producer 執行來源驗證。
+
+最終四模組 **128 PASS，0 failures／errors／skips，runner 18.643 秒**；
+先前三模組 111 PASS／17.068 秒，兩批重疊不加總。新檔有 25 個案例，包含
+真實隔離檔案／目錄替換、來源變動、consumer 欄位／callback 拒絕與明確 synthetic
+完整／缺 gate 資料。測試內 runtime import attestation 為明確 fixture；共同執行
+既有 daily bootstrap 回歸。獨立 review 未發現 actionable defect，已補其建議的
+runtime inventory、實際 root replacement 與完整 synthetic reducer 案例。
+私人日誌 `.local-adaptive/source-binding-20260924-2.log`。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command 'C:\Python313\python.exe -m unittest tests.test_adaptive_capability_build tests.test_adaptive_capability_evidence tests.test_adaptive_capability_runner tests.test_adaptive_daily_bootstrap -q' -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
+Windows／base Python 3.13，正常日常 admission，沒有豁免。測試依賴受保護 dirty
+baseline 與同輪尚待獨立驗證的 Job security source；commit message 揭露。
+沒有 actual native gate／clean-clone full-suite 通過聲明。尚未接通 aggregate
+producer bootstrap、v2 publication 或完整 serial S1 measurement；舊 common
+admission placeholder 仍拒絕。Job security observation 與 serial case custody
+正在實作，不能當作已驗收。Items 5/6 仍有 source 缺口，後續 P4／S3／P6 缺口
+維持未完成。未部署、未變更日常 config／Scheduled Task／啟動入口，adaptive off。
+
+### 先前 S1 wrapper boundary checkpoint（歷史驗證）
+
 S1 root／child scope timing 與 wrapper Create readiness source 已接線，先行契約
 為 [`c64708c`](S1-WRAPPER-BOUNDARY.md)。Guardian 在原 allocation transaction
 固定 reservation／binding、原始到期時間及保守 monotonic 截止點。Bootstrap v2

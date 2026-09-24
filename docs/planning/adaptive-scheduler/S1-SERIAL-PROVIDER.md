@@ -40,7 +40,11 @@ No next case starts until the previous one positively releases or abandons its
 original daily demand. A state label, copied JSON, elapsed TTL, root exit, empty
 Job or closed native handle cannot release capacity.
 
-- Never submitted, queued or positively rejected: original
+- A clean successfully captured demand before any submission preparation uses
+  its original `close_unsubmitted()`; that method verifies no submission or
+  pending guard before closing its original process handle. Failed/partial
+  capture or unknown preparation remains held; do not fabricate a guard.
+- After actual submission preparation, never submitted, queued or positively rejected: original
   `Coordinator.abandon_experiment(demand)` must positively finish its original
   checks and self-close. Only its returned terminal disposition ends custody.
 - Interrupted admission: settle the same original admission guard with

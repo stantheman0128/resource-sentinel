@@ -33,6 +33,9 @@ runtime inventory (`sentinel/**/*.py`, command adapter) and producer inventories
 resolved against each inventory's own root. All existing entry/file/byte/depth
 bounds and stable-file checks remain. Source/root/inventory changes invalidate
 the original reader; it does not adopt a new generation or build silently.
+The reader also calls the existing canonical `verify_import_provenance` audit;
+matching files cannot certify a consumer still executing different loaded code.
+This production audit imports no fixture code and runs outside control locks.
 
 `NativeEvidenceAuthority` must choose this concrete reader itself after parsing
 and hash-checking bundle v2. It must reject an injected build callback for v2.

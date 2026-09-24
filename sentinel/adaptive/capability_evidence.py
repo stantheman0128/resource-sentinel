@@ -291,8 +291,9 @@ class CurrentBuildSource:
         self._cache = {}
         self._inventories = {}
 
-    def _inventory(self, roots, extras=()):
-        key = (tuple(roots), tuple(extras))
+    def _inventory(self, roots, extras=(), *, relative_root=None):
+        relative_root = _ROOT if relative_root is None else relative_root
+        key = (tuple(roots), tuple(extras), relative_root)
         previous = self._inventories.get(key)
         if previous is not None:
             paths, directories = previous
@@ -300,7 +301,7 @@ class CurrentBuildSource:
                 info = os.lstat(directory)
                 if (info.st_dev, info.st_ino, info.st_mtime_ns) != stamp:
                     _reject("capability_build_inventory_changed")
-            return self._hash_paths(paths)
+            return self._hash_paths(paths, relative_root=relative_root)
         paths, visited = [], 0
         directories = {}
         for root in roots:
@@ -332,9 +333,10 @@ class CurrentBuildSource:
         if not paths or len(paths) > _MAX_BUILD_FILES:
             _reject("capability_build_missing")
         self._inventories[key] = (tuple(sorted(paths)), directories)
-        return self._hash_paths(paths)
+        return self._hash_paths(paths, relative_root=relative_root)
 
-    def _hash_paths(self, paths):
+    def _hash_paths(self, paths, *, relative_root=None):
+        relative_root = _ROOT if relative_root is None else relative_root
         records, total = [], 0
         for path in sorted(paths):
             before = _fingerprint(path)
@@ -345,7 +347,7 @@ class CurrentBuildSource:
             if cached is None or cached[0] != before:
                 payload, observed = _read(path, _MAX_BUILD_BYTES)
                 cached = self._cache[path] = (observed, _sha(payload))
-            records.append(path.relative_to(_ROOT).as_posix() + "\0" + cached[1] + "\n")
+            records.append(path.relative_to(relative_root).as_posix() + "\0" + cached[1] + "\n")
         return _sha("".join(records).encode("utf-8"))
 
     def __call__(self):
@@ -1203,7 +1205,9 @@ class NativeEvidenceAuthority:
         self.directory = None if bundle_directory is None else Path(bundle_directory)
         self.expected_bundle_sha256 = expected_bundle_sha256
         self.context_source = NativeContextSource() if live_context_source is None else live_context_source
+        self._default_build_source = build_source is None
         self.build_source = CurrentBuildSource() if build_source is None else build_source
+        self._bound_build_source = None
         self._bundle = None
         self._artifacts = {}
         self._files = {}
@@ -1233,6 +1237,8 @@ class NativeEvidenceAuthority:
             _reject("capability_path_unsafe")
         _safe_directory(self.directory)
         if self._bundle is not None:
+            if self._bundle["schema_version"] == 2 and self.build_source is not self._bound_build_source:
+                _reject("capability_bound_build_override_refused")
             if any(_fingerprint(path) != value for path, value in self._files.items()):
                 _reject("capability_evidence_changed")
             return
@@ -1240,8 +1246,13 @@ class NativeEvidenceAuthority:
         payload, fingerprint = _read(path, _MAX_BYTES)
         if _sha(payload) != self.expected_bundle_sha256:
             _reject("capability_bundle_hash_mismatch")
-        bundle = _object(strict_json_loads(payload), ("schema_version", "kind", "run_id", "evidence_source", "build", "context", "profile_revision", "artifacts"))
-        if type(bundle["schema_version"]) is not int or bundle["schema_version"] != 1 or bundle["kind"] != "native_capability_bundle":
+        bundle = strict_json_loads(payload)
+        version = bundle.get("schema_version")
+        if type(version) is not int or version not in (1, 2):
+            _reject("capability_schema_invalid")
+        fields = ("schema_version", "kind", "run_id", "evidence_source", "build", "context", "profile_revision", "artifacts")
+        _object(bundle, (*fields, "source_binding") if version == 2 else fields)
+        if bundle["kind"] != "native_capability_bundle":
             _reject("capability_schema_invalid")
         _uuid(bundle["run_id"])
         if bundle["evidence_source"] != "native":
@@ -1264,6 +1275,12 @@ class NativeEvidenceAuthority:
                 _reject("capability_evidence_not_native")
             artifacts[gate] = artifact["data"]
             files[artifact_path] = checked
+        if version == 2:
+            if not self._default_build_source or type(self.build_source) is not CurrentBuildSource:
+                _reject("capability_bound_build_override_refused")
+            from .capability_build import SourceBinding, SourceBoundBuildSource
+            bound_source = SourceBoundBuildSource(SourceBinding.from_dict(bundle["source_binding"]))
+            self.build_source = self._bound_build_source = bound_source
         self._artifacts, self._bundle, self._files = artifacts, bundle, files
 
     def assess(self):

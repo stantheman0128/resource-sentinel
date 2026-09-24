@@ -79,8 +79,13 @@ original exception. The existing Job-owning `WRAPPER_NOT_CREATED` branch may
 produce `NativeScopeCompletion` after all of its actual cleanup. Failures even
 earlier than that branch require an explicit original preparation-cleanup path
 that accounts for every attempted acquisition before it can mint a completion;
-the current `NativeScopeCompletion` cannot be assumed to cover them. Until
-that path exists or positively settles, the reservation remains held.
+the current `NativeScopeCompletion` cannot be assumed to cover them. A positive
+early-preparation path has the distinct `PREPARATION_CLOSED` disposition: no
+wrapper was created and no successful Job escaped preparation, and every
+attempted acquisition is accounted by its retained original owner and positive
+close or its original never-entered slot. A missing constructor return is not
+positive accounting. Until that path positively settles, the reservation
+remains held; it never becomes `BEFORE_NATIVE` retroactively.
 
 For a created wrapper, completion requires authenticated launch sealing, the
 actual root disposition, disabled original CPU control, no pending intent,
@@ -116,7 +121,7 @@ schema must bind at least:
 | Identity and operation | Schema version, receipt/operation ID, experiment ID, suite, daily execution/reservation/request IDs, exact original caller PID/birth/logon, demand binding hash and declaration/scope hash. |
 | Actual daily source | Canonical daily ledger path and file identity, source generation/source/config digests, admission binding/spec hashes, daily POLICY instance/logon. |
 | Declared capacity | Original requested demand and the allocation/floor preimage actually validated for release. No cap-adjusted demand or zeroed historical floor. |
-| Native disposition | Closed enum: `BEFORE_NATIVE`, `WRAPPER_NOT_CREATED`, `NEVER_LAUNCHED` or `FINISHED` **for the isolated experiment only**. Exact original completion digest; nullable scope fields are allowed only by the defined variant. |
+| Native disposition | Closed enum: `BEFORE_NATIVE`, `PREPARATION_CLOSED`, `WRAPPER_NOT_CREATED`, `NEVER_LAUNCHED` or `FINISHED` **for the isolated experiment only**. Exact original completion digest; nullable scope fields are allowed only by the defined variant. `PREPARATION_CLOSED` preserves the exact retained attempted-owner accounting and never invents a wrapper or successful Job. |
 | Scope evidence | When present: isolated ledger identity/path, scope ID, command hash, creation nonce, Job name, original guardian/wrapper/root identities, terminal record and its digest, original deadline, exclusion binding hash, settled intent/slot disposition and exact closed-owner binding. |
 | Transaction binding | Daily pre-state/revision and canonical preimage hash; deterministic cancellation/archive postimage hash; prior/result registry revision; expected exclusion postimage or positive original no-registration disposition; fixed transaction time. |
 | Integrity | Canonical domain-separated receipt digest over all preceding fields, with exact scalar types, enum validation, size limits and no unknown fields. |
@@ -309,3 +314,69 @@ this exact committed receipt tuple and settled final fences, followed by a
 legitimate next experiment's admission. A passing portable suite, live PID,
 receipt-shaped JSON, native close flag or absent reservation does not establish
 that end-to-end outcome.
+
+## Next implementation: original generation binding and release-only SQL
+
+This amendment specifies the next release slice. The separate original
+preparation/completion slice does not implement `prepare_release`,
+`release_experiment`, receipt publication or capacity release. None of these
+routes exists merely because readiness and preparation source tests pass.
+
+During the original authenticated admission, retain the complete validated
+daily generation row on the original demand, before admission can publish.
+The current `_prepared` tuple contains only generation/source/config digests
+and is insufficient for this full binding. Pin every immutable generation
+field, including source manifest/root, ledger path/file identity, original
+generation-owner identity and readiness endpoint instance. Include that pin
+in the immutable completion and release-operation binding. The only permitted
+later row difference is the same generation's `ACTIVE` to `DRAINING` state
+transition. Never fill missing original fields from the row first observed
+during cleanup; an older demand lacking this original pin must refuse release.
+
+The exact original `ExperimentReleaseOperation` supplies cleanup authority
+through its retained demand and concrete original completion. Add only a
+dedicated lexical operation seam to `daily_generation` and the existing
+POLICY/connection hooks: require that exact registered operation, ledger,
+thread, sealed binding and phase. It must not acquire or renew daily readiness,
+depend on the admission lease still being live, adopt a generation owner, or
+construct a `DailyReadinessAuthority`. Revalidate source/import provenance,
+config, generation fields and file identity on the actual consumer connection
+and after its `BEGIN`. No side connection, live-status lookup or new peer can
+replace those checks. A changed/unavailable source or ledger still refuses.
+
+The operation owns these distinct, narrowly authorized connection phases:
+
+| Phase | Permitted operation and original custody |
+| --- | --- |
+| Read and reconcile | Bounded reads of the exact original bindings and full pre/postimage; no capacity UDF or mutation authority. |
+| Publish POLICY nonce | Require an already-initialized, unchanged original POLICY binding. Publish only this operation's candidate nonce against a null preimage, retaining the original attempt before SQL. No binding initialization or replacement is allowed. |
+| Hold and publish receipt | Reuse the existing native POLICY acquire/revalidate/release order. Under the same guard, permit only the reviewed receipt, exact cancellation/archive, exact reservation/queue deletion, exclusion close and one registry revision transition. |
+| Clear original nonce | Only after positive original native release, clear exactly this operation's guard nonce to null. Preserve current timeout/unknown-release rules and the original guard if SQL acknowledgement or close is uncertain. |
+| Postcommit readback | After positive original SQL and guard cleanup, verify the entire exact committed tuple through retained operation custody before reporting release complete. |
+
+The existing `readiness_nonce_cleanup` and `_nonce_only` provide exact nonce
+fencing, not release authority: they only clear an
+already-owned nonce. The original local install and retirement
+`authorize_nonce_cleanup` paths remain separate. `RetainedPolicyOperation`
+and the original managed-submission reconciliation provide existing custody
+patterns; their reads and holds also need the same release lexical seam, so
+they must not silently enter a fresh readiness RPC during cleanup.
+
+The current `daily_generation._install_triggers` requires `ACTIVE` plus
+`sentinel_daily_generation()` for every capacity INSERT/UPDATE/DELETE.
+Consequently a connection hook alone cannot implement this contract. Revise
+the canonical persistent guards together with the receipt schema so that only
+the exact original receipt-bound reservation/queue DELETE can take the
+release route in `ACTIVE` or `DRAINING`. Cleanup must never install a fake
+`sentinel_daily_generation`, return a generation string as general capacity
+authority, or exempt arbitrary DELETE statements. Other writes retain their
+existing daily authority requirement. Preserve and validate the retirement
+fence, experiment immutability guards, exclusion guards and full historical
+tuple; readers unable to validate the revised canonical schema must refuse it.
+
+Focused verification must include an expired/unavailable readiness service,
+the same original row in both states, a changed endpoint/owner/source/file
+binding, missing original admission pin, attempted new POLICY binding,
+unrelated row deletion, wrong phase or retained connection after lexical exit,
+and lost ACK/unknown cleanup. No new native experiment or runtime activation
+is authorized by this amendment.

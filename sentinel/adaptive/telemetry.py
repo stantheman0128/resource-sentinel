@@ -104,6 +104,8 @@ class EmitReceipt:
     accepted: bool
     serialized_bytes: int
     outcome: str
+    kind: str | None = None
+    superseded: int | None = None
 
 
 @dataclass(frozen=True)
@@ -128,6 +130,10 @@ class WriteReceipt:
     deleted: tuple[ChunkObservation, ...]
     inventory: tuple[ChunkObservation, ...]
     utc_ns: int
+    offers: tuple[tuple[int, int], ...]
+    before_inventory: tuple[ChunkObservation, ...]
+    lock_identity: tuple
+    kind: str
 
 
 class _FileOwner:
@@ -352,6 +358,14 @@ class SharedTelemetryStore:
         finally:
             self._unlock_close(lock)
 
+    def inventory_observation(self):
+        """Explicit read-only measurement, outside the resident offer path."""
+        lock = self._acquire_lock()
+        try:
+            return _identity(os.fstat(lock.fd)), self._inventory()
+        finally:
+            self._unlock_close(lock)
+
     def _unlock_close(self, lock):
         try:
             self._lock(lock.fd, False)
@@ -381,6 +395,7 @@ class SharedTelemetryStore:
                 raise TelemetryError("telemetry_utc_regressed")
             self._last_utc = now
             chunks = list(self._inventory())
+            before_inventory = tuple(chunks)
             if any(item.created_utc_ns > now for item in chunks):
                 raise TelemetryError("telemetry_utc_regressed")
             before = 1 + sum(item.size for item in chunks)
@@ -436,7 +451,9 @@ class SharedTelemetryStore:
                 raise TelemetryError("telemetry_byte_conservation_failed")
             self._write_sequence += 1
             return WriteReceipt(self._write_sequence, records[0][0], records[-1][0], len(records),
-                len(payload), removed, before, after, tuple(deleted), after_inventory, now)
+                len(payload), removed, before, after, tuple(deleted), after_inventory, now,
+                tuple((seq, len(line)) for seq, line in records), before_inventory,
+                _identity(os.fstat(lock.fd)), kind.value)
         finally:
             self._unlock_close(lock)
 
@@ -462,6 +479,7 @@ class ResidentTelemetry:
         self._error = None
         self._last_flush = self._clock()
         self._receipts = deque(maxlen=128)
+        self._offers = deque(maxlen=128)
         self._active_batch = None
         self._last_iteration_state = None
         self._last_rpc_states = {}
@@ -551,7 +569,7 @@ class ResidentTelemetry:
             seq = self._sequence
             if self._stop or self._error is not None:
                 self._dropped += 1
-                return EmitReceipt(self.instance_id, seq, False, 0, "telemetry_unavailable")
+                return self._offer_receipt(seq, False, 0, "telemetry_unavailable")
             try:
                 if type(record) is not dict or not _bounded_record(record):
                     raise ValueError("record")
@@ -566,21 +584,39 @@ class ResidentTelemetry:
                     raise ValueError("size")
             except (TypeError, ValueError, OverflowError):
                 self._dropped += 1
-                return EmitReceipt(self.instance_id, seq, False, 0, "telemetry_record_invalid")
+                return self._offer_receipt(seq, False, 0, "telemetry_record_invalid")
             queued = len(self._events) + (self._aggregate is not None) + (
                 0 if self._active_batch is None else len(self._active_batch[1]))
+            superseded = None
             if selected is TelemetryKind.AGGREGATE and self._aggregate is not None:
+                superseded = self._aggregate[0]
                 self._coalesced += 1
             elif queued >= MAX_PENDING:
                 self._dropped += 1
-                return EmitReceipt(self.instance_id, seq, False, len(payload), "telemetry_queue_full")
+                return self._offer_receipt(seq, False, len(payload), "telemetry_queue_full", selected.value)
             if selected is TelemetryKind.AGGREGATE:
                 self._aggregate = (seq, payload)
             else:
                 self._events.append((seq, payload))
             self._accepted += 1
             self._condition.notify()
-            return EmitReceipt(self.instance_id, seq, True, len(payload), "telemetry_queued")
+            return self._offer_receipt(seq, True, len(payload), "telemetry_queued", selected.value, superseded)
+
+    def _offer_receipt(self, sequence, accepted, size, outcome, kind=None, superseded=None):
+        # Fixed-size observation ring only. No callback, filesystem I/O or wait
+        # for the logger; overflow is detectable from the original sequence.
+        receipt = EmitReceipt(self.instance_id, sequence, accepted, size, outcome, kind, superseded)
+        self._offers.append(receipt)
+        return receipt
+
+    def observe(self):
+        """One consistent bounded observation; queued never means persisted.
+
+        Consumers must reject sequence gaps in either ring. Reading does not
+        consume, drain, rotate or grant any resource/control authority.
+        """
+        with self._condition:
+            return self.snapshot(), tuple(self._offers), tuple(self._receipts)
 
     def request_stop(self):
         with self._condition:

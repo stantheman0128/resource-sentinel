@@ -319,7 +319,7 @@ class P4Producer:
         self.active = session
         self.pending_open = False
         self._covered(session)
-        required = ("assert_daily_coverage", "read_guardian_set_audit", "enter_idle",
+        required = ("assert_daily_coverage", "read_guardian_set_audit", "read_resident_telemetry", "enter_idle",
                     "enter_stress", "prepare_wrapper_trial", "retire")
         if any(not callable(getattr(session, method, None)) for method in required):
             raise NativeRunBlocked("p4_cohort_interface_incomplete")
@@ -344,8 +344,13 @@ class P4Producer:
         probe = NativeCostProbe(witnesses)
         self.local_owners.append(probe)
         sampler = NativeHelperHostSampler(self.profile, session.jobs, host=session.helper_host,
-            report_stream=session.helper_report_stream, log_directory=logs)
+            telemetry_sink=session.helper_telemetry_sink, log_directory=logs, scope_nonce=session.scope_nonce)
         self.local_owners.append(sampler)
+        from tests.windows.adaptive_overhead_telemetry import CohortTelemetryTrace
+        sampler.telemetry_trace = CohortTelemetryTrace(scope_nonce=session.scope_nonce,
+            identities={role: next(identity for identity, names in roles.items() if role in names)
+                        for role in ("helper", "guardian", "supervisor")})
+        self._collect_telemetry(session, sampler)
         if sampler.logical_processors != self.context.logical_processors:
             raise NativeRunBlocked("p4_native_denominator_changed")
         return session, probe, sampler, roles, directory
@@ -357,7 +362,31 @@ class P4Producer:
             maximum_age=self.profile.sample_max_age_ms * 10_000)
 
     def _pace(self, session, sampler):
-        return sampler.pace(lambda: self._covered(session))
+        result = sampler.pace(lambda: self._covered(session))
+        self._collect_telemetry(session, sampler)
+        return result
+
+    def _collect_telemetry(self, session, sampler):
+        from tests.windows.adaptive_overhead_telemetry import NativeTelemetryObservation
+        remote = session.read_resident_telemetry()
+        if (type(remote) is not tuple or len(remote) != 2
+                or any(type(item) is not NativeTelemetryObservation for item in remote)
+                or {item.role for item in remote} != {"guardian", "supervisor"}):
+            raise NativeRunBlocked("p4_authenticated_telemetry_peers_unavailable")
+        for observation in (sampler.telemetry_probe.read(), *remote):
+            age = sampler._clock() - observation.observed_tick
+            if not 0 <= age <= self.profile.sample_max_age_ms * 10_000:
+                raise NativeRunBlocked("p4_telemetry_observation_stale")
+            sampler.telemetry_trace.add(observation)
+
+    def _telemetry_result(self, session, sampler):
+        # A real independent locked directory inventory brackets receipt reads.
+        # Concurrent unpublished writes fail conservation rather than becoming
+        # guessed persistence. No stop, prefill, forced flush or report omission.
+        self._collect_telemetry(session, sampler)
+        lock_identity, inventory = sampler.telemetry_probe.inventory()
+        self._collect_telemetry(session, sampler)
+        return sampler.telemetry_trace.finish(lock_identity, inventory)
 
     def _retire(self, session, probe, sampler):
         self._covered(session)
@@ -415,6 +444,7 @@ class P4Producer:
                 if audit.calls or sampler.native_set_calls:
                     raise NativeRunBlocked("p4_shadow_set_observed")
             self._covered(session)
+            telemetry = self._telemetry_result(session, sampler)
             end = clock()
             last = probe.read()
             audit = self._audit(session, audit, clock)
@@ -423,7 +453,8 @@ class P4Producer:
             result = dict(jobs=jobs, started_tick=start, ended_tick=end,
                 processes=process_endpoints(roles, first, last), samples=samples,
                 native_set_calls=audit.calls + sampler.native_set_calls, sampling_cases=cases,
-                host_loop=sampler.host_record(session.scope_nonce, started_iteration, host_ticks))
+                host_loop=sampler.host_record(session.scope_nonce, started_iteration, host_ticks),
+                telemetry=telemetry)
             _write_new(directory / "scale.json", result, expected_gate="P4")
             trace.close()
             self._retire(session, probe, sampler)
@@ -483,8 +514,9 @@ class P4Producer:
             if audit.calls or sampler.native_set_calls:
                 raise NativeRunBlocked("p4_shadow_set_observed")
             result = dict(started_tick=start, ended_tick=end, idle_before=before,
-                          idle_after=after, observations=observations)
-            _write_new(directory / "leak.json", result)
+                          idle_after=after, observations=observations,
+                          telemetry=self._telemetry_result(session, sampler))
+            _write_new(directory / "leak.json", result, expected_gate="P4")
             trace.close()
             self._retire(session, probe, sampler)
             return result
@@ -527,7 +559,8 @@ class P4Producer:
                 audit = self._audit(session, audit, clock)
                 if audit.calls or sampler.native_set_calls:
                     raise NativeRunBlocked("p4_shadow_set_observed")
-        _write_new(directory / "wrappers.json", result)
+        result["wrapper_telemetry"] = self._telemetry_result(session, sampler)
+        _write_new(directory / "wrappers.json", result, expected_gate="P4")
         self._retire(session, probe, sampler)
         return result
 
@@ -544,7 +577,7 @@ class P4Producer:
             sampler.tick()
 
     def run(self):
-        data = {"scales": []}
+        data = {"schema_version": 2, "scales": []}
         try:
             for jobs in SCALES:
                 data["scales"].append(self._scale(jobs))

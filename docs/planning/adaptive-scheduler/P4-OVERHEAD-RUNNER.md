@@ -37,7 +37,7 @@ returns one in-process session with the following original custody:
 | --- | --- |
 | `helper` | Retained `VerifiedProcess` for the current external-console runner. It executes the actual helper loop and all probe work, all of which is charged to monitoring CPU. |
 | `helper_host` | The initialized original `OperationalHelperHost` in shadow mode, in that same process, with its actual registry, QUERY handles, parent witness and operator endpoint. A PID, `ShadowHelper` core, approval flag or reconstructed object is insufficient. |
-| `helper_report_stream` | The original writable UTF-8 text stream backed by a regular file in `log_directory`; the actual host metrics serializer/write/flush runs against it. Provider retains and closes the stream only after host cleanup. |
+| `helper_telemetry_sink` | Original running `ResidentTelemetry` installed on the actual helper. Its canonical shared `adaptive-telemetry` directory is exactly `log_directory`; all resident log files and metadata count. The original worker remains in the helper process and its CPU/private memory is charged. |
 | `guardian` | Retained exact witness for a real isolated guardian host. A sleeping fixture must not be labeled guardian. |
 | `wrappers` | Exactly `jobs` original witnesses for real waiting wrapper hosts, all retained and continuously covered. |
 | `monitor_processes` | Tuple of `(role, original VerifiedProcess)` pairs covering exactly one helper, guardian, supervisor, accounting keeper and daily activation/readiness owner, plus every waiting wrapper. The known supervisor/keeper/readiness roles may share an exact process identity; preserve all roles and charge that identity once. No caller-only demand witness may be relabeled as a keeper. |
@@ -46,6 +46,7 @@ returns one in-process session with the following original custody:
 | `database`, `log_directory` | Isolated runtime database and bounded runtime logs, distinct from producer raw evidence. The daily admission DB is never supplied here. |
 | `assert_daily_coverage()` | Bounded actual daily allocation/adoption check for every fixture and infrastructure member; returns `None` on success. Unknown, stale or lost coverage raises and preserves original owners. |
 | `read_guardian_set_audit()` | Authenticated read of the guardian's actual native Set boundary instrumentation, installed before the experiment. Returns typed `NativeSetObservation` bound to the exact peer and scope with advancing sequence, original install tick and cumulative counters. |
+| `read_resident_telemetry()` | Authenticated reads of original guardian and supervisor `NativeTelemetryProbe` objects, returning exactly those two typed `NativeTelemetryObservation` values. Validate the original peer/scope before returning; neither the value's type nor a callback is authentication. Helper observations are read directly from its retained original probe. |
 | `enter_idle()` / `enter_stress()` | Cooperative commands to the owned fixtures. Preserve the same helper, guardian, waiting wrappers and Jobs. Stress churns children within those Jobs; do not manufacture lifecycle rows, stop user work or clear historical state. |
 | `prepare_wrapper_trial(kind, iteration)` | Actual admission preparation completed outside the latency bracket; returns an original once-only launch attempt, already retained by this session. |
 | `retire()` | Provider-owned cooperative stop, actual Job empty/disabled verification, lifecycle/archive settlement and original-handle cleanup before release of daily capacity. |
@@ -75,13 +76,14 @@ serialize a receipt, reconstruct owners from PIDs or exit with live obligations.
 
 Each measured tick invokes the original `OperationalHelperHost.run_once()` and
 the production report path. Its normal enrollment refresh, registry read, native
-open/release, memory scanner, operator poll, metrics serialization, file write and
-flush all belong inside the timed bracket. The engine defers only the sleep
+open/release, memory scanner, operator poll, metrics serialization and enqueue
+belong inside the timed bracket. The asynchronous writer's work is charged in
+the same original process CPU and Private Commit measurements. The engine defers only the sleep
 operation. Transparent taps count the actual operator invocation and capture the
 exact original machine observation without changing it. All original callbacks
 are retained and restored exactly; the engine performs the
-actual wait outside that bracket, and record the native deadline and before/after
-wait timestamps. An unresolved callback replacement, stream write, or cleanup
+actual wait outside that bracket, and records the native deadline and before/after
+wait timestamps. An unresolved callback replacement, original sink receipt, or cleanup
 keeps the original owner and fails the run.
 
 For 1/10 Jobs, the actual host enrolls exactly the measured canonical scopes.
@@ -102,7 +104,8 @@ the supplementary shards; no fabricated frame or repeated short delta is used.
 
 The scale artifact must include actual host identity and scope, original
 iteration range, completed registry-refresh/report/operator-poll counts, report
-bytes, and per-sample pacing observations. The strict P4 verifier rejects old
+enqueue bytes and sequences, and per-sample pacing observations. Exact later
+write receipts must prove those required reports persisted. The strict P4 verifier rejects old
 core-only artifacts; a provider boolean cannot certify host coverage. Raw traces
 retain the detailed observations behind these counts.
 
@@ -166,12 +169,10 @@ actual-host adapter and both capability-evidence modules. The run used normal
 daily Sentinel admission and the protected dirty baseline. No native host
 overhead result has been certified.
 
-The current production operator poll has a 50 ms timeout inside `run_once()`.
-That wait is included in tick cost and may by itself prevent the unchanged
-10-Job p95 ≤50 ms gate from passing. Removing it from measured work would hide
-the defect. A separate production change would need a retained asynchronous
-accept/read with bounded nonblocking completion polling, preserving pipe cleanup
-custody and request latency; this measurement change does not make that change.
+The original 50 ms operator accept wait has since been replaced by retained
+nonblocking polling in production source. The real poll remains inside the
+measured tick; its source tests are not a measured p95 result. The same 10-Job
+p95 ≤50 ms gate still applies, with pipe custody and request latency preserved.
 
 ## Honest remaining native sampling gap
 
@@ -206,6 +207,42 @@ peak attribution, missing-case preservation, native audit replay/freshness,
 no-provider refusal before side effects, retained custody after interruption,
 read-only footprint accounting and both Windows structure layouts. They prove
 those software behaviors only, not cost, recovery, capability or a passed P4.
+
+The sink-integration regression uses closed P4 data `schema_version=2`.
+Every scale, the wrapper group and the leak experiment carry original sink
+offer/write counters and complete bounded receipt coverage. The verifier
+reconstructs the unique shared file inventory chain from an initially empty
+isolated store to a fresh independently locked final inventory, including the
+one-byte lock metadata. Required reports must be persisted, not merely queued or
+superseded. Recorder gaps, replacement, degraded storage, clock regression and
+counter/byte discrepancies fail the evidence. Original receipt rings and the
+bounded recorder's memory remain in the measured monitoring cohort. No fake
+inventory, prefill, report suppression, imported stream or empty log replacement
+is accepted.
+
+Trace retention is also byte-bounded before insertion: at most the existing
+2 MiB artifact allowance per trace, including a fixed 64 KiB framing reserve.
+Only new bounded receipts are serialized for incremental accounting; repeated
+ring observations do not repeatedly serialize the retained history. A refused
+receipt permanently marks that trace incomplete. The unchanged whole-artifact
+2 MiB check still applies across all scopes and can refuse the combined output.
+This prevents count-bounded full inventories from accumulating over 100 MiB;
+it does not prove that full native runs fit the final artifact or memory budget.
+No observer allocation is excluded from cost, and the strict idle Private
+Commit comparison can still fail if retained evidence grows during the run.
+
+This source integration **retains the strict idle-after log-byte comparison**.
+The proposed log-only deviation in `P4-BOUNDED-TELEMETRY-CONTRACT.md` requires
+additional native storage-fault/rotation/recovery-preservation evidence and a
+reviewed interpretation of unexercised native quota/age boundaries. It is not
+enabled by a schema version or bounded-policy constant. The authenticated
+aggregate fixture provider remains missing, so this producer has not executed
+or passed P4. Central source regression on 2026-09-24 passed **259 tests in
+13.765 seconds, zero failures/errors/skips**, across the seven telemetry,
+host/runner and capability modules. Full private log:
+`.local-adaptive/p4-sink-regression-20260924-1.log`. The tested tree includes
+protected dirty baseline and adjacent readiness/preparation source; this is
+not clean-clone or native acceptance evidence.
 
 On 2026-09-22, the central admitted S1/S2/inventory/P4/S3 portable batch passed
 161 tests in 41.676 seconds (zero failures/errors/skips), including the 39

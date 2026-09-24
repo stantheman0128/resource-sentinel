@@ -98,6 +98,39 @@ def case_rows(recovery):
     return result
 
 
+def telemetry_data(nonce="1" * 32, helper_instance="00000001-2000-4000-8000-000000000001", count=20):
+    """Explicit synthetic wire fixture; never native source evidence."""
+    cap, age, now = 20 * MIB, 7 * 24 * 60 * 60 * 10 ** 9, 1_800_000_000_000_000_000
+    lock = [1, 10]
+    aggregate = f"aggregate-{now:020d}-{'a' * 32}.jsonl"
+    event = f"event-{now + count:020d}-{'b' * 32}.jsonl"
+    current, sinks = [], []
+    for role_index, role in enumerate(("helper", "guardian", "supervisor")):
+        instance = helper_instance if role == "helper" else f"00000001-3000-4000-8000-{role_index:012x}"
+        records = count if role == "helper" else 1
+        size, kind = (512, "aggregate") if role == "helper" else (128, "event")
+        writes = []
+        for index in range(records):
+            before = deepcopy(current)
+            utc = now + index if role == "helper" else now + count + role_index - 1
+            if role == "helper":
+                current = [[aggregate, (index + 1) * size, now, kind, [1, 11]]]
+            elif role == "guardian":
+                current.append([event, size, utc, kind, [1, 12]])
+            else:
+                current[-1][1] += size
+            writes.append(dict(sequence=index + 1, offers=[[index + 1, size]], before=before,
+                after=deepcopy(current), deleted=[], utc_ns=utc, lock_identity=lock, kind=kind))
+        status = dict(role=role, instance_id=instance, offered=records, accepted=records,
+            persisted=records, dropped=0, coalesced=0, pending_records=0,
+            written_bytes=size * records, deleted_bytes=0, inventory_bytes=1 + sum(row[1] for row in current),
+            rotations=0, error=None, stopping=False, stopped=False, retained_files=0, max_bytes=cap, max_age_ns=age)
+        sinks.append(dict(role=role, identity=identity(100 + role_index), instance_id=instance,
+            status=status, offers=[[index + 1, size, kind, None] for index in range(records)], writes=writes))
+    return dict(schema_version=1, scope_nonce=nonce, max_bytes=cap, max_age_ns=age,
+                lock_identity=lock, final_inventory=deepcopy(current), sinks=sinks)
+
+
 def p4_data(profile=None):
     if profile is None:
         profile = replace(validate_policy_profile(json.loads(
@@ -115,23 +148,28 @@ def p4_data(profile=None):
             operator_instance_id=f"{jobs:08x}-2000-4000-8000-000000000002",
             scope_nonce=f"{jobs:032x}", config_revision=profile_revision(profile),
             managed_execution_ids=executions[:10], query_only_execution_ids=executions[10:],
-            enroll_every_ticks=5, report_every_ticks=10, started_iteration=0, ended_iteration=600,
+            enroll_every_ticks=5, report_every_ticks=30, started_iteration=0, ended_iteration=600,
+            telemetry_instance_id=f"{jobs:08x}-2000-4000-8000-000000000001",
             ticks=[[second + 1, int(second > 0 and second % 5 == 0),
-                int((second + 1) % 10 == 0), 1, 512 if (second + 1) % 10 == 0 else 0,
-                (second + 1) * T, second * T + 100_000, (second + 1) * T, 0, 0]
+                int((second + 1) % 30 == 0), 1, 512 if (second + 1) % 30 == 0 else 0,
+                (second + 1) * T, second * T + 100_000, (second + 1) * T, 0, 0,
+                (second + 1) // 30 if (second + 1) % 30 == 0 else 0]
                 for second in range(600)])
         scales.append(dict(jobs=jobs, started_tick=0, ended_tick=600 * T,
             processes=processes, samples=[[second * T, second * T + 100_000,
                 90 * MIB, 20 * MIB, 100 * MIB, sum(peaks), list(peaks)] for second in range(600)],
             host_loop=host,
+            telemetry=telemetry_data(host["scope_nonce"], host["telemetry_instance_id"]),
             native_set_calls=0, sampling_cases=dict(membership_added=1, membership_removed=1,
                 inaccessible_identity=1, member_scan_timeout=1, subtraction_zero_samples=1,
                 unsafe_subtractions=0)))
-    idle = dict(private_bytes=100 * MIB, handles=20, rows=3, log_bytes=1024)
-    return dict(scales=scales, wrapper_cold_ns=[100_000_000] * 10,
+    idle = dict(private_bytes=100 * MIB, handles=20, rows=3, log_bytes=10497)
+    return dict(schema_version=2, scales=scales, wrapper_cold_ns=[100_000_000] * 10,
+        wrapper_telemetry=telemetry_data(),
         wrapper_warm_ns=[50_000_000] * 10, leak=dict(started_tick=0, ended_tick=3600 * T,
+        telemetry=telemetry_data(),
         idle_before=idle, idle_after=deepcopy(idle), observations=[
-            [second * T, 100 * MIB, 20, 3, 1024] for second in (0, 1800, 3600)]))
+            [second * T, 100 * MIB, 20, 3, 10497] for second in (0, 1800, 3600)]))
 
 
 def p5_data():
@@ -557,8 +595,8 @@ class CapabilityEvidenceTests(unittest.TestCase):
 
     def test_p4_host_iteration_refresh_report_and_operator_are_observed(self):
         original = deepcopy(self.data["P4"])
-        for position, field, value in ((0, 0, 2), (5, 1, 0), (9, 2, 0),
-                                       (0, 3, 0), (9, 4, 0), (0, 4, 512)):
+        for position, field, value in ((0, 0, 2), (5, 1, 0), (29, 2, 0),
+                                       (0, 3, 0), (29, 4, 0), (0, 4, 512)):
             with self.subTest(position=position, field=field):
                 self.data["P4"] = deepcopy(original)
                 self.data["P4"]["scales"][0]["host_loop"]["ticks"][position][field] = value
@@ -568,16 +606,19 @@ class CapabilityEvidenceTests(unittest.TestCase):
         self.data["P4"]["scales"][0]["host_loop"]["ticks"][0][1] = False
         self.failed_gate("P4", "capability_measurement_invalid")
 
-    def test_p4_nondefault_host_cadences_and_original_iteration_are_verified(self):
+    def test_p4_original_iteration_and_enrollment_preserve_required_report_cadence(self):
         host = self.data["P4"]["scales"][0]["host_loop"]
         host.update(started_iteration=17, ended_iteration=617,
-                    enroll_every_ticks=7, report_every_ticks=13)
+                    enroll_every_ticks=7, report_every_ticks=30)
+        report = 0
         for offset, tick in enumerate(host["ticks"]):
             iteration = 18 + offset
             tick[0] = iteration
             tick[1] = int(iteration > 1 and (iteration - 1) % 7 == 0)
-            tick[2] = int(iteration % 13 == 0)
+            tick[2] = int(iteration % 30 == 0)
             tick[4] = 512 if tick[2] else 0
+            report += tick[2]
+            tick[10] = report if tick[2] else 0
         result = self.authority().assess()
         self.assertTrue(result.eligible, result)
 
@@ -592,7 +633,8 @@ class CapabilityEvidenceTests(unittest.TestCase):
                     tick[index] = 0
                     if index == 2:
                         tick[4] = 0
-                self.failed_gate("P4", "capability_host_loop_coverage_incomplete")
+                self.failed_gate("P4", "capability_host_loop_coverage_incomplete" if index == 1
+                                 else "capability_host_loop_cadence_changed")
 
     def test_p4_pacing_cannot_hide_wait_inside_tick_or_cross_next_sample(self):
         original = deepcopy(self.data["P4"])

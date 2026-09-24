@@ -22,7 +22,11 @@ Producer contract v1 (item 6 must emit this, existing spike JSON is not v1):
   Their fixed matrices/observations are declared below; producers must keep the
   original detailed native logs whose fixed producer digest identifies their
   interpretation. A pass boolean cannot replace any numeric observation.
-* P4 data is {scales, wrapper_cold_ns, wrapper_warm_ns, leak}. Scales contain
+* P4 data uses closed schema_version=2 with {scales, wrapper_cold_ns,
+  wrapper_warm_ns, wrapper_telemetry, leak}. Original asynchronous sink offer,
+  write and directory observations accompany each scope. Queued report bytes
+  are not persisted bytes. The strict idle growth predicate is unchanged.
+  Scales contain
   exact monitor identities and CPU endpoints, timestamped Private Commit and waiting-wrapper
   overhead, at 1/10/50 Jobs; 50 is stress outside the allowed <=10 Job scope.
 * P5 data is {reaction, helper_loss, guardian_loss, grant_restore, invariants,
@@ -715,11 +719,185 @@ def _p95(values):
     return ordered[math.ceil(.95 * len(ordered)) - 1]
 
 
+def _p4_telemetry(value, context, *, roles=None, nonce=None, reports=None, helper_instance=None):
+    """Recompute bounded receipt coverage and exact per-file conservation.
+
+    This is observational evidence, never a source of accounting/control rights.
+    Fresh isolated stores must have an empty chunk inventory before the first
+    real append. The lock's one byte is explicitly included throughout. Native
+    rotation/age/storage-fault recovery proof remains a separate acceptance gap;
+    this verifier does not relax the existing idle-after log comparison.
+    """
+    cap, age, chunk_cap = 20 * 1024 * 1024, 7 * 24 * 60 * 60 * 1_000_000_000, 512 * 1024
+    _object(value, ("schema_version", "scope_nonce", "max_bytes", "max_age_ns",
+                    "lock_identity", "final_inventory", "sinks"))
+    if (type(value["schema_version"]) is not int or value["schema_version"] != 1
+            or type(value["max_bytes"]) is not int or value["max_bytes"] != cap
+            or type(value["max_age_ns"]) is not int or value["max_age_ns"] != age
+            or type(value["scope_nonce"]) is not str
+            or re.fullmatch(r"[0-9a-f]{32}", value["scope_nonce"]) is None
+            or nonce is not None and value["scope_nonce"] != nonce):
+        _reject("capability_telemetry_binding_invalid")
+
+    def file_id(item):
+        # Native filesystem identities are not signed performance counters.
+        # Windows can expose unsigned/128-bit file indices (e.g. ReFS).
+        # Keep this bound local; CPU/time/byte measurements retain their limits.
+        device, inode = _list(item, minimum=2, maximum=2)
+        return (_integer(device, minimum=1, maximum=(1 << 64) - 1),
+                _integer(inode, minimum=1, maximum=(1 << 128) - 1))
+
+    lock = file_id(value["lock_identity"])
+
+    def inventory(items):
+        result, identities = {}, set()
+        for item in _list(items, minimum=0, maximum=63):
+            _list(item, minimum=5, maximum=5)
+            name, size, created, kind, identity = item
+            if type(name) is not str or (match := re.fullmatch(
+                    r"(aggregate|event)-([0-9]{20})-([0-9a-f]{32})\.jsonl", name)) is None:
+                _reject("capability_telemetry_inventory_invalid")
+            identity = file_id(identity)
+            size, created = _integer(size, minimum=1), _integer(created)
+            if (name in result or identity in identities or identity == lock or size > chunk_cap
+                    or kind != match[1] or created != int(match[2])):
+                _reject("capability_telemetry_inventory_invalid")
+            identities.add(identity)
+            result[name] = (size, created, kind, identity)
+        if 1 + sum(item[0] for item in result.values()) > cap:
+            _reject("capability_telemetry_quota_exceeded")
+        return result
+
+    final = inventory(value["final_inventory"])
+    all_writes, seen, identities = [], set(), set()
+    helper_offers, helper_persisted = {}, set()
+    expected_status = ("role", "instance_id", "offered", "accepted", "persisted", "dropped",
+        "coalesced", "pending_records", "written_bytes", "deleted_bytes", "inventory_bytes",
+        "rotations", "error", "stopping", "stopped", "retained_files", "max_bytes", "max_age_ns")
+    for sink in _list(value["sinks"], minimum=3, maximum=3):
+        _object(sink, ("role", "identity", "instance_id", "status", "offers", "writes"))
+        role = sink["role"]
+        try:
+            identity = ProcessIdentity.from_dict(sink["identity"])
+        except Exception:
+            _reject("capability_telemetry_binding_invalid")
+        if (type(role) is not str or role not in {"helper", "guardian", "supervisor"} or role in seen
+                or identity in identities or identity.logon_id != context.logon_id
+                or roles is not None and identity != roles[role][0]):
+            _reject("capability_telemetry_binding_invalid")
+        seen.add(role)
+        identities.add(identity)
+        _uuid(sink["instance_id"])
+        if role == "helper" and helper_instance is not None and sink["instance_id"] != helper_instance:
+            _reject("capability_telemetry_binding_invalid")
+        status = _object(sink["status"], expected_status)
+        if (status["role"] != role or status["instance_id"] != sink["instance_id"]
+                or status["error"] is not None or status["stopping"] is not False
+                or status["stopped"] is not False or status["max_bytes"] != cap
+                or status["max_age_ns"] != age):
+            _reject("capability_telemetry_degraded")
+        numeric = set(expected_status) - {"role", "instance_id", "error", "stopping", "stopped"}
+        for key in numeric:
+            _integer(status[key])
+        if status["dropped"] or status["pending_records"] > 128 or status["retained_files"] > 2:
+            _reject("capability_telemetry_degraded")
+        offers, superseded = {}, set()
+        for index, item in enumerate(_list(sink["offers"], maximum=16000), 1):
+            _list(item, minimum=4, maximum=4)
+            sequence, size, kind, prior = item
+            _integer(sequence, minimum=1)
+            _integer(size, minimum=1)
+            if sequence != index or size > 16 * 1024 or kind not in ("event", "aggregate"):
+                _reject("capability_telemetry_offer_coverage_invalid")
+            if prior is not None:
+                _integer(prior, minimum=1)
+                if kind != "aggregate" or prior not in offers or offers[prior][1] != "aggregate" or prior in superseded:
+                    _reject("capability_telemetry_coalescing_invalid")
+                superseded.add(prior)
+            offers[sequence] = (size, kind)
+        persisted, written, deleted, rotations, utc = set(), 0, 0, 0, -1
+        last_bytes = 0
+        for index, write in enumerate(_list(sink["writes"], maximum=2048), 1):
+            _object(write, ("sequence", "offers", "before", "after", "deleted", "utc_ns", "lock_identity", "kind"))
+            if _integer(write["sequence"], minimum=1) != index or file_id(write["lock_identity"]) != lock:
+                _reject("capability_telemetry_write_coverage_invalid")
+            now = _integer(write["utc_ns"])
+            if now < utc or write["kind"] not in ("event", "aggregate"):
+                _reject("capability_telemetry_clock_invalid")
+            utc = now
+            byte_count = 0
+            for item in _list(write["offers"], maximum=128):
+                _list(item, minimum=2, maximum=2)
+                seq, size = (_integer(v, minimum=1) for v in item)
+                if (seq not in offers or offers[seq] != (size, write["kind"])
+                        or seq in persisted or seq in superseded):
+                    _reject("capability_telemetry_persistence_invalid")
+                persisted.add(seq)
+                byte_count += size
+            if byte_count > 64 * 1024:
+                _reject("capability_telemetry_write_bound")
+            before, after, removed = (inventory(write[name]) for name in ("before", "after", "deleted"))
+            if any(name not in before or before[name] != item for name, item in removed.items()):
+                _reject("capability_telemetry_file_conservation_failed")
+            survivors = {name: item for name, item in before.items() if name not in removed}
+            if any(name not in after for name in survivors):
+                _reject("capability_telemetry_file_conservation_failed")
+            changes = []
+            for name, item in after.items():
+                old = survivors.get(name)
+                if old is None:
+                    if name in before or item[0] != byte_count or item[1] != now or item[2] != write["kind"]:
+                        _reject("capability_telemetry_file_conservation_failed")
+                    changes.append(name)
+                elif item != old:
+                    if item[1:] != old[1:] or item[0] - old[0] != byte_count or item[2] != write["kind"]:
+                        _reject("capability_telemetry_file_conservation_failed")
+                    changes.append(name)
+            if (len(changes) != 1 or any(item[1] > now or item[1] < now - age for item in after.values())
+                    or 1 + sum(item[0] for item in survivors.values()) + byte_count > cap):
+                _reject("capability_telemetry_file_conservation_failed")
+            removed_bytes = sum(item[0] for item in removed.values())
+            written += byte_count
+            deleted += removed_bytes
+            rotations += len(removed)
+            last_bytes = 1 + sum(item[0] for item in after.values())
+            all_writes.append((before, after, now))
+        if (status["offered"] != len(offers) or status["accepted"] != len(offers)
+                or status["persisted"] != len(persisted) or status["coalesced"] != len(superseded)
+                or status["pending_records"] != len(set(offers) - persisted - superseded)
+                or status["written_bytes"] != written or status["deleted_bytes"] != deleted
+                or status["rotations"] != rotations or status["inventory_bytes"] != last_bytes):
+            _reject("capability_telemetry_counter_mismatch")
+        if role == "helper":
+            helper_offers, helper_persisted = offers, persisted
+    # Independent role-local counters do not order shared writes. Reconstruct
+    # the unique complete native inventory chain, including every other writer.
+    current, utc = {}, -1
+    while all_writes:
+        matches = [index for index, row in enumerate(all_writes) if row[0] == current]
+        if len(matches) != 1:
+            _reject("capability_telemetry_shared_write_coverage_incomplete")
+        _, current, now = all_writes.pop(matches[0])
+        if now < utc:
+            _reject("capability_telemetry_clock_invalid")
+        utc = now
+    if current != final:
+        _reject("capability_telemetry_final_inventory_mismatch")
+    if reports is None:
+        reports = [(seq, size) for seq, (size, kind) in helper_offers.items() if kind == "aggregate"]
+    for sequence, size in reports:
+        if sequence not in helper_persisted or helper_offers.get(sequence) != (size, "aggregate"):
+            _reject("capability_telemetry_report_not_persisted")
+    return 1 + sum(item[0] for item in final.values())
+
+
 def _p4(data, context, profile):
-    _object(data, ("scales", "wrapper_cold_ns", "wrapper_warm_ns", "leak"))
+    _object(data, ("schema_version", "scales", "wrapper_cold_ns", "wrapper_warm_ns", "wrapper_telemetry", "leak"))
+    if type(data["schema_version"]) is not int or data["schema_version"] != 2:
+        _reject("capability_p4_schema_unsupported")
     seen, notes = set(), []
     for row in _list(data["scales"], minimum=3, maximum=3):
-        _object(row, ("jobs", "started_tick", "ended_tick", "processes", "samples", "native_set_calls", "sampling_cases", "host_loop"))
+        _object(row, ("jobs", "started_tick", "ended_tick", "processes", "samples", "native_set_calls", "sampling_cases", "host_loop", "telemetry"))
         jobs = _integer(row["jobs"])
         if jobs not in {1, 10, 50} or jobs in seen:
             _reject("capability_cost_scope_invalid")
@@ -790,7 +968,7 @@ def _p4(data, context, profile):
         host = _object(row["host_loop"], ("identity", "parent_identity", "instance_id",
             "operator_instance_id", "scope_nonce", "config_revision", "managed_execution_ids",
             "query_only_execution_ids", "enroll_every_ticks", "report_every_ticks",
-            "started_iteration", "ended_iteration", "ticks"))
+            "started_iteration", "ended_iteration", "telemetry_instance_id", "ticks"))
         try:
             helper_identity = ProcessIdentity.from_dict(host["identity"])
             parent_identity = ProcessIdentity.from_dict(host["parent_identity"])
@@ -816,22 +994,25 @@ def _p4(data, context, profile):
             _reject("capability_host_loop_scope_invalid")
         enroll_every = _integer(host["enroll_every_ticks"], minimum=1, maximum=3600)
         report_every = _integer(host["report_every_ticks"], minimum=1, maximum=3600)
+        if report_every != 30:
+            _reject("capability_host_loop_cadence_changed")
         first_iteration, last_iteration = (_integer(host[name])
             for name in ("started_iteration", "ended_iteration"))
         host_ticks = _list(host["ticks"], minimum=len(samples), maximum=len(samples))
         if last_iteration - first_iteration != len(samples):
             _reject("capability_host_loop_coverage_incomplete")
         refreshes = reports = 0
+        report_receipts = []
         for index, (sample, observation) in enumerate(zip(samples, host_ticks)):
-            _list(observation, minimum=10, maximum=10)
+            _list(observation, minimum=11, maximum=11)
             (iteration, refreshed, reported, operator_polls, report_bytes, deadline,
-             wait_started, wait_ended, skipped, overrun) = (_integer(value) for value in observation)
+             wait_started, wait_ended, skipped, overrun, report_sequence) = (_integer(value) for value in observation)
             expected_iteration = first_iteration + index + 1
             expected_refresh = expected_iteration > 1 and (expected_iteration - 1) % enroll_every == 0
             expected_report = expected_iteration % report_every == 0
             if (iteration != expected_iteration or refreshed != int(expected_refresh)
                     or reported != int(expected_report) or operator_polls != 1
-                    or (report_bytes > 0) != expected_report):
+                    or (report_bytes > 0) != expected_report or (report_sequence > 0) != expected_report):
                 _reject("capability_host_loop_coverage_incomplete")
             next_begin = samples[index + 1][0] if index + 1 < len(samples) else end
             if (deadline <= 0 or wait_started < sample[1] or wait_ended < wait_started
@@ -840,8 +1021,14 @@ def _p4(data, context, profile):
                 _reject("capability_host_loop_pacing_invalid")
             refreshes += refreshed
             reports += reported
+            if reported:
+                if report_receipts and report_sequence <= report_receipts[-1][0]:
+                    _reject("capability_telemetry_report_replayed")
+                report_receipts.append((report_sequence, report_bytes))
         if not refreshes or not reports:
             _reject("capability_host_loop_coverage_incomplete")
+        _p4_telemetry(row["telemetry"], context, roles=role_members, nonce=host["scope_nonce"],
+            reports=report_receipts, helper_instance=host["telemetry_instance_id"])
         cpu, tick = delta / elapsed, _p95(ticks) / 1e9
         private, wrappers = max(private_values), max(wrapper_values)
         _zero_observations(row, ("native_set_calls",))
@@ -859,7 +1046,8 @@ def _p4(data, context, profile):
     for name in ("wrapper_cold_ns", "wrapper_warm_ns"):
         if _p95(data[name]) > 500_000_000:
             _reject("capability_wrapper_latency_failed")
-    leak = _object(data["leak"], ("started_tick", "ended_tick", "idle_before", "idle_after", "observations"))
+    _p4_telemetry(data["wrapper_telemetry"], context)
+    leak = _object(data["leak"], ("started_tick", "ended_tick", "idle_before", "idle_after", "observations", "telemetry"))
     leak_start, leak_end = _integer(leak["started_tick"]), _integer(leak["ended_tick"])
     if leak_end - leak_start < 3600 * _TICKS:
         _reject("capability_leak_duration_missing")
@@ -877,6 +1065,11 @@ def _p4(data, context, profile):
         _object(leak[name], ("private_bytes", "handles", "rows", "log_bytes"))
         for value in leak[name].values():
             _integer(value)
+    final_log_bytes = _p4_telemetry(leak["telemetry"], context)
+    if (leak["idle_after"]["log_bytes"] != final_log_bytes
+            or any(row[4] > 20 * _MIB for row in observations)
+            or leak["idle_before"]["log_bytes"] > 20 * _MIB):
+        _reject("capability_telemetry_footprint_mismatch")
     # A positive non-growing result is accepted, not a fitted/noisy upward
     # trend reclassified as harmless. Higher post-idle values need additional
     # evidence; this verifier does not invent a permitted leak allowance.

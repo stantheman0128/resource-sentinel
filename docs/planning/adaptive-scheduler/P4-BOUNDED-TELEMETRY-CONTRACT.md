@@ -2,11 +2,17 @@
 
 Status: slices 1–2 have a source implementation and passed central verification
 on 2026-09-24: **276 tests, 8.418 seconds, zero failures/errors/skips**.
-This is **not a measured P4 result, changed
-gate or production activation**. Slices 3–4 remain pending. Formal authority
-remains `IMPLEMENTATION-PLAN.md` §5.5, §8, §11.2 and §12.1/S4. Existing P4
-capability validation and its strict idle comparison remain unchanged until the
-producer and evidence schema below receive their separate review.
+This is **not a measured P4 result or production activation**. Slice 3 passed
+central source regression: **259 tests, 13.765 seconds, zero failures/errors/skips**
+on 2026-09-24, covering original sink
+observations, asynchronous report receipts, and closed P4 data v2. Native
+storage-fault, recovery preservation, rollover/age acceptance, and the
+authenticated aggregate provider remain incomplete. Formal authority remains
+`IMPLEMENTATION-PLAN.md` §5.5, §8, §11.2 and §12.1/S4. Existing P4 performance
+thresholds and its strict idle comparison remain unchanged. The full private
+log is `.local-adaptive/p4-sink-regression-20260924-1.log`. Protected dirty baseline
+and adjacent readiness/preparation source were present; clean-clone and native
+acceptance are not claimed.
 
 ## Observed production and evidence paths before slices 1–2
 
@@ -281,3 +287,77 @@ producer still expects synchronous stderr writes; its original-sink integration
 and schema change are source work, not an external-console-only gap. No native
 performance/retention claim, production installation or control enablement follows
 from this regression result.
+
+## Slice 3 source contract: original sink observations (source regression passed)
+
+`ResidentTelemetry.observe()` returns a single condition-protected snapshot of
+the original counters plus bounded offer and append receipt rings. Each ring
+retains at most 128 records. It performs no disk operation, flush, wait for the
+worker, callback or control action. The additional ring objects remain charged
+to the resident process. Lost sequence coverage fails the recorder; no missing
+receipt is extrapolated from a cumulative count or a final file size.
+
+An offer receipt records its exact sequence, serialized bytes, kind and the
+specific older aggregate it superseded, if any. Each successful append receipt
+includes exact `(sequence, serialized bytes)` pairs, the pre-append inventory,
+actual post-append inventory, deleted chunks and the native lock-file identity.
+It is published only after the original append/unlock/close path returns. The
+independent `inventory_observation()` is an explicit read-only probe under the
+same storage lock; it is never called by the resident offer path.
+
+The native producer requires the original helper `ResidentTelemetry` through
+`helper_telemetry_sink`. `NativeTelemetryProbe` runs inside each original
+resident process, checks the actual host/emit/sink/store/worker bindings, fixed
+production policy, clocks and identity, and reads its original observations.
+The missing aggregate bridge must read guardian/supervisor probes through its
+authenticated original peer channels. A `NativeTelemetryObservation` value is
+measurement data, not peer authentication, native custody or logging authority.
+The local helper probe is retained directly; it cannot be replaced by stderr,
+a provided `native=true` flag or a generic report callback.
+
+Closed P4 data now requires `schema_version=2`; the outer capability artifact
+continues to use its existing version. Old synchronous artifacts are rejected
+under the new pinned producer instead of silently upgraded. The actual host
+tick records report enqueue bytes and sequence, and the scale's telemetry
+evidence must later prove that exact report was persisted. A queued, superseded,
+missing, replayed, or different-size report cannot satisfy that proof. Production
+helper reporting remains every 30 ticks at the required one-second interval.
+Background disk work is included in the original process CPU/Private Commit;
+no allowance or subtraction is introduced.
+
+Each scope includes all three original sinks, beginning with their startup
+offer/write sequences. The verifier recomputes counters, aggregate supersession,
+pending records, persisted records, and the unique complete shared inventory
+chain across all writers. Each append must change exactly one chunk by the
+confirmed serialized bytes; every removal, unchanged file, native identity and
+metadata byte is reconciled. Prefilled stores, foreign replacement, quota excess,
+clock regression, retained expired chunks after append, missing receipts, and a
+mismatched final independent inventory are failures. Recording has fixed
+per-sink limits of 16,000 offers and 2,048 writes. Those counts alone are not a
+safe byte bound: a full-width 63-chunk before/after receipt can occupy 22,118
+JSON bytes, so 95 such receipts alone exceed the existing 2 MiB artifact cap.
+This is static schema arithmetic, not a measured native workload.
+
+The recorder therefore also enforces an early **2 MiB per-trace serialized-byte
+budget**, reserving 64 KiB for closed framing/status/three identities and the
+final bounded inventory. It accounts each genuinely new bounded receipt once,
+before retaining it; unchanged ring entries are not repeatedly serialized or
+charged. Rejected evidence poisons the trace, including partial observations,
+so a later `finish()` cannot silently omit the refused records. Sticky state
+contains bounded primitive labels, with no exception, cause or traceback
+reference that could retain a rejected oversized observation. The original
+exception still propagates to its caller. Finish verifies
+the reserved framing and exact final trace size. The final **whole P4 artifact**
+check remains 2 MiB across all five scopes and their measurements; separately
+bounded traces can still exceed that aggregate limit and must refuse. Nothing
+raises a limit, truncates history or claims that the current full-inventory
+representation is efficient enough for all native workloads. Recorder CPU and
+Private Commit remain charged, including its retained evidence.
+
+This slice deliberately **does not apply the proposed log-only relaxation**.
+Full storage-fault/rotation recovery inventories and the acceptance decision
+for unexercised native 20 MiB/seven-day boundaries are still absent. The old
+`idle_after <= idle_before` checks for private bytes, handles, rows **and logs**
+remain. Real useful log growth can therefore still fail P4. Do not prefill,
+clear, suppress or hide reports to make it pass. This is an explicit remaining
+acceptance issue, not a native success or an external-console-only gap.

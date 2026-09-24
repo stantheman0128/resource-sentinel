@@ -11,6 +11,8 @@ from unittest.mock import Mock, patch
 
 from sentinel.adaptive.contracts import Validity
 from sentinel.adaptive.helper_control_host import OperationalHelperHost
+from sentinel.adaptive.contracts import ProcessIdentity
+from sentinel.adaptive.telemetry import ResidentTelemetry
 from tests.windows import adaptive_overhead_native as native
 
 
@@ -86,7 +88,12 @@ class ActualLoopFixtureTests(unittest.TestCase):
         host.report_every_ticks = report_every
         host._last_enrollment_complete = True
         host.refresh_enrollment = Mock()
-        host.metrics_record = lambda: {"event": "actual_metrics", "iteration": host._iterations}
+        host.metrics_record = lambda: {"event": "helper_host_metrics", "iteration": host._iterations}
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        host.telemetry = ResidentTelemetry(data_dir=Path(directory.name), role="helper",
+            identity=ProcessIdentity(7001, 134343072000000001, "S-1-5-5-1-2"),
+            instance_id="00000000-0000-4000-8000-000000000001")
         host._operator_poll = lambda: setattr(clock, "now", clock.now + 500_000)
         jobs = SimpleNamespace(memory_scanner=object(), memory_budget_source=None,
             unreadable=lambda: (), enrolled=(), last_memory_scan=(), memory_sample_started_tick=0)
@@ -118,8 +125,7 @@ class ActualLoopFixtureTests(unittest.TestCase):
         sampler._case_totals = dict.fromkeys(native._CASE_NAMES, 0)
         sampler._clock, sampler._topology = clock, (8, 1)
         sampler._lock = threading.RLock()
-        sampler._report_stream = stream
-        sampler._report_file = __import__("os").fstat(stream.fileno())
+        sampler._telemetry_sink = host.telemetry
         sampler._verify_host = Mock()  # Native construction is tested separately.
         sampler._install_taps()
         return sampler, host, clock, observation
@@ -251,7 +257,7 @@ class ProvenanceRefusalTests(unittest.TestCase):
         with patch.object(native, "_platform"):
             with self.assertRaisesRegex(native.NativeOverheadError, "actual_operational_host_required"):
                 native.NativeHelperHostSampler(SHADOW, (), host=SimpleNamespace(native=True),
-                    report_stream=io.StringIO(), log_directory=Path("."))
+                    telemetry_sink=io.StringIO(), log_directory=Path("."), scope_nonce="a" * 32)
 
 
 class MemoryCaseEvidenceTests(unittest.TestCase):

@@ -6,7 +6,8 @@ Fifty Jobs are a read-only stress workload, split into production-sized sampler
 shards; this does not enroll fifty Jobs into a production guardian.
 
 The producer measures the initialized OperationalHelperHost, including its
-registry refresh, operator poll and report serialization/write/flush. Additional
+registry refresh, operator poll and report serialization/enqueue. The original
+asynchronous worker stays in the same charged process. Additional
 query-only shards share that host's actual machine sample and one scan budget.
 """
 from __future__ import annotations
@@ -15,8 +16,6 @@ import ctypes as C
 from dataclasses import dataclass
 import os
 from pathlib import Path
-import stat
-import sys
 import threading
 import time
 from uuid import UUID
@@ -295,7 +294,7 @@ class NativeHelperHostSampler:
     sleep deferral, Set interposers and extra query-only memory scanner caches.
     Its original host remains resident until provider-managed drain/cleanup.
     """
-    def __init__(self, profile, jobs, *, host, report_stream, log_directory):
+    def __init__(self, profile, jobs, *, host, telemetry_sink, log_directory, scope_nonce):
         from sentinel.adaptive.helper_control_host import OperationalHelperHost
         from sentinel.adaptive.member_memory import NativeMemberMemoryScanner
         from sentinel.adaptive.pipe_windows import NativePipeListener, NativePipeRegistry
@@ -311,7 +310,7 @@ class NativeHelperHostSampler:
         self._warmup_pending = True
         self._case_totals = dict.fromkeys(_CASE_NAMES, 0)
         self._lock = threading.RLock()
-        self._report_stream = report_stream
+        self._telemetry_sink = telemetry_sink
         self._native = False
         if (type(host) is not OperationalHelperHost or type(profile) is not PolicyProfile
                 or profile.mode is not Mode.SHADOW or host.profile != profile
@@ -329,6 +328,7 @@ class NativeHelperHostSampler:
                 or host.sampler._jobs._backend is not host.jobs
                 or getattr(host.run_once, "__func__", None) is not OperationalHelperHost.run_once
                 or getattr(host._report, "__func__", None) is not HelperHost._report
+                or getattr(host.metrics_record, "__func__", None) is not OperationalHelperHost.metrics_record
                 or getattr(host._pace, "__func__", None) is not HelperHost._pace
                 or getattr(host._operator_poll, "__func__", None) is not OperationalHelperHost._operator_poll
                 or getattr(host.refresh_enrollment, "__func__", None) is not OperationalHelperHost.refresh_enrollment
@@ -357,15 +357,12 @@ class NativeHelperHostSampler:
             raise NativeOverheadError("overhead_native_topology_unsupported")
         if (profile.sample_interval_ms != 1000 or profile.max_enrolled_jobs != 10
                 or type(host.enroll_every_ticks) is not int or host.enroll_every_ticks <= 0
-                or type(host.report_every_ticks) is not int or host.report_every_ticks <= 0):
+                or type(host.report_every_ticks) is not int or host.report_every_ticks != 30):
             raise NativeOverheadError("overhead_host_cadence_invalid")
-        logs = Path(log_directory).resolve(strict=True)
-        stream_path = Path(getattr(report_stream, "name", "")).resolve(strict=True)
-        if (report_stream is not sys.stderr or stream_path == logs or logs not in stream_path.parents
-                or not report_stream.writable() or getattr(report_stream, "encoding", "").lower().replace("-", "") != "utf8"
-                or not stat.S_ISREG(os.fstat(report_stream.fileno()).st_mode)):
-            raise NativeOverheadError("overhead_original_report_stream_required")
-        self._report_file = os.fstat(report_stream.fileno())
+        from tests.windows.adaptive_overhead_telemetry import NativeTelemetryProbe
+        if host.telemetry is not telemetry_sink:
+            raise NativeOverheadError("overhead_original_telemetry_sink_required")
+        self.telemetry_probe = NativeTelemetryProbe(host, scope_nonce=scope_nonce, log_directory=log_directory)
         self._managed = tuple(host.jobs.enrolled)
         items = dict(self.jobs)
         if (len(items) != len(self.jobs) or len(self._managed) != min(len(items), 10)
@@ -476,9 +473,11 @@ class NativeHelperHostSampler:
             config_revision=self.host.sampler.config_revision, managed_execution_ids=list(self._managed),
             query_only_execution_ids=list(self._query_only), enroll_every_ticks=self.host.enroll_every_ticks,
             report_every_ticks=self.host.report_every_ticks, started_iteration=started_iteration,
-            ended_iteration=self.host._iterations, ticks=ticks)
+            ended_iteration=self.host._iterations, telemetry_instance_id=self._telemetry_sink.instance_id,
+            ticks=ticks)
 
     def _verify_host(self):
+        self.telemetry_probe.verify()
         for binding in self._bindings:
             binding.verify()
         if (self.host.jobs.memory_budget_source is not self._installed_budget_source
@@ -493,13 +492,12 @@ class NativeHelperHostSampler:
         if self.native_set_calls:
             raise NativeOverheadError("overhead_shadow_native_set_attempted")
 
-    def _report_size(self):
-        if sys.stderr is not self._report_stream:
-            raise NativeOverheadError("overhead_report_stream_changed")
-        current = os.fstat(self._report_stream.fileno())
-        if (current.st_dev, current.st_ino) != (self._report_file.st_dev, self._report_file.st_ino):
-            raise NativeOverheadError("overhead_report_file_changed")
-        return current.st_size
+    def _report_observation(self):
+        from sentinel.adaptive.telemetry import ResidentTelemetry
+        if (self.host.telemetry is not self._telemetry_sink
+                or type(self._telemetry_sink) is not ResidentTelemetry):
+            raise NativeOverheadError("overhead_report_sink_changed")
+        return self._telemetry_sink.observe()
 
     def _frame_cases(self, source, helper, before, warmup, begin, counts):
         frame = helper.latest_frame
@@ -559,11 +557,17 @@ class NativeHelperHostSampler:
                             raise NativeOverheadError("overhead_shadow_job_capped")
                 iteration = self.host._iterations
                 before = self.host.shadow.metrics.frames
-                report_before = self._report_size()
                 outcome = self.host.run_once()
+                report_before = self._report_observation()[0]["offered"]
                 self.host._report()
-                report_bytes = self._report_size() - report_before
+                status, offered, _ = self._report_observation()
+                reports = [item for item in offered if item.sequence > report_before]
                 reported = int(self.host._iterations % self.host.report_every_ticks == 0)
+                if (len(reports) != reported or status["offered"] != report_before + reported
+                        or any(not item.accepted or item.kind != "aggregate" for item in reports)):
+                    raise NativeOverheadError("overhead_report_enqueue_unverified")
+                report_bytes = sum(item.serialized_bytes for item in reports)
+                report_sequence = reports[0].sequence if reports else 0
                 if (self.host._iterations != iteration + 1 or self._machine_calls != 1
                         or self._poll_calls != 1 or self._sleep_calls != 1
                         or bool(reported) != bool(report_bytes > 0) or report_bytes < 0
@@ -597,7 +601,7 @@ class NativeHelperHostSampler:
                     raise NativeOverheadError("overhead_native_clock_invalid")
                 self._pending_tick = [self.host._iterations, int(outcome.refreshed), reported,
                     self._poll_calls, report_bytes, self.host._deadline_100ns, None, None,
-                    self.host._skipped_boundaries, None]
+                    self.host._skipped_boundaries, None, report_sequence]
                 self._warmup_pending = False
                 self._last_tick_warmup = warmup
                 for name in counts:

@@ -52,14 +52,51 @@ class DailyReadinessAuthority:
         self._thread, self._pid = threading.current_thread(), os.getpid()
         self._peer = None
         self._issued = self._closed = self._close_unknown = False
+        self._original = (self, endpoint, self._binding, deadline, self._thread, self._pid)
+        self._binding_bytes = json.dumps(self._binding, sort_keys=True, separators=(",", ":"))
+        self._endpoint_values = (endpoint.logon_id, endpoint.instance_id, endpoint.server_identity.to_dict())
+        self._deadline_pin = (deadline._api, deadline._start, deadline._end, deadline._pid)
+        self._original_peer = self._peer_pin = None
 
     def __reduce__(self):
         raise TypeError("daily_readiness_authority_not_serializable")
+
+    def _retain_peer(self, peer):
+        """Bind the duplicate while its authenticated original is still held."""
+        if self._original_peer is not None or type(peer) is not VerifiedProcess:
+            failure = DailyReadinessError("daily_readiness_original_peer_required")
+            failure._daily_readiness_rejected_peer = peer
+            raise failure
+        # Keep the acquired owner before inspecting its fields. Any subsequent
+        # rejection still leaves its original cleanup with this authority.
+        self._peer = self._original_peer = peer
+        self._peer_pin = (peer._backend, peer._handle, peer.identity, peer._lock, peer.identity.to_dict())
+        self._assert_original()
+
+    def _assert_original(self):
+        owner, endpoint, binding, deadline, thread, pid = self._original
+        if (owner is not self or type(self) is not DailyReadinessAuthority or
+                self._endpoint is not endpoint or self._binding is not binding or
+                (endpoint.logon_id, endpoint.instance_id, endpoint.server_identity.to_dict()) != self._endpoint_values or
+                self._deadline is not deadline or self._thread is not thread or self._pid != pid or
+                json.dumps(binding, sort_keys=True, separators=(",", ":")) != self._binding_bytes or
+                deadline._api is not self._deadline_pin[0] or
+                (deadline._start, deadline._end, deadline._pid) != self._deadline_pin[1:] or
+                self._peer is not self._original_peer):
+            raise DailyReadinessError("daily_readiness_original_authority_changed")
+        peer = self._original_peer
+        if peer is not None:
+            backend, handle, identity, lock, identity_values = self._peer_pin
+            if (type(peer) is not VerifiedProcess or peer._backend is not backend or
+                    peer._handle != handle or peer.identity is not identity or peer._lock is not lock or
+                    peer.identity.to_dict() != identity_values or peer._close_outcome_unknown or handle is None):
+                raise DailyReadinessError("daily_readiness_original_peer_changed")
 
     def revalidate(self, endpoint, binding):
         if (not self._issued or self._closed or self._close_unknown or
                 self._thread is not threading.current_thread() or self._pid != os.getpid()):
             raise DailyReadinessError("daily_readiness_authority_unavailable")
+        self._assert_original()
         if endpoint != self._endpoint or binding != self._binding:
             raise DailyReadinessError("daily_readiness_authority_binding_changed")
         self._deadline.require()
@@ -69,13 +106,19 @@ class DailyReadinessAuthority:
         if (observed.status is not IdentityStatus.ALIVE or
                 observed.identity != self._endpoint.server_identity):
             raise DailyReadinessError("daily_readiness_original_peer_unavailable")
+        self._assert_original()
         self._deadline.require()
 
     def close(self):
+        # A copied authority cannot close the original's native witness. After
+        # our own positive close, repeated close remains an idempotent no-op.
+        if self._original[0] is not self:
+            raise DailyReadinessError("daily_readiness_original_authority_changed")
         if self._closed:
             return
         if self._close_unknown:
             raise DailyReadinessError("daily_readiness_authority_cleanup_unknown")
+        self._assert_original()
         self._issued = False
         if self._peer is not None:
             self._close_unknown = True
@@ -336,7 +379,7 @@ class DailyReadinessClient:
                     if authority is not None:
                         if type(peer) is not VerifiedProcess:
                             raise DailyReadinessError("daily_readiness_original_peer_required")
-                        authority._peer = peer.duplicate()
+                        authority._retain_peer(peer.duplicate())
                         _live(connection, peer, self.endpoint.server_identity)
                     exchange_complete = True
                 peer_settled = True

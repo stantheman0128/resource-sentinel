@@ -4,6 +4,19 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
+Cleanup history 資料驗證器已完成：**9 模組、165 tests 全過，21.627 秒，
+0 failures／errors／skips**，包含 23 個 history 案例；完整私人日誌為
+`.local-adaptive/experiment-history-20260924-1.log`。它在同一 SQL snapshot
+核對 immutable admission、確切 cancellation／archive、沒有殘留容量義務，
+以及對應 CLOSED exclusion，並保留 4096 rows／table 與共用 16 MiB byte budget。
+已涵蓋五種 completion 資料、混合已完成與一個未完成實驗、兩個未完成實驗拒絕、
+scope／ledger 身分、preparation 順序、task／reservation aliases 與異常歷史。
+獨立 review 已完成；測試使用隔離資料及 synthetic closed tuples，經正常日常
+wrapper 准入，仍依賴受保護的 dirty baseline。這不是 native gate 證據。
+**驗證器目前只讀，不發布 receipt、不釋放容量；admission／exclusion／retirement
+consumer 接線與原子 release 交易仍待實作。** 下一步先整合這些 consumer，
+再讓原始 typed operation 執行同一筆 cancellation／archive／receipt／exclusion 交易。
+
 Cleanup 的原始 operation／read／nonce 接線已完成，**15 模組、351 tests 全過，
 45.886 秒，0 failures／errors／skips**。`DailyExperimentDemand.prepare_release`
 現在保留同一原始 completion、admission POLICY binding 與 generation；read／nonce

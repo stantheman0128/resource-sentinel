@@ -15,6 +15,17 @@ implement receipt publication, `Coordinator.release_experiment`, reservation
 release, closed-history reuse or mixed retirement. The original self witness
 remains retained. No native gate or runtime activation is claimed.
 
+The separate `experiment_history` module implements the closed, bounded data
+validator. It validates the immutable admission metadata, exact terminal managed
+row, unique archive, absent live obligations and matching closed exclusion as one
+tuple. It does not open a connection, install its exported schema, publish a
+receipt, mint a native completion or release capacity. Receipt publication and
+the admission/exclusion/retirement consumers must still be integrated before a
+completed historical tuple can make another experiment position available.
+Verification: nine related modules, 165 tests passed in 21.627 seconds, zero
+failures/errors/skips, including 23 history cases. These isolated synthetic
+records test data validation, not native cleanup or a successful release.
+
 The required result is one truthful daily cancellation after the original
 isolated experiment has positively completed native cleanup. The daily claim
 never launched anything: its reservation covered a separately executed test.

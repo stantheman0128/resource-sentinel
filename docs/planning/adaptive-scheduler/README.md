@@ -4,9 +4,58 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
+Serial S1 provider 的原始 case／daily demand／admission／cleanup 接線已實作。
+`tests/windows/adaptive_s1_provider.py` 保留同一個原始 case 與 command，排隊期間
+不建立 native scope；准入後只準備一次 scope，部分失敗沿原始 owner 收尾，前一個
+case 尚未正面釋放或取消時不能開始下一個。`recover_once()` 僅做原始 cleanup，
+不重新准入、launch 或量測；marker／output 前置檢查失敗不阻止原始 close tick。
+這不表示隔離 ledger 被破壞後仍能完成釋放；未知證據仍 HOLD。
+
+獨立 review 找到的 public admission result handoff 缺口已補：呼叫前先記錄結果
+未確認，exact bool 分類完成才清除；回覆遺失或本地賦值中斷，透過原始已完成
+submission tuple 的唯讀 settlement，再做實際 abandon／release。清理完成不會
+抹掉本次 run 的原始 errors。安全契約仍以
+[S1-SERIAL-PROVIDER.md](S1-SERIAL-PROVIDER.md) 為準。
+
+最終 **7 模組、140 PASS，0 failures／errors／skips，runner 29.899 秒**。
+新增 provider 34 個案例，加上一個實際原始 scope prepare／completion／daily
+release 整合案例。使用真實隔離 SQLite、Coordinator、原始 scope／launcher custody
+與 release receipt；Win32、IPC、process creation 和 source attestation 為明確
+fixtures，沒有 native workload 或 gate 通過聲明。三模組先行 67 PASS／15.987 秒；
+更早 124 PASS／24.246 秒，測試重疊不相加。初次 provider 29 tests 有 2 failures：
+synthetic process birth 與真實 PID observer 不一致，已讓兩個 fixture observer 使用
+同一 identity，保留並補強 queue／capacity 斷言。最終私人日誌
+`.local-adaptive/s1-provider-shared-20260924-2.log`。
+
+```powershell
+$sentinelS1ProviderTests = @(
+    'tests.test_adaptive_s1_provider'
+    'tests.test_adaptive_s1_provider_native'
+    'tests.test_adaptive_experiment_demand'
+    'tests.test_adaptive_experiment_admission_settlement'
+    'tests.test_adaptive_experiment_unadmitted_cleanup'
+    'tests.test_adaptive_experiment_generation_pin'
+    'tests.test_adaptive_experiment_release_native'
+)
+$sentinelS1ProviderCommand = 'C:\Python313\python.exe -m unittest ' + ($sentinelS1ProviderTests -join ' ') + ' -q'
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command $sentinelS1ProviderCommand -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
+Windows／base Python 3.13，正常日常 admission、沒有豁免。測試依賴受保護 dirty
+baseline，commit message 揭露；未宣稱 clean-checkout 或 full-suite 通過。
+**Items 5/6 仍未全部完成**：完整 serial S1 measurement、aggregate producer
+bootstrap／v2 publication、fresh-generation restart、P4 aggregate/storage/overhead、
+剩餘 S3 drivers／完整 orchestration 及 P6 A/B 仍有 source 工作。舊 common
+admission placeholder 繼續拒絕，尚不能說只差使用者執行外部 console。未部署、
+未變更日常 config／Scheduled Task／啟動入口，adaptive off；沒有實際 Job CPU
+cap 需要撤回。下一步是將真正 S1 measurement runner 接上此原始 provider，並完成
+aggregate fixture execution attestation／v2 producer publication。
+
+### Job security observation checkpoint（歷史驗證）
+
 Job security observation 與原始 dependency cleanup 已實作並驗證，契約見
 [JOB-SECURITY-OBSERVATION.md](JOB-SECURITY-OBSERVATION.md)。`NativeJob.query_security()`
-只查詢同一原始 handle，傳回实际 owner／logon SID、descriptor／ACL／ACE 及 handle
+只查詢同一原始 handle，傳回實際 owner／logon SID、descriptor／ACL／ACE 及 handle
 flags；buffer／token 正面清理後才產生 typed observation。中斷 acquisition／unknown
 close 保留原始 owner，不能重做 native release；已知 FALSE 僅重試原始資源。
 Job handle 已關閉仍不能掩蓋 security dependency 未清理。
@@ -49,7 +98,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\reso
 
 Windows／base Python 3.13，正常日常 admission、沒有豁免。測試依賴受保護 dirty
 baseline，commit message 揭露；不是 clean-clone full-suite 或 native gate 證據。
-Serial provider source 尚待本輪獨立驗證／提交，完整 measurement、aggregate producer
+此 checkpoint 當時 Serial provider 尚待驗證（後續結果見頂端）；完整 measurement、aggregate producer
 bootstrap／v2 publication、fresh-generation restart、P4／S3／P6 仍有 source 缺口。
 Items 5/6 未完成；舊 common admission placeholder 繼續拒絕。未部署或變更日常
 config／Scheduled Task／啟動入口，adaptive off，沒有施加或需撤回的實際 Job CPU cap。

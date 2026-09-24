@@ -4,6 +4,7 @@ import sqlite3
 import unittest
 from uuid import uuid4
 
+from sentinel.adaptive import daily_generation as generation
 from sentinel.adaptive.contracts import ProcessIdentity
 from sentinel.adaptive.daily_generation import REQUIRED_PATHS, SourceEntry, SourceManifest
 from sentinel.adaptive.daily_retirement_fence import (
@@ -50,7 +51,27 @@ class RetirementFenceTests(unittest.TestCase):
             encoded(manifest.to_dict()), self.binding["source_root"], self.binding["ledger_path"],
             self.binding["owner_identity_json"], self.binding["ledger_identity_json"],
             self.binding["readiness_instance_id"]))
+        generation._install_triggers(self.conn)
+        generation.validate_triggers(self.conn)
+        # SQL-only authority for this connection and its original complete row.
+        # This is explicitly synthetic readiness, not a native generation owner.
+        # Keep the real canonical triggers/readers; a changed row must not make
+        # this fixture authorize a replacement generation or a DRAINING writer.
+        self._sql_generation_row = tuple(self.conn.execute(
+            "SELECT * FROM adaptive_daily_generation").fetchone())
+        self.conn.create_function("sentinel_daily_generation", 0, self.fixture_generation)
+        self.conn.create_function("sentinel_daily_delete_authority", 2, self.fixture_delete_authority)
         self.request_id = str(uuid4())
+
+    def fixture_generation(self):
+        current = tuple(self.conn.execute("SELECT * FROM adaptive_daily_generation").fetchone())
+        if current == self._sql_generation_row:
+            return self._sql_generation_row[2]
+        return None
+
+    def fixture_delete_authority(self, table, key):
+        return int(table in {"reservations", "queue"} and type(key) is str and bool(key)
+                   and self.fixture_generation() == self._sql_generation_row[2])
 
     def insert(self, table, values):
         self.conn.execute(f"INSERT INTO {table}({','.join(values)}) VALUES({','.join('?' for _ in values)})",
@@ -275,6 +296,54 @@ class RetirementFenceTests(unittest.TestCase):
         with self.assertRaisesRegex(DailyRetirementError, "guards_unverified"):
             install_freeze_locked(self.conn, self.binding, self.request_id, self.guard)
         self.conn.rollback()
+
+    def test_missing_or_tampered_generation_guard_refuses_freeze_and_existing_reads(self):
+        for frozen in (False, True):
+            if frozen:
+                self.freeze()
+            for tampered in (False, True):
+                with self.subTest(frozen=frozen, tampered=tampered):
+                    self.conn.execute("BEGIN")
+                    try:
+                        self.conn.execute("DROP TRIGGER adaptive_daily_queue_insert")
+                        if tampered:
+                            self.conn.execute("""CREATE TRIGGER adaptive_daily_queue_insert
+                                BEFORE INSERT ON queue BEGIN SELECT 1; END""")
+                        with self.assertRaisesRegex(generation.DailyGenerationUnavailable,
+                                                    "daily_generation_guards_unverified"):
+                            generation.read_generation(self.conn)
+                        for check in (assert_new_capacity_allowed, assert_tightening_allowed):
+                            with self.assertRaisesRegex(DailyRetirementError, "generation_invalid"):
+                                check(self.conn)
+                        with self.assertRaisesRegex(DailyRetirementError, "generation_invalid"):
+                            install_freeze_locked(self.conn, self.binding, self.request_id, self.guard)
+                        if frozen:
+                            with self.assertRaisesRegex(DailyRetirementError, "generation_invalid"):
+                                read_retirement(self.conn)
+                        else:
+                            self.assertIsNone(self.conn.execute(
+                                "SELECT 1 FROM sqlite_master WHERE name=?", (TABLE,)).fetchone())
+                    finally:
+                        self.conn.rollback()
+                    generation.validate_triggers(self.conn)
+
+    def test_synthetic_sql_authority_refuses_changed_generation_or_draining(self):
+        self.direct()
+        self.conn.execute("INSERT INTO queue VALUES('needed',100)")
+        for column, value in (("generation", str(uuid4())), ("state", "DRAINING")):
+            with self.subTest(column=column):
+                self.conn.execute("BEGIN")
+                try:
+                    self.conn.execute(f"UPDATE adaptive_daily_generation SET {column}=?", (value,))
+                    for sql in ("INSERT INTO queue VALUES('new',100)",
+                                "DELETE FROM queue WHERE request_key='needed'",
+                                "DELETE FROM reservations WHERE id='direct'"):
+                        with self.assertRaisesRegex(sqlite3.IntegrityError, "daily_generation_required"):
+                            self.conn.execute(sql)
+                    self.assertEqual(self.conn.execute("SELECT count(*) FROM queue").fetchone()[0], 1)
+                    self.assertEqual(self.conn.execute("SELECT count(*) FROM reservations").fetchone()[0], 1)
+                finally:
+                    self.conn.rollback()
 
     def test_empty_or_wrong_retirement_schema_is_not_absent(self):
         self.conn.execute(f"CREATE TABLE {TABLE}(singleton INTEGER PRIMARY KEY)")

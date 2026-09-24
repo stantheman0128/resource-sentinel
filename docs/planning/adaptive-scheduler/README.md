@@ -4,7 +4,8 @@
 
 ## 2026-09-24 Codex 實作 checkpoint（目前狀態）
 
-最新提交完成 **fresh-generation restart 的原始 predecessor 證據保留**，契約見
+最新提交完成 **successor 的有界 immutable history 模組與 retirement fence
+fixture 修正**。先前已完成的原始 predecessor 證據保留繼續有效，契約見
 [DAILY-GENERATION-SUCCESSOR.md](DAILY-GENERATION-SUCCESSOR.md)。原始 seal 寫入前
 保留同一 inventory snapshot、digest 與 SQL/POLICY/native owners；完整退場後，
 `assert_successor_predecessor()` 核對同一操作、程序與 thread、原始 guards 的退出、
@@ -13,20 +14,32 @@ readiness、supervisor startup／child witnesses、SQL connection、cohort／pro
 receipt 與依 execution ID 排序的 journal bytes，不重新查詢 DB 或取得 native
 handle，也不授予重啟或准入權限。SEALED 紀錄及複製物件不能代替原始操作。
 
-**這只是 predecessor 證據這個 source slice，fresh-generation restart 仍未完成。**
-真正 successor transaction、immutable history transfer、host／CLI integration
-及 fresh readiness 尚待實作；未驗證的 archive 草稿留在本機，沒有納入提交。
+`daily_successor_history.py` 驗證完整 generation chain、canonical schema／JSON、
+digest、原始已完成 retirement 及新的 POLICY guard；讀取前限制資料列、payload
+及 schema 大小。Archive 最多 4,096 rows／16 MiB，單筆最多 4 MiB，拒絕 changed
+replay、chain cycle、binding 改動及 UPDATE／DELETE。Append 只在 caller 的原始
+transaction 裡寫入，不自行 commit、移除 fence、替換 generation 或授予准入。
+
+**這是 archive data 層的 source slice，fresh-generation restart 仍未完成。**
+真正 successor transaction、history／inventory integration、host／CLI integration
+及 fresh readiness 尚未驗證完成。相關未完成草稿留在本機，沒有納入本次提交。
 沒有部署日常 source、修改 config／Scheduled Task／啟動入口或啟用 adaptive。
 
-最終 **9 模組、210 PASS，0 failures／errors／skips，runner 29.072 秒**，包含
-12 個新增案例及既有 retirement／generation／activation 回歸。測試使用隔離的
-真實 SQLite、terminal receipt／journal 與明確 synthetic native collaborators；
-不代表 Windows native gate、完整套件或 clean-checkout 驗證。獨立 review 的
-journal key、startup／child witness 及底層 SQL connection binding 問題已修正。
-私人日誌 `.local-adaptive/successor-predecessor-final-20260924-1.log`。重現命令：
+最終 **11 模組、260 PASS，0 failures／errors／skips，runner 32.205 秒**，包含
+22 個 archive、28 個 fence 及先前 210 個 predecessor／retirement／generation／
+activation 案例。驗證從暫存 index 的 tree
+`b2fa06df07c6884c4e4f1e16e5cd751598bb32f9` 獨立 `git archive` 匯出；沒有複製
+未提交 source、runtime 或 config。測試用正常 daily wrapper 准入；因此程式碼
+驗證不依賴受保護 dirty source，但准入仍使用既有日常 wrapper。只有其後這份
+README 更新不在測試 tree 內。隔離真實 SQLite／receipt／journal 與明確 synthetic
+native collaborators，不代表 Windows native gate 或完整套件驗證。私人日誌
+`.local-adaptive/succession-commit-export-20260924-1/test.log`。在乾淨匯出或含
+本次提交的 checkout 使用下列正常准入命令重現；不要混入未完成 successor 草稿：
 
 ```powershell
 $sentinelPredecessorTests = @(
+    'tests.test_adaptive_daily_successor_history'
+    'tests.test_adaptive_daily_retirement_fence'
     'tests.test_adaptive_daily_successor_predecessor'
     'tests.test_adaptive_daily_retirement'
     'tests.test_adaptive_daily_retirement_inventory'
@@ -41,17 +54,31 @@ $sentinelPredecessorCommand = 'C:\Python313\python.exe -m unittest ' + ($sentine
 powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command $sentinelPredecessorCommand -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
 ```
 
-另有 **已確認的既有失敗，沒有列入上述通過數**：第一次 224-test batch 有
+先前 **已確認的既有 fence fixture 失敗，本次已修正**：第一次 224-test batch 有
 2 failures／22 errors，全部來自 `test_adaptive_daily_retirement_fence` 的舊
 fixture 沒有建立 canonical generation guards，觸發
 `daily_generation_guards_unverified`。使用獨立 `git archive 2b3817b` 的已提交
 source 與原測試執行 `C:\Python313\python.exe -m unittest discover -s tests -p
 test_adaptive_daily_retirement_fence.py -q`，26 tests 同樣 2 failures／22 errors
-（0.249 秒）。沒有修改其測試預期或移除 guard；這項 fixture 缺口仍待修正。
+（0.249 秒）。本次 fixture 建立並驗證真正 canonical generation guards，SQL-only
+synthetic readiness 僅授權同一原始 row／connection，沒有更改原有 26 個測試的
+預期或移除 production guard。新增兩個案例證明 guard 缺失／遭改動、generation
+替換或 DRAINING 仍拒絕；最終上述 28 個 fence 案例全部通過。
 私人日誌 `successor-predecessor-existing-20260924-1.log` 與
 `fence-baseline-2b3817b-complete.log`。首次 12-case focused run 通過後出現一則
 Python DummyThread shutdown 警告，已修正 foreign-thread 測試的 lookup fixture；
-最後 210-test batch 正常退出，沒有該警告。
+先前 210-test batch 與本次 260-test export 均正常退出，沒有該警告。
+
+**未提交整合草稿的失敗另列，不冒充上述通過結果**：dirty working tree 的
+260-test batch 有 11 errors（nonce cleanup 對沒有 `db_path` 的既有 fixture
+過早查詢，以及 archive reader 要求原始 SQLite connection 而舊 close-unknown
+fixture 使用 proxy）；14 個 successor inventory 案例有 7 errors，拒絕碼為
+`daily_retirement_inventory_ledger_changed`。私人日誌分別為
+`successor-foundation-regression-20260924-1.log`、`successor-inventory-20260924-1.log`。
+新的 12 個 successor operation 案例尚未執行。原始 native owner 的 retry binding、
+known nonce-clear ACK loss、SQL pre-bind close 與 fresh-readiness admission fence
+仍有 review 待辦；不可啟用或把草稿提交為完成的 restart。下一步先修正這些
+原始 ownership／SQL 契約與測試，再接 host／CLI，維持 cold-adoption 拒絕。
 
 前一批 S1 source 實作與驗證如下。
 

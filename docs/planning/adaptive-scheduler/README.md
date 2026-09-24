@@ -2,9 +2,44 @@
 
 日期：2026-09-19。狀態：**正式計畫已入庫，分階段實作進行中；production adaptive 維持 off。**
 
-## 2026-09-25 Codex 實作 checkpoint（目前狀態）
+## 2026-09-25 process duplicate custody checkpoint（目前狀態）
 
-最新 source checkpoint 為 **aggregate host ledger、共用歷史上限與實際 consumer 接線**，
+Source commit `f395d035bc088d29d2dc446e7dafb06154d93b4e` 修補原始
+process handle 的 duplicate capture：先保留 native output cell，再呼叫
+DuplicateHandle；未知結果不能冒充明確 FALSE。完成 handle transfer 後、
+返回 caller 前的中斷也保留原始 owner；關閉外層 process handle 不會誤證
+另一次 token cleanup 已完成。六個既有 fixture 使用相同的 explicit output API。
+
+精確 staged tree `759cce7559aa7ba484c2757a154a4d8fff2b2d0a` 匯出後，
+Windows／Python 3.13.3 九模組 **162 PASS，0 failures／errors／skips**，
+runner 36.579 秒。Commit tree 與測試 tree 一致；沒有依賴其他 dirty source。
+原始紀錄：`.local-adaptive/identity-custody-export-20260925-1/`。
+這是 portable source/custody 回歸，沒有執行需明確選取的 native smoke tests。
+
+在乾淨 checkout 透過正常日常准入重現：
+
+```powershell
+$sentinelIdentityTests = @(
+    'tests.test_adaptive_created_identity'
+    'tests.test_adaptive_identity_cleanup'
+    'tests.test_adaptive_identity_transfer'
+    'tests.test_adaptive_daily_successor_cycle'
+    'tests.test_adaptive_daily_successor_host_registration'
+    'tests.test_adaptive_early_guardian_death'
+    'tests.test_adaptive_legacy_native'
+    'tests.test_adaptive_native_launcher'
+    'tests.test_adaptive_guardian_launch'
+)
+powershell -NoProfile -ExecutionPolicy Bypass -File C:\Users\stans\Projects\resource-sentinel\scripts\invoke-sentinel.ps1 -Command ('C:\Python313\python.exe -m unittest -v ' + ($sentinelIdentityTests -join ' ')) -ResourceClass HEAVY -Priority P2 -CpuUnits 1 -RamGiB 1 -IoSlots 0
+```
+
+完整 aggregate provider 與必要 native gates 仍未完成；下面各批的剩餘接線
+與驗收缺口仍有效。沒有部署、修改日常 runtime/config/排程或施加 Job 限制；
+production adaptive 維持 off。
+
+## 2026-09-25 aggregate ledger checkpoint（前一批）
+
+該批 source checkpoint 為 **aggregate host ledger、共用歷史上限與實際 consumer 接線**，
 source commit `dd5cf3459a4e12188998bcfd8efed9d0629fdf8b`：
 
 - S2/P4 host scope 的 infrastructure／workload partitions 共用原始 daily demand，

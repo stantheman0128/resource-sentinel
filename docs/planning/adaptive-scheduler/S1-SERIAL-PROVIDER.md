@@ -69,6 +69,28 @@ Errors during logging or repeated interrupts must not discard custody. The
 eventual console entry retains `NativeRunUnsettled` and runs cleanup ticks in
 the same process; successful cleanup after a failed test reports failure.
 
+### Original successful-admission result handoff
+
+An interruption after actual admission returns but before the provider records
+the result must enter cleanup-only settlement of that original attempt. Publish
+the unclassified-attempt marker before the call and clear it only after exact
+result classification. Never infer a queue or allocation from local defaults.
+
+Successful admission may already have cleared its pending guard. Settlement may
+then use only the exact retained `demand._submission_original` tuple (policy,
+store, original PolicyGuard, binding and nonce), with the same positively closed
+original SQL transaction. Retain the tuple by identity and revalidate all pins;
+require positive original nonce-clear and native-cleanup facts, a still-None
+pending guard and no policy cleanup error. Missing, replaced or unknown evidence
+remains HOLD. Never reconstruct or republish a guard, perform another admission,
+clear a new nonce, or adopt authority from a later database row. Settlement's
+existing original read-only classification still grants no release or launch.
+
+Test successful admitted and queued attempts whose outer reply is lost, plus
+an interrupt during provider classification. Recovery must settle the same
+attempt and then positively release or abandon through its existing original
+operation; uncertain cleanup cannot start the next case.
+
 ## Measurement and evidence integration
 
 Adapt S1 in `adaptive_capability_runner.py` explicitly to the new exact provider;

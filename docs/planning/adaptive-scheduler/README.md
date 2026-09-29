@@ -1,6 +1,35 @@
 # GPT Pro 規劃交接：Agent 動態資源調度
 
-日期：2026-09-19。最新狀態：**2026-09-30 依 active goal 續作；已提交一批驗證過的修正，完整 host 整合繼續中。production adaptive 維持 off，未部署。**
+日期：2026-09-19。最新狀態：**2026-09-30 使用者明確要求「暫停＋收尾」，任務已 paused；鎖修正通過測試，host 整合仍有錯誤，以 WIP 入庫。production adaptive 維持 off，未部署。未獲恢復要求前不繼續實作。**
+
+## 2026-09-30 最新收尾 checkpoint
+
+本輪沒有擴充到下一個 phase。`fb1f8fe6a1be4ed06ec70b7a2d7be584292464e3`
+獨立修正 Supervisor lifetime mutex 分類，保留原 Windows singleton 名稱與 ACL；
+精確 tree 測試 **74 PASS，0 failures／errors／skips**。
+
+Host 整合保存於 `ea20e4aacf694e24ce957c42bff98eb5429b32dd`，接上 parent
+dispatcher、實際 SupervisorHost、guardian parent／telemetry custody、authenticated
+terminal receipts、v4 aggregate history，以及建立連線當下固定的原始 SQL owner。
+這個 commit 是 **WIP，尚未通過本批整合 gate**，不是可部署版本。
+
+精確 source tree `2df276b1a58dba31137f3da930c9d49ab55fe9e7` 的 32 模組：
+**702 tests，688 PASS；14 個不同案例產生 23 筆 errors；0 failures、0 skips，
+288.574 秒**。其中九個案例各另有一次 cleanup error。主要錯誤是
+`experiment_host_retirement_admission_transaction_unsettled` 和
+`experiment_child_original_native_custody_changed`；沒有改預期掩蓋錯誤。
+
+完整模組、重跑命令、錯誤接點與範圍見
+[HOST-WRAPUP-VERIFICATION-20260930.md](HOST-WRAPUP-VERIFICATION-20260930.md)。
+兩輪均為 Windows／base Python 3.13.3、正常 daily admission，匯出精確 Git tree
+並移除 PYTHONPATH；沒有未提交 source 依賴。不同輪次有重疊，數字不相加。
+
+下一步先修上述兩組錯誤，再接完 S2/P4 provider、query-only owner、S3/P6
+orchestration；readiness acquisition 前的未知 cleanup 也仍需處理。
+這些仍是 source 工作，不能寫成只剩使用者執行主控台。
+P3–P6 native capability／recovery／overhead／A/B 均未因本批而通過。
+十四個 protected 修改與無關 untracked 檔案保留，日常 config 雜湊未變；
+未改正式 Scheduled Task／全域入口，這次未施加 native Job CPU 限制。
 
 ## 2026-09-30 WIP 修復續作
 

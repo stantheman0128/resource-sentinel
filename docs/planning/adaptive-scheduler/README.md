@@ -1,8 +1,44 @@
 # GPT Pro 規劃交接：Agent 動態資源調度
 
-日期：2026-09-19。最新狀態：**2026-09-30 依使用者 commit 要求停止擴充並保存本批 WIP；production adaptive 維持 off，未部署。**
+日期：2026-09-19。最新狀態：**2026-09-30 依 active goal 續作；已提交一批驗證過的修正，完整 host 整合繼續中。production adaptive 維持 off，未部署。**
 
-## 2026-09-30 本批收尾保存
+## 2026-09-30 WIP 修復續作
+
+上一輪 `071bc22`／`a710a88` 已正常 push；沒有退回歷史 `e52d849`。
+本輪第一批 source commit：`1c373aeb4291dc066ef6e5487b29b9df96916d28`。
+它保留 wrapper 的實際 exit code／constructor failure 原始 owner，修正已提交
+Job intent 在 HOLD／seal 後的唯讀 receipt replay，並把 experimental control
+scope 接在 capability assessment 之後、原本 lifecycle mutation 之前。
+Capability probing 和 RPC 仍在 POLICY 外；原始 replay、frames、restore 路徑保留。
+
+驗證分開記錄，不能相加或當成完整 native gate：
+
+- 第一輪整合候選 tree `97bb899d584a7cfb74be8c3089751cb4f819ca54`：
+  12 模組、**287 tests，283 PASS、0 failures、4 errors、0 skips**，
+  runner 208.776 秒。四項分別是 invalid-actor fixture 建構提前失敗、兩個
+  測試用了不存在的 `VerifiedProcess.handle`，以及 malformed hello 的錯誤
+  類型未統一。其餘整合程式仍在修正，沒有宣稱該 tree 通過。
+- 將可獨立提交的七檔抽出，確認不依賴其他未提交 source，再匯出精確 tree
+  `45c5ca0ead1d14fe3da93433bbcec81a8ccec6cd`：四模組 **57 PASS，
+  0 failures／errors／skips，runner 63.029 秒**。該 tree 與 `1c373ae` 相同。
+  模組為 `test_adaptive_experiment_child_host`、`test_adaptive_experiment_job_parent`、
+  `test_adaptive_experiment_job_publication`、`test_adaptive_experiment_control_dispatch`。
+
+兩輪均為 Windows／base Python 3.13.3，正常 daily HEAVY/P2/CPU1/RAM1GiB/IO0
+准入、清除 PYTHONPATH 的 `git archive` 匯出測試。原始日誌／manifest 分別在
+本機 `.local-adaptive/boundary-20260930-host-repairs1/` 與
+`.local-adaptive/boundary-20260930-host-fixes-commit/`。使用既有
+`verify-boundary-20260930.py` driver；完整四模組 unittest 可在相同 source checkout
+用 base Python 經正常 wrapper 重跑。
+
+剩餘 source 工作仍包括父程序 dispatcher、authenticated terminal receipt、
+完整 aggregate cleanup、實際 SupervisorHost 接線及其 singleton 鎖的分類修正、
+query-only fixture owner，以及 S2/P4／S3/P6 provider。這些不能寫成只剩使用者
+執行主控台。readiness 在正向清理前失敗的 retry 邊界也正在補測。
+十四個 protected 檔案保留，不修改日常 config、正式 Scheduled Task 或全域入口。
+本輪沒有施加任何 native Job 限制。
+
+## 2026-09-30 上一批收尾保存（歷史狀態）
 
 本批以 `35bfc1a` 為基準，保存固定 child bootstrap、authenticated role release、
 guardian／Job publication 接線，以及 prelaunch aggregate cleanup。完整 host

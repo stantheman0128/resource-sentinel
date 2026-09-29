@@ -52,6 +52,7 @@ class DailyRetirementPrelaunchTests(unittest.TestCase):
             writer = sqlite3.connect(f.db, isolation_level=None)
             writer.row_factory = sqlite3.Row
             self.addCleanup(writer.close)
+            generation.prepare_connection(writer, role="lifecycle", db_path=f.db)
             writer.execute("BEGIN IMMEDIATE")
             self.generation_owner.install_locked(writer, policy=policy, guard=guard)
             writer.commit()

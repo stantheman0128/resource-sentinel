@@ -53,7 +53,7 @@ def current_operation(db_path=None):
     if type(operation) not in (ExperimentReleaseOperation, ExperimentAdmissionSettlement, ExperimentUnadmittedCleanup):
         _fail("original_operation_required")
     operation._current(frame)
-    if db_path is not None and Path(db_path).resolve() != operation.ledger_path:
+    if db_path is not None and Path(db_path) != operation.ledger_path:
         _fail("ledger_changed", operation)
     return operation
 
@@ -104,7 +104,7 @@ class _OriginalCleanupAccess:
 
     @contextmanager
     def _scope(self, phase):
-        self._original()
+        self._preflight()
         previous = getattr(_LOCAL, "frame", None)
         if phase not in self._phases or previous is not None and previous[0] is not self:
             _fail("phase_invalid", self)
@@ -128,14 +128,41 @@ class _OriginalCleanupAccess:
     def connection_scope(self, db_path):
         frame = getattr(_LOCAL, "frame", None)
         self._current(frame)
-        if Path(db_path).resolve() != self.ledger_path:
+        if Path(db_path) != self.ledger_path:
             _fail("ledger_changed", self)
         yield self
+
+    def _preflight(self):
+        """Actual observations before BEGIN; never callable from SQL guards."""
+        self._original()
+        # A cold import executes the source-provenance audit, including real
+        # path resolution. Load the locked helpers here before attesting the
+        # full executed module set, never on their first SQL callback.
+        from . import daily_retirement_fence, experiment_history, experiment_exclusion, experiment_host_ledger
+        original = self.demand._original_generation_binding()
+        generation._assert_daily_locations(original["source_root"], self.ledger_path)
+        if (generation._ledger_identity(self.ledger_path) != self.ledger_identity or
+                generation._fixed_policy_digest(self.ledger_path) != original["config_digest"] or
+                Path(self.store.db_path).resolve() != self.ledger_path):
+            _fail("ledger_or_config_changed", self)
+        coordinator = getattr(self, "coordinator", None)
+        if coordinator is not None and Path(coordinator.db_path).resolve() != self.ledger_path:
+            _fail("ledger_or_config_changed", self)
+        from .experiment_demand import _identity
+        if _identity(self.demand.directory) != self.demand.directory_identity:
+            _fail("original_demand_changed", self)
+        generation.verify_import_provenance(
+            generation.SourceManifest.from_dict(json.loads(original["source_manifest_json"])),
+            original["source_root"])
 
     def _validate(self, conn, frame):
         self._current(frame)
         if self._connections.get(id(conn)) != (conn, frame):
             _fail("connection_changed", self)
+        pinned = getattr(self, "_database_pins", {}).get(id(conn))
+        if (pinned is None or pinned[0] is not conn or pinned[1] is not frame or
+                tuple(tuple(row) for row in conn.execute("PRAGMA database_list")) != pinned[2]):
+            _fail("connection_metadata_changed", self)
         original = self.demand._original_generation_binding()
         actual = generation.read_generation(conn)
         if actual is None or actual["state"] not in {"ACTIVE", "DRAINING"}:
@@ -146,14 +173,6 @@ class _OriginalCleanupAccess:
         retirement = read_retirement(conn)
         if retirement is not None and retirement["phase"] == "SEALED" and frame[1] in {"PUBLISH", "ABANDON"}:
             _fail("generation_sealed", self)
-        generation._assert_daily_locations(original["source_root"], self.ledger_path)
-        if (not generation._ledger_matches(conn, self.ledger_path) or
-                generation._ledger_identity(self.ledger_path) != self.ledger_identity or
-                generation._fixed_policy_digest(self.ledger_path) != original["config_digest"]):
-            _fail("ledger_or_config_changed", self)
-        generation.verify_import_provenance(
-            generation.SourceManifest.from_dict(json.loads(original["source_manifest_json"])),
-            original["source_root"])
         runtime = self.policy._runtime(conn)
         binding = self.policy._binding(runtime, self._policy_binding.logon_id)
         if (binding != self._policy_binding or runtime["mode"] != "off" or
@@ -170,7 +189,9 @@ class _OriginalCleanupAccess:
             _fail("connection_scope_invalid", self)
         self._connections[id(conn)] = conn, frame
         conn.execute("PRAGMA busy_timeout=250")
-        self._validate(conn, frame)
+        self._preflight()
+        if not generation._ledger_matches(conn, self.ledger_path):
+            _fail("ledger_or_config_changed", self)
         phase = frame[1]
         # Never register sentinel_daily_generation. Publication alone receives
         # exact receipt-bound mutation authority, separate from read/nonce.
@@ -182,8 +203,10 @@ class _OriginalCleanupAccess:
                 return int(self._nonce_attempted and old is None and new == self._guard.nonce and
                     runtime["policy_entry_nonce"] is None and self.policy.current_guard() is None)
             if phase == "CLEAR":
+                facts = (self._guard._native_exit_confirmed, self._guard._native_no_entry_confirmed)
                 return int(old == self._guard.nonce and new is None and
-                    self.policy.current_cleanup_guard() is self._guard and self.policy.current_guard() is None)
+                    self.policy.current_cleanup_guard() is self._guard and self.policy.current_guard() is None and
+                    all(type(value) is bool for value in facts) and facts in {(True, False), (False, True)})
             return 0
         conn.create_function("sentinel_experiment_nonce_owned", 2, nonce_owned)
         conn.execute("""CREATE TEMP TRIGGER experiment_release_nonce_guard
@@ -231,11 +254,16 @@ class _OriginalCleanupAccess:
                         action == sqlite3.SQLITE_UPDATE and table == "adaptive_runtime" and column == "registry_revision"):
                     return sqlite3.SQLITE_OK
             return sqlite3.SQLITE_DENY
+        if not hasattr(self, "_database_pins"):
+            self._database_pins = {}
+        self._database_pins[id(conn)] = (conn, frame,
+            tuple(tuple(row) for row in conn.execute("PRAGMA database_list")))
+        self._validate(conn, frame)
         conn.set_authorizer(authorize)
 
     def revalidate_connection(self, conn, *, db_path):
         frame = getattr(_LOCAL, "frame", None)
-        if Path(db_path).resolve() != self.ledger_path or not conn.in_transaction:
+        if Path(db_path) != self.ledger_path or not conn.in_transaction:
             _fail("transaction_scope_invalid", self)
         self._validate(conn, frame)
 
@@ -246,12 +274,15 @@ class _OriginalCleanupAccess:
             if bound[0] is not conn:
                 _fail("connection_changed", self)
             self._connections.pop(id(conn))
+            getattr(self, "_database_pins", {}).pop(id(conn), None)
 
     @contextmanager
     def nonce_cleanup(self, policy, guard):
         self._original()
+        facts = (guard._native_exit_confirmed, guard._native_no_entry_confirmed)
         if (policy is not self.policy or guard is not self._guard or
-                policy.current_guard() is not None or guard.binding != self._policy_binding):
+                policy.current_guard() is not None or guard.binding != self._policy_binding or
+                not all(type(value) is bool for value in facts) or facts not in {(True, False), (False, True)}):
             _fail("nonce_cleanup_not_owned", self)
         with self._scope("CLEAR"):
             yield
@@ -909,7 +940,7 @@ class ExperimentAdmissionSettlement(_OriginalCleanupAccess):
             _fail("original_settlement_changed", self)
         self.demand._static_original()
         if (self._quarantine is not None or type(self.coordinator) is not Coordinator or
-                Path(self.coordinator.db_path).resolve() != self.ledger_path or
+                Path(self.coordinator.db_path) != self.ledger_path or
                 getattr(self.coordinator, "_managed_store", None) is not self.store or
                 not self.demand._native_preparation_sealed or self.demand._native_preparation is not None or
                 self.demand._release_operation is not None or
@@ -920,7 +951,7 @@ class ExperimentAdmissionSettlement(_OriginalCleanupAccess):
                 self.inner._abandon_target is not None or self.inner._submission_prepare_unknown or
                 self.inner._submission_policy is not self.policy or type(self.policy) is not PolicyCoordinator or
                 self.policy.store is not self.store or self.store._policy is not self.policy or
-                Path(self.store.db_path).resolve() != self.ledger_path or
+                Path(self.store.db_path) != self.ledger_path or
                 type(self._guard) is not PolicyGuard or type(self._policy_binding) is not PolicyBinding or
                 self._guard.binding != self._policy_binding or
                 self._guard.nonce != self._nonce or self.demand._generation_original != self._generation):

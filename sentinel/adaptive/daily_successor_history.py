@@ -298,8 +298,14 @@ def append_successor_history_locked(conn, *, retirement, successor_row, guard, t
             guard.nonce in {retirement._freeze_guard.nonce, retirement._seal_guard.nonce}):
         _fail("new_policy_guard_required")
     retirement.policy.assert_held(guard)
-    if (not generation._ledger_matches(conn, retirement.owner.ledger_path) or
-            generation._ledger_identity(retirement.owner.ledger_path) != retirement.owner.ledger_identity):
+    from .daily_successor_scope import current_operation
+    from .daily_successor import DailySuccessorError
+    operation = current_operation(retirement.owner.ledger_path)
+    if operation is None:
+        _fail("original_transaction_required")
+    try:
+        operation.assert_inventory_connection(conn, retirement, guard)
+    except DailySuccessorError:
         _fail("original_transaction_required")
     runtime = retirement.policy.revalidate(conn, guard)
     predecessor = generation.read_generation(conn)

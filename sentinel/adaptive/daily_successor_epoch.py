@@ -244,7 +244,7 @@ def current_sql_owner(db_path=None):
     if type(owner) is not SuccessorGuardianEpoch:
         _fail("original_operation_required")
     owner._original()
-    if db_path is not None and Path(db_path).resolve() != owner.store.db_path.resolve():
+    if db_path is not None and Path(db_path) != owner.operation.ledger_path:
         _fail("ledger_changed")
     return owner
 
@@ -290,6 +290,7 @@ class SuccessorGuardianEpoch:
         if (any(left is not right for left, right in zip(current[:11], self._pins[:11])) or
                 current[11:] != self._pins[11:] or self.operation._guardian_epoch_operation is not self or
                 self._policy_operation is not self._policy_original or self.policy is not self.store._policy or
+                Path(self.store.db_path) != self.operation.ledger_path or
                 self.binding is not self.startup.binding or self.identity != self._pins[-1] or
                 len(self._connections) != len(self._connection_pins) or
                 any(self._connection_pins.get(id(item)) != (item, item.connection) for item in self._connections)):
@@ -320,7 +321,9 @@ class SuccessorGuardianEpoch:
             _CURRENT.operation = prior
 
     def begin_sql_acquisition(self):
-        self._original()
+        # Canonical/source/native observations precede opening this consumer,
+        # while current_sql_owner remains a metadata-only dispatch under SQL.
+        self._authority()
         owner = _ConnectionCustody(None)
         self._connections.append(owner)
         self._connection_pins[id(owner)] = (owner, None)

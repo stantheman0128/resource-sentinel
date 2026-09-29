@@ -1,5 +1,6 @@
 """L1 lifecycle tests with synthetic evidence. They prove no Windows behavior."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import replace
 import hashlib
 import json
@@ -8,6 +9,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from tests.fixtures.adaptive_evidence import FixturePolicyProvider, fixture_evidence_provider
 import uuid
 
@@ -69,6 +71,59 @@ class AdaptiveLifecycleTests(unittest.TestCase):
         conn.row_factory = sqlite3.Row
         self.addCleanup(conn.close)
         return conn
+
+    def test_existing_ledger_path_fields_cannot_change_after_begin(self):
+        store = LifecycleStore(self.db, existing_path=True, policy_provider=self.policy)
+        original_connect = sqlite3.connect
+        for publication in (False, True):
+            for field in ("db_path", "_existing_ledger_path", "existing_path"):
+                with self.subTest(publication=publication, field=field):
+                    original = getattr(store, field)
+                    changed = False if field == "existing_path" else self.db.with_name("foreign.db")
+                    observed = []
+
+                    class MutateAfterBegin(sqlite3.Connection):
+                        def execute(conn, sql, parameters=()):
+                            result = super().execute(sql, parameters)
+                            if sql == "BEGIN IMMEDIATE":
+                                observed.append(conn.in_transaction)
+                                setattr(store, field, changed)
+                            return result
+
+                    policy = store._policy
+                    guard = policy.prepare(WRAPPER.logon_id) if publication else None
+                    with policy.hold(guard) if publication else nullcontext():
+                        try:
+                            with patch.object(sqlite3, "connect", side_effect=lambda *a, **k:
+                                    original_connect(*a, **k, factory=MutateAfterBegin)):
+                                with self.assertRaisesRegex(LifecycleError, "coverage_registry_unavailable"):
+                                    scope = (store._publication_transaction(guard, True) if publication
+                                             else store._transaction())
+                                    with scope:
+                                        self.fail("changed path exposed a mutation transaction")
+                        finally:
+                            setattr(store, field, original)
+                    self.assertEqual(observed, [True])
+                    self.assertFalse(self.db.with_name("foreign.db").exists())
+
+    def test_path_change_during_transaction_body_rolls_back_original_connection(self):
+        store = LifecycleStore(self.db, existing_path=True, policy_provider=self.policy)
+        for publication in (False, True):
+            with self.subTest(publication=publication):
+                policy = store._policy
+                guard = policy.prepare(WRAPPER.logon_id) if publication else None
+                with policy.hold(guard) if publication else nullcontext():
+                    try:
+                        with self.assertRaisesRegex(LifecycleError, "coverage_registry_unavailable"):
+                            scope = (store._publication_transaction(guard, True) if publication
+                                     else store._transaction())
+                            with scope as conn:
+                                conn.execute("UPDATE adaptive_runtime SET registry_revision=registry_revision+1")
+                                store.db_path = self.db.with_name("foreign.db")
+                    finally:
+                        store.db_path = self.db
+                self.assertEqual(self.connection().execute(
+                    "SELECT registry_revision FROM adaptive_runtime").fetchone()[0], 0)
 
     def spec(self, *, reservation_id=None, kind=AllocationKind.DIRECT, parent=None,
              execution_id=None, wrapper=WRAPPER, demand=None):

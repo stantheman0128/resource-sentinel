@@ -127,6 +127,52 @@ class DailyReadinessPinTests(unittest.TestCase):
         with self.assertRaisesRegex(transport.DailyReadinessError, "authority_unavailable"):
             self.check(authority)
 
+    def test_retained_check_never_observes_process_or_native_clock(self):
+        with generation.readiness_scope(self.fixture.db) as scope:
+            authority = scope.authority
+            with patch.object(authority._peer, "observe", side_effect=AssertionError("native query")), \
+                    patch.object(authority._deadline, "require", side_effect=AssertionError("native clock")), \
+                    patch.object(authority._deadline, "remaining_ms", side_effect=AssertionError("native clock")):
+                authority.assert_retained(authority._endpoint, authority._binding)
+
+    def test_retained_deadline_is_never_renewed_and_clock_reversal_refuses(self):
+        with generation.readiness_scope(self.fixture.db) as scope:
+            authority = scope.authority
+            bound = authority._retained_time
+            self.fixture.clock.now += 700
+            authority.assert_retained(authority._endpoint, authority._binding)
+            self.assertIs(authority._retained_time, bound)
+            self.fixture.clock.now -= 1
+            with self.assertRaisesRegex(transport.DailyReadinessError, "clock_invalid"):
+                authority.assert_retained(authority._endpoint, authority._binding)
+            self.fixture.clock.now += 301
+            with self.assertRaisesRegex(transport.DailyReadinessError, "pipe_timeout"):
+                authority.assert_retained(authority._endpoint, authority._binding)
+
+    def test_retained_bound_replacement_cannot_extend_original_authority(self):
+        with generation.readiness_scope(self.fixture.db) as scope:
+            authority = scope.authority
+            with patch.object(authority, "_retained_time", (0, 10**12)), \
+                    self.assertRaisesRegex(transport.DailyReadinessError, "original_authority_changed"):
+                authority.assert_retained(authority._endpoint, authority._binding)
+
+    def test_retained_conversion_starts_before_native_remaining_query(self):
+        original = NativeDeadline.require
+        started = self.fixture.clock.now
+        delayed = False
+        def remaining(deadline):
+            nonlocal delayed
+            if not delayed:
+                delayed = True
+                self.fixture.clock.now += 200
+            return original(deadline)
+        with patch.object(NativeDeadline, "require", remaining):
+            with generation.readiness_scope(self.fixture.db) as scope:
+                self.assertEqual(scope.authority._retained_time, (started / 1000, started / 1000 + .8))
+                self.fixture.clock.now = started + 800
+                with self.assertRaisesRegex(transport.DailyReadinessError, "pipe_timeout"):
+                    scope.authority.assert_retained(scope.authority._endpoint, scope.authority._binding)
+
 
 if __name__ == "__main__":
     unittest.main()

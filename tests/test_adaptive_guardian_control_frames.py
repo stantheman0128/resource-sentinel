@@ -12,6 +12,7 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
+from sentinel.adaptive import daily_generation
 from sentinel.adaptive.contracts import (
     ApplyResult, CpuControlMode, CpuTarget, TICKS_PER_SECOND, Validity,
 )
@@ -149,6 +150,80 @@ class GuardianControlFrameTests(unittest.TestCase):
     def first_frame_proposal(self, case, frame):
         return self.proposal(case, sample_seq=frame.sample_seq - 4,
             window_end=frame.window_end_tick_100ns, decision=self.ticks)
+
+    def test_level_two_revalidates_after_intent_before_native_set(self):
+        case, _ = self.start_timed_episode()
+        for _ in range(9):
+            frame = self.transition_frame(case)
+            self.assertIs(self.apply_transition(case, frame).result, ApplyResult.RENEWED)
+        frame = self.transition_frame(case)
+        before = [call for call in case.job.calls if call[0] == "set"]
+
+        def refuse(path):
+            record = self.journal.read(case.spec.execution_id, creation_nonce=case.record.creation_nonce)
+            self.assertIsNotNone(record.pending_intent)
+            raise daily_generation.DailyGenerationUnavailable("daily_owner_not_alive")
+
+        with patch.object(daily_generation, "revalidate_scoped_native_readiness", side_effect=refuse):
+            ack = self.apply_transition(case, frame,
+                target=self.episode_target(case, self.control.profile.retreat_l2_fraction))
+        self.assertNotEqual(ack.result, ApplyResult.APPLIED)
+        self.assertEqual([call for call in case.job.calls if call[0] == "set"], before)
+
+    def test_level_two_readback_expiry_restores_without_extending_lease(self):
+        case, _ = self.start_timed_episode()
+        for _ in range(9):
+            frame = self.transition_frame(case)
+            self.assertIs(self.apply_transition(case, frame).result, ApplyResult.RENEWED)
+        frame = self.transition_frame(case)
+        episode = self.control._episodes[case.spec.execution_id]
+        previous_lease = episode.lease_deadline_tick_100ns
+        state = {"issued": False, "expired": False}
+        original_set, original_query = case.job.set_cpu_rate_unverified, case.job.query_cpu
+
+        def require():
+            if state["expired"]:
+                raise RuntimeError("original_native_deadline_expired")
+            return 100
+
+        deadline = SimpleNamespace(require=require)
+
+        def gate(path):
+            state["issued"] = True
+            return deadline
+
+        def native_set(rate, *, native_deadline):
+            self.assertIs(native_deadline, deadline)
+            native_deadline.require()
+            original_set(rate)
+
+        def query():
+            value = original_query()
+            if state["issued"]:
+                state["expired"] = True
+            return value
+
+        with patch.object(daily_generation, "revalidate_scoped_native_readiness", side_effect=gate), \
+                patch.object(case.job, "set_cpu_rate_unverified", side_effect=native_set), \
+                patch.object(case.job, "query_cpu", side_effect=query):
+            ack = self.apply_transition(case, frame,
+                target=self.episode_target(case, self.control.profile.retreat_l2_fraction))
+        self.assertNotEqual(ack.result, ApplyResult.APPLIED)
+        self.assertTrue(episode.lease_deadline_tick_100ns is None or
+            episode.lease_deadline_tick_100ns <= previous_lease)
+        self.assertEqual(case.job.control["flags"], 0)
+
+    def test_renewal_readiness_failure_does_not_extend_existing_restriction(self):
+        case, first = self.start_timed_episode()
+        frame = self.transition_frame(case)
+        with patch.object(daily_generation, "revalidate_scoped_native_readiness",
+                side_effect=daily_generation.DailyGenerationUnavailable("daily_owner_not_alive")):
+            with self.assertRaises(daily_generation.DailyGenerationUnavailable):
+                self.apply_transition(case, frame)
+        episode = self.control._episodes[case.spec.execution_id]
+        self.assertTrue(episode.lease_deadline_tick_100ns is None or
+            episode.lease_deadline_tick_100ns <= first.lease_deadline_tick_100ns)
+        self.assertEqual(len([call for call in case.job.calls if call[0] == "set"]), 1)
 
     def test_proposal_without_authenticated_frame_cannot_apply(self):
         case = self.start()

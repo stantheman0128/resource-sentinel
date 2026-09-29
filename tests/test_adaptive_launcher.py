@@ -309,6 +309,29 @@ class Harness:
         self.mutex = Mutex(self.events)
         self.mutex_factory = Mock(return_value=self.mutex)
         self.store = Store(self)
+        self.daily_active = False
+        self.daily_deadline = None
+        self.daily_revalidate_error = None
+
+    @contextmanager
+    def daily_scope(self, path):
+        if path != self.coordinator.db_path or self.mutex.held or self.daily_active:
+            raise AssertionError("fixture daily scope acquired out of order")
+        self.daily_active = True
+        self.events.append(("daily.enter",))
+        try:
+            yield
+        finally:
+            self.daily_active = False
+            self.events.append(("daily.exit",))
+
+    def revalidate_daily(self, path):
+        if path != self.coordinator.db_path or not self.daily_active or not self.mutex.held:
+            raise AssertionError("fixture final readiness has no original scope")
+        self.events.append(("daily.revalidate",))
+        if self.daily_revalidate_error is not None:
+            raise self.daily_revalidate_error
+        return self.daily_deadline
 
     def open_job(self, *args, **kwargs):
         self.events.append(("open_job",))
@@ -327,6 +350,13 @@ class Harness:
         launcher = module.ManagedLauncher(SPEC, **arguments)
         # Explicit portable ledger double; separate store tests use real SQLite.
         launcher._store = self.store
+        create_fenced = launcher._create_fenced
+        def portable_scope(*args, **kwargs):
+            from sentinel.adaptive import daily_generation
+            with patch.object(daily_generation, "readiness_scope", self.daily_scope), \
+                    patch.object(daily_generation, "revalidate_scoped_native_readiness", self.revalidate_daily):
+                return create_fenced(*args, **kwargs)
+        launcher._create_fenced = portable_scope
         return launcher
 
     def admitted(self, **overrides):
@@ -357,6 +387,33 @@ class ManagedLauncherTests(unittest.TestCase):
         self.assertEqual(harness.job.close_calls, 0)
         self.assertEqual(harness.process.close_calls, 0)
         self.assertTrue(harness.coordinator.reservation_retained)
+
+    def test_original_daily_scope_spans_job_fence_and_final_create(self):
+        h = Harness()
+        h.daily_deadline = object()  # explicit native-launch fixture only
+        launcher = h.admitted()
+        launcher.launch_once(**STDIO)
+        stages = [event[0] for event in h.events if event[0] in {
+            "daily.enter", "fence.acquire", "ledger.fence", "daily.revalidate",
+            "create", "fence.release", "daily.exit", "bind"}]
+        self.assertEqual(stages, ["daily.enter", "fence.acquire", "ledger.fence",
+            "daily.revalidate", "create", "fence.release", "daily.exit", "bind"])
+        self.assertIs(h.native_launch.call_args.kwargs["readiness_deadline"], h.daily_deadline)
+        self.assertFalse(h.daily_active)
+
+    def test_post_sql_daily_failure_never_calls_native_create(self):
+        h = Harness()
+        failure = RuntimeError("fixture_final_daily_owner_unavailable")
+        h.daily_revalidate_error = failure
+        launcher = h.admitted()
+        with self.assertRaises(RuntimeError) as raised:
+            launcher.launch_once(**STDIO)
+        self.assertIs(raised.exception, failure)
+        self.assertFalse(launcher._create_attempted)
+        self.assertFalse(h.daily_active)
+        self.assertFalse(h.mutex.held)
+        self.assertIn(("ledger.fence", 1, True), h.events)
+        h.native_launch.assert_not_called()
 
     def test_queued_and_uncertain_admission_retries_keep_context_key_and_original_payload(self):
         h = Harness()
@@ -1401,6 +1458,191 @@ class ManagedLauncherTests(unittest.TestCase):
             self.assertFalse(launcher.abandon_once()["settled"])
         self.assertLessEqual(len(launcher._operation_errors), 3)
         self.assertEqual(h.native_launch.call_count, 1)
+
+
+class ExperimentLauncherTests(unittest.TestCase):
+    """Actual partition/publication/authority, explicit synthetic native I/O.
+
+    The daily intent is published by the existing parent fixture. The real
+    authenticated publication client receives that exact durable observation
+    over a completed in-memory pipe; it does not prove a running parent server
+    or Windows launch. The real isolated Coordinator performs admission and
+    cancellation without re-admitting or releasing the daily reservation.
+    """
+
+    def setUp(self):
+        from sentinel.adaptive import experiment_backing_transport as transport
+        from sentinel.adaptive import launch_transport
+        from tests import test_adaptive_experiment_host_authority as authority_fixtures
+        from tests.test_adaptive_admission_context import PAYLOAD
+        from tests.test_adaptive_ipc import Clock
+        from uuid import uuid4
+
+        self.authority_fixture = authority_fixtures.ExperimentHostAuthorityTests()
+        self.authority_fixture.setUp()
+        self.addCleanup(self.authority_fixture.doCleanups)
+        self.partition_fixture = self.authority_fixture.fixture
+        self.partition = self.partition_fixture.adapter
+        self.context = self.partition_fixture.context
+        self.snapshot = self.partition_fixture.snapshot
+        self.spec = LaunchSpec(command=PAYLOAD["command"], cwd=PAYLOAD["cwd"],
+            repo_identifier=self.snapshot.request.repo, requested=self.snapshot.requested,
+            role=self.snapshot.role, priority=self.snapshot.priority, admission_timeout_sec=0)
+        self.endpoint = self.authority_fixture.endpoint()
+        self.guardian_epoch = "fixture-experiment-guardian"
+        self.publication = transport.ExperimentBackingPublication.prepare(
+            self.partition_fixture.child_binding, self.context,
+            member_id=self.partition.member_id, reservation_id=self.partition.reservation_id,
+            request_id=str(uuid4()))
+        self.addCleanup(transport._PUBLICATIONS.pop, self.publication._key, None)
+        self.client = Mock()
+        self.channels = []
+        self.connect_error = None
+        self.pipe_factory = self.publication_pipe
+        for override in (
+            patch.object(module, "resolve_system_cmd", return_value=CMD),
+            patch.object(launch_transport, "ManagedLaunchClient", return_value=self.client),
+            patch("sentinel.adaptive.pipe_windows._backend", return_value=Clock()),
+            patch("sentinel.adaptive.windows.current_thread_holds_mutex", return_value=False),
+            patch.object(transport.NativePipeConnection, "connect", side_effect=self.connect),
+        ):
+            override.start()
+            self.addCleanup(override.stop)
+
+    def publication_pipe(self, *, response=True):
+        from sentinel.adaptive import experiment_backing_transport as transport
+        from tests import test_adaptive_experiment_host_transport as pipe_fixture
+        from tests import test_adaptive_experiment_backing_transport as backing_fixture
+        from tests.test_adaptive_ipc import wire_frame
+
+        request = self.publication.request
+        operation = self.partition_fixture.operation
+        observed = self.partition_fixture.fixture.validate(operation)
+        payload = transport._result(observed, request)
+        challenge = dict(version=1, kind="ExperimentBackingChallenge", request_id=request.request_id,
+            nonce=pipe_fixture.NONCE, endpoint_id=request.manifest.endpoint.instance_id,
+            server=request.manifest.endpoint.server_identity.to_dict(),
+            client=request.manifest.child_identity.to_dict(), payload_sha256=request.payload_sha256)
+        reply = dict(version=1, kind="ExperimentBackingResult", request_id=request.request_id,
+            nonce=pipe_fixture.NONCE, result=payload,
+            mac=backing_fixture.wire_mac("result", request.to_dict(), challenge, payload))
+        incoming = wire_frame(challenge) + (wire_frame(reply) if response else b"")
+        return pipe_fixture.Pipe(request.manifest.endpoint.server_identity, incoming)
+
+    def connect(self, *args, **kwargs):
+        if self.connect_error is not None:
+            raise self.connect_error
+        connection = self.pipe_factory()
+        self.channels.append(connection)
+        return connection
+
+    def build(self, **overrides):
+        values = dict(partition=self.partition, publication=self.publication,
+                      endpoint=self.endpoint, guardian_epoch=self.guardian_epoch)
+        values.update(overrides)
+        return module.ManagedLauncher.for_experiment(self.spec, **values)
+
+    def daily_floor(self):
+        fixture = self.partition_fixture.host
+        return fixture.fixture.assert_retained(fixture.owner)
+
+    def test_real_partition_keeps_one_original_context_and_daily_floor(self):
+        before = self.daily_floor()
+        launcher = self.build()
+        self.assertIs(self.build(), launcher)
+        self.assertIs(launcher.admission, self.context)
+        result = launcher.admit_once(None)
+        self.assertTrue(result["allowed"])
+        self.assertEqual(result["reservation_id"], self.partition.reservation_id)
+        self.assertIs(launcher._ledger(), self.partition_fixture.base_store)
+        self.assertEqual(len(self.publication.attempts), 1)
+        self.assertEqual(len(self.partition_fixture.rows("reservations")), 1)
+        self.assertEqual(self.daily_floor(), before)
+        # Run the actual typed authority on the real backing and local row.
+        launcher._ready(result)
+        self.client.prepare_execution.assert_not_called()
+        self.assertEqual(launcher.admit_once(None), result)
+        self.assertEqual(len(self.publication.attempts), 1)
+
+    def test_copied_capacity_inputs_cannot_enter_partition(self):
+        launcher = self.build()
+        for status, config in (({}, None), (None, {})):
+            with self.subTest(status=status, config=config), self.assertRaisesRegex(
+                    module.ManagedLaunchError, "capacity_input_forbidden"):
+                launcher.admit_once(status, config=config)
+        self.assertEqual(self.publication.attempts, ())
+        self.partition_fixture.assert_empty()
+
+    def test_admitted_abandon_cancels_only_isolated_row_and_retains_daily_floor(self):
+        before = self.daily_floor()
+        launcher = self.build()
+        launcher.admit_once(None)
+        settled = launcher.abandon_once()
+        self.assertTrue(settled["settled"], settled)
+        self.assertTrue(settled["closed"])
+        self.assertEqual(self.partition_fixture.rows("reservations"), [])
+        row = self.partition_fixture.rows("managed_executions")[0]
+        self.assertEqual(row["state"], "CANCELLED_BEFORE_START")
+        self.assertEqual(self.daily_floor(), before)
+        self.client.prepare_execution.assert_not_called()
+
+    def test_publication_lost_response_retains_context_until_original_replay(self):
+        from sentinel.adaptive import experiment_backing_transport as transport
+        self.pipe_factory = lambda: self.publication_pipe(response=False)
+        before = self.daily_floor()
+        launcher = self.build()
+        request = self.publication.request
+        with self.assertRaises(transport.ExperimentBackingTransportError):
+            launcher.admit_once(None)
+        self.assertFalse(launcher._submitted)
+        self.assertTrue(self.publication.attempts[0].accepted)
+        self.assertFalse(self.publication.attempts[0].cleanup_pending)
+        with self.assertRaisesRegex(module.ManagedLaunchError, "publication_outcome_pending"):
+            launcher.close_local()
+        self.assertFalse(self.context._closed)
+        self.pipe_factory = self.publication_pipe
+        settled = launcher.abandon_once()
+        self.assertTrue(settled["settled"], settled)
+        self.assertIs(self.publication.request, request)
+        self.assertEqual(len(self.publication.attempts), 2)
+        self.partition_fixture.assert_empty()
+        self.assertEqual(self.daily_floor(), before)
+        self.assertTrue(self.context._closed)
+        self.client.prepare_execution.assert_not_called()
+
+    def test_unknown_publication_channel_close_never_retries_or_drops_context(self):
+        from sentinel.adaptive import experiment_backing_transport as transport
+        connection = self.publication_pipe()
+        connection.channel_error = RuntimeError("fixture_channel_close_unknown")
+        self.pipe_factory = lambda: connection
+        launcher = self.build()
+        with self.assertRaises(transport.ExperimentBackingTransportError):
+            launcher.admit_once(None)
+        self.assertTrue(self.publication.attempts[0].cleanup_pending)
+        for _ in range(2):
+            result = launcher.abandon_once()
+            self.assertFalse(result["settled"])
+            self.assertFalse(self.context._closed)
+        self.assertEqual(len(self.publication.attempts), 1)
+        self.assertEqual(self.channels, [connection])
+        with self.assertRaisesRegex(module.ManagedLaunchError, "publication_cleanup_pending"):
+            launcher.close_local()
+        self.partition_fixture.assert_empty()
+
+    def test_constructor_failure_retains_original_binding_and_never_replaces_it(self):
+        error = RuntimeError("fixture_system_cmd_unavailable")
+        with patch.object(module, "resolve_system_cmd", side_effect=error):
+            with self.assertRaises(RuntimeError) as raised:
+                self.build()
+        self.assertIs(raised.exception, error)
+        binding = error.experiment_wrapper_binding
+        self.assertIs(binding, self.publication._wrapper_launcher_binding)
+        self.assertIs(binding._construction_error, error)
+        self.assertIsNotNone(binding._launcher)
+        with self.assertRaisesRegex(module.ManagedLaunchError, "original_binding_changed"):
+            self.build()
+        self.assertFalse(self.context._closed)
+        self.assertEqual(self.publication.attempts, ())
 
 
 if __name__ == "__main__":

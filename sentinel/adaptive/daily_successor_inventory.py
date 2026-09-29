@@ -348,7 +348,9 @@ def revalidate_successor_inventory(conn, retirement, guard, snapshot):
         _refuse("snapshot_scope_changed")
     if _original(retirement, guard) != captured.preimage:
         _refuse("original_preimage_changed")
-    _identity(retirement)
+    # Actual file identity belongs to capture and the original operation's
+    # connection preflight. The locked original-connection check below retains
+    # that connection's SQLite metadata; never stat the ledger under BEGIN.
     if not isinstance(conn, sqlite3.Connection) or not conn.in_transaction:
         _refuse("transaction_required")
     if not _connection_path(conn, retirement, guard):

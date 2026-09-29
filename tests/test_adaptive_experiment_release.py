@@ -598,8 +598,40 @@ class ExperimentReleaseTests(unittest.TestCase):
             self.assert_released(self.release())
         self.assertEqual(refused, [change])
 
-    def test_cached_publication_insert_revalidates_original_config_digest(self):
-        self._assert_cached_insert_revalidates_original_write_authority("config")
+    def test_config_change_after_begin_uses_preflight_until_next_connection(self):
+        # DAILY-READINESS-TRANSACTION-DECISION explicitly replaces the old
+        # per-write filesystem observation guarantee. Original completed
+        # cleanup can publish under its already-bound SQL snapshot; it cannot
+        # authorize new native work. A fresh connection must observe the file.
+        publish, prepare = self.operation._publish_locked, self.operation._prepare_publication
+        config = Path(self.db).with_name("config.json")
+        original = config.read_bytes()
+        changed = []
+
+        def prepare_then_change(conn):
+            fresh = prepare(conn)
+            self.assertTrue(conn.in_transaction)
+            config.write_bytes(original + b"\n")
+            changed.append(True)
+            return fresh
+
+        def publish_with_changed_file(conn):
+            try:
+                with patch.object(self.operation, "_prepare_publication", side_effect=prepare_then_change):
+                    publish(conn)
+            finally:
+                config.write_bytes(original)
+
+        with patch.object(self.operation, "_publish_locked", side_effect=publish_with_changed_file):
+            self.assert_released(self.release())
+        self.assertEqual(changed, [True])
+        try:
+            config.write_bytes(original + b"\n")
+            with self.assertRaisesRegex(cleanup.ExperimentReleaseError, "ledger_or_config_changed"):
+                with self.operation._scope("READ"), self.operation.store._transaction():
+                    self.fail("new connection accepted changed config")
+        finally:
+            config.write_bytes(original)
 
     def test_cached_publication_insert_revalidates_original_policy_nonce(self):
         self._assert_cached_insert_revalidates_original_write_authority("policy")

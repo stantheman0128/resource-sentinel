@@ -307,29 +307,30 @@ class OriginalSuccessorHistoryAppendTests(unittest.TestCase):
         self.fixture.setUp()
         self.retirement = self.fixture.complete()
         self.retirement.assert_successor_predecessor()
+        from sentinel.adaptive.daily_successor import DailySuccessorOperation
+        self.operation = DailySuccessorOperation(self.retirement)
         self.transition = str(uuid4())
         self.successor = dict(self.retirement._generation_row, generation=str(uuid4()),
             readiness_instance_id=str(uuid4()))
 
     @contextmanager
     def transaction(self):
-        # Explicit new-POLICY native seam: the same original coordinator has
-        # this distinct guard on its thread, backed by the actual SQL nonce.
-        # This models the outer successor scope still being implemented; it
-        # does not patch archive validation or reconstruct the old retirement.
-        conn = sqlite3.connect(self.retirement.owner.ledger_path, isolation_level=None)
-        conn.row_factory = sqlite3.Row
-        guard = PolicyGuard(self.retirement._seal_guard.binding, str(uuid4()))
-        conn.execute("BEGIN IMMEDIATE")
-        conn.execute("UPDATE adaptive_runtime SET policy_entry_nonce=? WHERE singleton=1", (guard.nonce,))
-        self.retirement.policy._held.guard = guard
-        try:
-            yield conn, guard
-        finally:
-            self.retirement.policy._held.guard = None
-            if conn.in_transaction:
-                conn.rollback()
-            conn.close()
+        # The approved boundary requires a real pre-BEGIN original connection
+        # binding. Use the now-implemented successor scope and native fixture
+        # POLICY provider instead of manufacturing a held guard on a raw DB.
+        operation = self.operation
+        with operation.scope():
+            operation._prepare_guard()
+            with operation.policy.hold(operation.guard):
+                with operation._connection(transition=True) as conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    operation._transition_connection = conn
+                    operation._transition_stage = "archive"
+                    try:
+                        yield conn, operation.guard
+                    finally:
+                        if conn.in_transaction:
+                            conn.rollback()
 
     def append(self, conn, guard, **changes):
         args = dict(retirement=self.retirement, successor_row=self.successor, guard=guard,

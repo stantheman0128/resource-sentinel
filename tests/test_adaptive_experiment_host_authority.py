@@ -43,6 +43,10 @@ class ExperimentHostAuthorityTests(unittest.TestCase):
         self.execution_id = self.snapshot.execution_id
         self.scoped_readiness = []
         self.guardian_identity = self.guardian_member = self.guardian_process = None
+        # This suite verifies custody and SQL decisions, not the wall-clock
+        # speed of a synthetic two-ledger fixture. Exercise budget expiry
+        # explicitly below; native overhead remains a separate unverified gate.
+        self.monotonic_now = 10.0
 
         def scoped_readiness(path, *, expected_generation):
             self.assertEqual(path, self.host.store.db_path.resolve())
@@ -61,6 +65,7 @@ class ExperimentHostAuthorityTests(unittest.TestCase):
         overrides = (
             patch.object(module, "daily_generation", proof),
             patch.object(module.time, "time", return_value=NOW),
+            patch.object(module.time, "monotonic", side_effect=lambda: self.monotonic_now),
             patch.object(host_authority, "read_host_capability", return_value=capability),
             patch.object(module, "read_host_capability", return_value=capability),
         )
@@ -233,6 +238,16 @@ class ExperimentHostAuthorityTests(unittest.TestCase):
                             authority.assert_create_ready(self.context, row, endpoint)
         with self.assertRaises(host_authority.HostReadinessError):
             authority.assert_create_ready(self.context, row, endpoint)
+
+    def test_original_operation_budget_expiry_refuses_without_releasing_capacity(self):
+        row = self.admit()
+        authority = self.wrapper()
+        with authority.new_work_scope(self.execution_id, operation="prepare"):
+            self.monotonic_now += .251
+            with self.assertRaisesRegex(module.ExperimentHostAuthorityError, "operation_expired"):
+                authority.assert_covered(row)
+        self.assertEqual(len(self.fixture.rows("reservations")), 1)
+        self.assertEqual(self.store.query(self.execution_id, existing_path=True)["state"], "RESERVED")
 
     def test_guardian_missing_job_refuses_restriction_and_renewal_then_exact_intent_allows_them(self):
         self.admit()

@@ -67,6 +67,7 @@ class DailyGenerationTests(unittest.TestCase):
         writer = sqlite3.connect(self.db)
         writer.row_factory = sqlite3.Row
         self.addCleanup(writer.close)
+        generation.prepare_connection(writer, role="lifecycle", db_path=self.db)
         writer.execute("BEGIN IMMEDIATE")
         self.owner.install_locked(writer, policy=self.policy, guard=self.guard)
         writer.commit()
@@ -555,6 +556,7 @@ class DailyGenerationTests(unittest.TestCase):
                 if sql.startswith("CREATE TABLE adaptive_daily_generation"):
                     raise RuntimeError("synthetic lost SQL outcome")
                 return self.conn.execute(sql, *arguments)
+        generation.prepare_connection(self.conn, role="lifecycle", db_path=self.db)
         with self.assertRaisesRegex(RuntimeError, "lost SQL"):
             self.owner.install_locked(FailingConnection(), policy=self.policy, guard=self.guard)
         with self.assertRaisesRegex(generation.DailyGenerationUnavailable, "custody_required"):
@@ -563,6 +565,7 @@ class DailyGenerationTests(unittest.TestCase):
     def test_ack_rejects_unclosed_original_install_connection(self):
         with patch.object(generation, "verify_import_provenance"):
             self.owner.prepare_install(policy=self.policy, guard=self.guard)
+        generation.prepare_connection(self.conn, role="lifecycle", db_path=self.db)
         self.conn.execute("BEGIN IMMEDIATE")
         self.owner.install_locked(self.conn, policy=self.policy, guard=self.guard)
         self.conn.commit()

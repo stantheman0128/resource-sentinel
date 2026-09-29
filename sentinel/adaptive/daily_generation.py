@@ -106,6 +106,29 @@ class _ReadinessScope:
         self.ledger_identity = None
         self.closed = False
         self.cleanup = None
+        self._retained = None
+
+    def retain(self):
+        self._retained = (self, self.path, self.absence_only, self.pool, self.thread,
+            os.getpid(), None if self.row is None else dict(self.row),
+            self.authority, self.local_owner, self.ledger_identity,
+            None if self.local_owner is None else _local_pin(self.local_owner))
+
+    def assert_retained(self):
+        self.assert_current()
+        retained = self._retained
+        if retained is None or retained[0] is not self:
+            _reject("daily_readiness_original_scope_required")
+        if (self.path != retained[1] or
+                self.absence_only != retained[2] or self.pool is not retained[3] or
+                self.thread is not retained[4] or os.getpid() != retained[5] or
+                self.row != retained[6] or self.authority is not retained[7] or
+                self.local_owner is not retained[8] or self.ledger_identity != retained[9]):
+            _reject("daily_readiness_scope_binding_changed")
+        if (self.row is not None or self.absence_only) and self.pool.get(id(self)) is not self:
+            _reject("daily_readiness_original_scope_required")
+        if self.local_owner is not None:
+            _assert_local_pin(self.local_owner, retained[10])
 
     def poison(self, error):
         if self.error is None:
@@ -262,6 +285,7 @@ def _owned_readiness_scope(path, *, absence_only):
             # Do not impose the daily native-custody limit on legacy callers.
             with _READINESS_SCOPES_LOCK:
                 pool.pop(id(scope), None)
+        scope.retain()
         yield scope
     except BaseException as error:
         primary = error
@@ -338,7 +362,7 @@ def revalidate_scoped_readiness(db_path, *, expected_generation):
         _reject("daily_readiness_scope_required")
     _READINESS_LOCAL.scope = scope
     try:
-        scope.assert_current()
+        scope.assert_retained()
         with _READINESS_SCOPES_LOCK:
             if scope.pool is not _READINESS_SCOPES or _READINESS_SCOPES.get(id(scope)) is not scope:
                 _reject("daily_readiness_original_scope_required")
@@ -387,7 +411,67 @@ def revalidate_scoped_readiness(db_path, *, expected_generation):
         _READINESS_LOCAL.scope = previous
 
 
+def revalidate_scoped_native_readiness(db_path):
+    """Actual final observation for Create/Set, using only lexical custody.
+
+    An original absent generation is checked against its retained ledger, not
+    silently upgraded to a newly present owner. No RPC or replacement authority
+    is acquired. The caller must invoke this after SQL closes and immediately
+    before its native operation, carrying any returned original deadline.
+    """
+    path = Path(db_path).resolve()
+    previous = getattr(_READINESS_LOCAL, "scope", None)
+    group = getattr(_READINESS_LOCAL, "group", None)
+    scope = group.get(path) if group is not None else previous
+    if type(scope) is not _ReadinessScope or scope.path != path:
+        _reject("daily_readiness_scope_required")
+    _READINESS_LOCAL.scope = scope
+    try:
+        scope.assert_retained()
+        if scope.cleanup is not None:
+            _reject("daily_readiness_capacity_scope_required")
+        if scope.row is not None:
+            return revalidate_scoped_readiness(path, expected_generation=scope.row)
+        if scope.ledger_identity is None:
+            _reject("daily_ledger_identity_unavailable")
+        if _ledger_identity(path) != scope.ledger_identity:
+            _reject("daily_ledger_identity_changed")
+        reader = _ReadinessReader()
+        scope.native_reader = reader
+        primary = None
+        try:
+            reader.open_attempted = True
+            reader.connection = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True,
+                timeout=.25, isolation_level=None)
+            reader.connection.execute("PRAGMA query_only=ON")
+            if read_generation(reader.connection) is not None:
+                _reject("daily_generation_changed")
+            if (not _ledger_matches(reader.connection, path) or
+                    _ledger_identity(path) != scope.ledger_identity):
+                _reject("daily_ledger_identity_changed")
+            scope.assert_retained()
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            try:
+                reader.close()
+            except BaseException as cleanup:
+                target = primary or cleanup
+                scope.poison(target)
+                target.daily_readiness_native_reader = reader
+                target.add_note("daily_readiness_scope_reader_cleanup_unknown")
+                if primary is None:
+                    raise
+        return None
+    finally:
+        _READINESS_LOCAL.scope = previous
+
+
 def _revalidate_absent(conn, scope, db_path):
+    if conn.in_transaction:
+        _revalidate_connection_metadata(conn, db_path)
+        return
     if scope is None:
         return
     scope.assert_current()
@@ -416,6 +500,9 @@ def readiness_nonce_cleanup(policy, guard):
         with operation.nonce_cleanup(policy, guard):
             yield
         return
+    _released_native_facts(guard)
+    if policy.current_guard() is not None:
+        _reject("daily_readiness_cleanup_not_owned")
     scope = getattr(_READINESS_LOCAL, "scope", None)
     if scope is None:
         yield
@@ -430,21 +517,27 @@ def readiness_nonce_cleanup(policy, guard):
         scope.cleanup = None
 
 
+def _released_native_facts(guard):
+    facts = (getattr(guard, "_native_exit_confirmed", None),
+             getattr(guard, "_native_no_entry_confirmed", None))
+    if (not all(type(value) is bool for value in facts) or
+            facts not in {(True, False), (False, True)}):
+        _reject("daily_readiness_cleanup_not_owned")
+    return facts
+
+
 def _nonce_only(conn, *, scope=None, policy=None, guard=None, row=None):
     if scope is not None:
+        released = _released_native_facts(guard)
         def owned():
             if (getattr(_READINESS_LOCAL, "scope", None) is not scope or scope.closed or
                     scope.error is not None or scope.thread is not threading.current_thread() or
                     scope.cleanup is None or scope.cleanup[0] is not policy or scope.cleanup[1] is not guard or
                     policy.current_cleanup_guard() is not guard or policy.current_guard() is not None):
                 return 0
-            if read_generation(conn) != row or not _ledger_matches(conn, scope.path):
+            if _released_native_facts(guard) != released:
                 return 0
-            if (_ledger_identity(scope.path) != tuple(int(v) for v in json.loads(row["ledger_identity_json"])) or
-                    _fixed_policy_digest(scope.path) != row["config_digest"]):
-                return 0
-            verify_import_provenance(SourceManifest.from_dict(json.loads(row["source_manifest_json"])),
-                                     row["source_root"])
+            _revalidate_connection_metadata(conn, scope.path)
             return 1
         conn.create_function("sentinel_daily_nonce_clear", 0, owned)
         conn.execute("""CREATE TEMP TRIGGER daily_readiness_nonce_guard
@@ -911,6 +1004,119 @@ def _ledger_matches(conn, db_path):
         return False
 
 
+def _main_metadata(conn):
+    """SQLite's already opened main database metadata; no path resolution."""
+    rows = tuple(tuple(row) for row in conn.execute("PRAGMA database_list") if row[1] == "main")
+    if len(rows) != 1:
+        _reject("daily_ledger_mismatch")
+    return rows
+
+
+def _bind_connection_metadata(conn, db_path, *, scope=None, row=None):
+    """Pre-BEGIN proof bound to this exact connection, never a receipt."""
+    if conn.in_transaction or not _ledger_matches(conn, db_path):
+        _reject("daily_connection_scope_invalid")
+    metadata, path = _main_metadata(conn), os.fspath(db_path)
+    ledger_identity = _ledger_identity(db_path)
+    if (scope is not None and scope.ledger_identity is not None and
+            ledger_identity != scope.ledger_identity):
+        _reject("daily_ledger_identity_changed")
+    if row is not None and ledger_identity != tuple(int(v) for v in json.loads(row["ledger_identity_json"])):
+        _reject("daily_ledger_identity_changed")
+    thread, pid = threading.current_thread(), os.getpid()
+    expected = None if row is None else dict(row)
+    retained = None if scope is None else scope._retained
+    cleanup = None if scope is None else scope.cleanup
+    def current(requested_path):
+        if (requested_path != path or thread is not threading.current_thread() or
+                pid != os.getpid() or _main_metadata(conn) != metadata):
+            _reject("daily_ledger_mismatch")
+        if scope is not None:
+            scope.assert_retained()
+            if scope._retained is not retained or scope.cleanup is not cleanup:
+                _reject("daily_readiness_scope_binding_changed")
+        if read_generation(conn) != expected:
+            _reject("daily_generation_changed")
+        return 1
+    conn.create_function("sentinel_daily_connection", 1, current)
+    def original_identity(requested_path):
+        current(requested_path)
+        return _canonical([str(value) for value in ledger_identity]).decode()
+    conn.create_function("sentinel_daily_ledger_identity", 1, original_identity)
+    return current
+
+
+def _revalidate_connection_metadata(conn, db_path):
+    result = conn.execute("SELECT sentinel_daily_connection(?)", (os.fspath(db_path),)).fetchone()
+    if result is None or result[0] != 1:
+        _reject("daily_ledger_mismatch")
+
+
+def _process_pin(process):
+    if process is None:
+        return None
+    fields = vars(process)
+    # Production capture owns VerifiedProcess. Private owner fixtures used by
+    # portable tests may expose only identity/observe; no factory accepts them.
+    return (process, type(process), fields.get("_backend"), fields.get("_handle"),
+        process.identity, process.identity.to_dict(), fields.get("_lock"))
+
+
+def _assert_process_pin(process, pin):
+    if pin is None:
+        if process is not None:
+            _reject("daily_readiness_local_owner_changed")
+        return
+    fields = vars(process)
+    if (process is not pin[0] or type(process) is not pin[1] or
+            fields.get("_backend") is not pin[2] or fields.get("_handle") != pin[3] or
+            process.identity is not pin[4] or process.identity.to_dict() != pin[5] or
+            fields.get("_lock") is not pin[6] or fields.get("_close_outcome_unknown", False) or
+            isinstance(process, VerifiedProcess) and pin[3] is None):
+        _reject("daily_readiness_local_owner_changed")
+
+
+def _local_pin(local):
+    cohort, process = local.cohort, local.process
+    fields = vars(cohort)
+    endpoint = local.readiness_endpoint
+    return (local, _process_pin(process), cohort, type(cohort), fields.get("_backend"),
+        fields.get("_lock"), _process_pin(fields.get("_current")),
+        tuple(_process_pin(value) for value in fields.get("_processes", ())),
+        local.manifest, local.manifest.digest, local.source_root, local.ledger_path,
+        local.ledger_identity, local.generation, getattr(local, "_config_digest", None),
+        endpoint, (endpoint.logon_id, endpoint.instance_id, endpoint.server_identity.to_dict()),
+        local._readiness_reader_lock, getattr(local, "_successor_operation", None))
+
+
+def _assert_local_pin(local, pin):
+    if type(local) is not DailyGenerationOwner or local is not pin[0]:
+        _reject("daily_readiness_local_owner_changed")
+    _assert_process_pin(local.process, pin[1])
+    cohort, fields = local.cohort, vars(local.cohort)
+    if (cohort is not pin[2] or type(cohort) is not pin[3] or
+            fields.get("_backend") is not pin[4] or fields.get("_lock") is not pin[5] or
+            fields.get("_closed", False) or fields.get("_closing", False) or
+            fields.get("_unresolved") is not None or local._closed or
+            local._readiness_cleanup_error is not None or not local._activated or
+            local.manifest is not pin[8] or local.manifest.digest != pin[9] or
+            (local.source_root, local.ledger_path, local.ledger_identity, local.generation,
+             getattr(local, "_config_digest", None)) != pin[10:15] or
+            local.readiness_endpoint is not pin[15] or
+            (local.readiness_endpoint.logon_id, local.readiness_endpoint.instance_id,
+             local.readiness_endpoint.server_identity.to_dict()) != pin[16] or
+            local._readiness_reader_lock is not pin[17] or
+            getattr(local, "_successor_operation", None) is not pin[18] or
+            _LOCAL_GENERATIONS.get(local.generation) is not local):
+        _reject("daily_readiness_local_owner_changed")
+    _assert_process_pin(fields.get("_current"), pin[6])
+    candidates = fields.get("_processes", ())
+    if len(candidates) != len(pin[7]):
+        _reject("daily_readiness_local_owner_changed")
+    for process, original in zip(candidates, pin[7]):
+        _assert_process_pin(process, original)
+
+
 def prepare_connection(conn, *, role, db_path):
     """Validate outside BEGIN and bind this connection, without installing schema."""
     if role not in ROLES or conn.in_transaction:
@@ -932,6 +1138,7 @@ def prepare_connection(conn, *, role, db_path):
     if row is None:
         scope = getattr(_READINESS_LOCAL, "scope", None)
         _revalidate_absent(conn, scope, db_path)
+        _bind_connection_metadata(conn, db_path, scope=scope)
         return None
     scope = getattr(_READINESS_LOCAL, "scope", None)
     if scope is not None and scope.absence_only:
@@ -954,6 +1161,7 @@ def prepare_connection(conn, *, role, db_path):
         from .daily_retirement import DailyRetirementOperation
         if type(retirement) is not DailyRetirementOperation or retirement.owner is not local:
             _reject("daily_retirement_cleanup_not_owned")
+        _bind_connection_metadata(conn, db_path, scope=scope, row=row)
         retirement.authorize_nonce_cleanup(conn, row)
         return None
     if (local is not None and role == "lifecycle" and not local._activated and
@@ -965,6 +1173,7 @@ def prepare_connection(conn, *, role, db_path):
         # The original install POLICY must clear its nonce before readiness
         # can be ACKed. This connection gets NO capacity-generation function.
         # Permit only that metadata cleanup, never a reservation or DDL write.
+        _bind_connection_metadata(conn, db_path, scope=scope, row=row)
         _nonce_only(conn)
         return None
     scope = getattr(_READINESS_LOCAL, "scope", None)
@@ -975,12 +1184,13 @@ def prepare_connection(conn, *, role, db_path):
                 policy.current_cleanup_guard() is not guard):
             _reject("daily_readiness_cleanup_binding_changed")
         policy.revalidate(conn, guard)
+        _bind_connection_metadata(conn, db_path, scope=scope, row=row)
         _nonce_only(conn, scope=scope, policy=policy, guard=guard, row=row)
         return None
     if scope is not None:
         # Capacity always uses the same branch proved before locks. A new
         # registry entry cannot replace an authenticated remote original.
-        scope.assert_current()
+        scope.assert_retained()
         if scope.row != row or scope.path != Path(db_path).resolve():
             _reject("daily_readiness_scope_binding_changed")
         local = scope.local_owner
@@ -996,24 +1206,16 @@ def prepare_connection(conn, *, role, db_path):
         else:
             _revalidate_local_scope(scope, row, db_path)
         _revalidate_local(local, row)
+    retained_local = None if local is None else _local_pin(local)
+    bound_connection = _bind_connection_metadata(conn, db_path, scope=scope, row=row)
     def current_generation():
         # SQLite invokes this within the actual writer transaction. Re-read
         # that same connection, never a side database or readiness RPC.
-        if read_generation(conn) != row:
-            _reject("daily_generation_changed")
-        if (_ledger_identity(db_path) != tuple(int(v) for v in json.loads(row["ledger_identity_json"]))
-                or not _ledger_matches(conn, db_path)):
-            _reject("daily_ledger_identity_changed")
-        if _fixed_policy_digest(db_path) != row["config_digest"]:
-            _reject("daily_config_changed")
-        verify_import_provenance(manifest, row["source_root"])
+        bound_connection(os.fspath(db_path))
         if local is None:
-            scope.assert_current()
-            _revalidate_remote(scope, row)
+            _revalidate_remote(scope, row, retained_only=True)
         else:
-            if scope is not None:
-                _revalidate_local_scope(scope, row, db_path)
-            _revalidate_local(local, row)
+            _assert_local_pin(local, retained_local)
         return row["generation"]
     conn.create_function("sentinel_daily_generation", 0, current_generation)
     def delete_authority(table, key):
@@ -1028,7 +1230,7 @@ def prepare_connection(conn, *, role, db_path):
 
 
 def _revalidate_local_scope(scope, row, db_path):
-    scope.assert_current()
+    scope.assert_retained()
     if scope.row != row or scope.path != Path(db_path).resolve():
         _reject("daily_readiness_scope_binding_changed")
     if (type(scope.local_owner) is not DailyGenerationOwner or
@@ -1069,15 +1271,15 @@ def revalidate_transaction(conn, *, db_path):
     # the capacity UDF would turn nonce cleanup into capacity authorization.
     if ((scope is not None and scope.cleanup is not None) or
             (local is not None and (not local._activated or row["state"] == "DRAINING"))):
+        _revalidate_connection_metadata(conn, db_path)
         if scope is not None and scope.cleanup is not None and local is None and scope.row != row:
             _reject("daily_readiness_cleanup_binding_changed")
         return
-    if not _ledger_matches(conn, db_path):
-        _reject("daily_ledger_mismatch")
+    _revalidate_connection_metadata(conn, db_path)
     conn.execute("SELECT sentinel_daily_generation()").fetchone()
 
 
-def _revalidate_remote(scope, row):
+def _revalidate_remote(scope, row, *, retained_only=False):
     from .daily_readiness_transport import DailyReadinessAuthority, LedgerFileIdentity, _binding
     from .pipe_windows import NativePipeEndpoint
     if type(scope.authority) is not DailyReadinessAuthority:
@@ -1086,7 +1288,10 @@ def _revalidate_remote(scope, row):
     endpoint = NativePipeEndpoint(identity.logon_id, row["readiness_instance_id"], identity)
     binding = _binding(row["generation"], row["source_digest"], row["config_digest"],
         LedgerFileIdentity(*(int(v) for v in json.loads(row["ledger_identity_json"]))))
-    scope.authority.revalidate(endpoint, binding)
+    if retained_only:
+        scope.authority.assert_retained(endpoint, binding)
+    else:
+        scope.authority.revalidate(endpoint, binding)
 
 
 def _prove_retained_owner_ready(row, *, local_owner=_TOKEN):
@@ -1244,7 +1449,12 @@ class DailyGenerationOwner:
         if prepared is None or prepared[0] is not policy or prepared[1] is not guard:
             _reject("daily_install_not_prepared")
         policy.assert_held(guard)
-        if not conn.in_transaction or not _ledger_matches(conn, self.ledger_path):
+        if not conn.in_transaction:
+            _reject("daily_install_transaction_invalid")
+        _revalidate_connection_metadata(conn, self.ledger_path)
+        observed = conn.execute("SELECT sentinel_daily_ledger_identity(?)",
+            (os.fspath(self.ledger_path),)).fetchone()
+        if observed is None or tuple(int(value) for value in json.loads(observed[0])) != self.ledger_identity:
             _reject("daily_install_transaction_invalid")
         policy.revalidate(conn, guard)
         self._install_policy, self._install_guard = policy, guard

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -22,6 +23,7 @@ import secrets
 import stat
 import struct
 import threading
+from time import monotonic
 from uuid import uuid4
 
 from .contracts import ContractViolation, IdentityStatus, ProcessIdentity, strict_json_loads
@@ -57,6 +59,17 @@ class DailyReadinessAuthority:
         self._endpoint_values = (endpoint.logon_id, endpoint.instance_id, endpoint.server_identity.to_dict())
         self._deadline_pin = (deadline._api, deadline._start, deadline._end, deadline._pid)
         self._original_peer = self._peer_pin = None
+        # Capture before querying the original native remaining time: conversion
+        # may shorten, never extend, the one authenticated exchange deadline.
+        # SQL bookkeeping uses this process-local bound without another Win32
+        # clock or process query. Native calls still require the original clock.
+        start = monotonic()
+        remaining = deadline.require()
+        if not math.isfinite(start) or not 0 < remaining <= 1000:
+            raise DailyReadinessError("daily_readiness_deadline_invalid")
+        self._retained_time = (start, start + remaining / 1000)
+        self._retained_time_original = self._retained_time
+        self._last_retained_time = start
 
     def __reduce__(self):
         raise TypeError("daily_readiness_authority_not_serializable")
@@ -92,13 +105,26 @@ class DailyReadinessAuthority:
                     peer.identity.to_dict() != identity_values or peer._close_outcome_unknown or handle is None):
                 raise DailyReadinessError("daily_readiness_original_peer_changed")
 
-    def revalidate(self, endpoint, binding):
+    def assert_retained(self, endpoint, binding):
+        """Metadata-only SQL check; never proves current native liveness."""
         if (not self._issued or self._closed or self._close_unknown or
                 self._thread is not threading.current_thread() or self._pid != os.getpid()):
             raise DailyReadinessError("daily_readiness_authority_unavailable")
         self._assert_original()
         if endpoint != self._endpoint or binding != self._binding:
             raise DailyReadinessError("daily_readiness_authority_binding_changed")
+        if self._retained_time is not self._retained_time_original:
+            raise DailyReadinessError("daily_readiness_original_authority_changed")
+        now = monotonic()
+        start, end = self._retained_time
+        if not math.isfinite(now) or now < start or now < self._last_retained_time:
+            raise DailyReadinessError("daily_readiness_clock_invalid")
+        if now >= end:
+            raise DailyReadinessError("pipe_timeout")
+        self._last_retained_time = now
+
+    def revalidate(self, endpoint, binding):
+        self.assert_retained(endpoint, binding)
         self._deadline.require()
         if type(self._peer) is not VerifiedProcess:
             raise DailyReadinessError("daily_readiness_original_peer_required")
@@ -108,6 +134,7 @@ class DailyReadinessAuthority:
             raise DailyReadinessError("daily_readiness_original_peer_unavailable")
         self._assert_original()
         self._deadline.require()
+        self.assert_retained(endpoint, binding)
 
     def close(self):
         # A copied authority cannot close the original's native witness. After

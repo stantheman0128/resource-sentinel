@@ -59,10 +59,12 @@ class DailySuccessorOperation:
         self._connections = []
         self._connection_pins = {}
         self._bound_connections = {}
+        self._database_pins = {}
         self._owner_pins = None
         self._owner_prepared = False
         self._readiness_host = None
         self._host_pins = self._readiness_pins = self._supervisor_pins = None
+        self._supervisor_held_pin = None
         self._guardian_epoch_operation = None
         self._pending_supervisor = None
         self._startup_pins = None
@@ -154,6 +156,7 @@ class DailySuccessorOperation:
             if custody.connection.in_transaction:
                 custody.connection.rollback()
             custody.close()
+            self._database_pins.pop(id(custody.connection), None)
         except BaseException as error:
             self._quarantine = "sql_cleanup_unknown"
             self._error = error
@@ -228,6 +231,8 @@ class DailySuccessorOperation:
 
     def _authorize(self, conn, *, transition=False, nonce_guard=True):
         from . import daily_successor_history as history
+        if conn.in_transaction:
+            self._fail("connection_preflight_required")
         # These are validated canonical names from the actual predecessor
         # schema. A separate operation may never supply a SQL identifier.
         removable = frozenset(fence._definitions(conn)) if transition else frozenset()
@@ -235,6 +240,9 @@ class DailySuccessorOperation:
                         sqlite3.SQLITE_FUNCTION}
 
         def nonce_allowed(old, new):
+            self._assert_connection_metadata(conn)
+            self._original()
+            self._read_state(conn, archive=False)
             if (getattr(_CURRENT, "operation", None) is not self or self._quarantine is not None or
                     threading.current_thread() is not self._thread or os.getpid() != self._pid):
                 return 0
@@ -302,6 +310,8 @@ class DailySuccessorOperation:
                 return sqlite3.SQLITE_OK
             return sqlite3.SQLITE_DENY
 
+        metadata = tuple(tuple(row) for row in conn.execute("PRAGMA database_list"))
+        self._database_pins[id(conn)] = (conn, metadata)
         conn.set_authorizer(authorize)
 
     def bind_connection(self, conn, *, role, db_path):
@@ -345,6 +355,13 @@ class DailySuccessorOperation:
         if retained[0] is not conn or retained[1]:
             self._fail("connection_close_unowned")
         self._bound_connections[id(conn)] = (conn, True)
+        self._database_pins.pop(id(conn), None)
+
+    def _assert_connection_metadata(self, conn):
+        retained = self._database_pins.get(id(conn))
+        if (retained is None or retained[0] is not conn or
+                tuple(tuple(row) for row in conn.execute("PRAGMA database_list")) != retained[1]):
+            self._fail("original_database_changed")
 
     def assert_inventory_connection(self, conn, retirement, guard):
         self._original()
@@ -356,14 +373,18 @@ class DailySuccessorOperation:
                 not conn.in_transaction or not (own or bound is not None and
                     bound[0] is conn and bound[1] is False)):
             self._fail("original_inventory_connection_required")
+        self._assert_connection_metadata(conn)
         self.policy.assert_held(guard)
 
     def revalidate_connection(self, conn, *, db_path):
-        self._source()
+        # Source/file observations were performed while binding this exact
+        # connection. The locked check inspects retained objects and SQLite.
+        self._original()
         retained = self._bound_connections.get(id(conn))
         if (current_operation(db_path) is not self or not conn.in_transaction or
                 retained is None or retained[0] is not conn or retained[1]):
             self._fail("original_connection_required")
+        self._assert_connection_metadata(conn)
         self._read_state(conn)
 
     def _read_state(self, conn, *, archive=True):
@@ -512,9 +533,28 @@ class DailySuccessorOperation:
             self._fail("readiness_cleanup_unsettled")
 
     def assert_supervisor(self, supervisor):
+        """Actual source and held native self observations, outside BEGIN."""
+        self._source()
+        self._assert_supervisor_objects(supervisor)
+        startup = supervisor.startup
+        startup.assert_held()
+        current = (supervisor, startup, startup._current, startup._mutex, startup._scope, startup._lease)
+        if self._supervisor_pins is None:
+            self._supervisor_pins = current
+            self._supervisor_held_pin = (generation._process_pin(startup._current),
+                startup.binding, startup.instance_binding, self._supervisor_mutex_metadata(startup._mutex),
+                startup._thread, startup._native_thread, startup._pid)
+        self.assert_supervisor_retained(supervisor)
+
+    @staticmethod
+    def _supervisor_mutex_metadata(mutex):
+        return tuple(vars(mutex).get(name) for name in
+            ("_api", "_state_lock", "_handle", "_owner", "_owner_native_id", "_waiting", "acquired", "closed"))
+
+    def _assert_supervisor_objects(self, supervisor):
         from .supervisor_host import SupervisorHost
         from .supervisor_startup import SupervisorStartup
-        self._source()
+        self._original()
         self.assert_readiness_published(self.owner)
         if (type(supervisor) is not SupervisorHost or self._pending_supervisor is not supervisor or
                 self._readiness_host.supervisor is not supervisor or
@@ -525,14 +565,28 @@ class DailySuccessorOperation:
             self._fail("original_supervisor_required")
         startup = supervisor.startup
         self._assert_startup_binding(supervisor)
-        startup.assert_held()
         if startup.binding != self.guard.binding:
             self._fail("supervisor_binding_changed")
+
+    def assert_supervisor_retained(self, supervisor):
+        """Already observed original held custody; never refresh or query it."""
+        self._assert_supervisor_objects(supervisor)
+        startup = supervisor.startup
         current = (supervisor, startup, startup._current, startup._mutex, startup._scope, startup._lease)
-        if self._supervisor_pins is None:
-            self._supervisor_pins = current
-        elif any(left is not right for left, right in zip(current, self._supervisor_pins)):
+        pin = self._supervisor_held_pin
+        if (self._supervisor_pins is None or pin is None or
+                any(left is not right for left, right in zip(current, self._supervisor_pins)) or
+                startup.binding is not pin[1] or startup.instance_binding is not pin[2] or
+                self._supervisor_mutex_metadata(startup._mutex) != pin[3] or
+                vars(startup._mutex).get("_api") is not pin[3][0] or
+                vars(startup._mutex).get("_state_lock") is not pin[3][1] or
+                startup._thread is not pin[4] or startup._native_thread != pin[5] or startup._pid != pin[6] or
+                startup._thread is not threading.current_thread() or startup._pid != os.getpid() or
+                not startup.acquired or startup._lease.abandoned or
+                any(vars(startup._mutex).get(name, False) for name in
+                    ("_closed", "_close_unknown", "_release_unknown"))):
             self._fail("original_supervisor_changed")
+        generation._assert_process_pin(startup._current, pin[0])
 
     def bind_supervisor(self, supervisor):
         from .supervisor_host import SupervisorHost
@@ -654,7 +708,7 @@ class DailySuccessorOperation:
 
     def assert_startup_inventory_connection(self, conn, supervisor, guard):
         from .daily_successor_epoch import current_sql_owner
-        self.assert_supervisor(supervisor)
+        self.assert_supervisor_retained(supervisor)
         self.policy.assert_held(guard)
         if (not isinstance(conn, sqlite3.Connection) or not conn.in_transaction or
                 guard in (self.guard, self.retirement._freeze_guard, self.retirement._seal_guard)):
@@ -670,13 +724,23 @@ class DailySuccessorOperation:
             self._fail("original_startup_connection_required")
         if not any(item.connection is conn and not item.closed and not item.close_unknown for item in owners):
             self._fail("original_startup_connection_required")
+        if id(conn) in self._database_pins:
+            self._assert_connection_metadata(conn)
+        else:
+            generation._revalidate_connection_metadata(conn, self.ledger_path)
 
-    def published_epoch(self, supervisor):
-        self.assert_supervisor(supervisor)
+    def published_epoch(self, supervisor, *, retained_only=False):
+        if retained_only:
+            self.assert_supervisor_retained(supervisor)
+        else:
+            self.assert_supervisor(supervisor)
         epoch = self._guardian_epoch_operation
         if epoch is None:
             return None
-        epoch._authority()
+        if retained_only:
+            epoch._original()
+        else:
+            epoch._authority()
         if epoch.operation is not self or epoch.supervisor is not supervisor:
             self._fail("original_epoch_changed")
         if not epoch._complete:

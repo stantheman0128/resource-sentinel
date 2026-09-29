@@ -50,7 +50,7 @@ class ExperimentUnadmittedCleanup(_OriginalCleanupAccess):
 
     def _original(self):
         from sentinel.coordinator import Coordinator
-        from .experiment_demand import _RETAINED, _identity
+        from .experiment_demand import _RETAINED
         from .identity import VerifiedProcess
         actual = (self.coordinator, self.demand, self.inner, self.snapshot, self._process,
             self._submission, self._transaction, self.thread)
@@ -60,7 +60,7 @@ class ExperimentUnadmittedCleanup(_OriginalCleanupAccess):
                 _OPERATIONS.get(self.operation_id) is not self or self.demand._unadmitted_cleanup is not self or
                 self.thread is not threading.current_thread() or self.pid != os.getpid() or
                 self._quarantine is not None or type(self.coordinator) is not Coordinator or
-                Path(self.coordinator.db_path).resolve() != self.ledger_path or
+                Path(self.coordinator.db_path) != self.ledger_path or
                 getattr(self.coordinator, "_managed_store", None) is not self.store):
             _fail("original_unadmitted_changed", self)
         if (self.demand._submission_original is not self._submission or
@@ -68,7 +68,7 @@ class ExperimentUnadmittedCleanup(_OriginalCleanupAccess):
                     enumerate((self.policy, self.store, self._guard, self._policy_binding))) or
                 self._nonce != self._submission[4] or type(self.policy) is not PolicyCoordinator or
                 self.policy.store is not self.store or self.store._policy is not self.policy or
-                Path(self.store.db_path).resolve() != self.ledger_path or
+                Path(self.store.db_path) != self.ledger_path or
                 type(self._guard) is not PolicyGuard or type(self._policy_binding) is not PolicyBinding or
                 self._guard.binding != self._policy_binding or self._guard.nonce != self._nonce or
                 self._policy_binding.logon_id != self.snapshot.logon_id):
@@ -99,8 +99,7 @@ class ExperimentUnadmittedCleanup(_OriginalCleanupAccess):
                 self.demand._before_native_completion is not None or self.demand._release_operation is not None or
                 self.inner._process is not self._process or type(self._process) is not VerifiedProcess or
                 self._process.identity != self.snapshot.wrapper_identity or self.inner._claim_exported or
-                self.inner._prepare_attempted or self.inner._cancel_sealed or self.inner._abandon_target is not None or
-                _identity(self.demand.directory) != self.demand.directory_identity):
+                self.inner._prepare_attempted or self.inner._cancel_sealed or self.inner._abandon_target is not None):
             _fail("original_demand_changed", self)
         self.demand._original_generation_binding()
         positive = self._close_positive or (self._close_attempted and self._close_error is None and

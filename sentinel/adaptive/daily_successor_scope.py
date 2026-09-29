@@ -15,7 +15,9 @@ def current_operation(db_path=None):
     if type(operation) is not DailySuccessorOperation:
         raise DailySuccessorError("original_operation_required")
     operation._original()
-    if db_path is not None and Path(db_path).resolve() != operation.ledger_path:
+    # The operation's actual canonical/file check belongs to connection
+    # preparation. Dispatch is also used under BEGIN and must be lexical only.
+    if db_path is not None and Path(db_path) != operation.ledger_path:
         raise DailySuccessorError("ledger_changed", operation)
     return operation
 
@@ -29,6 +31,6 @@ def current_startup_operation(db_path=None):
     if type(operation) is not DailySuccessorOperation:
         raise DailySuccessorError("original_operation_required")
     operation._original()
-    if db_path is not None and Path(db_path).resolve() != operation.ledger_path:
+    if db_path is not None and Path(db_path) != operation.ledger_path:
         raise DailySuccessorError("ledger_changed", operation)
     return operation

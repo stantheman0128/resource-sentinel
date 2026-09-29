@@ -1015,14 +1015,20 @@ class LifecycleStore:
     def _transaction(self, *, existing_path: Path | None = None):
         connection = self._connection() if existing_path is None else self._connection(existing_path=existing_path)
         with connection as conn:
+            target = self._connection_ledger_path(existing_path)
+            path_pin = (self.db_path, self._existing_ledger_path, self.existing_path)
             conn.execute("BEGIN IMMEDIATE")
             try:
+                if (self.db_path, self._existing_ledger_path, self.existing_path) != path_pin:
+                    raise LifecycleError("coverage_registry_unavailable")
                 from .daily_generation import revalidate_transaction
-                revalidate_transaction(conn, db_path=self._connection_ledger_path(existing_path))
+                revalidate_transaction(conn, db_path=target)
                 present = _check_version(conn)
                 if (existing_path is not None or self.existing_path) and not present:
                     raise LifecycleError("coverage_registry_unavailable")
                 yield conn
+                if (self.db_path, self._existing_ledger_path, self.existing_path) != path_pin:
+                    raise LifecycleError("coverage_registry_unavailable")
                 conn.commit()
             except BaseException as primary:
                 try:
@@ -1080,13 +1086,19 @@ class LifecycleStore:
             with self._connection() as conn:
                 connection_entered = True
                 try:
+                    target = self._connection_ledger_path()
+                    path_pin = (self.db_path, self._existing_ledger_path, self.existing_path)
                     conn.execute("BEGIN IMMEDIATE")
+                    if (self.db_path, self._existing_ledger_path, self.existing_path) != path_pin:
+                        raise LifecycleError("coverage_registry_unavailable")
                     from .daily_generation import revalidate_transaction
-                    revalidate_transaction(conn, db_path=self._connection_ledger_path())
+                    revalidate_transaction(conn, db_path=target)
                     _check_version(conn)
                     self._policy.assert_held(guard)
                     self._policy.revalidate(conn, guard)
                     yield conn
+                    if (self.db_path, self._existing_ledger_path, self.existing_path) != path_pin:
+                        raise LifecycleError("coverage_registry_unavailable")
                     commit_attempted = True
                     conn.commit()
                 except BaseException as primary:

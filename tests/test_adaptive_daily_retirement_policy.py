@@ -10,6 +10,7 @@ import threading
 import unittest
 from uuid import uuid4
 
+from sentinel.adaptive.daily_generation import DailyGenerationUnavailable
 from sentinel.adaptive.policy import PolicyBinding, PolicyCoordinator, PolicyError, PolicyGuard
 
 
@@ -56,6 +57,9 @@ class _SqlFixtureStore:
 class DailyRetirementPolicyScopeTests(unittest.TestCase):
     def setUp(self):
         self.guard = PolicyGuard(PolicyBinding(str(uuid4()), "S-1-5-5-10-20"), str(uuid4()))
+        # This SQL-only fixture starts after an explicitly synthetic positive
+        # no-entry result. A prepared guard alone must never authorize cleanup.
+        self.guard._native_no_entry_confirmed = True
         self.store = _SqlFixtureStore(self.guard)
         self.addCleanup(self.store.connection.close)
         # Supplying a fixture object avoids all native provider interactions.
@@ -104,6 +108,7 @@ class DailyRetirementPolicyScopeTests(unittest.TestCase):
 
     def test_nested_cleanup_refuses_before_open_and_preserves_outer_guard(self):
         different = PolicyGuard(self.guard.binding, str(uuid4()))
+        different._native_no_entry_confirmed = True
         def on_open():
             with self.assertRaises(PolicyError):
                 self.coordinator._clear(different)
@@ -113,6 +118,17 @@ class DailyRetirementPolicyScopeTests(unittest.TestCase):
         self.assertEqual(self.store.opens, 1)
         self.assertIsNone(self.coordinator.current_cleanup_guard())
         self.assertIsNone(self.nonce())
+
+    def test_missing_ambiguous_or_nonboolean_native_proof_refuses_before_sql_open(self):
+        for exit_fact, no_entry_fact in ((False, False), (True, True), (1, False)):
+            with self.subTest(facts=(exit_fact, no_entry_fact)):
+                self.guard._native_exit_confirmed = exit_fact
+                self.guard._native_no_entry_confirmed = no_entry_fact
+                with self.assertRaisesRegex(DailyGenerationUnavailable, "cleanup_not_owned"):
+                    self.coordinator._clear(self.guard)
+                self.assertEqual(self.store.opens, 0)
+                self.assertEqual(self.nonce(), self.guard.nonce)
+                self.assertIsNone(self.coordinator.current_cleanup_guard())
 
     def test_open_failure_clears_marker_without_clearing_nonce(self):
         failure = OSError("synthetic connection opening failed")

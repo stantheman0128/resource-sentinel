@@ -66,6 +66,7 @@ class DailyRetirementIntegrationTests(unittest.TestCase):
             writer = sqlite3.connect(self.db, isolation_level=None)
             self.addCleanup(writer.close)
             writer.row_factory = sqlite3.Row
+            generation.prepare_connection(writer, role="lifecycle", db_path=self.db)
             writer.execute("BEGIN IMMEDIATE")
             self.owner.install_locked(writer, policy=policy, guard=guard)
             writer.commit()

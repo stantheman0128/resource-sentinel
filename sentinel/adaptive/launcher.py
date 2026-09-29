@@ -181,6 +181,23 @@ class _ExperimentWrapperBinding:
             error.experiment_wrapper_binding = self
             raise
 
+    def assert_publication_settled(self):
+        """A missing isolated submission does not disprove a parent mutation."""
+        self.assert_original()
+        if (any(attempt.cleanup_pending for attempt in self.publication.attempts) or
+                self.publication._registry.status().resources):
+            raise ManagedLaunchError("experiment_wrapper_publication_cleanup_pending")
+        if self.publication.attempts and self._result is None:
+            raise ManagedLaunchError("experiment_wrapper_publication_outcome_pending")
+
+    def settle_publication(self):
+        # A clean lost response is reconciled with the one original request.
+        # No isolated admission is made while abandoning, and no daily floor
+        # is released here. Unknown pipe/native cleanup blocks publish itself.
+        if self.publication.attempts and self._result is None:
+            self.publish_before_admission()
+        self.assert_publication_settled()
+
 
 def resolve_system_cmd(cmd_path: str | None = None) -> str:
     """Resolve the OS system cmd.exe, never COMSPEC/PATH or a supplied program.
@@ -453,8 +470,12 @@ class ManagedLauncher:
 
     def _create_fenced(self, command_line, *, timeout_ms, stdin_handle, stdout_handle, stderr_handle):
         if self._experiment is None:
-            return self._create_with_job_fence(command_line, timeout_ms=timeout_ms,
-                stdin_handle=stdin_handle, stdout_handle=stdout_handle, stderr_handle=stderr_handle)
+            from .daily_generation import readiness_scope
+            # Obtain the original daily (or absent-generation) authority before
+            # the Job mutex. A post-SQL check cannot mint a replacement scope.
+            with readiness_scope(self.coordinator.db_path):
+                return self._create_with_job_fence(command_line, timeout_ms=timeout_ms,
+                    stdin_handle=stdin_handle, stdout_handle=stdout_handle, stderr_handle=stderr_handle)
         self._experiment.assert_original(self)
         # Acquire before constructing/waiting on the Job mutex. This scope ends
         # before launch_once dispatches BindRoot over the guardian pipe.
@@ -492,12 +513,17 @@ class ManagedLauncher:
             store.assert_admission_covered(self.admission, row)
             store.assert_launch_fence(row, version=1)
             native_bounds = {}
+            self.admission.verify_launch_payload(command=self._spec.command, cwd=self._spec.cwd)
             if self._experiment is not None:
                 self._experiment.assert_original(self)
-                self.admission.verify_launch_payload(command=self._spec.command, cwd=self._spec.cwd)
                 if self._readiness.assert_create_ready(self.admission, row, self.endpoint) is not None:
                     raise ManagedLaunchError("native_launch_readiness_unverified")
                 native_bounds = self._readiness._native_create_limits(self.execution_id)
+            else:
+                from .daily_generation import revalidate_scoped_native_readiness
+                deadline = revalidate_scoped_native_readiness(self.coordinator.db_path)
+                if deadline is not None:
+                    native_bounds = dict(readiness_deadline=deadline)
             self._create_attempted = True
             self.phase = "CREATING"
             try:
@@ -731,6 +757,8 @@ class ManagedLauncher:
             try:
                 if self._transport_cleanup_unknown:
                     raise ManagedLaunchError("launcher_transport_cleanup_unknown")
+                if self._experiment is not None and not self._closed and not self._closing:
+                    self._experiment.settle_publication()
                 if not self._closed and not self._closing:
                     if not self._submitted:
                         pass
@@ -914,6 +942,8 @@ class ManagedLauncher:
             if self._transport_cleanup_unknown:
                 raise ManagedLaunchError("launcher_transport_cleanup_unknown")
             if not self._closing:
+                if self._experiment is not None:
+                    self._experiment.assert_publication_settled()
                 if self._submitted and self._retired_result is None and self._abandon_result is None:
                     if not self._bound or not self.poll_root().exited:
                         raise ManagedLaunchError("launcher_custody_unsettled")

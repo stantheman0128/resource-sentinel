@@ -116,6 +116,7 @@ class DailyReadinessLockBoundaryTests(unittest.TestCase):
                          side_effect=lambda manifest, root: manifest.verify(root)),
             patch.object(generation.VerifiedProcess, "current", side_effect=self.current),
             patch("sentinel.adaptive.pipe_windows._backend", return_value=self.clock),
+            patch.object(transport, "monotonic", side_effect=lambda: self.clock.now / 1000),
             patch.object(transport.NativePipeConnection, "connect", side_effect=self.connect),
         )
         for replacement in replacements:
@@ -314,17 +315,23 @@ class DailyReadinessLockBoundaryTests(unittest.TestCase):
             with self.assertRaisesRegex(generation.DailyGenerationUnavailable, "generation_changed"):
                 self.bind(self.conn)
 
-    def test_begin_revalidates_original_witness_without_rpc(self):
+    def test_death_after_begin_keeps_intent_but_rejects_native_readiness(self):
+        # Approved DAILY-READINESS-TRANSACTION-DECISION: SQL records intent
+        # using original pins; actual liveness is observed again before Create.
         with generation.readiness_scope(self.db):
             self.bind(self.conn)
             self.conn.execute("BEGIN IMMEDIATE")
             self.server_backend.status = IdentityStatus.DEAD
-            with self.assertRaises(sqlite3.OperationalError):
-                generation.revalidate_transaction(self.conn, db_path=self.db)
-            self.conn.rollback()
+            generation.revalidate_transaction(self.conn, db_path=self.db)
+            self.conn.execute("INSERT INTO reservations VALUES('retained-intent')")
+            self.conn.commit()
+            with self.assertRaisesRegex(transport.DailyReadinessError, "peer_unavailable"):
+                generation.revalidate_scoped_readiness(self.db,
+                    expected_generation=generation.read_generation(self.conn))
+            self.assertEqual(self.conn.execute("SELECT id FROM reservations").fetchone()[0], "retained-intent")
         self.assertEqual(self.events.count("rpc"), 1)
 
-    def test_source_config_ledger_and_witness_changes_at_write_fail(self):
+    def test_source_config_and_witness_changes_after_begin_cannot_reach_native_gate(self):
         changes = (
             lambda: (self.root / "config.json").write_text("{}"),
             lambda: (self.root / "sentinel/coordinator.py").write_text("# changed\n"),
@@ -337,13 +344,21 @@ class DailyReadinessLockBoundaryTests(unittest.TestCase):
             with self.subTest(change=change):
                 with generation.readiness_scope(self.db):
                     self.bind(self.conn)
+                    self.conn.execute("BEGIN IMMEDIATE")
                     change()
-                    with self.assertRaises(sqlite3.OperationalError):
-                        self.conn.execute("INSERT INTO queue VALUES('refused')")
-                    self.conn.rollback()
+                    self.conn.execute("INSERT INTO queue VALUES('conservative-intent')")
+                    self.conn.commit()
+                    with self.assertRaises(Exception):
+                        generation.revalidate_scoped_readiness(self.db,
+                            expected_generation=generation.read_generation(self.conn))
+                    self.assertEqual(self.conn.execute("SELECT count(*) FROM queue").fetchone()[0], 1)
                 (self.root / "config.json").write_bytes(original_config)
                 (self.root / "sentinel/coordinator.py").write_bytes(original_source)
                 self.server_backend.status = IdentityStatus.ALIVE
+                with generation.readiness_scope(self.db):
+                    self.bind(self.conn)
+                    self.conn.execute("DELETE FROM queue")
+                    self.conn.commit()
 
     def test_native_mutex_held_refuses_new_rpc(self):
         key = threading.current_thread(), "fixture-original-native-mutex"
@@ -409,14 +424,17 @@ class DailyReadinessLockBoundaryTests(unittest.TestCase):
         self.assertNotIn("peer.duplicate", self.events)
         self.assertTrue(self.connections[0].closed)
 
-    def test_changed_ledger_identity_fails_at_write(self):
+    def test_changed_ledger_identity_after_begin_is_caught_before_native_work(self):
         original = generation._ledger_identity(self.db)
         with generation.readiness_scope(self.db):
             self.bind(self.conn)
+            self.conn.execute("BEGIN IMMEDIATE")
             with patch.object(generation, "_ledger_identity", return_value=(original[0], original[1] + 1)):
-                with self.assertRaises(sqlite3.OperationalError):
-                    self.conn.execute("INSERT INTO queue VALUES('wrong-ledger')")
-                self.conn.rollback()
+                self.conn.execute("INSERT INTO queue VALUES('conservative-intent')")
+                self.conn.commit()
+                with self.assertRaisesRegex(generation.DailyGenerationUnavailable, "identity_changed"):
+                    generation.revalidate_scoped_readiness(self.db,
+                        expected_generation=generation.read_generation(self.conn))
 
     def test_cross_ledger_nested_scope_refuses_without_another_rpc(self):
         with generation.readiness_scope(self.db):
@@ -475,6 +493,9 @@ class DailyReadinessLockBoundaryTests(unittest.TestCase):
     def test_remote_cleanup_never_has_capacity_or_out_of_scope_nonce_authority(self):
         policy = self.store._policy
         guard = policy.prepare(self.identity.logon_id)
+        # Explicit synthetic positive timeout/no-entry outcome; a merely
+        # prepared guard no longer grants cleanup permission.
+        guard._native_no_entry_confirmed = True
         with generation.readiness_scope(self.db):
             with generation.readiness_nonce_cleanup(policy, guard):
                 policy._held.cleanup_guard = guard
@@ -562,6 +583,7 @@ class DailyReadinessLockBoundaryTests(unittest.TestCase):
     def test_group_selectors_do_not_borrow_other_ledger_cleanup_marker(self):
         isolated = self.isolated_store()
         guard = self.store._policy.prepare(self.identity.logon_id)
+        guard._native_no_entry_confirmed = True
         with generation.readiness_scopes((self.db, isolated.db_path), absent_paths=(isolated.db_path,)):
             with generation.readiness_scope(self.db) as daily:
                 with generation.readiness_nonce_cleanup(self.store._policy, guard):

@@ -163,14 +163,22 @@ class WrapperHost:
                 raise WrapperHostRefused("experiment_wrapper_original_host_changed")
             original._assert_experiment_host()
             return original
-        owner = cls(data_dir=partition.db_path.parent, command=spec.command, cwd=spec.cwd,
-            repo_identifier=spec.repo_identifier, role=spec.role, priority=spec.priority, requested=spec.requested,
-            guardian_epoch=guardian_epoch, guardian_pid=endpoint.server_identity.pid,
-            guardian_created_filetime_100ns=endpoint.server_identity.created_filetime_100ns,
-            endpoint_instance_id=endpoint.instance_id, admission_timeout_sec=spec.admission_timeout_sec,
-            rpc_timeout_ms=rpc_timeout_ms, poll_interval_ms=poll_interval_ms, max_wait_sec=max_wait_sec)
-        owner._experiment, owner._experiment_limits = binding, limits
+        owner = cls.__new__(cls)
+        # Register before initialization. A failure cannot discard the original
+        # publication/context by allowing a replacement host to be constructed.
         binding._host = owner
+        try:
+            cls.__init__(owner, data_dir=partition.db_path.parent, command=spec.command, cwd=spec.cwd,
+                repo_identifier=spec.repo_identifier, role=spec.role, priority=spec.priority, requested=spec.requested,
+                guardian_epoch=guardian_epoch, guardian_pid=endpoint.server_identity.pid,
+                guardian_created_filetime_100ns=endpoint.server_identity.created_filetime_100ns,
+                endpoint_instance_id=endpoint.instance_id, admission_timeout_sec=spec.admission_timeout_sec,
+                rpc_timeout_ms=rpc_timeout_ms, poll_interval_ms=poll_interval_ms, max_wait_sec=max_wait_sec)
+            owner._experiment, owner._experiment_limits = binding, limits
+        except BaseException as error:
+            binding._construction_error = error
+            error.experiment_wrapper_binding = binding
+            raise
         return owner
 
     def __init__(self, *, data_dir, command, cwd, repo_identifier, role, priority,

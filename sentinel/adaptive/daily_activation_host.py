@@ -323,6 +323,7 @@ class DailyActivationHost:
         with policy.hold(self.guard):
             self.owner.prepare_install(policy=policy, guard=self.guard)
             current = self._open()
+            generation.prepare_connection(current.connection, role="lifecycle", db_path=self.ledger_path)
             current.connection.execute("BEGIN IMMEDIATE")
             self.owner.install_locked(current.connection, policy=policy, guard=self.guard)
             current.connection.commit()

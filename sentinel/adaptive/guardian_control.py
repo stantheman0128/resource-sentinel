@@ -34,6 +34,7 @@ import statistics
 import time
 from uuid import uuid4
 
+from . import daily_generation
 from .contracts import (ApplyAck, ApplyResult, ContractViolation, ControlProposal, CpuControl,
                         CpuControlMode, FastFrame, IdentityStatus, PendingIntent,
                         ProcessIdentity, RecoveryManifest, Validity)
@@ -656,8 +657,14 @@ class GuardianControl:
             raise
         try:
             self._restriction_tick(proposal, frame, row, helper_identity, lease=lease, intervention=intervention)
+            # SQL intent is only bookkeeping. Re-observe the original daily
+            # owner/source after its transaction closes, then carry that same
+            # nonrenewed deadline to the concrete Set boundary. Restoration
+            # keeps its independent retained-native authority.
+            deadline = daily_generation.revalidate_scoped_native_readiness(self.store.db_path)
+            native_bounds = {} if deadline is None else {"native_deadline": deadline}
             self.backend_calls.append(("set", proposal.execution_id, desired.cpu_rate_bp))
-            entry.job.set_cpu_rate_unverified(desired.cpu_rate_bp)
+            entry.job.set_cpu_rate_unverified(desired.cpu_rate_bp, **native_bounds)
         except BaseException as error:
             self._fault(proposal, entry, episode, "control_set_failed", error)
             if not isinstance(error, Exception):
@@ -680,6 +687,8 @@ class GuardianControl:
         try:
             self._settle_intent(entry, record, observed)
             self._restriction_tick(proposal, frame, row, helper_identity, lease=lease, intervention=intervention)
+            if deadline is not None:
+                deadline.require()
         except BaseException as error:
             # Without the settled manifest the cap is live while the journal
             # still shows a pending intent. It is withdrawn through the same
@@ -748,6 +757,9 @@ class GuardianControl:
             row = self.floor_publisher.prepare_locked(entry, row, frame, uncapped=False)
             self._restriction_tick(proposal, frame, row, episode.helper_identity,
                 lease=episode.lease_deadline_tick_100ns, intervention=episode.intervention_deadline_tick_100ns)
+            deadline = daily_generation.revalidate_scoped_native_readiness(self.store.db_path)
+            if deadline is not None:
+                deadline.require()
         except BaseException as error:
             self._fault(proposal, entry, episode, "control_floor_update_failed", error)
             raise
@@ -813,9 +825,11 @@ class GuardianControl:
                       if native_change else None)
             self._restriction_tick(proposal, frame, row, episode.helper_identity,
                 lease=episode.lease_deadline_tick_100ns, intervention=episode.intervention_deadline_tick_100ns)
+            deadline = daily_generation.revalidate_scoped_native_readiness(self.store.db_path)
+            native_bounds = {} if deadline is None else {"native_deadline": deadline}
             if native_change:
                 self.backend_calls.append(("set", proposal.execution_id, desired.cpu_rate_bp))
-                entry.job.set_cpu_rate_unverified(desired.cpu_rate_bp)
+                entry.job.set_cpu_rate_unverified(desired.cpu_rate_bp, **native_bounds)
             observed = self.lifecycle._control(entry)
             raw = entry.job.query_cpu()
             queried = self.clock()
@@ -825,6 +839,8 @@ class GuardianControl:
                 self._settle_intent(entry, record, observed)
             self._restriction_tick(proposal, frame, row, episode.helper_identity,
                 lease=episode.lease_deadline_tick_100ns, intervention=episode.intervention_deadline_tick_100ns)
+            if deadline is not None:
+                deadline.require()
         except BaseException as error:
             self._fault(proposal, entry, episode, "control_target_change_failed", error)
             if not isinstance(error, Exception):

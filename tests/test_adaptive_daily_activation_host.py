@@ -175,9 +175,18 @@ class DailyActivationHostTests(unittest.TestCase):
         ack.close_error = ack_close_error
         writer_custody, ack_custody = activation._ConnectionCustody(writer), activation._ConnectionCustody(ack)
         self.host._connections.extend((writer_custody, ack_custody))
+        def prepare(connection, *, role, db_path):
+            # This assembly fixture has no SQLite engine. The boundary tests
+            # exercise the real UDF; here assert the exact pre-BEGIN handoff.
+            self.assertIs(connection, writer)
+            self.assertEqual(role, "lifecycle")
+            self.assertEqual(db_path, self.host.ledger_path)
+            self.assertNotIn(("install", "BEGIN IMMEDIATE"), self.events)
+            self.events.append("writer_prepare")
         stack = (
             patch.object(activation, "LifecycleStore", return_value=SimpleNamespace(_policy=policy)),
             patch.object(self.host, "_open", side_effect=[writer_custody, ack_custody]),
+            patch.object(generation, "prepare_connection", side_effect=prepare),
         )
         return policy, writer_custody, ack_custody, stack
 
@@ -311,10 +320,10 @@ class DailyActivationHostTests(unittest.TestCase):
 
     def test_install_ack_follows_original_commit_policy_and_connection_cleanup(self):
         policy, writer, ack, replacements = self.install_fixture()
-        with replacements[0], replacements[1]:
+        with replacements[0], replacements[1], replacements[2]:
             self.host._install_once()
         self.assertIs(self.host.guard, policy.guard)
-        self.assertEqual(self.events, ["policy_prepare", "policy_enter", "owner_prepare",
+        self.assertEqual(self.events, ["policy_prepare", "policy_enter", "owner_prepare", "writer_prepare",
             ("install", "BEGIN IMMEDIATE"), "owner_install", ("install", "commit"),
             "policy_exit", "owner_settle", ("install", "close"), "owner_ack", ("ack", "close")])
         self.assertTrue(writer.closed)
@@ -324,7 +333,7 @@ class DailyActivationHostTests(unittest.TestCase):
     def test_unknown_commit_never_acknowledges_or_discards_original_connection(self):
         error = sqlite3.OperationalError("synthetic lost commit observation")
         policy, writer, ack, replacements = self.install_fixture(commit_error=error)
-        with replacements[0], replacements[1], self.assertRaises(sqlite3.OperationalError):
+        with replacements[0], replacements[1], replacements[2], self.assertRaises(sqlite3.OperationalError):
             self.host._install_once()
         self.assertIs(self.host.guard, policy.guard)
         self.assertIs(self.owner._install_connection, writer.connection)
@@ -334,7 +343,7 @@ class DailyActivationHostTests(unittest.TestCase):
 
     def test_policy_cleanup_failure_keeps_guard_and_no_ready_ack(self):
         policy, writer, ack, replacements = self.install_fixture(exit_error=RuntimeError("cleanup"))
-        with replacements[0], replacements[1], self.assertRaises(RuntimeError):
+        with replacements[0], replacements[1], replacements[2], self.assertRaises(RuntimeError):
             self.host._install_once()
         self.assertIs(self.host.guard, policy.guard)
         self.assertFalse(writer.closed)
@@ -342,7 +351,7 @@ class DailyActivationHostTests(unittest.TestCase):
 
     def test_ack_connection_close_unknown_prevents_host_readiness(self):
         policy, writer, ack, replacements = self.install_fixture(ack_close_error=RuntimeError("cleanup"))
-        with replacements[0], replacements[1], self.assertRaises(RuntimeError):
+        with replacements[0], replacements[1], replacements[2], self.assertRaises(RuntimeError):
             self.host._install_once()
         self.assertTrue(self.owner._activated)
         self.assertTrue(ack.close_unknown)

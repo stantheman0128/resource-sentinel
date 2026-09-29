@@ -50,6 +50,7 @@ class ExperimentDemandTests(unittest.TestCase):
         self.proof = SimpleNamespace(
             daily_locations=Mock(return_value=(self.scope, self.fixture.directory)),
             _assert_daily_locations=Mock(),
+            _ledger_matches=generation._ledger_matches,
             prepare_connection=Mock(side_effect=lambda *a, **k: self.generation["generation"]),
             revalidate_transaction=Mock(),
             read_generation=Mock(side_effect=lambda *a: dict(self.generation)))

@@ -484,6 +484,7 @@ class ExperimentWrapperHostTests(unittest.TestCase):
             patch.object(module, "emit"),
             patch.object(module, "stdio_handles", return_value=STDIO),
             patch.object(module, "read_host_capability", return_value=SYNTHETIC),
+            patch.object(WrapperHost, "_logon", return_value=self.fixture.snapshot.logon_id),
         ):
             override.start()
             self.addCleanup(override.stop)
@@ -510,6 +511,50 @@ class ExperimentWrapperHostTests(unittest.TestCase):
                 self.build(max_wait_sec=value)
         self.assertFalse(self.fixture.context._submitted)
         self.assertIsNone(self.fixture.partition._context)
+        self.assertEqual(self.fixture.publication.attempts, ())
+
+    def test_host_uses_original_partition_without_reading_copied_capacity_files(self):
+        host = self.build()
+        self.assertIs(self.build(), host)
+        before = self.fixture.daily_floor()
+        stop = RuntimeError("fixture_stop_before_native_launch")
+        with patch.object(module, "_load_json", side_effect=AssertionError("copied capacity input")), \
+                patch.object(host, "_coordinator", side_effect=AssertionError("ordinary coordinator")), \
+                patch.object(host, "_launch", side_effect=stop):
+            with self.assertRaises(RuntimeError) as raised:
+                host.run()
+        self.assertIs(raised.exception, stop)
+        self.assertIs(host.launcher.admission, self.fixture.context)
+        self.assertIs(host.coordinator, self.fixture.partition)
+        self.assertIs(host.endpoint, self.fixture.endpoint)
+        self.assertEqual(len(self.fixture.partition_fixture.rows("reservations")), 1)
+        self.assertEqual(len(self.fixture.publication.attempts), 1)
+        settled = host.release()
+        self.assertTrue(settled["settled"], settled)
+        self.assertEqual(self.fixture.daily_floor(), before)
+        self.fixture.client.prepare_execution.assert_not_called()
+
+    def test_reconstructed_host_cannot_extend_original_wait_or_replace_spec(self):
+        host = self.build()
+        with self.assertRaisesRegex(WrapperHostRefused, "original_host_changed"):
+            self.build(max_wait_sec=2)
+        self.assertIs(self.build(), host)
+        self.assertFalse(self.fixture.context._submitted)
+
+    def test_constructor_failure_retains_original_host_and_context(self):
+        from sentinel.adaptive.launcher import ManagedLaunchError
+        failure = RuntimeError("fixture_host_constructor_failure")
+        with patch.object(WrapperHost, "__init__", side_effect=failure):
+            with self.assertRaises(RuntimeError) as raised:
+                self.build()
+        self.assertIs(raised.exception, failure)
+        binding = failure.experiment_wrapper_binding
+        self.assertIs(binding, self.fixture.publication._wrapper_launcher_binding)
+        self.assertIsNotNone(binding._host)
+        self.assertIs(binding._construction_error, failure)
+        with self.assertRaisesRegex(ManagedLaunchError, "original_binding_changed"):
+            self.build()
+        self.assertFalse(self.fixture.context._closed)
         self.assertEqual(self.fixture.publication.attempts, ())
 
 

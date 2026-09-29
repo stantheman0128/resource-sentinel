@@ -21,6 +21,7 @@ import unittest
 from unittest.mock import patch
 from uuid import uuid4
 
+from sentinel.adaptive import daily_generation
 from sentinel.adaptive.contracts import (
     ApplyResult, ControlProposal, CpuControl, CpuControlMode, CpuTarget, ProcessIdentity,
     ResourceDemand, TICKS_PER_SECOND, Validity,
@@ -385,6 +386,49 @@ class GuardianControlTests(unittest.TestCase):
         self.assertEqual(rows[0]["action_state"], "APPLIED")
         self.assertEqual(rows[0]["action_id"], ack.action_id)
         self.assertEqual(rows[0]["applied_flags"], 5)
+
+    def test_original_daily_deadline_is_forwarded_after_intent_before_set(self):
+        case = self.start()
+        proposal = self.proposal(case)
+        deadline = SimpleNamespace(require=lambda: 100)  # explicit collaborator, not OS evidence
+        original_set = case.job.set_cpu_rate_unverified
+
+        def verify(path):
+            self.assertEqual(path, self.store.db_path)
+            record = self.journal.read(case.spec.execution_id, creation_nonce=case.record.creation_nonce)
+            self.assertIsNotNone(record.pending_intent)
+            self.assertEqual(case.job.sets, 0)
+            case.job.calls.append(("daily_readiness", None))
+            return deadline
+
+        def native_set(rate_bp, *, native_deadline):
+            self.assertIs(native_deadline, deadline)
+            self.assertEqual(case.job.calls[-1][0], "daily_readiness")
+            original_set(rate_bp)
+
+        with patch.object(daily_generation, "revalidate_scoped_native_readiness", side_effect=verify), \
+                patch.object(case.job, "set_cpu_rate_unverified", side_effect=native_set):
+            ack = self.apply(proposal, now_tick_100ns=self.ticks)
+        self.assertEqual(ack.result, ApplyResult.APPLIED)
+        self.assertEqual(case.job.sets, 1)
+
+    def test_daily_readiness_lost_after_intent_refuses_set_and_keeps_allocation(self):
+        case = self.start()
+        proposal = self.proposal(case)
+        with self.connection() as conn:
+            before = list(conn.execute("SELECT * FROM reservations"))
+
+        def refuse(path):
+            record = self.journal.read(case.spec.execution_id, creation_nonce=case.record.creation_nonce)
+            self.assertIsNotNone(record.pending_intent)
+            raise daily_generation.DailyGenerationUnavailable("daily_owner_not_alive")
+
+        with patch.object(daily_generation, "revalidate_scoped_native_readiness", side_effect=refuse):
+            ack = self.apply(proposal, now_tick_100ns=self.ticks)
+        self.assertNotEqual(ack.result, ApplyResult.APPLIED)
+        self.assertEqual([call for call in case.job.calls if call[0] == "set"], [])
+        with self.connection() as conn:
+            self.assertEqual(list(conn.execute("SELECT * FROM reservations")), before)
 
     def test_lease_matches_plan_formula_for_each_minimum_branch(self):
         case = self.start()

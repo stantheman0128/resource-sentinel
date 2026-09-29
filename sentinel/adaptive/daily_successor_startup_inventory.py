@@ -90,10 +90,13 @@ def _snapshot(snapshot):
     return value
 
 
-def _original(operation, supervisor, guard):
+def _original(operation, supervisor, guard, *, retained_only=False):
     if type(operation) is not DailySuccessorOperation:
         _refuse("original_operation_required")
-    operation.assert_supervisor(supervisor)
+    if retained_only:
+        operation.assert_supervisor_retained(supervisor)
+    else:
+        operation.assert_supervisor(supervisor)
     retirement = operation.retirement
     old_guards = (operation.guard, retirement._freeze_guard, retirement._seal_guard)
     if (type(guard) is not PolicyGuard or any(guard is old for old in old_guards) or
@@ -104,7 +107,7 @@ def _original(operation, supervisor, guard):
     if operation.policy.current_guard() is not guard:
         _refuse("original_policy_required")
     preimage = prior.retired_inventory_preimage(retirement)
-    published = operation.published_epoch(supervisor)
+    published = operation.published_epoch(supervisor, retained_only=retained_only)
     epoch = operation._guardian_epoch_operation
     pin = (epoch, None, None, False)
     if published is not None:
@@ -143,8 +146,7 @@ def _path(conn, operation):
         _refuse("transaction_required")
     rows = conn.execute("PRAGMA database_list").fetchmany(2)
     if (len(rows) != 1 or rows[0][1] != "main" or type(rows[0][2]) is not str or
-            os.path.normcase(os.path.abspath(rows[0][2])) != os.path.normcase(str(operation.ledger_path)) or
-            generation._ledger_identity(operation.ledger_path) != operation.owner.ledger_identity):
+            os.path.normcase(rows[0][2]) != os.path.normcase(str(operation.ledger_path))):
         _refuse("ledger_changed")
 
 
@@ -295,7 +297,7 @@ def revalidate_startup_inventory(conn, operation, supervisor, guard, snapshot):
             captured.journal._directory != captured.directory or captured.journal._directory_ids != captured.directory_ids or
             operation._archive is not captured.archive):
         _refuse("snapshot_scope_changed")
-    preimage, published, epoch_pin = _original(operation, supervisor, guard)
+    preimage, published, epoch_pin = _original(operation, supervisor, guard, retained_only=True)
     if preimage != captured.preimage or not _same_epoch(epoch_pin, captured.epoch_pin):
         _refuse("original_preimage_changed")
     records = transfer._records(preimage)

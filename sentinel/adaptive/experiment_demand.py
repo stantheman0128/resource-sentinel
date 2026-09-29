@@ -274,6 +274,7 @@ class DailyExperimentDemand:
         self._before_native_completion = self._before_native_digest = None
         self._before_native_record = self._before_native_binding = None
         self._seal_connection = None
+        self._seal_database_metadata = None
         self._seal_connection_unknown = False
 
     @classmethod
@@ -365,8 +366,7 @@ class DailyExperimentDemand:
                 row["state"] != "ACTIVE"):
             _deny("daily_generation_unverified", self)
         main = [value[2] for value in conn.execute("PRAGMA database_list") if value[1] == "main"]
-        if (len(main) != 1 or Path(main[0]).resolve(strict=True) != self.ledger_path or
-                _identity(self.ledger_path) != self.ledger_identity or
+        if (len(main) != 1 or Path(main[0]) != self.ledger_path or
                 row["ledger_path"] != str(self.ledger_path) or
                 row["source_root"] != str(self._source_root) or
                 row["ledger_identity_json"] != _canonical([str(value) for value in self.ledger_identity])):
@@ -463,9 +463,9 @@ class DailyExperimentDemand:
         """Bind this read transaction to the original ledger, without readiness."""
         if conn is not self._seal_connection or not conn.in_transaction:
             _deny("completion_connection_changed", self)
-        main = [row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main"]
-        if (len(main) != 1 or Path(main[0]).resolve(strict=True) != self.ledger_path or
-                _identity(self.ledger_path) != self.ledger_identity):
+        pinned = self._seal_database_metadata
+        if (pinned is None or pinned[0] is not conn or
+                tuple(tuple(row) for row in conn.execute("PRAGMA database_list")) != pinned[1]):
             _deny("completion_ledger_changed", self)
 
     def seal_without_native(self):
@@ -501,6 +501,11 @@ class DailyExperimentDemand:
                     self._seal_connection_unknown = False
                     conn = self._seal_connection
                     conn.row_factory = sqlite3.Row
+                    if (not daily_generation._ledger_matches(conn, self.ledger_path) or
+                            _identity(self.ledger_path) != self.ledger_identity):
+                        _deny("completion_ledger_changed", self)
+                    self._seal_database_metadata = (conn,
+                        tuple(tuple(row) for row in conn.execute("PRAGMA database_list")))
                     conn.execute("BEGIN")
                     self._validate_completion_connection(conn)
                     _schema(conn)
@@ -540,6 +545,7 @@ class DailyExperimentDemand:
                             primary.add_note("experiment_completion_connection_cleanup_unverified")
                         else:
                             self._seal_connection = None
+                            self._seal_database_metadata = None
                             self._seal_connection_unknown = False
                 self._before_native_binding = _canonical(binding)
                 self._before_native_record = _canonical(record)
@@ -619,6 +625,15 @@ class DailyExperimentDemand:
                     raise
                 if generation is None:
                     _deny("daily_generation_unverified", self)
+                # Publications and file identity are actual observations made
+                # before BEGIN. The SQL snapshot below must match their digest;
+                # it grants bookkeeping only, never native launch authority.
+                prepared_until = time.monotonic() + 2
+                if (not daily_generation._ledger_matches(conn, self.ledger_path) or
+                        _identity(self.ledger_path) != self.ledger_identity):
+                    _deny("daily_generation_binding_changed", self)
+                config, digest = _read_json(self.ledger_path.with_name("config.json"), limit=1024 * 1024)
+                status, _ = _read_json(self.ledger_path.with_name("status.json"), limit=4 * 1024 * 1024)
                 # Bind the captured row to the original authenticated authority
                 # on this same read snapshot. A row read after prepare_connection
                 # without BEGIN could otherwise change before it becomes origin.
@@ -633,13 +648,10 @@ class DailyExperimentDemand:
                 pin = {key: row[key] for key in ("generation", "source_digest", "config_digest")}
                 if self._prepared is not None and self._prepared[0] != pin:
                     _deny("daily_generation_changed", self)
-                config, digest = _read_json(self.ledger_path.with_name("config.json"), limit=1024 * 1024)
                 if digest != pin["config_digest"]:
                     _deny("daily_config_changed", self)
-                status, _ = _read_json(self.ledger_path.with_name("status.json"), limit=4 * 1024 * 1024)
                 if _canonical(self._generation_row(conn)) != original:
                     _deny("daily_generation_changed", self)
-                prepared_until = time.monotonic() + 2
                 conn.rollback()
             except BaseException as error:
                 primary = error
@@ -684,7 +696,7 @@ class DailyExperimentDemand:
                 any(row[key] != value for key, value in self._prepared[0].items())):
             _deny("daily_generation_changed", self)
         main = [r[2] for r in conn.execute("PRAGMA database_list") if r[1] == "main"]
-        if len(main) != 1 or Path(main[0]).resolve() != self.ledger_path:
+        if len(main) != 1 or Path(main[0]) != self.ledger_path:
             _deny("daily_ledger_required", self)
         _schema(conn, create=True)
 

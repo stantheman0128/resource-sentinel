@@ -1,6 +1,20 @@
 # GPT Pro 規劃交接：Agent 動態資源調度
 
-日期：2026-09-19。最新狀態：**2026-09-30 依使用者續作要求恢復 source 實作；production adaptive 維持 off，未授權部署。**
+日期：2026-09-19。最新狀態：**2026-09-30 依使用者 commit 要求停止擴充並保存本批 WIP；production adaptive 維持 off，未部署。**
+
+## 2026-09-30 本批收尾保存
+
+本批以 `35bfc1a` 為基準，保存固定 child bootstrap、authenticated role release、
+guardian／Job publication 接線，以及 prelaunch aggregate cleanup。完整 host
+retirement、control consumer、S2/P4 provider 與 S3/P6 orchestration 仍未完成。
+**這是 WIP 保存點，不是可啟用或已通過 P3–P6 的版本。**
+
+已凍結 source，保留已發現但尚未修正的錯誤及測試結果；本次提交不再延伸實作。
+Source 保存於 `071bc22`。固定 tree 的 17 模組共 **328 tests：299 PASS、
+2 failures、27 errors、0 skips**，尚未通過本批 source gate；未修改測試預期掩蓋錯誤。
+本批精確測試 tree、限制與下次接點見
+[HOST-INTEGRATION-WIP-20260930.md](HOST-INTEGRATION-WIP-20260930.md)。
+以下「續作」段落是前一批 `bee5c5c`／`35bfc1a` 的證據，不能代替本批驗證。
 
 ## 2026-09-30 續作：目前狀態
 

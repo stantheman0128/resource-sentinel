@@ -169,12 +169,56 @@ class BindExperimentChildRequest:
 class ExperimentChildRegistration:
     manifest: ExperimentChildManifest
     auth_key: bytes = field(repr=False)
+    role_spec: object = field(default=None, repr=False)
 
     def __post_init__(self):
         if type(self.manifest) is not ExperimentChildManifest:
             _fail("manifest_required")
         if type(self.auth_key) is not bytes or len(self.auth_key) != 32:
             _fail("credential_invalid")
+        if self.role_spec is not None:
+            from .experiment_host_roles import GuardianRoleSpec, WrapperRoleSpec, HelperRoleSpec
+            if (type(self.role_spec) not in (GuardianRoleSpec, WrapperRoleSpec, HelperRoleSpec) or
+                    self.role_spec.member_id != self.manifest.actor_member_id or
+                    self.role_spec.role != self.manifest.role or
+                    Path(self.role_spec.data_dir) != Path(self.manifest.isolated_ledger_path).parent):
+                _fail("role_spec_mismatch")
+            self.role_spec.__post_init__()
+
+
+def _validate_role_release(value, registration):
+    """Validate authenticated role data; this function cannot mint a witness."""
+    from .contracts import _identifier
+    spec, manifest = registration.role_spec, registration.manifest
+    if (spec is None or type(value) is not dict or
+            set(value) != {"version", "plan_sha256", "actor_member_id", "role_spec", "guardian"} or
+            type(value["version"]) is not int or value["version"] != 1 or
+            value["plan_sha256"] != manifest.plan_sha256 or value["actor_member_id"] != manifest.actor_member_id or
+            _canonical(value["role_spec"]) != _canonical(spec.to_dict())):
+        _fail("role_release_invalid")
+    context = value["guardian"]
+    if type(context) is not dict:
+        _fail("role_release_invalid")
+    if spec.role == "guardian":
+        if context:
+            _fail("role_release_invalid")
+        return
+    fields = {"guardian_identity", "guardian_epoch"}
+    fields |= ({"launch_instance_id", "reservation_id", "backing_request_id"} if spec.role == "wrapper" else
+               {"control_instance_id", "instance_id", "operator_instance_id", "parent_instance_id",
+                "parent_identity", "policy_instance_id"})
+    if set(context) != fields:
+        _fail("role_release_invalid")
+    identity = _identity(context["guardian_identity"])
+    if identity.logon_id != manifest.child_identity.logon_id or identity in (manifest.child_identity, manifest.endpoint.server_identity):
+        _fail("role_release_identity_invalid")
+    _identifier(context["guardian_epoch"], "guardian_epoch")
+    for key in fields - {"guardian_identity", "guardian_epoch", "parent_identity"}:
+        _uuid(context[key])
+    if spec.role == "helper" and (
+            _identity(context["parent_identity"]) != manifest.endpoint.server_identity or
+            context["policy_instance_id"] != manifest.isolated_policy_instance_id):
+        _fail("role_release_parent_changed")
 
 
 def _read(connection, deadline, *, limit=MAX_MESSAGE_BYTES):
@@ -374,6 +418,7 @@ class ExperimentChildBinding:
         self._peer = self._peer_pin = None
         self._native_original = None
         self._issued = self._closed = self._close_attempted = False
+        self._role_release_wire = self._role_release_original = None
         self._close_error = None
         self._original = (client, self._manifest, self._process, self._attempt,
                           self._manifest_wire, self._thread, self._pid, self._registry)
@@ -435,6 +480,40 @@ class ExperimentChildBinding:
                 observed.status is not IdentityStatus.ALIVE):
             _fail("parent_unavailable")
         return None
+
+    @property
+    def released_role(self):
+        role = self._client.registration.role_spec
+        self.require_role_release(role)
+        return role
+
+    def require_role_release(self, spec):
+        """Original authenticated dispatch witness; never capacity authority."""
+        self.revalidate(self._manifest, role=self._manifest.role)
+        if (spec is None or spec is not self._client.registration.role_spec or
+                self._role_release_wire is None or self._role_release_original is None or
+                self._client._release_original is not self._role_release_original or
+                self._role_release_original[0] is not spec or
+                self._role_release_original[1] != self._role_release_wire):
+            _fail("original_role_release_required")
+        released = strict_json_loads(self._role_release_wire)
+        _validate_role_release(released, self._client.registration)
+
+    def role_release_context(self, spec):
+        """Fresh copies of authenticated selectors; hosts still need coverage."""
+        self.require_role_release(spec)
+        context = strict_json_loads(self._role_release_wire)["guardian"]
+        if spec.role == "guardian":
+            return {}
+        identity = _identity(context["guardian_identity"])
+        if spec.role == "wrapper":
+            return dict(endpoint=NativePipeEndpoint(identity.logon_id, context["launch_instance_id"], identity),
+                guardian_epoch=context["guardian_epoch"], reservation_id=context["reservation_id"],
+                backing_request_id=context["backing_request_id"])
+        return dict(instance_id=context["instance_id"], operator_instance_id=context["operator_instance_id"],
+            parent_instance_id=context["parent_instance_id"], policy_instance_id=context["policy_instance_id"],
+            guardian_epoch=context["guardian_epoch"], parent_identity=_identity(context["parent_identity"]),
+            guardian_endpoint=NativePipeEndpoint(identity.logon_id, context["control_instance_id"], identity))
 
     def close(self):
         self._check_original()
@@ -579,9 +658,14 @@ class ExperimentChildService:
             error.experiment_child_attempt = attempt
             raise
 
-    def _serve_connection(self, connection, deadline, attempt):
+    def _serve_connection(self, connection, deadline, attempt, *, hello=None):
         from .experiment_host_scope import ProductionExperimentScope
-        hello = _read(connection, deadline, limit=MAX_HELLO_BYTES)
+        if not any(item is attempt for item in self._attempts):
+            if len(self._attempts) >= MAX_SERVER_ATTEMPTS:
+                _fail("attempt_limit")
+            self._attempts.append(attempt)
+        if hello is None:
+            hello = _read(connection, deadline, limit=MAX_HELLO_BYTES)
         _shape(hello, "ExperimentChildHello", {"caller"})
         caller = _identity(hello["caller"])
         if caller.logon_id != self.endpoint.logon_id:
@@ -615,6 +699,10 @@ class ExperimentChildService:
             self._check_original()
             _live(connection, peer, caller)
             result = {"bound_manifest": registration.manifest.to_dict()}
+            if registration.role_spec is not None:
+                result["role_release"] = ProductionExperimentScope._release_transport_child(
+                    self.owner, request, peer, registration)
+                _validate_role_release(result["role_release"], registration)
             response = _envelope("ExperimentChildResult", request, challenge,
                                  _mac(registration.auth_key, "result", request, challenge, result))
             response["result"] = result
@@ -640,6 +728,9 @@ class ExperimentChildClient:
         self._process_pin = _NativePin(current_process)
         self._original = (registration, current_process, self._process_pin,
                           _canonical(registration.manifest.to_dict()), registration.auth_key)
+        self._role_original = registration.role_spec
+        self._role_wire = None if registration.role_spec is None else _canonical(registration.role_spec.to_dict())
+        self._release_original = None
         self._binding = None
         self._request_key = (os.getpid(), registration.manifest.child_identity,
                              registration.manifest.request_id)
@@ -648,7 +739,8 @@ class ExperimentChildClient:
         registration, process, pin, wire, key = self._original
         if (self.registration is not registration or self.current_process is not process or
                 self._process_pin is not pin or _canonical(registration.manifest.to_dict()) != wire or
-                registration.auth_key != key):
+                registration.auth_key != key or registration.role_spec is not self._role_original or
+                (None if registration.role_spec is None else _canonical(registration.role_spec.to_dict())) != self._role_wire):
             _fail("original_client_changed")
         pin.check()
         _current(process, registration.manifest.child_identity)
@@ -696,10 +788,16 @@ class ExperimentChildClient:
                     response = _read(connection, deadline)
                     _correlated(response, "ExperimentChildResult", request, challenge, result=True)
                     result = response["result"]
-                    if (result != {"bound_manifest": manifest.to_dict()} or
-                            not hmac.compare_digest(response["mac"],
+                    expected_keys = {"bound_manifest"} | ({"role_release"} if self.registration.role_spec is not None else set())
+                    if (type(result) is not dict or set(result) != expected_keys or
+                            result["bound_manifest"] != manifest.to_dict() or not hmac.compare_digest(response["mac"],
                                 _mac(self.registration.auth_key, "result", request, challenge, result))):
                         _fail("result_invalid")
+                    if self.registration.role_spec is not None:
+                        _validate_role_release(result["role_release"], self.registration)
+                        binding._role_release_wire = _canonical(result["role_release"])
+                        binding._role_release_original = self.registration.role_spec, binding._role_release_wire
+                        self._release_original = binding._role_release_original
                     _live(connection, peer, manifest.endpoint.server_identity)
                     self._check_original()
                     binding._peer = peer.duplicate()

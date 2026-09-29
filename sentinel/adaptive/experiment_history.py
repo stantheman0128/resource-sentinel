@@ -422,6 +422,19 @@ def _validate_completion(record):
     demand = completion.get("demand") if type(completion) is dict else None
     _validate_demand(demand)
     version = completion.get("schema_version")
+    if type(version) is int and version == 3:
+        from .experiment_host_completion import validate_record, digest_record
+        validate_record(completion)
+        if (kind != "FINISHED" or digest_record(completion) != record["completion_digest"] or
+                completion["reservation_id"] != record["reservation_id"] or
+                completion["daily_binding_sha256"] != record["demand_binding_sha256"] or
+                record["preimage"].get("host_rows") != completion["host_rows"] or
+                record["preimage"]["registry_revision"] < completion["registry_revision"]):
+            _fail("production_completion_changed")
+        aggregate_scope = completion["host_rows"]["adaptive_experiment_host_scopes"][0]
+        if aggregate_scope["daily_policy_instance_id"] != record["policy"]["instance_id"]:
+            _fail("production_policy_changed")
+        return demand
     if type(version) is not int or version not in {1, 2}:
         _fail("completion_version_invalid")
     if version == 2:
@@ -563,8 +576,11 @@ def canonical_receipt(record):
     policy, pre, post = record["policy"], record["preimage"], record["postimage"]
     _shape(policy, {"instance_id", "logon_id"})
     _uuid(policy["instance_id"])
-    _shape(pre, {"managed", "allocation", "queue", "exclusion", "registry_revision"})
-    _shape(post, {"managed", "archive", "exclusion", "registry_revision"})
+    aggregate = type(record["completion"]) is dict and record["completion"].get("schema_version") == 3
+    _shape(pre, {"managed", "allocation", "queue", "exclusion", "registry_revision"} | ({"host_rows"} if aggregate else set()))
+    _shape(post, {"managed", "archive", "exclusion", "registry_revision"} | ({"host_rows"} if aggregate else set()))
+    if aggregate and pre["host_rows"] != post["host_rows"]:
+        _fail("production_immutable_history_changed")
     _integer(pre["registry_revision"], 0, (1 << 63) - 2)
     _integer(post["registry_revision"], 1)
     now = record["transaction_time"]
@@ -591,7 +607,7 @@ def canonical_receipt(record):
             post["registry_revision"] != pre["registry_revision"] + 1):
         _fail("postimage_invalid")
     if pre["exclusion"] is None:
-        if post["exclusion"] is not None or record["disposition"] not in {"BEFORE_NATIVE", "PREPARATION_CLOSED", "WRAPPER_NOT_CREATED"}:
+        if post["exclusion"] is not None or (not aggregate and record["disposition"] not in {"BEFORE_NATIVE", "PREPARATION_CLOSED", "WRAPPER_NOT_CREATED"}):
             _fail("exclusion_disposition_invalid")
     else:
         values = _exclusion_binding(pre["exclusion"])
@@ -857,6 +873,15 @@ def verify_experiment_history_locked(conn, *, max_rows=MAX_ROWS, max_bytes=MAX_B
                 record["postimage"]["registry_revision"] > runtime["registry_revision"] or
                 not _same(exclusion, record["postimage"]["exclusion"])):
             _fail("committed_tuple_changed")
+        if record["completion"].get("schema_version") == 3:
+            from . import experiment_host_ledger as host_ledger
+            if not host_ledger.validate_schema_locked(conn):
+                _fail("production_history_missing")
+            for table in host_ledger.TABLES:
+                rows = _rows(conn, table, host_ledger.FIELDS[table], budget,
+                    where="scope_id=?", parameters=(record["completion"]["scope_id"],))
+                if rows != record["postimage"]["host_rows"][table]:
+                    _fail("production_history_changed")
         archive = _one(conn, "executions", ("id", *ARCHIVE_FIELDS), budget,
             "reservation_id=? OR request_key=?", (record["reservation_id"], record["request_key"]))
         _integer(archive["id"], 1)
@@ -872,3 +897,9 @@ def verify_experiment_history_locked(conn, *, max_rows=MAX_ROWS, max_bytes=MAX_B
     return ExperimentHistory(frozenset(completed), frozenset(json.loads(value)["experiment_id"] for value in active),
         tuple(records), tuple(active), tuple(archives), tuple(_canonical(value) for value in exclusions),
         budget.rows, budget.bytes, _digest("experiment-history-v1", observed), tuple(budget.observed))
+
+
+# Source audit hooks can resolve paths on import. Load the fixed aggregate data
+# validators before any history reader enters SQL; their module initialization
+# defines types/functions only and performs no native or ledger acquisition.
+from . import experiment_host_ledger, experiment_host_completion

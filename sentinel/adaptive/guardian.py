@@ -53,6 +53,7 @@ class _PendingExecution:
         self.retirement_cleanup_started = False
         self.retirement_mutex_close_unknown = False
         self.retirement_receipt_operation = None
+        self.experiment_job_publication = None
 
     def assert_held(self):
         self.owner.lifecycle.store._policy.assert_held()
@@ -103,6 +104,88 @@ class GuardianLaunchOwner:
         self._lock = self.lifecycle._lock
         self._draining = False
         self.store.evidence_provider = self.evidence_scope
+        from .experiment_host_authority import ExperimentBackedHostAuthority
+        self._experiment_authority_original = (self.authority if
+            type(self.authority) is ExperimentBackedHostAuthority else None)
+        self._experiment_closed = {}
+        self._experiment_seen = {}
+        self._experiment_custody_original = (self._experiment_closed, self._experiment_seen)
+        self._experiment_closed_snapshot = None
+        if self._experiment_authority_original is not None:
+            self.lifecycle._experiment_launch_owner = self
+
+    def _retain_experiment_closed(self, kind, entry, custody):
+        """Preserve exact post-close evidence before removing a live entry."""
+        if self._experiment_authority_original is None:
+            return
+        from .experiment_host_authority import ExperimentBackedHostAuthority
+        from .prelaunch_receipt import PrelaunchReceiptOperation
+        from .terminal_custody import TerminalCustody
+        from .terminal_receipt import TerminalReceiptOperation
+        if (type(self.authority) is not ExperimentBackedHostAuthority or
+                self.authority is not self._experiment_authority_original or
+                self.lifecycle._experiment_launch_owner is not self or
+                self.authority.guardian is not self.guardian or self._experiment_closed_snapshot is not None or
+                self._experiment_custody_original[0] is not self._experiment_closed or
+                self._experiment_custody_original[1] is not self._experiment_seen):
+            raise LifecycleError("guardian_experiment_closed_owner_changed")
+        seen = self._experiment_seen.get(entry.execution_id)
+        if (type(seen) is not _PendingExecution or seen.owner is not self or
+                seen.job_name != custody.manifest.job_name or seen.creation_nonce != custody.manifest.creation_nonce or
+                seen.spec_hash != custody.manifest.spec_hash or
+                seen.reservation != custody.manifest.reservation or
+                seen.wrapper.identity != custody.manifest.wrapper_identity):
+            raise LifecycleError("guardian_experiment_original_execution_missing")
+        if kind == "prelaunch":
+            if (type(custody) is not PrelaunchReceiptOperation or custody.owner is not self or
+                    custody._entry is not entry or entry.retirement_receipt_operation is not custody or
+                    self._pending.get(entry.execution_id) is not entry or entry.root is not None or
+                    not entry.retirement_sealed or entry.retirement_mutex_close_unknown or
+                    entry.closed_handles != {key for key, value in custody.owners.items() if value is not None}):
+                raise LifecycleError("guardian_experiment_closed_prelaunch_changed")
+            receipt = custody
+        elif kind == "terminal":
+            if (type(custody) is not TerminalCustody or entry.terminal_cleanup is not custody or
+                    self.lifecycle._entries.get(entry.execution_id) is not entry or
+                    custody.proof_published is not True or custody.native_complete is not True or
+                    custody.quarantined or custody.closed_owners != ("root", "wrapper", "job", "mutex") or
+                    type(custody.receipt_operation) is not TerminalReceiptOperation):
+                raise LifecycleError("guardian_experiment_closed_terminal_changed")
+            receipt = custody.receipt_operation
+            if receipt.lifecycle is not self.lifecycle or receipt.custody is not custody or receipt._entry is not entry:
+                raise LifecycleError("guardian_experiment_closed_receipt_changed")
+        else:
+            raise LifecycleError("guardian_experiment_closed_kind_invalid")
+        operation = receipt._operation
+        if operation._complete is not True or operation.pending or operation._quarantine or receipt._candidate is None:
+            raise LifecycleError("guardian_experiment_closed_receipt_unsettled")
+        previous = self._experiment_closed.get(entry.execution_id)
+        if previous is not None:
+            if previous[0] != kind or previous[1] is not entry or previous[2] is not custody:
+                raise LifecycleError("guardian_experiment_closed_custody_changed")
+            return
+        if len(self._experiment_closed) >= 10:
+            raise LifecycleError("guardian_experiment_closed_inventory_full")
+        self._experiment_closed[entry.execution_id] = (kind, entry, custody)
+
+    def closed_experiment_custody(self):
+        """Original post-retirement objects; the host independently proves exit."""
+        with self._lock:
+            if (self._experiment_authority_original is None or
+                    self.authority is not self._experiment_authority_original or
+                    self.lifecycle._experiment_launch_owner is not self or not self._draining or
+                    self.retained_execution_ids or len(self._experiment_closed) > 10 or
+                    self._experiment_custody_original[0] is not self._experiment_closed or
+                    self._experiment_custody_original[1] is not self._experiment_seen or
+                    set(self._experiment_closed) != set(self._experiment_seen)):
+                raise LifecycleError("guardian_experiment_closed_custody_unavailable")
+            values = tuple(self._experiment_closed[key] for key in sorted(self._experiment_closed))
+            if self._experiment_closed_snapshot is None:
+                self._experiment_closed_snapshot = values
+            original = self._experiment_closed_snapshot
+            if len(values) != len(original) or any(value is not saved for value, saved in zip(values, original)):
+                raise LifecycleError("guardian_experiment_closed_custody_changed")
+            return original
 
     def begin_drain(self):
         """Permanently stop new Job creation and launch grants, retaining cleanup."""
@@ -230,7 +313,13 @@ class GuardianLaunchOwner:
         self.store.assert_authenticated_allocation(row, caller=entry.wrapper.identity, expected_auth=entry.auth)
         if not recovery:
             self._authority("assert_ready")
-            self._authority("assert_covered", row)
+            from .experiment_host_authority import ExperimentBackedHostAuthority
+            active = getattr(self.authority, "_active", None)
+            if (type(self.authority) is ExperimentBackedHostAuthority and active is not None and
+                    active.execution_id == entry.execution_id and active.operation == "bind"):
+                self._authority("assert_existing_covered", row)
+            else:
+                self._authority("assert_covered", row)
 
     def _record_request(self, request, peer, auth, *, replay_only=False):
         if replay_only:
@@ -309,6 +398,8 @@ class GuardianLaunchOwner:
                 try:
                     entry = _PendingExecution(self, row, wrapper, auth_record)
                     self._pending[request.execution_id] = entry
+                    if self._experiment_authority_original is not None:
+                        self._experiment_seen[request.execution_id] = entry
                 except BaseException as primary:
                     self._failed_peers[request.execution_id] = wrapper
                     primary.add_note("guardian_wrapper_custody_retained")
@@ -340,10 +431,11 @@ class GuardianLaunchOwner:
                 if entry.job is None:
                     if entry.create_attempted:
                         raise LifecycleError("guardian_job_create_outcome_unknown")
+                    native_options = self._experiment_job_create_ready(entry)
                     entry.create_attempted = True
                     try:
                         entry.job = self._job_factory(entry.job_name, entry.creation_nonce,
-                            entry.wrapper.identity.logon_id, access=JobAccess.OWNER)
+                            entry.wrapper.identity.logon_id, access=JobAccess.OWNER, **native_options)
                     except BaseException as error:
                         self._uncertain.append(error)
                         raise
@@ -352,6 +444,112 @@ class GuardianLaunchOwner:
                     expected_revision=row["state_revision"], expected_auth=auth_record)
                 self._deadline(deadline)
                 return self._result(request, row, duplicate=duplicate)
+
+    def _experiment_job_create_ready(self, entry):
+        """Re-observe original readiness after SQL immediately before Job Create."""
+        from . import experiment_host_authority as authorities
+        authority = self.authority
+        if type(authority) is not authorities.ExperimentBackedHostAuthority:
+            return {}
+        authority._native(restrictive=True)
+        active = authority._check_active(entry.execution_id, restrictive=True)
+        if active.operation != "prepare" or entry.experiment_job_publication is None:
+            raise LifecycleError("guardian_original_job_publication_required")
+        # No fresh deadline or replacement scope may be minted after commit.
+        deadline = authorities.daily_generation.revalidate_scoped_readiness(authority.daily_path,
+            expected_generation=authorities.ledger._decode(active.generation_payload))
+        if deadline is not active.deadline:
+            raise LifecycleError("guardian_original_job_readiness_changed")
+        authority._check_active(entry.execution_id, restrictive=True)
+        return {} if deadline is None else {"native_deadline": deadline}
+
+    def prepare_experiment_job_intent(self, request, peer, *, auth_record, deadline):
+        """Retain and publish the original name before entering native fences.
+
+        The authenticated launch service calls this only after verifying its
+        wrapper MAC and before taking daily POLICY. A parent acknowledgement is
+        exclusion metadata, never permission to Create: prepare_execution still
+        checks fresh daily/isolated authority, manifest and ordered Job custody.
+        """
+        from .experiment_host_authority import ExperimentBackedHostAuthority
+        from .experiment_job_publication import ExperimentJobPublication
+        from .experiment_host_transport import _no_mutex
+        from .launch_transport import PrepareExecutionRequest
+        if (type(self.authority) is not ExperimentBackedHostAuthority or
+                type(request) is not PrepareExecutionRequest or self.authority.guardian is not self.guardian):
+            raise LifecycleError("guardian_original_experiment_required")
+        _no_mutex()
+        if (self.authority._active is not None or self.store._policy.current_guard() is not None or
+                self.authority._daily_policy.current_guard() is not None):
+            raise LifecycleError("guardian_experiment_publication_outer_scope_required")
+        with self._lock:
+            row = self._authenticate(request, peer, auth_record, deadline)
+            if self._draining:
+                raise LifecycleError("guardian_launch_draining")
+            if request.execution_id in self._failed_peers:
+                raise LifecycleError("guardian_peer_transfer_reconciliation_required")
+            entry = self._pending.get(request.execution_id)
+            if entry is None:
+                if (row["state"] != "RESERVED" or row["job_name"] is not None or row["claim_consumed"] or
+                        request.execution_id in self.lifecycle.retained_execution_ids):
+                    raise LifecycleError("guardian_launch_recovery_required")
+                if len(self.retained_execution_ids) >= 10:
+                    raise LifecycleError("managed_job_limit_reached")
+                self.store._require_revision(row, request.expected_revision)
+                try:
+                    wrapper = peer.duplicate()
+                except BaseException as error:
+                    if getattr(error, "_identity_handle_cleanup", ()):
+                        self._failed_peers[request.execution_id] = error
+                    raise
+                try:
+                    entry = _PendingExecution(self, row, wrapper, auth_record)
+                    self._pending[request.execution_id] = entry
+                    if self._experiment_authority_original is not None:
+                        self._experiment_seen[request.execution_id] = entry
+                except BaseException as error:
+                    self._failed_peers[request.execution_id] = wrapper
+                    error.add_note("guardian_wrapper_custody_retained")
+                    raise
+            self._check_entry(entry, row)
+            if entry.retirement_sealed:
+                raise LifecycleError("guardian_launch_retirement_sealed")
+            publication = entry.experiment_job_publication
+            if publication is None:
+                publication = ExperimentJobPublication.prepare(self.authority.child_binding, entry, request)
+            publication.require_request(request)
+            self._deadline(deadline)
+            publication.publish(timeout_ms=min(1000, deadline.remaining_ms()))
+            self._deadline(deadline)
+
+    @contextmanager
+    def experiment_launch_scope(self, request, peer, *, auth_record, deadline):
+        """Fixed transport dispatch scope; keep draining withdrawal independent.
+
+        The original owner lock makes the local drain decision monotonic through
+        dispatch. Neither that decision nor a wire flag grants new work. Normal
+        prepare publishes before taking the daily/isolated/Job fences; drain's
+        existing sealed retirement path cannot Create or authorize launch.
+        """
+        from .experiment_host_authority import ExperimentBackedHostAuthority
+        from .launch_transport import PrepareExecutionRequest, ClaimLaunchRequest, BindRootRequest
+        if type(self.authority) is not ExperimentBackedHostAuthority:
+            raise LifecycleError("guardian_original_experiment_required")
+        if type(request) not in {PrepareExecutionRequest, ClaimLaunchRequest, BindRootRequest}:
+            raise LifecycleError("guardian_experiment_operation_invalid")
+        with self._lock:
+            if self._draining and type(request) in {PrepareExecutionRequest, ClaimLaunchRequest}:
+                yield
+                return
+            if type(request) is PrepareExecutionRequest:
+                self.prepare_experiment_job_intent(request, peer, auth_record=auth_record, deadline=deadline)
+                manager = self.authority.new_work_scope(request.execution_id, operation="prepare")
+            elif type(request) is ClaimLaunchRequest:
+                manager = self.authority.new_work_scope(request.execution_id, operation="claim")
+            else:
+                manager = self.authority.existing_work_scope(request.execution_id)
+            with manager:
+                yield
 
     def _prepare_retirement_scope(self, request, peer, auth_record, entry, deadline):
         """Keep the original wrapper's cleanup route without ever creating a Job.
@@ -671,6 +869,7 @@ class GuardianLaunchOwner:
                         results.append({"execution_id": execution_id, "terminal": False,
                             "reason": published.reason or "guardian_retirement_receipt_pending"})
                         continue
+                    self._retain_experiment_closed("prelaunch", entry, receipt)
                     del self._pending[execution_id]
                     results.append({"execution_id": execution_id, "state": row["state"], "terminal": True})
                 except Exception as error:

@@ -54,6 +54,7 @@ class ProductionExperimentPlan:
     spec: ledger.HostScopeSpec
     members: tuple[ledger.MemberClaim, ...]
     commands: tuple = ()
+    roles: tuple = ()
 
     def __post_init__(self):
         if (type(self.spec) is not ledger.HostScopeSpec or type(self.members) is not tuple or
@@ -72,10 +73,29 @@ class ProductionExperimentPlan:
                     not {pair[0] for pair in self.commands} <=
                     {item.member_id for item in self.members if item.kind == "infrastructure"}):
                 _fail("plan_commands_invalid")
+        from .experiment_host_roles import GuardianRoleSpec, WrapperRoleSpec, HelperRoleSpec
+        if (type(self.roles) is not tuple or
+                any(type(role) not in (GuardianRoleSpec, WrapperRoleSpec, HelperRoleSpec) for role in self.roles) or
+                len({role.member_id for role in self.roles}) != len(self.roles)):
+            _fail("plan_roles_invalid")
+        members = {member.member_id: member for member in self.members}
+        roles = {role.member_id: role for role in self.roles}
+        for role in self.roles:
+            role.__post_init__()
+            member = members.get(role.member_id)
+            if (member is None or member.kind != "infrastructure" or member.role != role.role or
+                    Path(role.data_dir) != Path(self.spec.isolated_ledger_path).parent):
+                _fail("plan_role_member_mismatch")
+            if type(role) is WrapperRoleSpec:
+                workload = members.get(role.workload_member_id)
+                guardian = roles.get(role.guardian_member_id)
+                if (workload is None or workload.kind != "workload" or workload.role != "workload" or
+                        workload.requested != role.launch_spec.requested or type(guardian) is not GuardianRoleSpec):
+                    _fail("plan_role_partition_mismatch")
 
     def to_dict(self):
         spec = self.spec
-        return dict(domain="sentinel-production-experiment-plan-v1",
+        result = dict(domain="sentinel-production-experiment-plan-v1",
             scope=dict(scope_id=spec.scope_id, suite=spec.suite,
                 isolated_ledger_path=spec.isolated_ledger_path,
                 isolated_ledger_identity=list(spec.isolated_ledger_identity),
@@ -85,6 +105,11 @@ class ProductionExperimentPlan:
             commands=[dict(member_id=member, executable=command.executable,
                            arguments=list(command.arguments), cwd=command.cwd)
                       for member, command in self.commands])
+        # Preserve existing metadata-only plans. A dispatchable plan additionally
+        # commits the complete closed role union into the original declaration.
+        if self.roles:
+            result["roles"] = [role.to_dict() for role in self.roles]
+        return result
 
     @property
     def sha256(self):
@@ -155,6 +180,16 @@ class ProductionExperimentScope:
         self._published_actors = {}
         self._child_registrations = {}
         self._accepted_children = {}
+        self._released_roles = {}
+        self._role_release_data = {}
+        self._supervisor_host = None
+        self._supervisor_pin = None
+        self._registration_publications = {}
+        self._completion = None
+        self._retirement_service = None
+        self._job_service = None
+        self._job_publications = {}
+        self._job_members = {}
         self._transport_service = None
         self._transport_endpoint = None
         self._backing_service = None
@@ -408,6 +443,65 @@ class ProductionExperimentScope:
             self.demand._seal_native_preparation(self)
             self._sealed = True
 
+    def retire(self):
+        from .experiment_host_completion import retire
+        return retire(self)
+
+    def publish_child_registration(self, attempt, *, permitted_member_ids=()):
+        from .experiment_child_host import ChildRegistrationPublication
+        registration = self.child_registration(attempt, permitted_member_ids=permitted_member_ids)
+        owner = self._registration_publications.get(attempt.member.member_id)
+        if owner is None:
+            owner = ChildRegistrationPublication.prepare(registration, self.demand.directory)
+            self._registration_publications[attempt.member.member_id] = owner
+        try:
+            return owner.publish()
+        except BaseException as error:
+            raise self._retain(error)
+
+    def bind_supervisor(self, host):
+        """Retain an actual local supervisor; selectors alone are not a host."""
+        from .supervisor_host import SupervisorHost
+        self._assert_transport_original(self._transport_endpoint)
+        if type(host) is not SupervisorHost or host._closed or Path(host.data_dir) != self.ledger_path.parent:
+            _fail("original_supervisor_required", self)
+        current = host._operational_current
+        if (type(current) is not VerifiedProcess or current.identity != self.process.identity or
+                host.startup is None or host.startup._current is not current or
+                host.operations is None or host.binding.instance_id != self.spec.isolated_policy_instance_id):
+            _fail("original_supervisor_required", self)
+        host.startup.assert_fresh()
+        observed = current.observe()
+        if observed.status is not IdentityStatus.ALIVE or observed.identity != self.process.identity:
+            _fail("original_supervisor_unavailable", self)
+        pin = (host, current, host.startup, host.store, host.operations, host._instance_id)
+        if self._supervisor_pin is not None and any(a is not b for a, b in zip(pin[:5], self._supervisor_pin[:5])):
+            _fail("original_supervisor_changed", self)
+        if self._supervisor_pin is not None and pin[5] != self._supervisor_pin[5]:
+            _fail("original_supervisor_changed", self)
+        self._supervisor_host, self._supervisor_pin = host, pin
+
+    def _retain_retirement_transport(self, service):
+        from .experiment_host_retirement_transport import ExperimentHostRetirementService
+        if type(service) is not ExperimentHostRetirementService or service.owner is not self:
+            _fail("original_retirement_transport_required", self)
+        self._assert_transport_original(service.endpoint)
+        if self._retirement_service is not None and self._retirement_service is not service:
+            _fail("original_retirement_transport_changed", self)
+        self._retirement_service = service
+
+    def _retain_job_transport(self, service):
+        from .experiment_job_publication import retain_service
+        return retain_service(self, service)
+
+    def _transport_job_registration(self, request, peer):
+        from .experiment_job_publication import parent_registration
+        return parent_registration(self, request, peer)
+
+    def _publish_transport_job(self, request, peer, registration):
+        from .experiment_job_publication import publish_parent
+        return publish_parent(self, request, peer, registration)
+
     def _assert_creation_gate(self, attempt):
         """Original lexical readiness at each native boundary; no RPC or SQL."""
         self._assert_ledger_original(self.demand, self.spec)
@@ -549,7 +643,8 @@ class ProductionExperimentScope:
             isolated_policy_instance_id=self.spec.isolated_policy_instance_id,
             actor_member_id=attempt.member.member_id, role=attempt.member.role,
             permitted_member_ids=allowed, request_id=str(uuid4()))
-        registration = ExperimentChildRegistration(manifest, secrets.token_bytes(32))
+        role = next((role for role in self.plan.roles if role.member_id == attempt.member.member_id), None)
+        registration = ExperimentChildRegistration(manifest, secrets.token_bytes(32), role_spec=role)
         self._child_registrations[attempt.member.member_id] = (attempt, registration)
         return registration
 
@@ -618,6 +713,82 @@ class ProductionExperimentScope:
         if self._sealed and previous is None:
             _fail("new_work_sealed", self)
         self._accepted_children[request.request_id] = registration
+
+    def _release_transport_child(self, request, peer, registration):
+        """Release one declared role after original actor publication and auth.
+
+        The authenticated response is dispatch data, never admission or cleanup
+        authority. No POLICY/SQL scope survives the response write.
+        """
+        from .experiment_host_roles import GuardianRoleSpec, WrapperRoleSpec, HelperRoleSpec
+        if (self._transport_child_registration(request, peer) is not registration or
+                self._accepted_children.get(request.request_id) is not registration):
+            _fail("accepted_original_child_required", self)
+        role = registration.role_spec
+        if (role is None or not any(item is role for item in self.plan.roles) or
+                role.member_id != registration.manifest.actor_member_id or role.role != registration.manifest.role):
+            _fail("declared_role_required", self)
+        role.__post_init__()
+        context = {}
+        if type(role) in (WrapperRoleSpec, HelperRoleSpec):
+            guardian_roles = [item for item in self.plan.roles if type(item) is GuardianRoleSpec and
+                (type(role) is HelperRoleSpec or item.member_id == role.guardian_member_id)]
+            if len(guardian_roles) != 1:
+                _fail("declared_guardian_required", self)
+            guardian = guardian_roles[0]
+            published = self._published_actors.get(guardian.member_id)
+            released = self._released_roles.get(guardian.member_id)
+            if (type(guardian) is not GuardianRoleSpec or published is None or released is None or
+                    released[0] is not guardian):
+                _fail("released_original_guardian_required", self)
+            attempt, identity = published
+            attempt.assert_original(self)
+            observed = attempt.process.observe()
+            if observed.status is not IdentityStatus.ALIVE or observed.identity != identity:
+                _fail("original_guardian_unavailable", self)
+            context = dict(guardian_identity=identity.to_dict(), guardian_epoch=guardian.guardian_epoch)
+            selectors = self._role_release_data.get(role.member_id)
+            if selectors is None:
+                selectors = (str(uuid4()), str(uuid4()))
+                self._role_release_data[role.member_id] = selectors
+            if type(role) is WrapperRoleSpec:
+                context.update(launch_instance_id=guardian.launch_instance_id,
+                    reservation_id=selectors[0], backing_request_id=selectors[1])
+            else:
+                from .supervisor_host import SupervisorHost
+                supervisor = self._supervisor_host
+                if (type(supervisor) is not SupervisorHost or self._supervisor_pin is None or
+                        Path(supervisor.data_dir) != self.ledger_path.parent):
+                    _fail("original_supervisor_required", self)
+                self.bind_supervisor(supervisor)
+                context.update(control_instance_id=guardian.control_instance_id,
+                    instance_id=selectors[0], operator_instance_id=selectors[1],
+                    parent_instance_id=supervisor._instance_id, parent_identity=self.process.identity.to_dict(),
+                    policy_instance_id=self.spec.isolated_policy_instance_id)
+        result = dict(version=1, plan_sha256=self._plan_hash, actor_member_id=role.member_id,
+                      role_spec=role.to_dict(), guardian=context)
+        wire = _canonical(result)
+        prior = self._released_roles.get(role.member_id)
+        if prior is not None and (prior[0] is not role or prior[1] != wire):
+            _fail("original_role_release_changed", self)
+        if self._sealed and prior is None:
+            _fail("new_work_sealed", self)
+        with self._operation() as guard:
+            with self._sql(self.demand.ledger_path) as conn:
+                _, history, tables = ledger._inventory(conn, self._daily_policy, guard)
+                scopes = [row for row in tables[ledger.SCOPES_TABLE] if row["scope_id"] == self.scope_id]
+                if len(scopes) != 1:
+                    _fail("original_role_scope_missing", self)
+                ledger._daily_binding(conn, scopes[0], history, guard, restrictive=True)
+                actors = [row for row in tables[ledger.ACTORS_TABLE] if row["member_id"] == role.member_id]
+                if len(actors) != 1 or ledger._decode(actors[0]["identity_json"]) != request.manifest.child_identity.to_dict():
+                    _fail("original_role_actor_changed", self)
+                if context:
+                    actors = [row for row in tables[ledger.ACTORS_TABLE] if row["member_id"] == guardian.member_id]
+                    if len(actors) != 1 or ledger._decode(actors[0]["identity_json"]) != context["guardian_identity"]:
+                        _fail("original_role_guardian_changed", self)
+        self._released_roles[role.member_id] = (role, wire)
+        return result
 
     def _retain_backing_transport(self, service):
         from .experiment_backing_transport import ExperimentBackingService

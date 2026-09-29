@@ -286,9 +286,14 @@ class ExperimentBackingService:
             error.experiment_backing_service, error.experiment_backing_attempt = self, attempt
             raise
 
-    def _serve_connection(self, connection, deadline, attempt):
+    def _serve_connection(self, connection, deadline, attempt, *, hello=None):
         from .experiment_host_scope import ProductionExperimentScope
-        hello = child._read(connection, deadline, limit=child.MAX_HELLO_BYTES)
+        if not any(item is attempt for item in self._attempts):
+            if len(self._attempts) >= child.MAX_SERVER_ATTEMPTS:
+                _fail("attempt_limit")
+            self._attempts.append(attempt)
+        if hello is None:
+            hello = child._read(connection, deadline, limit=child.MAX_HELLO_BYTES)
         _shape(hello, "ExperimentBackingHello", {"caller"})
         caller = _identity(hello["caller"])
         if caller.logon_id != self.endpoint.logon_id:

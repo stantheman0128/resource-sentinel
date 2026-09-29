@@ -8,7 +8,8 @@ owners before publishing actors/Jobs and must publish before workload launch.
 All *_locked functions use the caller's existing daily connection and POLICY.
 They neither open another ledger nor query files, processes, IPC or native APIs.
 Child claims partition the ONE actual daily allocation; they admit no capacity.
-There is deliberately no child reuse, deletion, completion or release API.
+Rows remain immutable after exact aggregate completion. Closed history is
+validated before its exclusion is withdrawn; no child partition is reused.
 """
 from __future__ import annotations
 
@@ -109,18 +110,26 @@ for _table, _key in ((SCOPES_TABLE, "scope_id"), (MEMBERS_TABLE, "member_id"),
         f"WHERE {_collisions} OR rowid=NEW.rowid) "
         "BEGIN SELECT RAISE(ABORT,'experiment_host_history_immutable'); END")
 GUARDS[_PREFIX + "scope_limit"] = f"""CREATE TRIGGER experiment_host_scope_limit
-    BEFORE INSERT ON {SCOPES_TABLE} WHEN EXISTS(SELECT 1 FROM {SCOPES_TABLE})
+    BEFORE INSERT ON {SCOPES_TABLE} WHEN EXISTS(SELECT 1 FROM {SCOPES_TABLE} AS s
+        WHERE NOT EXISTS(SELECT 1 FROM adaptive_experiment_cleanup_receipts AS r
+            WHERE r.experiment_id=s.experiment_id AND
+                json_extract(r.receipt_json,'$.completion.schema_version')=3))
     BEGIN SELECT RAISE(ABORT,'experiment_host_scope_occupied'); END"""
 GUARDS[_PREFIX + "reservation_delete"] = f"""CREATE TRIGGER experiment_host_reservation_delete
     BEFORE DELETE ON reservations WHEN EXISTS(SELECT 1 FROM {SCOPES_TABLE}
-        WHERE reservation_id=OLD.id OR daily_execution_id=OLD.execution_id)
+        WHERE reservation_id=OLD.id OR daily_execution_id=OLD.execution_id) AND
+        sentinel_experiment_release_mutation('reservations',OLD.id,""" + \
+    experiment_demand._mutation_json_sql("OLD", experiment_demand._MUTATION_ALLOCATION_FIELDS) + """,NULL) IS NOT 1
     BEGIN SELECT RAISE(ABORT,'experiment_host_cleanup_unverified'); END"""
 GUARDS[_PREFIX + "execution_terminal"] = f"""CREATE TRIGGER experiment_host_execution_terminal
     BEFORE UPDATE ON managed_executions WHEN EXISTS(SELECT 1 FROM {SCOPES_TABLE}
         WHERE daily_execution_id=OLD.execution_id OR reservation_id=OLD.reservation_id) AND
         (NEW.state NOT IN ('RESERVED','UNCERTAIN_HOLD') OR NEW.claim_consumed IS NOT 0 OR
          NEW.launch_sealed IS NOT 0 OR NEW.launch_in_flight IS NOT 0 OR
-         NEW.claim_token_hash IS NOT OLD.claim_token_hash OR NEW.job_name IS NOT NULL OR NEW.root_pid IS NOT NULL)
+         NEW.claim_token_hash IS NOT OLD.claim_token_hash OR NEW.job_name IS NOT NULL OR NEW.root_pid IS NOT NULL) AND
+        sentinel_experiment_release_mutation('managed_executions',OLD.execution_id,""" + \
+    experiment_demand._mutation_json_sql("OLD", experiment_demand._MUTATION_MANAGED_FIELDS) + "," + \
+    experiment_demand._mutation_json_sql("NEW", experiment_demand._MUTATION_MANAGED_FIELDS) + """ ) IS NOT 1
     BEGIN SELECT RAISE(ABORT,'experiment_host_cleanup_unverified'); END"""
 # Every new row also needs the original lexical publisher. Outside that scope,
 # SQLite may reject the missing UDF while preparing the immutable guards.
@@ -514,6 +523,12 @@ def _inventory(conn, policy, guard):
     history = _history_locked(conn, budget)
     start_rows, start_bytes = budget.rows, budget.bytes
     tables = {table: _rows(conn, table, budget) for table in TABLES}
+    # Receipt verification has compared every immutable archived row with its
+    # full postimage. Only then can these rows stop excluding retired actors.
+    closed = {json.loads(raw)["completion"]["scope_id"] for raw in history.receipts_json
+              if json.loads(raw)["completion"].get("schema_version") == 3}
+    tables = {table: [row for row in rows if row["scope_id"] not in closed]
+              for table, rows in tables.items()}
     scopes = tables[SCOPES_TABLE]
     if len(scopes) > 1 or (not scopes and any(tables[name] for name in TABLES[1:])):
         _fail("scope_orphan")
@@ -609,6 +624,23 @@ def assert_release_unblocked_locked(conn, *, experiment_id, execution_id, reserv
         if (row["experiment_id"] == experiment_id or row["daily_execution_id"] == execution_id or
                 row["reservation_id"] == reservation_id):
             _fail("cleanup_unverified")
+
+
+def completion_rows_locked(conn, *, completion):
+    """Exact original completion and complete immutable preimage; no native IO."""
+    from .experiment_host_completion import ProductionScopeCompletion
+    if type(completion) is not ProductionScopeCompletion:
+        _fail("original_completion_required")
+    completion.assert_original()
+    record = completion.snapshot()
+    if not validate_schema_locked(conn):
+        _fail("completion_registry_missing")
+    budget = _Budget()
+    rows = {table: [row for row in _rows(conn, table, budget)
+                   if row["scope_id"] == record["scope_id"]] for table in TABLES}
+    if rows != record["host_rows"]:
+        _fail("completion_registry_changed")
+    return rows
 
 
 def _new_row(values, revision):

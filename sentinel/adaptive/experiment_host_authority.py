@@ -61,6 +61,17 @@ class _Operation:
     thread: int
 
 
+@dataclass(frozen=True)
+class _ActorOperation:
+    member_id: str
+    generation_payload: str
+    deadline: object
+    bound: float
+    expires_at: float
+    guard: object
+    thread: int
+
+
 class ExperimentBackedHostAuthority:
     """Exact in-process factories only; never a wire/config bypass switch."""
     def __init__(self, *, _key=None):
@@ -122,6 +133,7 @@ class ExperimentBackedHostAuthority:
         self._guardian_native = None if guardian is None else (guardian._backend, guardian._handle, guardian.identity)
         self._ordinary = HostAuthority(store, guardian=guardian)
         self._guard = self._active = self._body_attempt = None
+        self._actor_active = self._actor_registration = self._actor_registration_pins = None
         self._prepare_unknown = False
         self._reads, self._external_reads, self._errors = [], [], []
         # Register with the original authenticated child before first file or
@@ -195,7 +207,7 @@ class ExperimentBackedHostAuthority:
         error.experiment_host_authority = self
         return error
 
-    def _cleanup_observed(self):
+    def _cleanup_observed(self, *, registration=None):
         if self._prepare_unknown or self._reads or self._external_reads or self._body_attempt is not None:
             _fail("cleanup_unverified")
         if self._guard is not None and not (
@@ -203,6 +215,14 @@ class ExperimentBackedHostAuthority:
             _fail("native_cleanup_unverified")
         if self.adapter is not None:
             self.adapter._assert_daily_cleanup_observed()
+        if self._actor_registration is not None:
+            original, spec, wire = self._actor_registration_pins
+            if (self._actor_registration is not original or original.store is not self.store or
+                    original.guardian is not self.guardian or spec.to_json() != wire):
+                _fail("original_registration_changed")
+            original._original()
+            if original.pending and registration is not original:
+                _fail("registration_cleanup_unverified")
 
     @contextmanager
     def _sql(self, store):
@@ -272,8 +292,8 @@ class ExperimentBackedHostAuthority:
         else:
             self._external_reads.remove(attempt)
 
-    def _settle_guard(self):
-        self._cleanup_observed()
+    def _settle_guard(self, *, registration=None):
+        self._cleanup_observed(registration=registration)
         if self._guard is None:
             return
         guard = self._guard
@@ -287,6 +307,141 @@ class ExperimentBackedHostAuthority:
                 _fail("daily_nonce_changed")
             self._daily_policy._clear(guard)
         self._guard = None
+
+    def _actor_view(self):
+        """Existing published actor and its real daily floor; no execution ID."""
+        manifest = self.manifest
+        with self._sql(self.store) as conn:
+            runtime = self._isolated_policy._runtime(conn)
+            if (runtime["policy_instance_id"] != manifest.isolated_policy_instance_id or
+                    runtime["policy_logon_id"] != manifest.child_identity.logon_id or
+                    runtime["policy_binding_initialized"] != 1 or runtime["mode"] not in {"off", "shadow"} or
+                    runtime["admission_barrier"] != "NONE"):
+                _fail("isolated_actor_registration_blocked")
+        with self._sql(self.daily_store) as conn:
+            _, history, tables = ledger._inventory(conn, self._daily_policy, self._guard)
+            scopes = [row for row in tables.get(ledger.SCOPES_TABLE, ()) if row["scope_id"] == manifest.scope_id]
+            if len(scopes) != 1 or history is None:
+                _fail("actor_scope_missing")
+            scope = scopes[0]
+            if (any(scope[key] != getattr(manifest, key) for key in (
+                    "source_generation", "source_digest", "config_digest", "daily_policy_instance_id",
+                    "isolated_ledger_path", "isolated_policy_instance_id")) or
+                    ledger._decode(scope["isolated_ledger_identity_json"]) !=
+                        [manifest.isolated_ledger_identity.st_dev, manifest.isolated_ledger_identity.st_ino]):
+                _fail("actor_scope_changed")
+            ledger._daily_binding(conn, scope, history, self._guard, restrictive=True)
+            members = [row for row in tables[ledger.MEMBERS_TABLE] if row["member_id"] == manifest.actor_member_id]
+            actors = [row for row in tables[ledger.ACTORS_TABLE] if row["member_id"] == manifest.actor_member_id]
+            if (len(members) != 1 or members[0]["role"] != "guardian" or len(actors) != 1 or
+                    ProcessIdentity.from_dict(ledger._decode(actors[0]["identity_json"])) != manifest.child_identity):
+                _fail("actor_publication_required")
+            rows = conn.execute("SELECT expires_at FROM reservations WHERE id=? AND execution_id=? LIMIT 2",
+                (scope["reservation_id"], scope["daily_execution_id"])).fetchall()
+            if len(rows) != 1:
+                _fail("actor_daily_allocation_missing")
+            generation = daily_generation.read_generation(conn)
+            return generation, rows[0][0]
+
+    @contextmanager
+    def actor_registration_scope(self, registration, role_spec):
+        """Fence only the original guardian's isolated registration operation.
+
+        The actor was already published by its parent. This reads that exact
+        allocation and holds daily POLICY before GuardianRegistration acquires
+        isolated POLICY. It grants neither a workload claim nor native control.
+        """
+        from .guardian_registration import GuardianRegistration
+        from .experiment_host_roles import GuardianRoleSpec
+        self._original()
+        if (self.manifest.role != "guardian" or type(registration) is not GuardianRegistration or
+                type(role_spec) is not GuardianRoleSpec or registration.store is not self.store or
+                registration.guardian is not self.guardian or role_spec.member_id != self.manifest.actor_member_id or
+                registration.epoch != role_spec.guardian_epoch):
+            _fail("original_registration_required")
+        if self._actor_registration is None:
+            self._actor_registration = registration
+            self._actor_registration_pins = (registration, role_spec, role_spec.to_json())
+        elif self._actor_registration is not registration or self._actor_registration_pins[1] is not role_spec:
+            _fail("original_registration_changed")
+        self._cleanup_observed(registration=registration)
+        if self._active is not None or self._actor_active is not None or len(self._errors) >= _MAX_FAILURES:
+            _fail("operation_unavailable")
+        if (self._isolated_policy.current_guard() is not None or self._daily_policy.current_guard() is not None or
+                current_thread_holds_mutex()):
+            _fail("outer_daily_scope_required")
+        release = getattr(type(self.child_binding), "require_role_release", None)
+        if not callable(release) or release(self.child_binding, role_spec) is not None:
+            _fail("actor_role_release_required")
+        try:
+            with daily_generation.readiness_scopes((self.daily_path, self.isolated_path), absent_paths=(self.isolated_path,)):
+                with bounded_waits() as budget:
+                    self._settle_guard(registration=registration)
+                    self._native(restrictive=True)
+                    self._prepare_unknown = True
+                    try:
+                        self._guard = self._daily_policy.prepare(self.manifest.child_identity.logon_id)
+                    except PolicyBusy as error:
+                        if not getattr(error, "__notes__", ()):
+                            self._prepare_unknown = False
+                        raise
+                    self._prepare_unknown = False
+                    guard = self._guard
+                    with self._daily_policy.hold(guard):
+                        try:
+                            if (guard.binding.instance_id != self.manifest.daily_policy_instance_id or
+                                    guard.binding.logon_id != self.manifest.child_identity.logon_id):
+                                _fail("daily_policy_changed")
+                            generation, expiry = self._actor_view()
+                            self._native(restrictive=True)
+                            deadline = daily_generation.revalidate_scoped_readiness(self.daily_path,
+                                expected_generation=generation)
+                            before = time.monotonic()
+                            bound = min(budget.deadline, before + max(0, expiry - time.time()))
+                            if deadline is not None:
+                                bound = min(bound, before + deadline.require() / 1000)
+                            active = _ActorOperation(self.manifest.actor_member_id, ledger._canonical(generation),
+                                deadline, bound, expiry, guard, self._thread)
+                            self._actor_active = active
+                            self.assert_actor_registration_ready(registration)
+                            attempt = {"returned": False, "error": None}
+                            self._body_attempt = attempt
+                            try:
+                                yield
+                            except BaseException as error:
+                                attempt["error"] = error
+                                # tick retains its original SQL/native failures.
+                                # Transfer only to that exact existing owner;
+                                # an unrelated body failure remains quarantined.
+                                if registration._error is error:
+                                    self._body_attempt = None
+                                raise
+                            else:
+                                attempt["returned"] = True
+                                self._body_attempt = None
+                        except BaseException:
+                            if not self._reads and not self._external_reads and self._body_attempt is None:
+                                guard.clean_rejection = True
+                            raise
+                        finally:
+                            self._actor_active = None
+                    self._guard = None
+        except BaseException as error:
+            raise self._retain(error)
+
+    def assert_actor_registration_ready(self, registration):
+        """Original actor scope immediately before its isolated operation."""
+        self._original()
+        active = self._actor_active
+        if (registration is not self._actor_registration or type(active) is not _ActorOperation or
+                active.member_id != self.manifest.actor_member_id or active.guard is not self._guard or
+                active.thread != threading.get_ident() or self._reads or self._external_reads):
+            _fail("original_actor_operation_required")
+        self._daily_policy.assert_held(active.guard)
+        if time.monotonic() >= active.bound or time.time() >= active.expires_at:
+            _fail("operation_expired")
+        if active.deadline is not None:
+            active.deadline.require()
 
     def _local_view(self, execution_id, *, restrictive=True):
         with self._sql(self.store) as conn:
@@ -395,7 +550,7 @@ class ExperimentBackedHostAuthority:
         ledger._uuid(execution_id)
         self._original()
         self._cleanup_observed()
-        if self._active is not None or len(self._errors) >= _MAX_FAILURES:
+        if self._active is not None or self._actor_active is not None or len(self._errors) >= _MAX_FAILURES:
             _fail("operation_unavailable")
         # Refuse an inverted acquisition before any readiness RPC is possible.
         if (self._isolated_policy.current_guard() is not None or self._daily_policy.current_guard() is not None or

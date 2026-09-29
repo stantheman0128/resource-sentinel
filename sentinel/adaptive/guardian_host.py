@@ -31,6 +31,7 @@ host_foreign_parent_job, and that is the expected result there.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -90,6 +91,62 @@ def _reason(error):
 class GuardianHost:
     """One guardian process. Construct, start, run iterations, then close."""
 
+    @classmethod
+    def for_experiment(cls, spec, *, child_binding, isolated_store, daily_store):
+        """Consume one released guardian role and the original child custody.
+
+        The bootstrap owns the binding and its current-process handle. This
+        host borrows both until it has drained and closed its own resources;
+        host closure alone is not aggregate retirement or daily release.
+        """
+        from .experiment_host_roles import GuardianRoleSpec
+        from .experiment_host_transport import ExperimentChildBinding
+        from .experiment_host_authority import ExperimentBackedHostAuthority
+        from .identity import VerifiedProcess
+        from .store import LifecycleStore
+        if (cls is not GuardianHost or type(spec) is not GuardianRoleSpec or
+                type(child_binding) is not ExperimentChildBinding or
+                not isinstance(isolated_store, LifecycleStore) or not isinstance(daily_store, LifecycleStore)):
+            raise GuardianHostRefused("experiment_guardian_original_inputs_required")
+        manifest = child_binding.manifest
+        guardian = child_binding._process
+        if (manifest.role != "guardian" or manifest.actor_member_id != spec.member_id or
+                type(guardian) is not VerifiedProcess or guardian.identity != manifest.child_identity):
+            raise GuardianHostRefused("experiment_guardian_original_child_required")
+        wire = spec.to_json()
+        original = getattr(child_binding, "_experiment_guardian_host", None)
+        if original is not None:
+            if (type(original) is not cls or any(left is not right for left, right in zip(
+                    original._experiment_original[:5], (spec, child_binding, isolated_store, daily_store, guardian)))):
+                raise GuardianHostRefused("experiment_guardian_original_host_changed")
+            original._assert_experiment_host()
+            return original
+        owner = cls.__new__(cls)
+        # Retain before initialization/authority construction or native checks.
+        child_binding._experiment_guardian_host = owner
+        owner._experiment_original = (spec, child_binding, isolated_store, daily_store, guardian,
+                                      wire)
+        owner._experiment_construction_error = None
+        try:
+            cls.__init__(owner, data_dir=spec.data_dir, journal_dir=spec.journal_dir,
+                guardian_epoch=spec.guardian_epoch, profile_path=spec.profile_path,
+                rpc_timeout_ms=spec.rpc_timeout_ms, launch_instance_id=spec.launch_instance_id,
+                query_instance_id=spec.query_instance_id, control_instance_id=spec.control_instance_id,
+                instance_id=spec.instance_id, operator_instance_id=spec.operator_instance_id,
+                policy_instance_id=spec.policy_instance_id)
+            owner._experiment_binding = child_binding
+            owner.store, owner.guardian = isolated_store, guardian
+            owner.authority = ExperimentBackedHostAuthority.for_guardian(child_binding,
+                isolated_store=isolated_store, daily_store=daily_store, guardian=guardian)
+            owner._experiment_authority = owner.authority
+            owner._validate_experiment_start()
+        except BaseException as error:
+            owner._experiment_construction_error = error
+            error.experiment_guardian_host = owner
+            error.experiment_child_binding = child_binding
+            raise
+        return owner
+
     def __init__(self, *, data_dir, journal_dir, guardian_epoch, profile_path=None,
                  rpc_timeout_ms=DEFAULT_RPC_TIMEOUT_MS, launch_instance_id=None,
                  query_instance_id=None, control_instance_id=None, sleep=time.sleep,
@@ -135,6 +192,63 @@ class GuardianHost:
         self._registration = None
         self._startup_profile = None
         self._started = False
+        self._experiment_binding = None
+        self._experiment_closed = False
+        self._experiment_closed_custody = None
+
+    def _assert_experiment_host(self):
+        """Original object checks only, so recovery never needs fresh admission."""
+        from .experiment_host_authority import ExperimentBackedHostAuthority
+        if self._experiment_construction_error is not None:
+            raise GuardianHostRefused("experiment_guardian_construction_unsettled")
+        spec, binding, store, daily, guardian, wire = self._experiment_original
+        if (self._experiment_binding is not binding or binding._experiment_guardian_host is not self or
+                self._experiment_construction_error is not None or spec.to_json() != wire or
+                self.store is not store or self.guardian is not guardian or binding._process is not guardian or
+                self.authority is not self._experiment_authority or
+                type(self.authority) is not ExperimentBackedHostAuthority or
+                self.authority.store is not store or self.authority.daily_store is not daily or
+                self.authority.guardian is not guardian or self.authority.child_binding is not binding or
+                (self.data_dir, self.journal_dir, self.profile_path) !=
+                    (Path(spec.data_dir), Path(spec.journal_dir), Path(spec.profile_path)) or
+                (self.guardian_epoch, self.rpc_timeout_ms, self.launch_instance_id, self.query_instance_id,
+                 self.control_instance_id, self.instance_id, self.operator_instance_id, self.policy_instance_id) !=
+                    (spec.guardian_epoch, spec.rpc_timeout_ms, spec.launch_instance_id, spec.query_instance_id,
+                     spec.control_instance_id, spec.instance_id, spec.operator_instance_id, spec.policy_instance_id) or
+                self.parent_identity is not None or self.parent_instance_id is not None or
+                self.evidence_directory is not None or self.evidence_sha256 is not None or
+                self._telemetry_factory is not None or self.control_purpose != "isolated_canary"):
+            raise GuardianHostRefused("experiment_guardian_original_host_changed")
+        if self.owner is not None and (self.owner.authority is not self.authority or
+                self.owner.store is not store or self.owner.guardian is not guardian):
+            raise GuardianHostRefused("experiment_guardian_original_owner_changed")
+        self.authority._original()
+
+    def _experiment_profile_bytes(self):
+        raw = self.profile_path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != self._experiment_original[0].profile_sha256:
+            raise GuardianHostRefused("experiment_guardian_profile_changed")
+        return raw
+
+    def _validate_experiment_start(self):
+        self._assert_experiment_host()
+        if self._experiment_closed:
+            raise GuardianHostRefused("experiment_guardian_host_closed")
+        spec, binding, store, daily, guardian, wire = self._experiment_original
+        # The fixed bootstrap supplies the authenticated parent Release witness.
+        # A role/spec dict or successful child handshake alone is insufficient.
+        release = getattr(type(binding), "require_role_release", None)
+        if not callable(release) or release(binding, spec) is not None:
+            raise GuardianHostRefused("experiment_guardian_role_release_required")
+        manifest = binding.manifest
+        if (self.data_dir.resolve() != Path(store.db_path).resolve(strict=True).parent or
+                self.data_dir.resolve() == Path(daily.db_path).resolve(strict=True).parent or
+                not self.journal_dir.resolve().is_relative_to(self.data_dir.resolve()) or
+                spec.policy_instance_id != manifest.isolated_policy_instance_id):
+            raise GuardianHostRefused("experiment_guardian_paths_or_policy_changed")
+        self.authority._cleanup_observed()
+        self.authority._native(restrictive=True)
+        self._experiment_profile_bytes()
 
     def emit(self, record, stream=None):
         if stream is not None:
@@ -157,6 +271,15 @@ class GuardianHost:
     # --- startup ----------------------------------------------------------
 
     def start(self):
+        try:
+            return self._start()
+        except BaseException as error:
+            if self._experiment_binding is not None:
+                error.experiment_guardian_host = self
+                error.experiment_child_binding = self._experiment_binding
+            raise
+
+    def _start(self):
         """Refuse before touching the ledger when the host cannot support this."""
         from .decision import parse_policy_profile
         from .guardian import GuardianLaunchOwner
@@ -168,6 +291,12 @@ class GuardianHost:
         from .recovery_journal import RecoveryJournal
         from .store import LifecycleStore
 
+        if self._experiment_binding is not None:
+            self._assert_experiment_host()
+            # An existing uncertain registration must retain its original retry
+            # and cleanup path even if the parent/readiness has since failed.
+            if not self.registration_pending:
+                self._validate_experiment_start()
         if self.capability is None:
             self.capability = self._capability()
         if self._startup_profile is None:
@@ -199,6 +328,8 @@ class GuardianHost:
         except Exception as error:
             raise GuardianHostRefused("guardian_host_owner_unavailable", _reason(error)) from None
         self._register()
+        if self._experiment_binding is not None:
+            self._validate_experiment_start()
         self._endpoints()
         try:
             capability_authority = NativeEvidenceAuthority(profile=profile,
@@ -236,7 +367,9 @@ class GuardianHost:
 
     def _profile(self, parse):
         try:
-            return parse(self.profile_path.read_bytes())
+            raw = (self.profile_path.read_bytes() if self._experiment_binding is None else
+                   self._experiment_profile_bytes())
+            return parse(raw)
         except Exception as error:
             raise GuardianHostRefused("guardian_host_profile_unavailable", _reason(error)) from None
 
@@ -252,7 +385,20 @@ class GuardianHost:
             if self._registration is None:
                 self._registration = GuardianRegistration(self.store, self.journal,
                     guardian=self.guardian, guardian_epoch=self.guardian_epoch)
-            result = self._registration.tick()
+            if self._experiment_binding is None:
+                result = self._registration.tick()
+            elif (self._registration is self.authority._actor_registration and
+                    (self._registration.result.complete or self._registration.result.refused or
+                     self._registration.pending and self._registration._publication_pins is not None)):
+                # Replay/cleanup of the original captured registry postimage is
+                # conservative bookkeeping, not fresh host admission. A busy
+                # first attempt without that postimage must reacquire the actor
+                # scope; pending by itself never bypasses the daily gate.
+                result = self._registration.tick()
+            else:
+                with self.authority.actor_registration_scope(self._registration, self._experiment_original[0]):
+                    self.authority.assert_actor_registration_ready(self._registration)
+                    result = self._registration.tick()
         except Exception as error:
             raise GuardianHostRefused("guardian_host_registry_unavailable", _reason(error)) from None
         if result.refused:
@@ -417,6 +563,8 @@ class GuardianHost:
         """
         if not self._started:
             raise GuardianHostRefused("guardian_host_not_started")
+        if self._experiment_binding is not None:
+            self._assert_experiment_host()
         record = {"event": "guardian_host_iteration", "launch_rpc": None, "query_rpc": None,
                   "control_rpc": None, "reconciled": [], "reconcile_errors": [], "restored": [],
                   "barrier_clears": [], "barrier_clear_errors": []}
@@ -578,6 +726,8 @@ class GuardianHost:
         caller keeps the process alive. The command line entry point drains
         first, so reaching this refusal means the drain itself was skipped.
         """
+        if self._experiment_binding is not None:
+            self._assert_experiment_host()
         if self.registration_pending:
             # An empty execution inventory says nothing about the original
             # startup transaction or its POLICY/native cleanup obligation.
@@ -630,6 +780,10 @@ class GuardianHost:
         if status.resources or status.pending or status.quarantined:
             raise GuardianHostRefused("guardian_host_pipe_custody_unsettled")
         for name, process in (("parent", self.parent), ("self", self.guardian)):
+            if name == "self" and self._experiment_binding is not None:
+                # The original bootstrap must still observe/report this actor
+                # and close its child binding. Never consume its borrowed handle.
+                continue
             if process is None or name in self._closed_owners:
                 continue
             try:
@@ -641,8 +795,68 @@ class GuardianHost:
                     raise
                 raise GuardianHostRefused("guardian_host_identity_cleanup_unverified") from None
         self._started = False
-        return self._finish_telemetry(
+        result = self._finish_telemetry(
             {"event": "guardian_host_closed", "guardian_epoch": self.guardian_epoch})
+        if self._experiment_binding is not None:
+            self._experiment_closed = True
+        return result
+
+    def closed_experiment_custody(self):
+        """Return exact retired owners after positive host-resource closure.
+
+        This is historical custody only. The bootstrap still owns this actor's
+        process handle, and the parent must prove actor exit and its aggregate
+        separately. No closed native handle is queried or recreated here.
+        """
+        from .guardian import GuardianLaunchOwner
+        from .prelaunch_receipt import PrelaunchReceiptOperation
+        from .terminal_custody import TerminalCustody
+        from .terminal_receipt import TerminalReceiptOperation
+        self._assert_experiment_host()
+        if (self._experiment_binding is None or not self._experiment_closed or self._started or
+                not self._draining or type(self.owner) is not GuardianLaunchOwner or
+                self.registration_pending or self._cleanup_unknown or not self._operations_settled() or
+                self._descriptor_attempt is not None or self.descriptor is not None):
+            raise GuardianHostRefused("experiment_guardian_host_not_closed")
+        for name, resource in (("launch", self.launch_listener), ("query", self.query_listener),
+                ("control", self.control_listener), ("operator", self.operator_listener),
+                ("discovery", self.discovery)):
+            if resource is not None and name not in self._closed_owners:
+                raise GuardianHostRefused("experiment_guardian_host_not_closed")
+        values = GuardianLaunchOwner.closed_experiment_custody(self.owner)
+        for kind, entry, custody in values:
+            if kind == "prelaunch":
+                if (type(custody) is not PrelaunchReceiptOperation or custody.owner is not self.owner or
+                        custody._entry is not entry or entry.retirement_receipt_operation is not custody or
+                        entry.root is not None or not entry.retirement_sealed or
+                        not entry.retirement_cleanup_started or entry.retirement_mutex_close_unknown or
+                        entry.closed_handles != {key for key, value in custody.owners.items() if value is not None}):
+                    raise GuardianHostRefused("experiment_guardian_prelaunch_custody_changed")
+                receipt = custody
+            elif kind == "terminal":
+                if (type(custody) is not TerminalCustody or entry.terminal_cleanup is not custody or
+                        entry.closed is not True or custody.proof_published is not True or
+                        custody.native_complete is not True or custody.quarantined or
+                        custody.closed_owners != ("root", "wrapper", "job", "mutex") or
+                        type(custody.receipt_operation) is not TerminalReceiptOperation):
+                    raise GuardianHostRefused("experiment_guardian_terminal_custody_changed")
+                receipt = custody.receipt_operation
+            else:
+                raise GuardianHostRefused("experiment_guardian_custody_kind_invalid")
+            if (receipt.lifecycle is not self.owner.lifecycle or receipt.store is not self.store or
+                    receipt.custody is not custody or receipt._entry is not entry or
+                    receipt._operation._complete is not True or receipt._operation.pending or
+                    receipt._operation._quarantine or receipt._candidate is None or
+                    custody.manifest.guardian_identity != self.guardian.identity or
+                    custody.manifest.guardian_epoch != self.guardian_epoch or
+                    custody.execution_id != entry.execution_id or entry.journal_cleanup_error is not None or
+                    any(getattr(entry, name) is not original for name, original in custody.owners.items())):
+                raise GuardianHostRefused("experiment_guardian_closed_receipt_changed")
+        if self._experiment_closed_custody is None:
+            self._experiment_closed_custody = values
+        if values is not self._experiment_closed_custody:
+            raise GuardianHostRefused("experiment_guardian_closed_custody_changed")
+        return self._experiment_closed_custody
 
 
 def build_parser():

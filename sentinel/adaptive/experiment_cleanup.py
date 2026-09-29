@@ -138,7 +138,7 @@ class _OriginalCleanupAccess:
         # A cold import executes the source-provenance audit, including real
         # path resolution. Load the locked helpers here before attesting the
         # full executed module set, never on their first SQL callback.
-        from . import daily_retirement_fence, experiment_history, experiment_exclusion, experiment_host_ledger
+        from . import daily_retirement_fence, experiment_history, experiment_exclusion, experiment_host_ledger, experiment_host_completion
         original = self.demand._original_generation_binding()
         generation._assert_daily_locations(original["source_root"], self.ledger_path)
         if (generation._ledger_identity(self.ledger_path) != self.ledger_identity or
@@ -327,11 +327,12 @@ class ExperimentReleaseOperation(_OriginalCleanupAccess):
     def _initialize(self):
         from .experiment_demand import BeforeNativeCompletion
         from .experiment_scope import NativeScopeCompletion
+        from .experiment_host_completion import ProductionScopeCompletion
         self._original(initializing=True)
         if type(self.completion) is BeforeNativeCompletion:
             if self.completion.owner is not self.demand:
                 _fail("completion_owner_changed", self)
-        elif type(self.completion) is NativeScopeCompletion:
+        elif type(self.completion) in (NativeScopeCompletion, ProductionScopeCompletion):
             if self.completion.owner is not self.demand._native_preparation:
                 _fail("completion_owner_changed", self)
         else:
@@ -521,6 +522,9 @@ class ExperimentReleaseOperation(_OriginalCleanupAccess):
 
         def mutation(table, key, old_json, new_json):
             record = self._publication(conn, frame)
+            if record["completion"].get("schema_version") == 3:
+                from .experiment_host_ledger import completion_rows_locked
+                completion_rows_locked(conn, completion=self.completion)
             pre = json.loads(self._raw_preimage)
             if table == "managed_executions" and key == self.snapshot.execution_id:
                 old = pre["managed"]
@@ -584,7 +588,8 @@ class ExperimentReleaseOperation(_OriginalCleanupAccess):
     def _prepare_publication(self, conn):
         from . import experiment_history as history
         from . import experiment_demand, experiment_exclusion
-        from .experiment_host_ledger import HostLedgerError, assert_release_unblocked_locked
+        from .experiment_host_ledger import HostLedgerError, assert_release_unblocked_locked, completion_rows_locked
+        from .experiment_host_completion import ProductionScopeCompletion
         observed = history.verify_experiment_history_locked(conn)
         if self.snapshot.execution_id in observed.completed_execution_ids:
             self._verify_committed(conn)
@@ -603,10 +608,14 @@ class ExperimentReleaseOperation(_OriginalCleanupAccess):
         # S1/before-native completion cannot retire a separately registered
         # production-host cohort. Its distinct original completion and full
         # aggregate publication must exist before that release path can open.
+        aggregate_rows = None
         try:
-            assert_release_unblocked_locked(conn,
-                experiment_id=self.demand.declaration.experiment_id,
-                execution_id=self.snapshot.execution_id, reservation_id=reservation_id)
+            if type(self.completion) is ProductionScopeCompletion:
+                aggregate_rows = completion_rows_locked(conn, completion=self.completion)
+            else:
+                assert_release_unblocked_locked(conn,
+                    experiment_id=self.demand.declaration.experiment_id,
+                    execution_id=self.snapshot.execution_id, reservation_id=reservation_id)
         except HostLedgerError as error:
             raise ExperimentReleaseError("host_scope_cleanup_unverified", self) from error
         managed = history._one(conn, "managed_executions", history.MANAGED_FIELDS, budget,
@@ -632,6 +641,8 @@ class ExperimentReleaseOperation(_OriginalCleanupAccess):
             if experiment_exclusion.validate_schema_locked(conn) else [])
         pre = dict(managed=history.managed_image(managed), allocation=allocation, queue=queued[0] if queued else None,
             exclusion=excluded[0] if excluded else None, registry_revision=self.policy.revalidate(conn, self._guard)["registry_revision"])
+        if aggregate_rows is not None:
+            pre["host_rows"] = aggregate_rows
         raw = _canonical(pre | {"managed": self._wire(managed)})
         if self._candidate is not None:
             record = self._record()
@@ -646,6 +657,8 @@ class ExperimentReleaseOperation(_OriginalCleanupAccess):
         post = dict(managed=history.cancellation_image(pre["managed"], now), archive=history.archive_image(allocation, now),
             exclusion=None if pre["exclusion"] is None else pre["exclusion"] | dict(phase="CLOSED", cleanup_digest=digest),
             registry_revision=pre["registry_revision"] + 1)
+        if aggregate_rows is not None:
+            post["host_rows"] = aggregate_rows
         record = dict(schema_version=1, receipt_id=self.receipt_id, operation_id=self.operation_id,
             experiment_id=metadata["experiment_id"], execution_id=metadata["execution_id"], reservation_id=reservation_id,
             request_key=metadata["request_key"], suite=metadata["suite"], disposition=completion["disposition"],

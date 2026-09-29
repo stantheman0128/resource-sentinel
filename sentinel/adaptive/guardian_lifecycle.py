@@ -606,6 +606,12 @@ class GuardianLifecycle:
             if not receipt.complete:
                 custody.quarantined = custody.quarantined or receipt.quarantined
                 return custody.result(reason=receipt.reason or "guardian_terminal_receipt_pending")
+            experiment_owner = getattr(self, "_experiment_launch_owner", None)
+            if experiment_owner is not None:
+                from .guardian import GuardianLaunchOwner
+                if type(experiment_owner) is not GuardianLaunchOwner or experiment_owner.lifecycle is not self:
+                    raise LifecycleError("guardian_experiment_closed_owner_changed")
+                experiment_owner._retain_experiment_closed("terminal", entry, custody)
             del self._entries[execution_id]
             entry.closed = True
             return custody.result(complete=True, reason="guardian_terminal_retired")

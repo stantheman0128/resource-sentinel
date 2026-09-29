@@ -14,6 +14,7 @@ and cancellation semantics remain those of pipe_windows, including quarantine.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 import hashlib
 import hmac
@@ -352,14 +353,26 @@ class LaunchService:
                 raise IpcError("launch_auth_failed")
             _remaining(deadline)
             _live(connection, peer, record.wrapper_identity)
-            if type(request) is PrepareExecutionRequest:
-                result = self.owner.prepare_execution(request, peer, auth_record=record, deadline=deadline)
-            elif type(request) is ClaimLaunchRequest:
-                result = self.owner.claim_launch(request, peer, auth_record=record, deadline=deadline)
-            elif type(request) in {CancelBeforeStartRequest, StartFailedRequest}:
-                result = self.owner.retire_before_start(request, peer, auth_record=record, deadline=deadline)
-            else:
-                result = self.owner.bind_root(request, peer, auth_record=record, deadline=deadline)
+            from .experiment_host_authority import ExperimentBackedHostAuthority
+            scope = nullcontext()
+            if (type(getattr(self.owner, "authority", None)) is ExperimentBackedHostAuthority and
+                    type(request) in {PrepareExecutionRequest, ClaimLaunchRequest, BindRootRequest}):
+                # The original owner preserves its monotonic drain decision,
+                # publishes a fresh Job intent before taking POLICY, and then
+                # acquires daily POLICY before its ordinary isolated scope.
+                # Cancellation/failed-start custody is independent of fresh
+                # daily admission. No transport read/write happens in scope.
+                scope = self.owner.experiment_launch_scope(request, peer,
+                    auth_record=record, deadline=deadline)
+            with scope:
+                if type(request) is PrepareExecutionRequest:
+                    result = self.owner.prepare_execution(request, peer, auth_record=record, deadline=deadline)
+                elif type(request) is ClaimLaunchRequest:
+                    result = self.owner.claim_launch(request, peer, auth_record=record, deadline=deadline)
+                elif type(request) in {CancelBeforeStartRequest, StartFailedRequest}:
+                    result = self.owner.retire_before_start(request, peer, auth_record=record, deadline=deadline)
+                else:
+                    result = self.owner.bind_root(request, peer, auth_record=record, deadline=deadline)
             _remaining(deadline)
             _live(connection, peer, record.wrapper_identity)
             _check_result(request, result)

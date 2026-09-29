@@ -23,7 +23,7 @@ from .policy import PolicyBinding, PolicyError
 from .recovery_journal import RecoveryJournal
 from .store import LifecycleError, _FENCE_FIELDS, _RETIREMENT_FIELDS
 from .supervisor_reconcile import RetainedPolicyOperation
-from .windows import NativePolicyMutex, NativePolicyMutexError, PolicyMutexLease
+from .windows import NativeSupervisorInstanceMutex, NativePolicyMutexError, PolicyMutexLease
 
 
 _INSTANCE_NAMESPACE = UUID("d84073a2-b0be-5bf9-9d7a-d1c05c1f1f45")
@@ -70,7 +70,7 @@ class SupervisorStartup:
     def __init__(self, store, journal, *, current=None, mutex_factory=None):
         self.store, self.journal = store, journal
         self._current_source = current
-        self._mutex_factory = NativePolicyMutex if mutex_factory is None else mutex_factory
+        self._mutex_factory = mutex_factory
         self._current = self._mutex = self._scope = self._lease = None
         self.binding = self.instance_binding = None
         self._thread = self._native_thread = self._pid = None
@@ -196,7 +196,12 @@ class SupervisorStartup:
         self._acquire_stage = "mutex"
         try:
             try:
-                self._mutex = self._mutex_factory(self.instance_binding.logon_id, self.instance_binding.instance_id)
+                if self._mutex_factory is None:
+                    self._mutex = NativeSupervisorInstanceMutex(self.binding)
+                else:
+                    # Existing explicit synthetic factories keep their original
+                    # seam; normal hosts always use the typed lifetime owner.
+                    self._mutex = self._mutex_factory(self.instance_binding.logon_id, self.instance_binding.instance_id)
             except BaseException as error:
                 self._construction_error = error
                 raise

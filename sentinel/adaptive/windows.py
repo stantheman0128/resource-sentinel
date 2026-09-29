@@ -37,6 +37,10 @@ _PREFIX = "Local\\ResourceSentinel.Policy."
 _LOGON_SID = re.compile(r"S-1-5-5-([0-9]{1,10})-([0-9]{1,10})\Z")
 _SID_TEXT = re.compile(r"S-1-[0-9]+(?:-[0-9]+){1,15}\Z")
 _THREAD_NAMES = set()
+# A supervisor's lifetime singleton is not a POLICY/Job critical section.
+# Keep its real ownership separate; neither a name whitelist nor a caller flag
+# may hide an ordinary POLICY mutex from the no-RPC-under-lock checks.
+_SUPERVISOR_THREAD_NAMES = set()
 _THREAD_NAMES_LOCK = threading.Lock()
 
 
@@ -507,6 +511,7 @@ class NativePolicyMutex:
             raise NativePolicyMutexError("policy_mutex_timeout_invalid")
         owner = threading.current_thread()
         key = (owner, self._name)
+        names = _ownership_names(self)
         with self._state_lock:
             self._check_open()
             if self._owner is owner:
@@ -514,9 +519,9 @@ class NativePolicyMutex:
             if self._waiting or self._owner is not None:
                 raise NativePolicyMutexError("policy_mutex_busy")
             with _THREAD_NAMES_LOCK:
-                if key in _THREAD_NAMES:
+                if key in _THREAD_NAMES or key in _SUPERVISOR_THREAD_NAMES:
                     raise NativePolicyMutexError("policy_mutex_recursive_entry")
-                _THREAD_NAMES.add(key)
+                names.add(key)
             self._waiting = True
             handle = self._handle
         try:
@@ -529,7 +534,7 @@ class NativePolicyMutex:
                 with self._state_lock:
                     self._waiting = False
                     with _THREAD_NAMES_LOCK:
-                        _THREAD_NAMES.discard(key)
+                        names.discard(key)
             else:
                 # An interruption may hide the return from a successful native
                 # wait. Keep this handle quarantined: do not claim unowned,
@@ -545,12 +550,13 @@ class NativePolicyMutex:
     def _release(self):
         with self._state_lock:
             self._check_open()
+            names = _ownership_names(self)
             if (self._waiting or self._owner is not threading.current_thread() or
                     self._owner_native_id != threading.get_native_id()):
                 raise NativePolicyMutexError("policy_mutex_not_owner_thread")
             self._api.release(self._handle)
             with _THREAD_NAMES_LOCK:
-                _THREAD_NAMES.discard((self._owner, self._name))
+                names.discard((self._owner, self._name))
             self._owner = None
             self._owner_native_id = None
 
@@ -597,3 +603,45 @@ class NativePolicyMutex:
             except BaseException as cleanup:
                 _cleanup_note(primary, "policy_mutex_handle_close_failed", cleanup)
         return False
+
+
+class NativeSupervisorInstanceMutex(NativePolicyMutex):
+    """Exact lifetime singleton derived from the original POLICY binding.
+
+    The kernel name, ACL, wait, abandonment and cleanup behavior are unchanged.
+    This different owner type only prevents the supervisor's retained lifetime
+    lease from being mistaken for a POLICY/Job transaction spanning every RPC.
+    It cannot be constructed with an arbitrary mutex name or derived UUID.
+    """
+    def __init__(self, binding):
+        from .policy import PolicyBinding
+        from .supervisor_startup import supervisor_instance_binding
+        if type(self) is not NativeSupervisorInstanceMutex or type(binding) is not PolicyBinding:
+            raise NativePolicyMutexError("supervisor_instance_binding_invalid")
+        derived = supervisor_instance_binding(binding)
+        self._supervisor_policy_binding = binding
+        self._supervisor_instance_binding = derived
+        self._supervisor_binding_pin = (binding, derived, binding.logon_id, binding.instance_id,
+                                        derived.logon_id, derived.instance_id, derived.name)
+        super().__init__(derived.logon_id, derived.instance_id)
+
+    def _assert_instance_binding(self):
+        binding, derived, policy_logon, policy_id, logon, instance, name = self._supervisor_binding_pin
+        if (type(self) is not NativeSupervisorInstanceMutex or
+                self._supervisor_policy_binding is not binding or
+                self._supervisor_instance_binding is not derived or
+                (binding.logon_id, binding.instance_id) != (policy_logon, policy_id) or
+                (derived.logon_id, derived.instance_id, derived.name) != (logon, instance, name) or
+                (self._logon_id, self._instance_id, self._name) != (logon, instance, name)):
+            raise NativePolicyMutexError("supervisor_instance_binding_changed")
+
+    def _check_open(self):
+        NativeSupervisorInstanceMutex._assert_instance_binding(self)
+        super()._check_open()
+
+
+def _ownership_names(mutex):
+    if type(mutex) is NativeSupervisorInstanceMutex:
+        NativeSupervisorInstanceMutex._assert_instance_binding(mutex)
+        return _SUPERVISOR_THREAD_NAMES
+    return _THREAD_NAMES

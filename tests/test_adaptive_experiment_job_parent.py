@@ -5,7 +5,7 @@ partition admission are production implementations. Native creation, identity,
 POLICY and source readiness are explicit portable fixtures; no Windows Job is
 created and these tests are not native launch, recovery or capacity evidence.
 """
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from pathlib import Path
 import sqlite3
@@ -22,6 +22,7 @@ from sentinel.adaptive import experiment_host_ledger as ledger
 from sentinel.adaptive import experiment_host_scope as scopes
 from sentinel.adaptive import experiment_host_transport as child
 from sentinel.adaptive import experiment_job_publication as jobs
+from sentinel.adaptive import experiment_local_backing as local
 from sentinel.adaptive import experiment_partition_admission as partition
 from sentinel.adaptive import identity
 from sentinel.adaptive.contracts import ProcessIdentity, ResourceDemand
@@ -71,23 +72,28 @@ class ExperimentJobParentTests(unittest.TestCase):
         self.select_actor(self.wrapper_registration)
         wrapper_wire = self.accept_actor()
         self.context, self.snapshot = self.context_snapshot()
+        # Parent backing checks query the actual admission tables, including
+        # queue/executions. LifecycleStore alone does not initialize them.
+        # Build the Coordinator before sending any backing publication.
+        self.isolated_policy = FixturePolicyProvider(self.child_identity.logon_id)
+        self.isolated_coordinator = Coordinator(self.host.isolated.parent,
+            db_path=self.host.isolated, policy_provider=self.isolated_policy)
+        with closing(sqlite3.connect(self.host.isolated, isolation_level=None)) as conn:
+            conn.execute("UPDATE adaptive_runtime SET policy_instance_id=?,policy_logon_id=?,"
+                "policy_binding_initialized=1 WHERE singleton=1",
+                (self.owner.spec.isolated_policy_instance_id, self.child_identity.logon_id))
         self.reservation_id = uuid4().hex
         backing_request = backing_transport.PublishExperimentBackingRequest(self.manifest, str(uuid4()),
             self.member.member_id, self.reservation_id,
             backing_transport.AdmissionSnapshotObservation.from_snapshot(self.snapshot))
         service = backing_transport.ExperimentBackingService(self.endpoint, self.owner)
-        service.serve_once(Listener(self.endpoint, self.protocol_pipe(backing_request)))
+        try:
+            service.serve_once(Listener(self.endpoint, self.protocol_pipe(backing_request)))
+        except backing_transport.ExperimentBackingTransportError as error:
+            # Preserve the production wrapper while making its hidden cause
+            # visible in central unittest output when fixture setup fails.
+            raise error from error.original_error
         self.wrapper_binding = self.bind_wrapper(wrapper_wire)
-
-        self.isolated_policy = FixturePolicyProvider(self.child_identity.logon_id)
-        self.isolated_coordinator = Coordinator(self.host.isolated.parent,
-            db_path=self.host.isolated, policy_provider=self.isolated_policy)
-        # Bind the fixture's isolated POLICY identity to the already declared
-        # ledger. This is setup, not an admission/Job publication substitute.
-        with closing(sqlite3.connect(self.host.isolated, isolation_level=None)) as conn:
-            conn.execute("UPDATE adaptive_runtime SET policy_instance_id=?,policy_logon_id=?,"
-                "policy_binding_initialized=1 WHERE singleton=1",
-                (self.owner.spec.isolated_policy_instance_id, self.child_identity.logon_id))
         proof = SimpleNamespace(
             readiness_scopes=partition.daily_generation.readiness_scopes,
             revalidate_transaction=partition.daily_generation.revalidate_transaction,
@@ -207,6 +213,40 @@ class ExperimentJobParentTests(unittest.TestCase):
             self.assertEqual(self.rows(self.host.isolated, table), before)
         self.assertFalse(self.owner.demand._closed)
 
+    def hold_and_freeze(self):
+        """Actual test-ledger lifecycle HOLD and runtime admission freeze."""
+        original_floor = self.floor
+        original_isolated = self.isolated_before
+        backing_fixture.ExperimentBackingPublicationTests.set_hold(self)
+        store = self.isolated_coordinator._managed_lifecycle_store()
+        before = self.rows(self.host.isolated, "managed_executions")[0]
+        held = store.hold(self.snapshot.execution_id, expected_revision=before["state_revision"],
+            reason="recovery_unverified")
+        self.assertEqual(held["state"], "UNCERTAIN_HOLD")
+        for path in (self.owner.demand.ledger_path, self.host.isolated):
+            with closing(sqlite3.connect(path, isolation_level=None)) as conn:
+                conn.execute("UPDATE adaptive_runtime SET admission_barrier='RECOVERY_HOLD'")
+        self.floor = self.host.fixture.assert_retained(self.owner.demand)
+        self.isolated_before = {name: self.rows(self.host.isolated, name)
+            for name in ("reservations", "managed_executions")}
+        self.assertEqual(self.floor[0], original_floor[0])
+        self.assertEqual(self.isolated_before["reservations"], original_isolated["reservations"])
+
+    @contextmanager
+    def readonly_parent_sql(self):
+        actual = self.owner._sql
+        reads = []
+
+        @contextmanager
+        def checked(path, *, write=False):
+            self.assertFalse(write, "a committed replay must not open a Job publication writer")
+            with actual(path, write=write) as conn:
+                reads.append(path)
+                yield conn
+
+        with patch.object(self.owner, "_sql", checked):
+            yield reads
+
     def test_service_publishes_exact_job_intent_without_locks_at_any_wire_boundary(self):
         connection = self.serve()
         entry = self.entry()
@@ -264,6 +304,80 @@ class ExperimentJobParentTests(unittest.TestCase):
         self.assertEqual(self.revision(), revision)
         self.assert_capacity_retained()
 
+    def test_committed_ack_loss_replays_readonly_after_hold_freeze_and_seal(self):
+        error = OSError("fixture_job_ack_lost_before_hold")
+        connection = self.protocol_pipe(self.request, family="Job", fail_result=error)
+        with self.assertRaises(jobs.ExperimentJobPublicationError) as raised:
+            self.service.serve_once(Listener(self.endpoint, connection))
+        self.assertIs(raised.exception.original_error, error)
+        self.assertFalse(self.service.attempts[-1].cleanup_pending)
+        entry = self.entry()
+        original_request, original_binding = entry.request, entry.binding
+        before = self.job_rows()
+        self.assertEqual(len(before), 1)
+        self.hold_and_freeze()
+        self.owner.seal_new_work()
+        revision = self.revision()
+        with self.readonly_parent_sql() as reads, \
+                patch.object(ledger, "publish_job_locked", side_effect=AssertionError("replay cannot publish")):
+            self.serve(jobs.PublishExperimentJobRequest.from_dict(self.request.to_dict()))
+        self.assertIn(self.host.isolated, reads)
+        self.assertIn(self.owner.demand.ledger_path, reads)
+        self.assertIs(self.entry(), entry)
+        self.assertIs(entry.request, original_request)
+        self.assertIs(entry.binding, original_binding)
+        self.assertEqual(self.job_rows(), before)
+        self.assertEqual(self.revision(), revision)
+        self.assert_capacity_retained()
+
+    def test_absent_job_intent_under_hold_cannot_be_promoted_as_replay(self):
+        self.hold_and_freeze()
+        before = self.revision()
+        with self.assertRaises((jobs.ExperimentJobPublicationError, ledger.HostLedgerError)):
+            self.publish_parent()
+        self.assertEqual(self.job_rows(), [])
+        self.assertEqual(self.revision(), before)
+        self.assert_capacity_retained()
+
+    def test_committed_replay_rejects_changed_local_backing_even_after_hold(self):
+        self.publish_parent()
+        entry, before = self.entry(), self.job_rows()
+        self.hold_and_freeze()
+        # Explicit storage corruption fixture: restore the exact schema and
+        # recompute the data digest, so rejection must come from binding checks.
+        with closing(sqlite3.connect(self.host.isolated, isolation_level=None)) as conn:
+            conn.row_factory = sqlite3.Row
+            row = dict(conn.execute("SELECT * FROM " + local.TABLE).fetchone())
+            row["daily_registered_revision"] += 1
+            row["link_sha256"] = local._digest(row)
+            conn.execute("DROP TRIGGER " + local.PREFIX + "update")
+            conn.execute("UPDATE " + local.TABLE + " SET daily_registered_revision=?,link_sha256=?",
+                (row["daily_registered_revision"], row["link_sha256"]))
+            conn.execute(local.GUARDS[local.PREFIX + "update"])
+        revision = self.revision()
+        with self.assertRaisesRegex(jobs.ExperimentJobPublicationError, "original_backing_revision_changed"):
+            self.publish_parent()
+        self.assertIs(self.entry(), entry)
+        self.assertEqual(self.job_rows(), before)
+        self.assertEqual(self.revision(), revision)
+        self.assert_capacity_retained()
+
+    def test_committed_replay_rejects_mutated_original_job_row(self):
+        self.publish_parent()
+        entry, before, revision = self.entry(), self.job_rows(), self.revision()
+        original_row = self.owner.registered_scope._jobs[self.member.member_id][1]
+        original_revision = original_row["registered_revision"]
+        original_row["registered_revision"] += 1
+        try:
+            with self.assertRaisesRegex(jobs.ExperimentJobPublicationError, "original_committed_job_changed"):
+                self.publish_parent()
+        finally:
+            original_row["registered_revision"] = original_revision
+        self.assertIs(self.entry(), entry)
+        self.assertEqual(self.job_rows(), before)
+        self.assertEqual(self.revision(), revision)
+        self.assert_capacity_retained()
+
     def test_changed_name_nonce_request_or_backing_cannot_replace_first_publication(self):
         self.publish_parent()
         entry, before, revision = self.entry(), self.job_rows(), self.revision()
@@ -304,7 +418,10 @@ class ExperimentJobParentTests(unittest.TestCase):
         self.assert_capacity_retained()
 
     def test_wrong_actor_or_peer_cannot_borrow_guardian_registration(self):
-        changed_manifest = replace(self.manifest, actor_member_id=self.wrapper.member_id)
+        # Keep the Job payload structurally valid so this reaches the parent
+        # registration check. Selecting wrapper itself is rejected earlier by
+        # JobBinding's guardian != wrapper invariant.
+        changed_manifest = replace(self.manifest, actor_member_id=self.other.member_id)
         with self.assertRaisesRegex(scopes.ProductionScopeError, "original_child_registration_required"):
             self.publish_parent(replace(self.request, manifest=changed_manifest))
         wrapper_peer = VerifiedProcess(pipe_fixture.Backend(self.wrapper_created.process.identity),

@@ -240,6 +240,7 @@ class ExperimentChildHost:
         self.host = self.daily_store = self.isolated_store = self.coordinator = None
         self.partition = self.publication = self.context = self.terminal = None
         self.file_pin = self.profile_pin = self.role = None
+        self.workload_exit_code = None
         self.errors, self.constructing = [], {}
         self.authenticated = self.dispatched = self.host_closed = self.closed = False
         self._terminal_settled = self._binding_closed = self._protection_closed = self._process_closed = False
@@ -283,7 +284,13 @@ class ExperimentChildHost:
         owner = cls.__new__(cls)
         self.constructing[name] = owner
         setattr(self, name, owner)
-        cls.__init__(owner, **kwargs)
+        try:
+            cls.__init__(owner, **kwargs)
+        except BaseException as error:
+            # Embedded callers need the same retained owner as the fixed CLI.
+            # An exception must not leave the partial object only in a local.
+            self._retain(error)
+            raise
         return owner
 
     def _profile(self):
@@ -371,7 +378,10 @@ class ExperimentChildHost:
             host.close()
         elif type(host) is WrapperHost:
             try:
-                host.run()
+                result = host.run()
+                if type(result) is not int or not 0 <= result <= 0xffffffff:
+                    _fail("wrapper_exit_code_unverified")
+                self.workload_exit_code = result
             except BaseException as error:
                 self._retain(error)
                 host.settle_release()
@@ -427,6 +437,18 @@ class ExperimentChildHost:
             self._process_closed = True
         self.closed = True
 
+    def result_code(self):
+        """Expose actual workload exit only after original cleanup is settled."""
+        if not self.closed:
+            _fail("child_cleanup_pending")
+        if self.errors:
+            return 3
+        if type(self.role) is WrapperRoleSpec:
+            if type(self.workload_exit_code) is not int or not 0 <= self.workload_exit_code <= 0xffffffff:
+                _fail("wrapper_exit_code_unverified")
+            return self.workload_exit_code
+        return 0
+
 
 def main(argv=None):
     global _HOST
@@ -443,7 +465,11 @@ def main(argv=None):
         try:
             owner.authenticate()
         except FileNotFoundError:
-            time.sleep(.1)
+            try:
+                time.sleep(.1)
+            except BaseException as error:
+                owner._retain(error)
+                break
             continue
         except BaseException as error:
             owner._retain(error)
@@ -489,4 +515,4 @@ def main(argv=None):
                 time.sleep(1)
             except BaseException as interruption:
                 owner._retain(interruption)
-    return 0 if not owner.errors else 3
+    return owner.result_code()

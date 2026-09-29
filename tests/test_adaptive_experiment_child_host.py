@@ -227,15 +227,22 @@ class ExperimentChildHostTests(unittest.TestCase):
         self.authenticate(value, context)
         admission, publication = SimpleNamespace(), SimpleNamespace()
         host = WrapperHost.__new__(WrapperHost)
+        def partition_initialize(original, **kwargs):
+            # The production constructor is deliberately called unbound after
+            # registering this exact owner, so failures cannot lose custody.
+            self.assertIs(self.owner.partition, original)
+            self.assertIs(self.owner.constructing["partition"], original)
+            self.assertIs(kwargs["child_binding"], self.owner.binding)
         with patch.object(LifecycleStore, "__init__", return_value=None), \
                 patch.object(Coordinator, "__init__", return_value=None), \
                 patch.object(Coordinator, "admit_managed", side_effect=AssertionError("second machine admission")), \
-                patch.object(ExperimentPartitionCoordinator, "__init__", return_value=None) as partition, \
+                patch.object(ExperimentPartitionCoordinator, "__init__", side_effect=partition_initialize) as partition, \
                 patch.object(ManagedAdmission, "current", return_value=admission) as current, \
                 patch.object(ExperimentBackingPublication, "prepare", return_value=publication) as backing, \
                 patch.object(WrapperHost, "for_experiment", return_value=host) as factory:
             self.assertIs(self.owner.dispatch(), host)
-        partition.assert_called_once_with(coordinator=self.owner.coordinator, child_binding=self.owner.binding,
+        partition.assert_called_once_with(self.owner.partition,
+            coordinator=self.owner.coordinator, child_binding=self.owner.binding,
             member_id=self.owner.role.workload_member_id, reservation_id=context["reservation_id"],
             daily_store=self.owner.daily_store)
         spec = self.owner.role.launch_spec
@@ -248,6 +255,55 @@ class ExperimentChildHostTests(unittest.TestCase):
         self.assertIs(factory.call_args.kwargs["publication"], publication)
         self.assertEqual(factory.call_args.kwargs["endpoint"].server_identity, guardian)
         self.owner.binding.close()
+
+    def test_wrapper_preserves_actual_exit_code_only_after_cleanup(self):
+        self.owner.host = WrapperHost.__new__(WrapperHost)
+        self.owner.role = replace(roles.wrapper(), max_wait_sec=60)
+        with patch.object(WrapperHost, "run", return_value=7), \
+                patch.object(WrapperHost, "settle_release", return_value=None) as settle:
+            self.owner.run_host()
+        settle.assert_called_once_with()
+        self.assertEqual(self.owner.workload_exit_code, 7)
+        self.assertTrue(self.owner.host_closed)
+        self.assertFalse(self.owner.closed)
+        with self.assertRaisesRegex(module.ExperimentChildHostError, "cleanup_pending"):
+            self.owner.result_code()
+        self.owner.closed = True  # explicit synthetic completed child fixture
+        self.assertEqual(self.owner.result_code(), 7)
+
+    def test_constructor_failure_exception_keeps_original_bootstrap_owner(self):
+        class Partial:
+            def __init__(partial):
+                self.assertIs(self.owner.constructing["partial"], partial)
+                partial.marker = object()
+                raise RuntimeError("synthetic partial constructor")
+        with self.assertRaises(RuntimeError) as raised:
+            self.owner._construct("partial", Partial)
+        self.assertIs(raised.exception.experiment_child_host, self.owner)
+        self.assertIs(self.owner.partial, self.owner.constructing["partial"])
+        self.assertIs(self.owner.errors[0], raised.exception)
+        original = self.owner.partial
+        with self.assertRaisesRegex(module.ExperimentChildHostError, "construction_already_entered"):
+            self.owner._construct("partial", Partial)
+        self.assertIs(self.owner.partial, original)
+
+    def test_failed_terminal_publication_keeps_current_process_alive(self):
+        import sys
+        failure = RuntimeError("synthetic parent receipt unavailable")
+        def reject(*args):
+            self.assertIs(args[2], self.fixture.child)
+            raise failure
+        self.owner.host_closed = True
+        self.owner.host = object()
+        self.owner.binding = SimpleNamespace(close=lambda: self.fail("premature binding close"))
+        self.owner.process = self.fixture.child
+        transport_module = SimpleNamespace(publish_host_closed=reject)
+        with patch.dict(sys.modules, {"sentinel.adaptive.experiment_host_retirement_transport": transport_module}), \
+                self.assertRaises(RuntimeError) as raised:
+            self.owner.finish()
+        self.assertIs(raised.exception, failure)
+        self.assertEqual(self.fixture.child_backend.closed, [])
+        self.assertFalse(self.owner.closed)
 
     def test_private_publication_never_overwrites_existing_registration(self):
         registration = self.registration()

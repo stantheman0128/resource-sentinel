@@ -25,7 +25,7 @@ and synthetic backend tests do not themselves establish native support.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import fields, replace
 from enum import Enum
 import hashlib
@@ -542,7 +542,19 @@ class GuardianControl:
             except LifecycleError as error:
                 return self._reject(proposal, str(error))
             try:
-                with self.lifecycle._scope(entry):
+                from .experiment_host_authority import ExperimentBackedHostAuthority
+                authority = self.owner.authority
+                scope = nullcontext()
+                if type(authority) is ExperimentBackedHostAuthority:
+                    # Capability loading remains above, outside either POLICY.
+                    # The retained episode, not the helper's reason text,
+                    # selects the operation while the original owner lock is
+                    # held. Replayed acknowledgements need no new scope. The
+                    # authority acquires daily before the isolated Job scope;
+                    # transport response I/O occurs only after both exit.
+                    operation = "renew" if episode is not None and not episode.restored else "restrict"
+                    scope = authority.new_work_scope(proposal.execution_id, operation=operation)
+                with scope, self.lifecycle._scope(entry):
                     result = self._apply_locked(proposal, entry, episode, now, helper_identity, assessment_error)
                     self._proposal_payloads[proposal.request_id] = binding
                     if len(self._proposal_payloads) > 128:

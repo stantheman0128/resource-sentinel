@@ -19,7 +19,7 @@ from sentinel.adaptive.guardian import GuardianLaunchOwner, _PendingExecution
 from sentinel.adaptive.ipc import _get_ipc_auth_record
 from sentinel.adaptive.launch_transport import PrepareExecutionRequest
 from sentinel.adaptive.recovery_journal import RecoveryJournal
-from sentinel.adaptive.store import LifecycleError
+from sentinel.adaptive.store import LifecycleError, LifecycleStore
 from tests import test_adaptive_experiment_host_authority as fixture
 from tests import test_adaptive_experiment_host_transport as wire
 from tests import test_adaptive_guardian_launch as guardian_fixture
@@ -33,6 +33,12 @@ class ExperimentJobPublicationTests(unittest.TestCase):
         self.host.setUp()
         self.addCleanup(self.host.doCleanups)
         self.host.admit()
+        # A Coordinator's migration-capable store is not a guardian registry.
+        # Open the existing ledger exactly as the real host does, before the
+        # authority pins its original store and PolicyCoordinator objects.
+        original = self.host.store
+        self.host.store = LifecycleStore(original.db_path, existing_path=True,
+            policy_provider=self.host.fixture.policy, local_host_id=original.local_host_id)
         self.authority, self.binding = self.host.guardian()
         self.store = self.host.store
         self.peer = self.host.fixture.child_process

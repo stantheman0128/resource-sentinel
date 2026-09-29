@@ -135,13 +135,20 @@ def parent_registration(owner, request, peer):
     return registration
 
 
-def _isolated_before_publication(owner, request):
-    """Read one exact already-partitioned execution; never upgrade ordinary work."""
+def _isolated_before_publication(owner, request, *, committed=None):
+    """Read exact partition provenance; existing intent grants no fresh work.
+
+    ``committed`` comes only from the retained original daily row reader below.
+    Reconciliation keeps all immutable identity/link checks, but may observe a
+    HOLD or terminal isolated row: returning the earlier intent cannot Create,
+    consume a claim or release an allocation.
+    """
     with owner._sql(owner.ledger_path) as conn:
         runtime = PolicyCoordinator._runtime(conn)
         policy = PolicyCoordinator._binding(runtime, owner.process.identity.logon_id)
         if (policy.instance_id != owner.spec.isolated_policy_instance_id or
-                runtime["mode"] not in {"off", "shadow"} or runtime["admission_barrier"] != "NONE"):
+                committed is None and (runtime["mode"] not in {"off", "shadow"} or
+                                       runtime["admission_barrier"] != "NONE")):
             _fail("isolated_policy_changed")
         observed = local.read_link_locked(conn, request.execution_id, max_rows=1, max_bytes=local.MAX_BYTES)
         if observed is None:
@@ -169,12 +176,37 @@ def _isolated_before_publication(owner, request):
                 link["daily_registered_revision"] != original._row["registered_revision"]):
             _fail("original_backing_revision_changed")
         row = conn.execute("SELECT * FROM managed_executions WHERE execution_id=?", (request.execution_id,)).fetchone()
-        if (row is None or row["state"] not in {"RESERVED", "PREPARED"} or row["spec_hash"] != request.spec_hash or
-                row["reservation_id"] != request.reservation_id or row["claim_consumed"] or
+        if (row is None or row["spec_hash"] != request.spec_hash or
+                row["reservation_id"] != request.reservation_id or
+                committed is None and (row["state"] not in {"RESERVED", "PREPARED"} or row["claim_consumed"]) or
                 (row["job_name"] is not None and (row["job_name"] != request.job_name or
                     row["job_nonce"] != request.creation_nonce or row["guardian_epoch"] != request.guardian_epoch))):
             _fail("isolated_execution_changed")
-        owner.daily_store._require_authenticated_allocation(conn, row)
+        if committed is None:
+            owner.daily_store._require_authenticated_allocation(conn, row)
+
+
+def _committed_original(owner, entry, guard):
+    """Read-only exact replay proof; a matching name alone cannot recreate it."""
+    with owner._sql(owner.demand.ledger_path) as conn:
+        registered = owner.registered_scope
+        _scope, _runtime, tables, _history = ledger._publication(conn, registered, owner._daily_policy, guard)
+        original = registered._backings[entry.request.member_id]
+        original._original()
+        observed = backing.validate_backing_locked(conn, scope_id=registered.spec.scope_id,
+            member_id=original.member_id, wrapper_member_id=original.wrapper_member_id,
+            binding=original.binding, policy=owner._daily_policy, guard=guard)
+        if (original._row is None or observed.binding_sha256 != original._row["binding_sha256"] or
+                observed.registered_revision != original._row["registered_revision"]):
+            _fail("original_backing_revision_changed")
+        rows = [row for row in tables[ledger.JOBS_TABLE] if row["member_id"] == entry.request.member_id]
+        if not rows:
+            return None
+        saved = registered._jobs.get(entry.request.member_id)
+        if (saved is None or saved[0] is not entry.binding or rows != [saved[1]] or
+                any(saved[1][key] != getattr(entry.binding, key) for key in ledger.JobBinding.__dataclass_fields__)):
+            _fail("original_committed_job_changed")
+        return dict(rows[0])
 
 
 def publish_parent(owner, request, peer, registration):
@@ -197,10 +229,18 @@ def publish_parent(owner, request, peer, registration):
             with owner._operation() as guard:
                 # The parent never waits for its child while these locks exist.
                 # All local SQL ends before the service writes any response.
-                _isolated_before_publication(owner, request)
-                with owner._sql(owner.demand.ledger_path, write=True) as conn:
-                    result = ledger.publish_job_locked(conn, scope=owner.registered_scope,
-                        binding=entry.binding, policy=owner._daily_policy, guard=guard)
+                committed = _committed_original(owner, entry, guard)
+                _isolated_before_publication(owner, request, committed=committed)
+                if committed is not None:
+                    # No writer transaction, UDF, revision change or fresh
+                    # admission occurs for an already committed original.
+                    result = _committed_original(owner, entry, guard)
+                    if result != committed:
+                        _fail("original_committed_job_changed")
+                else:
+                    with owner._sql(owner.demand.ledger_path, write=True) as conn:
+                        result = ledger.publish_job_locked(conn, scope=owner.registered_scope,
+                            binding=entry.binding, policy=owner._daily_policy, guard=guard)
             return _result(result, request)
         except BaseException as error:
             raise owner._retain(error)

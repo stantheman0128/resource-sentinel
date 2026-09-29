@@ -7,7 +7,7 @@ retain their own originals; registering this scope alone authorizes none of them
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import hashlib
 import json
@@ -184,6 +184,7 @@ class ProductionExperimentScope:
         self._role_release_data = {}
         self._supervisor_host = None
         self._supervisor_pin = None
+        self._supervisor_integration = None
         self._registration_publications = {}
         self._completion = None
         self._retirement_service = None
@@ -192,6 +193,7 @@ class ProductionExperimentScope:
         self._job_members = {}
         self._transport_service = None
         self._transport_endpoint = None
+        self._host_dispatcher = None
         self._backing_service = None
         self._backing_publications = {}
         self._backing_members = {}
@@ -288,6 +290,7 @@ class ProductionExperimentScope:
     @contextmanager
     def _operation(self):
         """Original daily fence; never entered by an existing SQL transaction."""
+        from .daily_generation import _readiness_cleanup_unknown
         with self._lock:
             if (self._active_sql is not None or self._guard is not None or self._guard_unknown or
                     self._scope_cleanup_error is not None):
@@ -300,22 +303,34 @@ class ProductionExperimentScope:
             try:
                 with daily_generation.readiness_scopes((self.demand.ledger_path, self.ledger_path),
                                                        absent_paths=(self.ledger_path,)):
-                    daily_generation.revalidate_scoped_readiness(self.demand.ledger_path,
-                        expected_generation=self.demand._original_generation_binding())
-                    # Retain prepare/hold uncertainty; no replacement POLICY
-                    # owner can infer that an interrupted entry was released.
-                    self._guard_unknown = True
-                    self._guard = self._daily_policy.prepare(self.process.identity.logon_id)
-                    with self._daily_policy.hold(self._guard):
+                    try:
+                        daily_generation.revalidate_scoped_readiness(self.demand.ledger_path,
+                            expected_generation=self.demand._original_generation_binding())
+                    except BaseException as error:
+                        # No POLICY prepare, consumer SQL or native work has
+                        # been entered. A clean observation refusal may be
+                        # retried only after the original readiness owners
+                        # positively return from their context cleanup below.
+                        # Unknown cleanup still propagates into those owners
+                        # so their original custody remains quarantined.
+                        if _readiness_cleanup_unknown(error):
+                            raise
+                        body_error = error
+                    else:
+                        # Retain prepare/hold uncertainty; no replacement POLICY
+                        # owner can infer that an interrupted entry was released.
+                        self._guard_unknown = True
+                        self._guard = self._daily_policy.prepare(self.process.identity.logon_id)
+                        with self._daily_policy.hold(self._guard):
+                            self._guard_unknown = False
+                            try:
+                                yield self._guard
+                            except BaseException as error:
+                                body_error = error
+                            finally:
+                                self._guard_unknown = True
+                        self._guard = None
                         self._guard_unknown = False
-                        try:
-                            yield self._guard
-                        except BaseException as error:
-                            body_error = error
-                        finally:
-                            self._guard_unknown = True
-                    self._guard = None
-                    self._guard_unknown = False
                 context_complete = True
                 if body_error is not None:
                     raise body_error
@@ -447,9 +462,21 @@ class ProductionExperimentScope:
         from .experiment_host_completion import retire
         return retire(self)
 
+    def open_dispatcher(self):
+        from .experiment_host_dispatch import ProductionHostDispatcher
+        from .pipe_windows import NativePipeEndpoint
+        self._assert_ledger_original(self.demand, self.spec)
+        if self._host_dispatcher is None and self._sealed:
+            _fail("scope_sealed", self)
+        if self._transport_endpoint is None:
+            self._transport_endpoint = NativePipeEndpoint(self.process.identity.logon_id,
+                                                         str(uuid4()), self.process.identity)
+        return ProductionHostDispatcher.open(self)
+
     def publish_child_registration(self, attempt, *, permitted_member_ids=()):
         from .experiment_child_host import ChildRegistrationPublication
         registration = self.child_registration(attempt, permitted_member_ids=permitted_member_ids)
+        self.open_dispatcher().assert_ready()
         owner = self._registration_publications.get(attempt.member.member_id)
         if owner is None:
             owner = ChildRegistrationPublication.prepare(registration, self.demand.directory)
@@ -470,15 +497,21 @@ class ProductionExperimentScope:
                 host.startup is None or host.startup._current is not current or
                 host.operations is None or host.binding.instance_id != self.spec.isolated_policy_instance_id):
             _fail("original_supervisor_required", self)
-        host.startup.assert_fresh()
-        observed = current.observe()
-        if observed.status is not IdentityStatus.ALIVE or observed.identity != self.process.identity:
-            _fail("original_supervisor_unavailable", self)
         pin = (host, current, host.startup, host.store, host.operations, host._instance_id)
         if self._supervisor_pin is not None and any(a is not b for a, b in zip(pin[:5], self._supervisor_pin[:5])):
             _fail("original_supervisor_changed", self)
         if self._supervisor_pin is not None and pin[5] != self._supervisor_pin[5]:
             _fail("original_supervisor_changed", self)
+        if self._supervisor_pin is None:
+            host.startup.assert_fresh()
+        else:
+            # After the original guardian registers, the isolated ledger is
+            # intentionally no longer empty. Recheck the same live singleton,
+            # not cold-start eligibility for a second supervisor.
+            host.startup.assert_held()
+        observed = current.observe()
+        if observed.status is not IdentityStatus.ALIVE or observed.identity != self.process.identity:
+            _fail("original_supervisor_unavailable", self)
         self._supervisor_host, self._supervisor_pin = host, pin
 
     def _retain_retirement_transport(self, service):
@@ -547,6 +580,20 @@ class ProductionExperimentScope:
                                                  ("scripts/adaptive-experiment-child.py",))
         return command
 
+    def _supervisor_creation_context(self, member):
+        integration = self._supervisor_integration
+        if integration is None:
+            return nullcontext()
+        from .experiment_supervisor import ExperimentSupervisor
+        if (type(integration) is not ExperimentSupervisor or integration.scope is not self or
+                integration.host is not self._supervisor_host or
+                self._supervisor_host._experiment_supervisor is not integration):
+            _fail("original_supervisor_integration_required", self)
+        integration.assert_original()
+        if member is integration.guardian_member or member is integration.helper_member:
+            return integration.creation_scope(member)
+        return nullcontext()
+
     def create_actor(self, member):
         """Only the declared inert entry; publish identity before releasing it."""
         from .experiment_host_creation import CreationAttempt
@@ -555,8 +602,9 @@ class ProductionExperimentScope:
                 member.kind != "infrastructure" or member.member_id in self._attempts):
             _fail("new_declared_actor_required", self)
         command = self._inert_command(member)
+        supervisor_scope = self._supervisor_creation_context(member)
         try:
-            with self._operation() as guard:
+            with self._operation() as guard, supervisor_scope:
                 with self._sql(self.demand.ledger_path, write=True) as conn:
                     ledger.reserve_member_locked(conn, scope=self.registered_scope, claim=member,
                                                  policy=self._daily_policy, guard=guard)
@@ -730,6 +778,10 @@ class ProductionExperimentScope:
             _fail("declared_role_required", self)
         role.__post_init__()
         context = {}
+        if type(role) is GuardianRoleSpec and self._supervisor_host is not None:
+            self.bind_supervisor(self._supervisor_host)
+            context = dict(parent_identity=self.process.identity.to_dict(),
+                           parent_instance_id=self._supervisor_host._instance_id)
         if type(role) in (WrapperRoleSpec, HelperRoleSpec):
             guardian_roles = [item for item in self.plan.roles if type(item) is GuardianRoleSpec and
                 (type(role) is HelperRoleSpec or item.member_id == role.guardian_member_id)]
@@ -783,7 +835,7 @@ class ProductionExperimentScope:
                 actors = [row for row in tables[ledger.ACTORS_TABLE] if row["member_id"] == role.member_id]
                 if len(actors) != 1 or ledger._decode(actors[0]["identity_json"]) != request.manifest.child_identity.to_dict():
                     _fail("original_role_actor_changed", self)
-                if context:
+                if type(role) in (WrapperRoleSpec, HelperRoleSpec):
                     actors = [row for row in tables[ledger.ACTORS_TABLE] if row["member_id"] == guardian.member_id]
                     if len(actors) != 1 or ledger._decode(actors[0]["identity_json"]) != context["guardian_identity"]:
                         _fail("original_role_guardian_changed", self)

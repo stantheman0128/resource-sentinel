@@ -113,13 +113,19 @@ GUARDS[_PREFIX + "scope_limit"] = f"""CREATE TRIGGER experiment_host_scope_limit
     BEFORE INSERT ON {SCOPES_TABLE} WHEN EXISTS(SELECT 1 FROM {SCOPES_TABLE} AS s
         WHERE NOT EXISTS(SELECT 1 FROM adaptive_experiment_cleanup_receipts AS r
             WHERE r.experiment_id=s.experiment_id AND
-                json_extract(r.receipt_json,'$.completion.schema_version')=3))
+                json_extract(r.receipt_json,'$.completion.schema_version') IN (3,4)))
     BEGIN SELECT RAISE(ABORT,'experiment_host_scope_occupied'); END"""
 GUARDS[_PREFIX + "reservation_delete"] = f"""CREATE TRIGGER experiment_host_reservation_delete
     BEFORE DELETE ON reservations WHEN EXISTS(SELECT 1 FROM {SCOPES_TABLE}
         WHERE reservation_id=OLD.id OR daily_execution_id=OLD.execution_id) AND
-        sentinel_experiment_release_mutation('reservations',OLD.id,""" + \
-    experiment_demand._mutation_json_sql("OLD", experiment_demand._MUTATION_ALLOCATION_FIELDS) + """,NULL) IS NOT 1
+        (NOT EXISTS(SELECT 1 FROM adaptive_experiment_cleanup_receipts AS r
+            WHERE r.reservation_id=OLD.id AND r.execution_id=OLD.execution_id AND
+                ((json_extract(r.receipt_json,'$.completion.schema_version')=3 AND
+                  json_extract(r.receipt_json,'$.completion.domain')='sentinel-production-scope-completion-v1') OR
+                 (json_extract(r.receipt_json,'$.completion.schema_version')=4 AND
+                  json_extract(r.receipt_json,'$.completion.domain')='sentinel-production-scope-completion-v2'))) OR
+         sentinel_experiment_release_mutation('reservations',OLD.id,""" + \
+    experiment_demand._mutation_json_sql("OLD", experiment_demand._MUTATION_ALLOCATION_FIELDS) + """,NULL) IS NOT 1)
     BEGIN SELECT RAISE(ABORT,'experiment_host_cleanup_unverified'); END"""
 GUARDS[_PREFIX + "execution_terminal"] = f"""CREATE TRIGGER experiment_host_execution_terminal
     BEFORE UPDATE ON managed_executions WHEN EXISTS(SELECT 1 FROM {SCOPES_TABLE}
@@ -127,9 +133,15 @@ GUARDS[_PREFIX + "execution_terminal"] = f"""CREATE TRIGGER experiment_host_exec
         (NEW.state NOT IN ('RESERVED','UNCERTAIN_HOLD') OR NEW.claim_consumed IS NOT 0 OR
          NEW.launch_sealed IS NOT 0 OR NEW.launch_in_flight IS NOT 0 OR
          NEW.claim_token_hash IS NOT OLD.claim_token_hash OR NEW.job_name IS NOT NULL OR NEW.root_pid IS NOT NULL) AND
-        sentinel_experiment_release_mutation('managed_executions',OLD.execution_id,""" + \
+        (NOT EXISTS(SELECT 1 FROM adaptive_experiment_cleanup_receipts AS r
+            WHERE r.execution_id=OLD.execution_id AND r.reservation_id=OLD.reservation_id AND
+                ((json_extract(r.receipt_json,'$.completion.schema_version')=3 AND
+                  json_extract(r.receipt_json,'$.completion.domain')='sentinel-production-scope-completion-v1') OR
+                 (json_extract(r.receipt_json,'$.completion.schema_version')=4 AND
+                  json_extract(r.receipt_json,'$.completion.domain')='sentinel-production-scope-completion-v2'))) OR
+         sentinel_experiment_release_mutation('managed_executions',OLD.execution_id,""" + \
     experiment_demand._mutation_json_sql("OLD", experiment_demand._MUTATION_MANAGED_FIELDS) + "," + \
-    experiment_demand._mutation_json_sql("NEW", experiment_demand._MUTATION_MANAGED_FIELDS) + """ ) IS NOT 1
+    experiment_demand._mutation_json_sql("NEW", experiment_demand._MUTATION_MANAGED_FIELDS) + """ ) IS NOT 1)
     BEGIN SELECT RAISE(ABORT,'experiment_host_cleanup_unverified'); END"""
 # Every new row also needs the original lexical publisher. Outside that scope,
 # SQLite may reject the missing UDF while preparing the immutable guards.
@@ -526,7 +538,7 @@ def _inventory(conn, policy, guard):
     # Receipt verification has compared every immutable archived row with its
     # full postimage. Only then can these rows stop excluding retired actors.
     closed = {json.loads(raw)["completion"]["scope_id"] for raw in history.receipts_json
-              if json.loads(raw)["completion"].get("schema_version") == 3}
+              if json.loads(raw)["completion"].get("schema_version") in (3, 4)}
     tables = {table: [row for row in rows if row["scope_id"] not in closed]
               for table, rows in tables.items()}
     scopes = tables[SCOPES_TABLE]
@@ -586,7 +598,7 @@ def _inventory(conn, policy, guard):
                     _fail("query_scope_invalid")
                 query.append(job.job_name)
     backings = experiment_host_backing.read_for_inventory_locked(conn, tables=tables,
-        revision=runtime["registry_revision"], budget=budget)
+        revision=runtime["registry_revision"], budget=budget, closed_scope_ids=frozenset(closed))
     _combined_jobs(conn, history, managed, query, backings)
     prior = experiment_exclusion._inventory_from_history_locked(conn, guard, history)
     return HostExclusionInventory(frozenset(identities), tuple(managed), tuple(query), budget.rows,
@@ -640,6 +652,10 @@ def completion_rows_locked(conn, *, completion):
                    if row["scope_id"] == record["scope_id"]] for table in TABLES}
     if rows != record["host_rows"]:
         _fail("completion_registry_changed")
+    backing_rows = [row for row in experiment_host_backing.history_rows_locked(conn, budget=budget)
+                    if row["scope_id"] == record["scope_id"]]
+    if backing_rows != record.get("backing_rows", []):
+        _fail("completion_backing_changed")
     return rows
 
 

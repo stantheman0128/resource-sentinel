@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import os
 from pathlib import Path
+import sqlite3
 import threading
 from uuid import uuid4
 
@@ -53,8 +54,14 @@ def _closure(value, role):
     if type(value) is not dict or value.get("kind") != role:
         _fail("closure_invalid")
     if role == "wrapper":
-        if set(value) != {"kind", "execution_id", "native_owners_closed", "publication_request_id",
-                          "publication_sha256", "launcher_phase"} or value["launcher_phase"] != "CLOSED":
+        expected = {"kind", "execution_id", "native_owners_closed", "publication_request_id",
+                    "publication_sha256", "launcher_phase"}
+        if "admission_retirement" in value:
+            expected.add("admission_retirement")
+            _admission_retirement_data(value["admission_retirement"])
+            if value["admission_retirement"]["execution_id"] != value["execution_id"]:
+                _fail("closure_invalid")
+        if set(value) != expected or value["launcher_phase"] != "CLOSED":
             _fail("closure_invalid")
         _uuid(value["execution_id"])
         _uuid(value["publication_request_id"])
@@ -96,6 +103,47 @@ def _closure(value, role):
     return wire
 
 
+def _admission_retirement_data(value):
+    common = {"kind", "execution_id", "reservation_id", "request_key", "spec_hash", "admission_binding_hash"}
+    if type(value) is not dict:
+        _fail("admission_retirement_invalid")
+    if value.get("kind") == "never_admitted":
+        expected = common | {"abandon_kind"}
+        if value.get("abandon_kind") not in {"NEVER_SUBMITTED", "NOT_SUBMITTED", "QUEUED_CANCELLED", "SUBMISSION_REJECTED"}:
+            _fail("admission_retirement_invalid")
+    elif value.get("kind") == "reserved_cancelled":
+        expected = common | {"state", "state_revision"}
+        if (value.get("state") != "CANCELLED_BEFORE_START" or type(value.get("state_revision")) is not int or
+                value["state_revision"] < 1):
+            _fail("admission_retirement_invalid")
+    else:
+        _fail("admission_retirement_invalid")
+    if set(value) != expected:
+        _fail("admission_retirement_invalid")
+    _uuid(value["execution_id"])
+    _text(value["reservation_id"], 128)
+    _text(value["request_key"], 256)
+    _hex(value["spec_hash"])
+    _hex(value["admission_binding_hash"])
+    return value
+
+
+def validate_snapshot(value):
+    """Validate an audit record only; never construct a retained receipt."""
+    if (type(value) is not dict or set(value) != {"version", "domain", "actor_member_id", "role",
+            "child_identity", "manifest_sha256", "request_id", "payload_sha256", "closure"} or
+            type(value["version"]) is not int or value["version"] != 1 or value["domain"] != DOMAIN or
+            value["role"] not in {"guardian", "wrapper", "helper"}):
+        _fail("snapshot_invalid")
+    _uuid(value["actor_member_id"])
+    _uuid(value["request_id"])
+    _identity(value["child_identity"])
+    _hex(value["manifest_sha256"])
+    _hex(value["payload_sha256"])
+    _closure(value["closure"], value["role"])
+    return strict_json_loads(_canonical(value))
+
+
 def _registry_closed(registry):
     if type(registry) is not NativePipeRegistry:
         _fail("original_registry_required")
@@ -104,11 +152,16 @@ def _registry_closed(registry):
         _fail("pipe_cleanup_pending")
 
 
-def _telemetry_closed(telemetry):
-    from .telemetry import ResidentTelemetry, SharedTelemetryStore
+def _telemetry_closed(telemetry, host):
+    from .telemetry import ResidentTelemetry, SharedTelemetryStore, _UnavailableTelemetry
+    if (type(telemetry) is _UnavailableTelemetry and host.telemetry is telemetry and
+            host._telemetry_factory is None and host._telemetry_start_error is telemetry.error):
+        # The default constructor acquires no native/file/thread owner. A
+        # failure before assigning its result is a known no-acquisition case.
+        return
     if (type(telemetry) is not ResidentTelemetry or type(telemetry.store) is not SharedTelemetryStore or
-            telemetry._thread is None or telemetry._thread.is_alive() or
-            telemetry._stop is not True or telemetry._done is not True or telemetry._error is not None or
+            telemetry._stop is not True or (telemetry._thread is not None and
+                (telemetry._thread.is_alive() or telemetry._done is not True)) or
             telemetry.store.retained_files or telemetry.store._quarantined or
             telemetry.store._quarantine_error is not None):
         _fail("telemetry_cleanup_pending")
@@ -130,6 +183,127 @@ def _closed_process(process):
     if (type(process) is not VerifiedProcess or process._handle is not None or
             process._close_outcome_unknown is not False):
         _fail("native_cleanup_pending")
+
+
+def _closed_transaction(transaction, *, original, context, snapshot, path):
+    if (type(original) is not tuple or len(original) != 5 or original[0] is not context or
+            original[1] is not transaction or type(transaction) is not dict or
+            original[2] is not transaction.get("connection") or
+            original[3] != snapshot.execution_id or original[4] != path):
+        _fail("admission_transaction_changed")
+    if (type(transaction) is not dict or transaction.get("connection_closed") is not True or
+            type(original[2]) is not sqlite3.Connection):
+        _fail("admission_transaction_unsettled")
+    if transaction is context._submission_transaction and (
+            transaction.get("execution_id") != snapshot.execution_id or transaction.get("db_path") != path):
+        _fail("admission_transaction_changed")
+    # Inspect the retained original SQLite owner, without executing SQL. A
+    # copied success flag cannot hide a still-open connection.
+    try:
+        original[2].in_transaction
+    except sqlite3.ProgrammingError:
+        return
+    _fail("admission_transaction_unsettled")
+
+
+def _admission_retirement(original, launcher):
+    """Positive original pre-Prepare disposition, never inferred Job absence."""
+    from .admission import ManagedAdmission, ManagedAdmissionSnapshot
+    from .launcher import ManagedLauncher, _ExperimentWrapperBinding
+    from .experiment_partition_admission import ExperimentPartitionCoordinator
+    if (type(original) is not _ExperimentWrapperBinding or type(launcher) is not ManagedLauncher or
+            type(original.context) is not ManagedAdmission or type(original.snapshot) is not ManagedAdmissionSnapshot or
+            type(original.partition) is not ExperimentPartitionCoordinator or
+            launcher.admission is not original.context or launcher._snapshot is not original.snapshot or
+            launcher.coordinator is not original.partition):
+        _fail("original_admission_required")
+    context, snapshot, partition = original.context, original.snapshot, original.partition
+    if launcher._prepare_attempted is True and context._prepare_attempted is True:
+        # This route needs the independent authenticated guardian Job receipt.
+        return None
+    if (launcher._prepare_attempted is not False or context._prepare_attempted is not False or
+            context._claim_exported is not False or launcher._claim_attempted is not False or
+            launcher._create_attempted is not False or launcher._bound is not False or
+            any(value is not None for value in (launcher._prepared, launcher._claim, launcher._root,
+                launcher.process, launcher.job, launcher._retired_result)) or
+            context._closed is not True or context._snapshot is not None or
+            context._claim_token is not None or context._key is not None or
+            context._submission_guard is not None or context._submission_prepare_unknown is not False or
+            context._submission_policy_error is not None or context._abandon_error is not None):
+        _fail("admission_retirement_unverified")
+    _closed_process(context._process)
+    partition._assert_daily_cleanup_observed()
+    common = dict(execution_id=snapshot.execution_id, reservation_id=partition.reservation_id,
+        request_key=snapshot.request.request_key, spec_hash=snapshot.spec_hash,
+        admission_binding_hash=snapshot.binding_hash)
+    target = (partition.db_path, snapshot.execution_id, snapshot.request.request_key)
+    transaction = context._submission_transaction
+    if launcher._submitted is False:
+        if (context._submitted is not False or context._admission_db_path is not None or
+                transaction is not None or context._cancel_target is not None or context._cancel_revision is not None or
+                context._submission_transaction_original is not None or
+                context._abandon_transaction_original is not None or
+                context._abandon_target is not None or context._abandon_transaction is not None or
+                context._abandon_result is not None or context._abandon_kind is not None or
+                context._abandon_commit_attempted is not False or launcher._admitted is not None or
+                launcher._abandon_result is not None or launcher._abandon_cancel_target is not None or
+                partition._context is not None or partition._snapshot is not None):
+            _fail("admission_never_submitted_unverified")
+        return _admission_retirement_data(dict(kind="never_admitted", abandon_kind="NEVER_SUBMITTED", **common))
+    if (launcher._submitted is not True or context._admission_db_path != partition.db_path or
+            partition._context is not context or partition._snapshot is not snapshot or
+            context._cancel_sealed is not True):
+        _fail("original_admission_changed")
+    if transaction is not None:
+        _closed_transaction(transaction, original=context._submission_transaction_original,
+                            context=context, snapshot=snapshot, path=partition.db_path)
+    reply = launcher._abandon_result
+    expected = dict(cancelled=True, execution_id=snapshot.execution_id, request_key=snapshot.request.request_key,
+                    allowed=False, launch_authorized=False)
+    if type(reply) is not dict or any(type(reply.get(key)) is not type(value) or reply.get(key) != value
+                                    for key, value in expected.items()):
+        _fail("admission_acknowledgement_required")
+    if reply.get("state") == "CANCELLED_BEFORE_START":
+        cancel_target = launcher._abandon_cancel_target
+        if (context._submitted is not True or transaction is None or
+                context._cancel_target != (partition.db_path, partition.reservation_id) or
+                type(context._cancel_revision) is not int or context._cancel_revision < 0 or
+                type(cancel_target) is not dict or set(cancel_target) != {"reservation_id", "expected_revision"} or
+                cancel_target["reservation_id"] != partition.reservation_id or
+                cancel_target["expected_revision"] != context._cancel_revision or
+                type(launcher._admitted) is not dict or
+                launcher._admitted.get("execution_id") != snapshot.execution_id or
+                launcher._admitted.get("reservation_id") != partition.reservation_id or
+                launcher._admitted.get("state_revision") != context._cancel_revision or
+                reply.get("reservation_id") != partition.reservation_id or
+                type(reply.get("state_revision")) is not int or reply["state_revision"] <= context._cancel_revision or
+                context._abandon_target is not None or context._abandon_transaction is not None or
+                context._abandon_result is not None):
+            _fail("reserved_cancellation_unverified")
+        return _admission_retirement_data(dict(kind="reserved_cancelled", state="CANCELLED_BEFORE_START",
+                                               state_revision=reply["state_revision"], **common))
+    kind = context._abandon_kind
+    if (kind not in {"NOT_SUBMITTED", "QUEUED_CANCELLED", "SUBMISSION_REJECTED"} or
+            reply.get("state") != kind or context._abandon_target != target or
+            context._abandon_commit_attempted is not True or context._cancel_target is not None or
+            context._cancel_revision is not None or launcher._abandon_cancel_target is not None or
+            launcher._admitted is not None or type(context._abandon_result) is not dict or
+            any(type(context._abandon_result.get(key)) is not type(value) or context._abandon_result.get(key) != value
+                for key, value in {**expected, "state": kind}.items())):
+        _fail("original_abandonment_required")
+    _closed_transaction(context._abandon_transaction, original=context._abandon_transaction_original,
+                        context=context, snapshot=snapshot, path=partition.db_path)
+    if context._abandon_transaction.get("commit_attempted") is not True:
+        _fail("abandonment_commit_unverified")
+    if kind == "NOT_SUBMITTED":
+        if context._submitted is not False or transaction is not None:
+            _fail("admission_never_submitted_unverified")
+    elif context._submitted is not True or transaction is None:
+        _fail("original_submission_required")
+    if kind == "SUBMISSION_REJECTED" and (transaction.get("first_submission") is not True or
+            transaction.get("commit_attempted") is not False or transaction.get("rolled_back") is not True):
+        _fail("submission_rejection_unverified")
+    return _admission_retirement_data(dict(kind="never_admitted", abandon_kind=kind, **common))
 
 
 def _wrapper_closed(host, binding, spec):
@@ -157,16 +331,23 @@ def _wrapper_closed(host, binding, spec):
     if any(record.get("state") != "closed" for record in launcher._cleanup_records.values()):
         _fail("wrapper_cleanup_pending")
     request = original.publication.request
-    return (dict(kind="wrapper", execution_id=original.snapshot.execution_id,
+    closure = dict(kind="wrapper", execution_id=original.snapshot.execution_id,
                  native_owners_closed=len({id(owner) for owner in owners}),
                  publication_request_id=request.request_id, publication_sha256=request.payload_sha256,
-                 launcher_phase="CLOSED"), (original, launcher, *owners))
+                 launcher_phase="CLOSED")
+    admission = _admission_retirement(original, launcher)
+    if admission is not None:
+        closure["admission_retirement"] = admission
+    return closure, (original, launcher, original.context, original.context._process,
+        original.context._submission_transaction, original.context._abandon_transaction, *owners)
 
 
 def _helper_closed(host, binding, spec):
+    from .experiment_child_host import ExperimentChildHost
     from .helper_host import JobHandleSource
     from .helper_control_host import OperationalHelperHost
-    from .contracts import Mode
+    from .decision import Mode
+    from .supervisor_reconcile import RetainedPolicyOperation
     if (type(host) is not OperationalHelperHost or host._experiment_child_binding is not binding or
             host._experiment_role_spec is not spec or host._closed is not True or host._started is not False or
             host._operator_ready is not True or host._cleanup_started is not True or
@@ -175,6 +356,12 @@ def _helper_closed(host, binding, spec):
             host.process is not None or host.parent_process is not None or host.operator_listener is not None or
             host._listener_factory is not None or host._observer_factory is not None or host._parent_opener is not None):
         _fail("helper_cleanup_pending")
+    bootstrap = getattr(binding, "_experiment_bootstrap_owner", None)
+    if (type(bootstrap) is not ExperimentChildHost or bootstrap.binding is not binding or
+            bootstrap.host is not host or bootstrap.role is not spec or
+            bootstrap.authenticated is not True or bootstrap.dispatched is not True or
+            bootstrap.host_closed is not True):
+        _fail("original_helper_required")
     fields = (host.data_dir, host.profile_path, host.enroll_every_ticks, host.report_every_ticks,
               host.instance_id, host.operator_instance_id, host.parent_instance_id, host.policy_instance_id,
               host.guardian_epoch, host.parent_identity, host.guardian_endpoint)
@@ -197,9 +384,10 @@ def _helper_closed(host, binding, spec):
     _closed_process(parent)
     _listener_closed(listener)
     _registry_closed(registry)
-    _telemetry_closed(telemetry)
+    _telemetry_closed(telemetry, host)
     operation = host._registration_operation
-    if operation is None or operation.pending or operation._quarantine:
+    if (type(operation) is not RetainedPolicyOperation or operation.store is not host.store or
+            operation._complete is not True or operation.pending or operation._quarantine):
         _fail("helper_registration_unsettled")
     return (dict(kind="helper", instance_id=host.instance_id, operator_instance_id=host.operator_instance_id,
                  iterations=host._iterations, mode="shadow"), owners)
@@ -231,7 +419,7 @@ def _guardian_closed(host, binding, spec):
                 _fail("guardian_custody_unsettled")
         else:
             _fail("guardian_custody_required")
-        if (operation is None or operation._candidate is None or operation._operation._changed is not True or
+        if (operation is None or operation._candidate is None or operation._operation._complete is not True or
                 operation._operation.pending or operation._operation._quarantine):
             _fail("guardian_receipt_unsettled")
         body = operation._candidate
@@ -241,7 +429,7 @@ def _guardian_closed(host, binding, spec):
         jobs.append(dict(execution_id=body["execution_id"], evidence_kind=body["evidence_kind"],
             job_name=body["job_name"], job_nonce=body["job_nonce"], manifest_hash=body["manifest_hash"],
             receipt_sha256=_digest(body)))
-    _telemetry_closed(host.telemetry)
+    _telemetry_closed(host.telemetry, host)
     return dict(kind="guardian", jobs=sorted(jobs, key=lambda value: value["execution_id"])), retained
 
 
@@ -325,7 +513,7 @@ def _check_challenge(value, request):
 
 
 def _mac(key, purpose, request, challenge, result=None):
-    if purpose not in {"proof", "result", "receipt"}:
+    if purpose not in {"proof", "result", "receipt", "settled", "finished"}:
         _fail("domain_invalid")
     transcript = dict(domain="ResourceSentinel/experiment-host-retirement-ipc/v1/" + purpose,
                       request=request.to_dict(), challenge=challenge)
@@ -369,8 +557,10 @@ class AcceptedHostRetirement:
                 service.owner is not scope or service._receipts.get(request.manifest.actor_member_id) is not self):
             _fail("original_receipt_changed")
         ExperimentHostRetirementService._retained_original(service, scope)
+        registered = scope._child_registrations.get(request.manifest.actor_member_id)
         if (scope._accepted_children.get(request.manifest.request_id) is not registration or
-                scope._child_registrations.get(request.manifest.actor_member_id) != (actor[0], registration) or
+                type(registered) is not tuple or len(registered) != 2 or
+                registered[0] is not actor[0] or registered[1] is not registration or
                 scope._published_actors.get(request.manifest.actor_member_id) is not actor or
                 actor[1] != request.manifest.child_identity or type(actor[0]) is not CreationAttempt):
             _fail("original_registration_changed")
@@ -521,6 +711,22 @@ class ExperimentHostRetirementService:
                 _fail("receipt_invalid")
             _live(connection, peer, caller)
             _remaining(deadline)
+            # The child must retain its live identity until this final ACK.
+            # Publication is already retained before a possibly lost ACK write;
+            # only the same request may reconcile that ambiguity.
+            child._write(connection, child._envelope("ExperimentHostRetirementSettled", request, challenge,
+                _mac(registration.auth_key, "settled", request, challenge, payload)), deadline)
+            # DisconnectNamedPipe discards unread bytes. Require bounded proof
+            # that the child consumed Settled before the server disconnects:
+            # https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-disconnectnamedpipe
+            finished = child._read(connection, deadline)
+            child._correlated(finished, "ExperimentHostRetirementFinished", request, challenge)
+            if not hmac.compare_digest(finished["mac"],
+                    _mac(registration.auth_key, "finished", request, challenge, payload)):
+                _fail("finished_invalid")
+            # The authenticated original child may exit immediately after its
+            # final write. No new ALIVE observation is required after Finished.
+            _remaining(deadline)
             attempt.exchange_complete = True
 
 
@@ -538,13 +744,33 @@ class ExperimentHostRetirementPublication:
 
     def _retained_original(self):
         values = (self.host, self.child_binding, self.process, self.request, self._wire,
-                  self._registry, self._owners, self._attempts, self._thread, self._pid, self._key)
+                  self._registry, self._owners, self._attempts, self._thread, self._pid, self._key,
+                  self._binding_original)
         if (type(self) is not ExperimentHostRetirementPublication or
                 any(a is not b for a, b in zip(values, self._fixed)) or
                 threading.current_thread() is not self._thread or os.getpid() != self._pid or
                 _PUBLICATIONS.get(self._key) is not self or _canonical(self.request.to_dict()) != self._wire):
             _fail("original_publication_changed")
-        self.child_binding._check_original()
+        # This accessor remains usable after the bootstrap positively closes
+        # its own identity. Binding._check_original performs a native ALIVE
+        # probe; publication custody instead pins the same original metadata.
+        binding, client, binding_origin, client_origin, role, role_wire, request_key = self._binding_original
+        registration, process, pin, manifest_wire, auth_key = client_origin
+        if (binding is not self.child_binding or binding._client is not client or
+                binding._original is not binding_origin or client._original is not client_origin or
+                binding._manifest is not self.request.manifest or binding._process is not self.process or
+                binding._attempt is not binding_origin[3] or binding._registry is not binding_origin[7] or
+                binding._manifest_wire != manifest_wire or binding._thread is not self._thread or
+                binding._pid != self._pid or client._binding is not binding or
+                client.registration is not registration or client.current_process is not process or
+                process is not self.process or client._process_pin is not pin or
+                client._request_key != request_key or child._ORIGINAL_CLIENTS.get(request_key) is not client or
+                _canonical(registration.manifest.to_dict()) != manifest_wire or registration.auth_key != auth_key or
+                registration.role_spec is not role or client._role_original is not role or
+                client._role_wire != role_wire or
+                (None if role is None else _canonical(role.to_dict())) != role_wire):
+            _fail("original_binding_changed")
+        pin.check(closed=process._handle is None)
 
     def _original(self):
         self._retained_original()
@@ -557,7 +783,7 @@ class ExperimentHostRetirementPublication:
     def custody_pending(self):
         self._retained_original()
         status = self._registry.status()
-        return (self._result is None or any(attempt.cleanup_pending for attempt in self._attempts) or
+        return (self._result != _result(self.request) or any(attempt.cleanup_pending for attempt in self._attempts) or
                 bool(status.resources or status.pending or status.quarantined))
 
     def assert_settled(self):
@@ -612,6 +838,12 @@ class ExperimentHostRetirementPublication:
                     self._original()
                     child._write(connection, child._envelope("ExperimentHostRetirementReceipt", request, challenge,
                         _mac(key, "receipt", request, challenge, payload)), deadline)
+                    settled = child._read(connection, deadline)
+                    child._correlated(settled, "ExperimentHostRetirementSettled", request, challenge)
+                    if not hmac.compare_digest(settled["mac"], _mac(key, "settled", request, challenge, payload)):
+                        _fail("settled_authentication_failed")
+                    child._write(connection, child._envelope("ExperimentHostRetirementFinished", request, challenge,
+                        _mac(key, "finished", request, challenge, payload)), deadline)
                     attempt.exchange_complete = True
             _remaining(deadline)
             self._original()
@@ -642,8 +874,11 @@ def publish_host_closed(host, child_binding, current_process):
             owner._wire, owner._owners = _canonical(owner.request.to_dict()), owners
             owner._registry, owner._attempts = NativePipeRegistry(max_resources=1), []
             owner._thread, owner._pid, owner._key = threading.current_thread(), os.getpid(), key
+            client = child_binding._client
+            owner._binding_original = (child_binding, client, child_binding._original, client._original,
+                                       client._role_original, client._role_wire, client._request_key)
             owner._fixed = (host, child_binding, current_process, owner.request, owner._wire,
-                owner._registry, owners, owner._attempts, owner._thread, owner._pid, key)
+                owner._registry, owners, owner._attempts, owner._thread, owner._pid, key, owner._binding_original)
             owner._result = None
             _PUBLICATIONS[key] = owner
         elif owner.host is not host or owner.child_binding is not child_binding or owner.process is not current_process:

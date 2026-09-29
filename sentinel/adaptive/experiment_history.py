@@ -422,7 +422,7 @@ def _validate_completion(record):
     demand = completion.get("demand") if type(completion) is dict else None
     _validate_demand(demand)
     version = completion.get("schema_version")
-    if type(version) is int and version == 3:
+    if type(version) is int and version in (3, 4):
         from .experiment_host_completion import validate_record, digest_record
         validate_record(completion)
         if (kind != "FINISHED" or digest_record(completion) != record["completion_digest"] or
@@ -434,6 +434,8 @@ def _validate_completion(record):
         aggregate_scope = completion["host_rows"]["adaptive_experiment_host_scopes"][0]
         if aggregate_scope["daily_policy_instance_id"] != record["policy"]["instance_id"]:
             _fail("production_policy_changed")
+        if version == 4 and record["preimage"].get("backing_rows") != completion["backing_rows"]:
+            _fail("production_backing_changed")
         return demand
     if type(version) is not int or version not in {1, 2}:
         _fail("completion_version_invalid")
@@ -576,11 +578,15 @@ def canonical_receipt(record):
     policy, pre, post = record["policy"], record["preimage"], record["postimage"]
     _shape(policy, {"instance_id", "logon_id"})
     _uuid(policy["instance_id"])
-    aggregate = type(record["completion"]) is dict and record["completion"].get("schema_version") == 3
-    _shape(pre, {"managed", "allocation", "queue", "exclusion", "registry_revision"} | ({"host_rows"} if aggregate else set()))
-    _shape(post, {"managed", "archive", "exclusion", "registry_revision"} | ({"host_rows"} if aggregate else set()))
+    aggregate = type(record["completion"]) is dict and record["completion"].get("schema_version") in (3, 4)
+    backing = aggregate and record["completion"].get("schema_version") == 4
+    extra = ({"host_rows"} if aggregate else set()) | ({"backing_rows"} if backing else set())
+    _shape(pre, {"managed", "allocation", "queue", "exclusion", "registry_revision"} | extra)
+    _shape(post, {"managed", "archive", "exclusion", "registry_revision"} | extra)
     if aggregate and pre["host_rows"] != post["host_rows"]:
         _fail("production_immutable_history_changed")
+    if backing and pre["backing_rows"] != post["backing_rows"]:
+        _fail("production_immutable_backing_changed")
     _integer(pre["registry_revision"], 0, (1 << 63) - 2)
     _integer(post["registry_revision"], 1)
     now = record["transaction_time"]
@@ -873,7 +879,7 @@ def verify_experiment_history_locked(conn, *, max_rows=MAX_ROWS, max_bytes=MAX_B
                 record["postimage"]["registry_revision"] > runtime["registry_revision"] or
                 not _same(exclusion, record["postimage"]["exclusion"])):
             _fail("committed_tuple_changed")
-        if record["completion"].get("schema_version") == 3:
+        if record["completion"].get("schema_version") in (3, 4):
             from . import experiment_host_ledger as host_ledger
             if not host_ledger.validate_schema_locked(conn):
                 _fail("production_history_missing")
@@ -882,6 +888,12 @@ def verify_experiment_history_locked(conn, *, max_rows=MAX_ROWS, max_bytes=MAX_B
                     where="scope_id=?", parameters=(record["completion"]["scope_id"],))
                 if rows != record["postimage"]["host_rows"][table]:
                     _fail("production_history_changed")
+            from . import experiment_host_backing as host_backing
+            backing_rows = (_rows(conn, host_backing.TABLE, host_backing.FIELDS, budget,
+                where="scope_id=?", parameters=(record["completion"]["scope_id"],))
+                if host_backing.validate_schema_locked(conn) else [])
+            if backing_rows != record["completion"].get("backing_rows", []):
+                _fail("production_backing_history_changed")
         archive = _one(conn, "executions", ("id", *ARCHIVE_FIELDS), budget,
             "reservation_id=? OR request_key=?", (record["reservation_id"], record["request_key"]))
         _integer(archive["id"], 1)

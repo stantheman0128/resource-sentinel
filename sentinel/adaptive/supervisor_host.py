@@ -280,6 +280,24 @@ class SupervisorHost:
         self._drain_closed_children = set()
         self._last_barrier = None
         self._descriptor_removed = self._operator_closed = self._discovery_closed = False
+        self._experiment_supervisor = None
+
+    @classmethod
+    def for_experiment(cls, scope):
+        """Use this actual host with one original, admitted experimental scope."""
+        from .experiment_supervisor import ExperimentSupervisor
+        if cls is not SupervisorHost:
+            raise SupervisorHostRefused("experiment_supervisor_original_host_required")
+        return ExperimentSupervisor.prepare(scope).host
+
+    def _experiment(self):
+        owner = getattr(self, "_experiment_supervisor", None)
+        if owner is not None:
+            from .experiment_supervisor import ExperimentSupervisor
+            if type(owner) is not ExperimentSupervisor or owner.host is not self:
+                raise SupervisorHostRefused("experiment_supervisor_original_integration_required")
+            ExperimentSupervisor.assert_original(owner)
+        return owner
 
     def emit(self, record, stream=None):
         if stream is not None:
@@ -313,6 +331,9 @@ class SupervisorHost:
         from .supervisor_startup import SupervisorStartup
 
         daily_successor = getattr(self, "_daily_successor_operation", None)
+        experiment = self._experiment()
+        if experiment is not None and daily_successor is not None:
+            raise SupervisorHostRefused("experiment_supervisor_successor_incompatible")
         if daily_successor is not None:
             from .daily_successor import DailySuccessorOperation
             if type(daily_successor) is not DailySuccessorOperation:
@@ -377,13 +398,16 @@ class SupervisorHost:
                 if self._initial_epoch is not None and self._initial_epoch != epoch.new_epoch:
                     raise SupervisorHostRefused("daily_successor_epoch_changed")
                 self._initial_epoch = epoch.new_epoch
-            if self.creation is None:
+            experiment = self._experiment()
+            if self.creation is None and experiment is None:
                 self.creation = _Creation()
             if self.draining and self.guardian is None:
                 raise SupervisorHostRefused("supervisor_host_draining")
             if self._initial_epoch is None:
                 self._initial_epoch = mint_guardian_epoch()
             self._ensure_operations(self._initial_epoch)
+            if experiment is not None:
+                experiment.bind_operations()
             self.guardian = self._start_initial_guardian()
         except Exception as error:
             self.cold_reason = _reason(error)
@@ -561,6 +585,9 @@ class SupervisorHost:
         self.operations(self._local_drain_request, caller_identity=self._operational_current.identity)
 
     def _operational_recovery_pending(self):
+        experiment = self._experiment()
+        if experiment is not None and experiment.pending:
+            return True
         if self.unverified or self.unsettled_captures or self._creation_unknown or self._unknown_handles:
             return True
         if self._operator_cleanup_errors:
@@ -662,7 +689,12 @@ class SupervisorHost:
                 self.begin_drain()
                 raise
         try:
-            self.operator_service.serve_once(self.operator_listener, timeout_ms=750)
+            if self._experiment() is None:
+                self.operator_service.serve_once(self.operator_listener, timeout_ms=750)
+            else:
+                # The original thread also services bounded child protocols.
+                # An idle operator accept must not consume their RPC deadline.
+                self.operator_service.poll_once(self.operator_listener, timeout_ms=750)
         except Exception as error:
             self.operations.last_error = error
             self._retain_operator_error(error)
@@ -685,6 +717,9 @@ class SupervisorHost:
                     self.operations.last_error = error
 
     def _start_initial_guardian(self):
+        experiment = self._experiment()
+        if experiment is not None:
+            return experiment.start_guardian(epoch=self._initial_epoch)
         successor = getattr(self, "_daily_successor_operation", None)
         if successor is None:
             return self._start_initial_guardian_owned()
@@ -736,6 +771,9 @@ class SupervisorHost:
 
     def _start_guardian(self, *, previous_epoch=None, epoch=None):
         """Create the child, then build its witness from the creation handle."""
+        experiment = self._experiment()
+        if experiment is not None:
+            return experiment.start_guardian(epoch=epoch, previous_epoch=previous_epoch)
         if self.draining:
             raise SupervisorHostRefused("supervisor_host_draining")
         if self.started_guardians >= self.max_guardians:
@@ -814,6 +852,10 @@ class SupervisorHost:
         be removed.
         """
         from .identity import VerifiedProcess
+
+        experiment = self._experiment()
+        if experiment is not None:
+            return experiment.start_helper()
 
         if self.draining:
             raise SupervisorHostRefused("supervisor_host_draining")
@@ -929,8 +971,21 @@ class SupervisorHost:
     # --- one bounded iteration --------------------------------------------
 
     def run_once(self):
+        experiment = self._experiment()
+        experiment_error = None
+        if experiment is not None:
+            try:
+                experiment.poll_once()
+            except Exception as error:
+                # The dispatcher retains its failed original IPC custody. A
+                # blocked peer must not starve the actual guardian's independent
+                # recovery/registry retirement on this same supervisor thread.
+                experiment_error = _reason(error)
+                self.begin_drain()
         record = self._run_recovery_once()
         self._operational_tick()
+        if experiment_error is not None:
+            record["experiment_transport_error"] = experiment_error
         if self.draining:
             record["draining"] = True
             record["custody"] = self._custody_snapshot()
@@ -1391,6 +1446,9 @@ class SupervisorHost:
         """
         if self._closed:
             return dict(self._close_record)
+        experiment = self._experiment()
+        if experiment is not None:
+            experiment.assert_close_ready()
         if self.draining and not self._drain_children_settled():
             raise SupervisorHostRefused("supervisor_host_custody_unsettled")
         if any(result is None or not result.complete for result in self._registry_results.values()):
@@ -1464,6 +1522,9 @@ class SupervisorHost:
             self._discovery_closed = True
 
     def _close_retired_child(self, child):
+        experiment = self._experiment()
+        if experiment is not None:
+            return experiment.close_child(child)
         # The duplicate owns its own unknown-close quarantine. Retain an
         # explicit tombstone for the raw CreateProcess handle as well.
         witness = getattr(child, "creation_witness", None) or child.process

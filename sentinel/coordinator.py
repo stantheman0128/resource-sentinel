@@ -415,6 +415,7 @@ class Coordinator:
                            "execution_id": managed.execution_id,
                            "db_path": context._admission_db_path}
             context._submission_transaction = transaction
+            context._submission_transaction_original = None
             try:
                 conn = self._connect()
             except BaseException as primary:
@@ -425,6 +426,10 @@ class Coordinator:
                 raise
             transaction["connection"] = conn
             transaction["connection_closed"] = False
+            # Pin the actual owner before BEGIN, independently of the mutable
+            # diagnostic fields retained on the transaction dictionary.
+            context._submission_transaction_original = (
+                context, transaction, conn, managed.execution_id, context._admission_db_path)
             rolled_back = False
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -881,6 +886,7 @@ class Coordinator:
             raise ManagedAdmissionUnavailable("managed_abandon_cleanup_unverified")
         transaction = {"commit_attempted": False}
         context._abandon_transaction = transaction
+        context._abandon_transaction_original = None
         try:
             conn = self._connect()
         except BaseException as primary:
@@ -888,6 +894,8 @@ class Coordinator:
                 context._abandon_error = primary
             raise
         transaction.update(connection=conn, connection_closed=False)
+        context._abandon_transaction_original = (
+            context, transaction, conn, snapshot.execution_id, path)
         try:
             conn.execute("BEGIN IMMEDIATE")
             observed = self._managed_reconciliation_locked(conn, context, snapshot)

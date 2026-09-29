@@ -128,12 +128,16 @@ class GuardianHost:
                                       wire)
         owner._experiment_construction_error = None
         try:
+            context = ExperimentChildBinding.role_release_context(child_binding, spec)
+            parent = (context.get("parent_identity"), context.get("parent_instance_id"))
+            owner._experiment_parent_original = parent
             cls.__init__(owner, data_dir=spec.data_dir, journal_dir=spec.journal_dir,
                 guardian_epoch=spec.guardian_epoch, profile_path=spec.profile_path,
                 rpc_timeout_ms=spec.rpc_timeout_ms, launch_instance_id=spec.launch_instance_id,
                 query_instance_id=spec.query_instance_id, control_instance_id=spec.control_instance_id,
                 instance_id=spec.instance_id, operator_instance_id=spec.operator_instance_id,
-                policy_instance_id=spec.policy_instance_id)
+                policy_instance_id=spec.policy_instance_id,
+                parent_identity=parent[0], parent_instance_id=parent[1])
             owner._experiment_binding = child_binding
             owner.store, owner.guardian = isolated_store, guardian
             owner.authority = ExperimentBackedHostAuthority.for_guardian(child_binding,
@@ -195,6 +199,8 @@ class GuardianHost:
         self._experiment_binding = None
         self._experiment_closed = False
         self._experiment_closed_custody = None
+        self._experiment_close_telemetry = None
+        self._experiment_owner_original = None
 
     def _assert_experiment_host(self):
         """Original object checks only, so recovery never needs fresh admission."""
@@ -202,6 +208,7 @@ class GuardianHost:
         if self._experiment_construction_error is not None:
             raise GuardianHostRefused("experiment_guardian_construction_unsettled")
         spec, binding, store, daily, guardian, wire = self._experiment_original
+        parent_identity, parent_instance_id = self._experiment_parent_original
         if (self._experiment_binding is not binding or binding._experiment_guardian_host is not self or
                 self._experiment_construction_error is not None or spec.to_json() != wire or
                 self.store is not store or self.guardian is not guardian or binding._process is not guardian or
@@ -215,13 +222,19 @@ class GuardianHost:
                  self.control_instance_id, self.instance_id, self.operator_instance_id, self.policy_instance_id) !=
                     (spec.guardian_epoch, spec.rpc_timeout_ms, spec.launch_instance_id, spec.query_instance_id,
                      spec.control_instance_id, spec.instance_id, spec.operator_instance_id, spec.policy_instance_id) or
-                self.parent_identity is not None or self.parent_instance_id is not None or
+                self.parent_identity is not parent_identity or self.parent_instance_id != parent_instance_id or
                 self.evidence_directory is not None or self.evidence_sha256 is not None or
                 self._telemetry_factory is not None or self.control_purpose != "isolated_canary"):
             raise GuardianHostRefused("experiment_guardian_original_host_changed")
-        if self.owner is not None and (self.owner.authority is not self.authority or
-                self.owner.store is not store or self.owner.guardian is not guardian):
+        if (self.owner is not self._experiment_owner_original or self.owner is not None and
+                (self.owner.authority is not self.authority or self.owner.store is not store or
+                 self.owner.guardian is not guardian)):
             raise GuardianHostRefused("experiment_guardian_original_owner_changed")
+        if self._experiment_close_telemetry is not None:
+            sink, store, thread = self._experiment_close_telemetry
+            if (sink is not self.telemetry or getattr(sink, "store", None) is not store or
+                    getattr(sink, "_thread", None) is not thread):
+                raise GuardianHostRefused("experiment_guardian_telemetry_owner_changed")
         self.authority._original()
 
     def _experiment_profile_bytes(self):
@@ -234,12 +247,17 @@ class GuardianHost:
         self._assert_experiment_host()
         if self._experiment_closed:
             raise GuardianHostRefused("experiment_guardian_host_closed")
+        if self._experiment_close_telemetry is not None:
+            raise GuardianHostRefused("experiment_guardian_host_closing")
         spec, binding, store, daily, guardian, wire = self._experiment_original
         # The fixed bootstrap supplies the authenticated parent Release witness.
         # A role/spec dict or successful child handshake alone is insufficient.
         release = getattr(type(binding), "require_role_release", None)
         if not callable(release) or release(binding, spec) is not None:
             raise GuardianHostRefused("experiment_guardian_role_release_required")
+        context = type(binding).role_release_context(binding, spec)
+        if (context.get("parent_identity"), context.get("parent_instance_id")) != self._experiment_parent_original:
+            raise GuardianHostRefused("experiment_guardian_parent_release_changed")
         manifest = binding.manifest
         if (self.data_dir.resolve() != Path(store.db_path).resolve(strict=True).parent or
                 self.data_dir.resolve() == Path(daily.db_path).resolve(strict=True).parent or
@@ -267,6 +285,24 @@ class GuardianHost:
             return record
         from .telemetry import stop_resident_telemetry
         return {**record, "telemetry": stop_resident_telemetry(self, record)}
+
+    def _assert_experiment_telemetry_closed(self):
+        """Positive original native/file closure, independently of delivery."""
+        from .telemetry import ResidentTelemetry, SharedTelemetryStore, _UnavailableTelemetry
+        if self.telemetry is None:
+            return
+        sink = self.telemetry
+        if (type(sink) is _UnavailableTelemetry and self._telemetry_factory is None and
+                getattr(self, "_telemetry_start_error", None) is sink.error):
+            # The fixed default constructors acquire no thread or file owner.
+            # This exact pre-assignment failure is known non-acquisition, not
+            # a replacement for a failed, retained ResidentTelemetry instance.
+            return
+        if (type(sink) is not ResidentTelemetry or type(sink.store) is not SharedTelemetryStore or
+                sink._stop is not True or
+                sink._thread is not None and (sink._done is not True or sink._thread.is_alive()) or
+                sink.store.retained_files != 0 or sink.store._quarantined):
+            raise GuardianHostRefused("experiment_guardian_telemetry_cleanup_pending")
 
     # --- startup ----------------------------------------------------------
 
@@ -325,6 +361,8 @@ class GuardianHost:
                 self.owner = GuardianLaunchOwner(self.store, self.journal,
                                                  guardian_epoch=self.guardian_epoch,
                                                  authority=self.authority, guardian=self.guardian)
+                if self._experiment_binding is not None:
+                    self._experiment_owner_original = self.owner
         except Exception as error:
             raise GuardianHostRefused("guardian_host_owner_unavailable", _reason(error)) from None
         self._register()
@@ -728,6 +766,9 @@ class GuardianHost:
         """
         if self._experiment_binding is not None:
             self._assert_experiment_host()
+            if self._experiment_close_telemetry is None:
+                self._experiment_close_telemetry = (self.telemetry,
+                    getattr(self.telemetry, "store", None), getattr(self.telemetry, "_thread", None))
         if self.registration_pending:
             # An empty execution inventory says nothing about the original
             # startup transaction or its POLICY/native cleanup obligation.
@@ -798,6 +839,7 @@ class GuardianHost:
         result = self._finish_telemetry(
             {"event": "guardian_host_closed", "guardian_epoch": self.guardian_epoch})
         if self._experiment_binding is not None:
+            self._assert_experiment_telemetry_closed()
             self._experiment_closed = True
         return result
 
@@ -818,6 +860,7 @@ class GuardianHost:
                 self.registration_pending or self._cleanup_unknown or not self._operations_settled() or
                 self._descriptor_attempt is not None or self.descriptor is not None):
             raise GuardianHostRefused("experiment_guardian_host_not_closed")
+        self._assert_experiment_telemetry_closed()
         for name, resource in (("launch", self.launch_listener), ("query", self.query_listener),
                 ("control", self.control_listener), ("operator", self.operator_listener),
                 ("discovery", self.discovery)):

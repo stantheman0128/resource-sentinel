@@ -93,6 +93,7 @@ class ManagedAdmission:
         self._submission_policy = None
         self._submission_guard = None
         self._submission_transaction = None
+        self._submission_transaction_original = None
         self._submission_policy_error = None
         self._submission_policy_entered = False
         self._submission_prepare_unknown = False
@@ -101,6 +102,7 @@ class ManagedAdmission:
         self._abandon_commit_attempted = False
         self._abandon_result = None
         self._abandon_transaction = None
+        self._abandon_transaction_original = None
         self._abandon_error = None
 
     @contextmanager

@@ -272,11 +272,11 @@ def _validate_relation(row, tables, revision, conn):
                               row["registered_revision"], row["binding_sha256"], float(allocations[0][0]))
 
 
-def read_for_inventory_locked(conn, *, tables, revision, budget):
-    """Private SQL composition; the enclosing ledger owns POLICY and budget."""
+def history_rows_locked(conn, *, budget):
+    """Bound all immutable rows before selecting live or closed cohort records."""
     if not validate_schema_locked(conn):
-        return ()
-    allowance = min(MAX_BACKINGS, ledger.MAX_ROWS - budget.rows)
+        return []
+    allowance = ledger.MAX_ROWS - budget.rows
     valid = "_backing_position<=" + str(allowance) + " AND " + " AND ".join(
         f"typeof({name})='text' AND length(CAST({name} AS BLOB))<={bound * 4} "
         f"AND length({name})<={bound} AND instr({name},char(0))=0" for name, bound in _BOUNDS.items())
@@ -297,6 +297,19 @@ def read_for_inventory_locked(conn, *, tables, revision, budget):
         if (row["schema_version"] != 1 or not 0 <= row["registered_revision"] < 1 << 63 or
                 row["binding_sha256"] != ledger._digest({key: value for key, value in row.items() if key != "binding_sha256"})):
             _fail("row_binding_invalid")
+        result.append(row)
+    return result
+
+
+def read_for_inventory_locked(conn, *, tables, revision, budget, closed_scope_ids=frozenset()):
+    """Private SQL composition; closed IDs come from complete validated history."""
+    rows = history_rows_locked(conn, budget=budget)
+    result = []
+    for row in rows:
+        if row["scope_id"] in closed_scope_ids:
+            continue
+        if len(result) >= MAX_BACKINGS:
+            _fail("history_or_partition_limit")
         result.append(_validate_relation(row, tables, revision, conn))
     return tuple(result)
 

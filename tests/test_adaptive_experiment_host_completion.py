@@ -4,6 +4,8 @@ These exercise positive prelaunch cleanup and refusal of missing remote evidence
 They neither launch/control native work nor establish a production-host gate.
 """
 from contextlib import closing
+import hashlib
+import hmac
 import json
 import sqlite3
 import unittest
@@ -15,7 +17,13 @@ from sentinel.adaptive import experiment_host_scope as scopes
 from sentinel.adaptive import experiment_host_creation as creation
 from sentinel.adaptive import experiment_cleanup as cleanup
 from sentinel.adaptive import experiment_history as history
+from sentinel.adaptive import daily_generation as generation
+from sentinel.adaptive.contracts import IdentityStatus
+from sentinel.adaptive import experiment_host_retirement_transport as retirement
 from tests import test_adaptive_experiment_host_scope as fixture
+from tests import test_adaptive_experiment_host_dispatch as dispatch_fixture
+from tests import test_adaptive_experiment_host_transport as pipe_fixture
+from tests.test_adaptive_ipc import canonical, wire_frame
 
 
 class ProductionScopeCompletionTests(unittest.TestCase):
@@ -32,6 +40,27 @@ class ProductionScopeCompletionTests(unittest.TestCase):
         self.assertEqual(self.fx.fixture.assert_retained(self.demand), self.before)
         self.assertFalse(self.demand._closed)
 
+    def prepare_release(self, completed):
+        # The parent fixture models source/readiness without installing daily
+        # runtime state. Cleanup consumes a real retained generation row. Match
+        # the existing release-custody fixture; do not call the actual daily
+        # locations or replace any cleanup/POLICY/SQL implementation.
+        with closing(sqlite3.connect(self.demand.ledger_path)) as conn:
+            row = self.fx.fixture.generation
+            conn.execute("CREATE TABLE adaptive_daily_generation (" + ",".join(
+                key + (" INTEGER" if type(value) is int else " TEXT") for key, value in row.items()) + ")")
+            conn.execute("INSERT INTO adaptive_daily_generation VALUES(" +
+                ",".join("?" for _ in row) + ")", tuple(row.values()))
+            generation._install_triggers(conn)
+            conn.commit()
+        for override in (patch.object(generation, "_assert_daily_locations"),
+                         patch.object(generation, "verify_import_provenance"),
+                         patch.object(generation, "_prove_retained_owner_ready",
+                             side_effect=AssertionError("cleanup attempted fresh readiness RPC"))):
+            override.start()
+            self.addCleanup(override.stop)
+        return self.demand.prepare_release(completed)
+
     def test_sealed_prelaunch_scope_has_distinct_exact_completion_and_atomic_release(self):
         self.owner.reserve_member(self.fx.claim)
         completed = completion.retire(self.owner)
@@ -41,7 +70,7 @@ class ProductionScopeCompletionTests(unittest.TestCase):
         self.assertEqual(record["domain"], completion.DOMAIN)
         self.assertEqual(record["actor_outcomes"], [dict(member_id=self.fx.claim.member_id,
             outcome="never_entered", identity=None)])
-        operation = self.demand.prepare_release(completed)
+        operation = self.prepare_release(completed)
         result = self.coordinator.release_experiment(operation)
         self.assertIs(result["released"], True)
         self.assertEqual(self.fx.fixture.rows("reservations"), [])
@@ -148,7 +177,7 @@ class ProductionScopeCompletionTests(unittest.TestCase):
     def test_receipt_preimage_must_cover_every_registered_member(self):
         self.owner.reserve_member(self.fx.claim)
         completed = completion.retire(self.owner)
-        operation = self.demand.prepare_release(completed)
+        operation = self.prepare_release(completed)
         self.coordinator.release_experiment(operation)
         record = json.loads(self.fx.fixture.rows(history.TABLE)[0]["receipt_json"])
         record["preimage"]["host_rows"][ledger.MEMBERS_TABLE].clear()
@@ -163,6 +192,141 @@ class ProductionScopeCompletionTests(unittest.TestCase):
                 conn.execute("DELETE FROM reservations WHERE execution_id=?", (self.demand._snapshot.execution_id,))
             conn.rollback()
         self.assert_charged()
+
+
+class AcceptedHostCompletionTests(unittest.TestCase):
+    """Real parent/SQL/mux/auth receipts with explicit synthetic native effects."""
+    prepare_release = ProductionScopeCompletionTests.prepare_release
+
+    def setUp(self):
+        self.dispatch_fx = dispatch_fixture.ProductionHostDispatcherTests()
+        self.dispatch_fx.setUp()
+        self.addCleanup(self.dispatch_fx.doCleanups)
+        self.fx = self.dispatch_fx.fixture.host
+        self.owner = self.dispatch_fx.owner
+        self.demand = self.owner.demand
+        self.coordinator = self.fx.fixture.coordinator
+        self.dispatcher = self.owner.open_dispatcher()
+        self.dispatch_fx.queue_child()
+        self.dispatcher.serve_once()
+        self.role_fx = self.dispatch_fx.fixture
+        self.actor, self.registration, _ = self.role_fx.children[self.role_fx.guardian.member_id]
+        self.native_closes = []
+        def close(native, handle):
+            self.assertIsNone(self.owner._active_sql)
+            self.assertIsNone(self.owner._guard)
+            self.native_closes.append(handle)
+            return 1
+        override = patch.object(creation._NativeCreation, "close", close)
+        override.start()
+        self.addCleanup(override.stop)
+
+    def receipt(self):
+        request = retirement.PublishHostClosedRequest(self.registration.manifest,
+            "389776fa-61af-4cda-ab95-e2b58d7c8f4f", canonical(dict(kind="guardian", jobs=[])))
+        state = {}
+        def mac(purpose, result=None):
+            value = dict(domain="ResourceSentinel/experiment-host-retirement-ipc/v1/" + purpose,
+                request=request.to_dict(), challenge=state["challenge"])
+            if purpose != "proof":
+                value["result"] = result
+            return hmac.new(self.registration.auth_key, canonical(value), hashlib.sha256).hexdigest()
+        def write(connection, message):
+            self.role_fx.assert_settled()
+            if message["kind"] == "ExperimentHostRetirementChallenge":
+                state["challenge"] = message
+                connection.enqueue(dict(version=1, kind="ExperimentHostRetirementProof",
+                    request_id=request.request_id, nonce=message["nonce"], mac=mac("proof")))
+            elif message["kind"] == "ExperimentHostRetirementResult":
+                state["payload"] = message["result"]
+                connection.enqueue(dict(version=1, kind="ExperimentHostRetirementReceipt",
+                    request_id=request.request_id, nonce=message["nonce"], mac=mac("receipt", message["result"])))
+            elif message["kind"] == "ExperimentHostRetirementSettled":
+                connection.enqueue(dict(version=1, kind="ExperimentHostRetirementFinished",
+                    request_id=request.request_id, nonce=message["nonce"], mac=mac("finished", state["payload"])))
+        hello = dict(version=1, kind="ExperimentHostRetirementHello", request_id=request.request_id,
+                     caller=request.manifest.child_identity.to_dict())
+        pipe = pipe_fixture.Pipe(request.manifest.child_identity,
+            wire_frame(hello) + wire_frame(request.to_dict()), on_write=write)
+        self.dispatch_fx.pending.append(pipe)
+        self.dispatcher.serve_once()
+        return retirement.retained_retirements(self.owner)[0]
+
+    def actors_dead(self):
+        for attempt, _, _ in self.role_fx.children.values():
+            attempt.process._backend.state = IdentityStatus.DEAD
+
+    def test_authenticated_host_actual_actor_close_and_dispatcher_close_publish_v4_then_release(self):
+        receipt = self.receipt()
+        self.actors_dead()
+        completed = completion.retire(self.owner)
+        data = completed.snapshot()
+        self.assertEqual(data["schema_version"], completion.HOST_VERSION)
+        self.assertEqual(data["host_retirements"], [receipt.snapshot()])
+        self.assertEqual(data["backing_rows"], [])
+        self.assertEqual(data["isolated_custody"], [])
+        self.assertTrue(all(attempt.native_settled for attempt, _, _ in self.role_fx.children.values()))
+        self.assertEqual(len(self.native_closes), 4)
+        self.dispatcher.assert_closed()
+        result = self.coordinator.release_experiment(self.prepare_release(completed))
+        self.assertTrue(result["released"])
+        archived = json.loads(self.fx.fixture.rows(history.TABLE)[0]["receipt_json"])
+        self.assertEqual(archived["completion"], data)
+        self.assertEqual(archived["preimage"]["backing_rows"], [])
+        self.assertEqual(archived["postimage"]["backing_rows"], [])
+
+    def test_actor_exit_without_terminal_receipt_retains_listener_and_capacity(self):
+        self.actors_dead()
+        with self.assertRaisesRegex(completion.ProductionCompletionError, "authenticated_host_retirement_required"):
+            completion.retire(self.owner)
+        self.assertFalse(self.dispatcher._closed)
+        self.assertFalse(self.native_closes)
+        self.assertTrue(self.fx.fixture.assert_retained(self.demand))
+
+    def test_authenticated_terminal_receipt_with_live_actor_keeps_capacity(self):
+        self.receipt()
+        with self.assertRaisesRegex(creation.CreationCustodyError, "actor_exit_unverified"):
+            completion.retire(self.owner)
+        self.assertFalse(self.dispatcher._closed)
+        self.assertFalse(self.demand._closed)
+
+    def test_dispatcher_unknown_close_cannot_be_replaced_by_actor_and_receipt_evidence(self):
+        self.receipt()
+        self.actors_dead()
+        self.dispatch_fx.close_error = OSError("synthetic_unknown_close")
+        with self.assertRaises(OSError):
+            completion.retire(self.owner)
+        self.assertFalse(self.demand._closed)
+        self.assertIsNone(self.owner._completion._record)
+        self.dispatch_fx.close_error = None
+        with self.assertRaises(Exception):
+            completion.retire(self.owner)
+
+    def test_copied_or_changed_terminal_receipt_is_not_original_completion_authority(self):
+        original = self.receipt()
+        self.actors_dead()
+        completed = completion.retire(self.owner)
+        service = self.owner._retirement_service
+        service._receipts[original.request.manifest.actor_member_id] = original.snapshot()
+        with self.assertRaises(Exception):
+            completed.assert_original()
+        self.assertFalse(self.demand._closed)
+
+    def test_v4_history_rejects_foreign_actor_identity_or_unbound_job_claim(self):
+        self.receipt()
+        self.actors_dead()
+        completed = completion.retire(self.owner)
+        data = completed.snapshot()
+        data["host_retirements"][0]["child_identity"]["pid"] += 1
+        with self.assertRaises(completion.ProductionCompletionError):
+            completion.validate_record(data)
+        data = completed.snapshot()
+        data["host_retirements"][0]["closure"]["jobs"] = [dict(
+            execution_id="b6a393de-cf66-4c9d-bc2a-68e28aa9f455",
+            evidence_kind="guardian_terminal_custody_closed", job_name="unbound-job",
+            job_nonce="1" * 32, manifest_hash="2" * 64, receipt_sha256="3" * 64)]
+        with self.assertRaises(completion.ProductionCompletionError):
+            completion.validate_record(data)
 
 
 if __name__ == "__main__":

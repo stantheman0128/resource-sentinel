@@ -522,7 +522,7 @@ class ExperimentReleaseOperation(_OriginalCleanupAccess):
 
         def mutation(table, key, old_json, new_json):
             record = self._publication(conn, frame)
-            if record["completion"].get("schema_version") == 3:
+            if record["completion"].get("schema_version") in (3, 4):
                 from .experiment_host_ledger import completion_rows_locked
                 completion_rows_locked(conn, completion=self.completion)
             pre = json.loads(self._raw_preimage)
@@ -643,6 +643,8 @@ class ExperimentReleaseOperation(_OriginalCleanupAccess):
             exclusion=excluded[0] if excluded else None, registry_revision=self.policy.revalidate(conn, self._guard)["registry_revision"])
         if aggregate_rows is not None:
             pre["host_rows"] = aggregate_rows
+            if self.completion.snapshot()["schema_version"] == 4:
+                pre["backing_rows"] = self.completion.snapshot()["backing_rows"]
         raw = _canonical(pre | {"managed": self._wire(managed)})
         if self._candidate is not None:
             record = self._record()
@@ -659,6 +661,8 @@ class ExperimentReleaseOperation(_OriginalCleanupAccess):
             registry_revision=pre["registry_revision"] + 1)
         if aggregate_rows is not None:
             post["host_rows"] = aggregate_rows
+            if "backing_rows" in pre:
+                post["backing_rows"] = pre["backing_rows"]
         record = dict(schema_version=1, receipt_id=self.receipt_id, operation_id=self.operation_id,
             experiment_id=metadata["experiment_id"], execution_id=metadata["execution_id"], reservation_id=reservation_id,
             request_key=metadata["request_key"], suite=metadata["suite"], disposition=completion["disposition"],
@@ -869,6 +873,11 @@ class ExperimentReleaseOperation(_OriginalCleanupAccess):
             self.demand._assert_unused_claim()
             self._settle_previous()
             if not self._committed:
+                from .experiment_host_completion import ProductionScopeCompletion
+                if type(self.completion) is ProductionScopeCompletion:
+                    # This may read manifests/isolated SQL. Complete it before
+                    # acquiring the daily POLICY or entering any daily SQL.
+                    ProductionScopeCompletion.revalidate_isolated_history(self.completion)
                 self._policy_settled = False
                 if self._guard is not None:
                     self._guard._nonce_clear_attempted = self._guard._nonce_clear_confirmed = False

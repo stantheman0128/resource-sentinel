@@ -201,7 +201,11 @@ def _validate_role_release(value, registration):
         _fail("role_release_invalid")
     if spec.role == "guardian":
         if context:
-            _fail("role_release_invalid")
+            if set(context) != {"parent_identity", "parent_instance_id"}:
+                _fail("role_release_invalid")
+            if _identity(context["parent_identity"]) != manifest.endpoint.server_identity:
+                _fail("role_release_parent_changed")
+            _uuid(context["parent_instance_id"])
         return
     fields = {"guardian_identity", "guardian_epoch"}
     fields |= ({"launch_instance_id", "reservation_id", "backing_request_id"} if spec.role == "wrapper" else
@@ -504,7 +508,8 @@ class ExperimentChildBinding:
         self.require_role_release(spec)
         context = strict_json_loads(self._role_release_wire)["guardian"]
         if spec.role == "guardian":
-            return {}
+            return (dict(parent_identity=_identity(context["parent_identity"]),
+                         parent_instance_id=context["parent_instance_id"]) if context else {})
         identity = _identity(context["guardian_identity"])
         if spec.role == "wrapper":
             return dict(endpoint=NativePipeEndpoint(identity.logon_id, context["launch_instance_id"], identity),

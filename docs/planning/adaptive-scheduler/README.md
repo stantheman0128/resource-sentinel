@@ -1,8 +1,64 @@
 # GPT Pro 規劃交接：Agent 動態資源調度
 
-日期：2026-09-19。狀態：**正式計畫已入庫；2026-09-25 依使用者要求收尾並暫停，production adaptive 維持 off。**
+日期：2026-09-19。最新狀態：**2026-09-30 依使用者續作要求恢復 source 實作；production adaptive 維持 off，未授權部署。**
 
-## 2026-09-25 WIP 保存提交（目前狀態）
+## 2026-09-30 續作：目前狀態
+
+接手 HEAD 為 `3d3e934`，沒有退回目標文字中的歷史 `e52d849`。
+七個草稿已在 `25aa05b` 保存；其後的 G1–G5 結果與凍結決策在 `3d3e934`。
+此次新的續作要求恢復程式工作，不構成日常來源安裝、設定變更或 native gate 通過。
+十四個原有 dirty 檔案的 hash 與 protected manifest 相同，保留不提交。
+
+先對 HEAD 的精確匯出 tree `bafcd5b0a2ab5767fa55839238f95272cb803bf7`
+執行十一個相關模組：**373 tests、0 failures、2 errors、0 skips，49.329 秒**。
+錯誤分別是 WIP wrapper fixture 不存在，以及 WIP authority 測試在合成雙帳本
+流程耗盡真實 250 ms 操作預算。此為修正前基準，不宣稱 HEAD 測試通過。
+完整命令、模組與原始日誌在本機 `.local-adaptive/boundary-20260930-baseline/`。
+
+Source commit `bee5c5ccf353ab1c988286fec407e01c61a41a4a` 已實作使用者批准的
+[SQL transaction boundary](DAILY-READINESS-TRANSACTION-DECISION.md)：
+BEGIN 前驗證原始程序與檔案、交易內只核對同一 connection／身分／版本／期限，
+Create／Set 前再實際查驗。也保留 publication ACK 不確定時的原始 wrapper
+責任，以及 constructor failure 的原始 binding，避免提前釋放容量或替換 owner。
+這批 source 修正沒有開放 native promotion。
+
+Windows／Python 3.13.3，正常 daily HEAVY/P2/CPU1/RAM1GiB/IO0 准入，
+從精確 Git tree 匯出並清除 PYTHONPATH 驗證：
+
+- Tree `a3383e37fe27cf6a9a94f7d73e7e8b345d4bcdad`：51 模組 **1,150 tests，
+  1,140 PASS、0 failures、10 errors、0 skips，402.488 秒**。10 errors 全在
+  同一個舊 SQL-only fixture，未宣告必要的 native no-entry 證據。
+- 最終 source tree `b7f10451c2b4ec68f82e6824cb36c66d10e90681` 僅修改該測試
+  檔，保留原 assertions，補明確的合成 no-entry 證據與反向拒絕案例；沒有改
+  production source。重跑該模組與相鄰邊界／cleanup custody 共三模組：
+  **32 PASS、0 failures／errors／skips，2.997 秒**。
+- 最後測試修正後未重跑全部 51 模組，不宣稱最終 tree 全套一次通過；較早的
+  42 PASS 與上述範圍重疊，不相加。沒有未提交 source 依賴。
+
+完整模組、命令、刻意調整的觀察契約及先前失敗記錄，見
+[transaction boundary 驗證紀錄](TRANSACTION-BOUNDARY-VERIFICATION.md)。
+新增測試使用真實隔離 SQLite 與明確的 synthetic native/readiness fixture，
+不是 P3–P6 native 驗收。原 14 個 protected 檔案不變，沒有部署、修改日常
+config／正式 Scheduled Task／全域入口；本批沒有施加測試 Job 限制。
+
+入口核對更正：`run_adaptive_s1.py` → `NativeEvidenceRun.run_s1()` →
+`S1SerialProvider` 是已存在的正式 source 路徑，不呼叫歷史
+`require_continuous_admission()` placeholder。它仍要求 canonical daily source
+與 readiness 就緒；目前沒有部署或 native 驗證。`ACCEPTANCE-RESULTS.md` 的
+G3 拒絕證據保留，但直接呼叫舊 placeholder 的結果不能推論新 S1 入口亦走此路徑。
+S3 recovery 與 P6 舊入口仍實際依賴 placeholder，不能刪除防線假裝接通。
+
+| 原目標 | 目前 source／驗證狀態 |
+| --- | --- |
+| 1. C2 退場、2. C4 failsafe | 已有契約與實作；下方數字是歷史測試，沒有重報為目前 HEAD 全套通過。 |
+| 3. helper sender、4. release／CLI | 已有 source 接線；native 控制、恢復及整體驗收仍未通過。 |
+| 5. S1 全程容量覆蓋 | Serial provider source 已有；shared transaction boundary 已實作並完成上述 source 回歸，仍需獨立授權的 daily source readiness 與實機 S1。 |
+| 6. S2–S3／成本／P6 命令 | WIP consumer、固定 child bootstrap／Release、aggregate completion、S2/P4 provider、S3 drivers／orchestration、P6 provider／A0 尚有 source 工作，不能寫成只剩使用者跑主控台。 |
+
+以下 checkpoint 保留歷史範圍；其中「暫停」「未提交」等描述是當時狀態，
+以本節與後續實際驗證結果判斷目前進度。
+
+## 2026-09-25 WIP 保存提交（歷史狀態）
 
 依使用者後續的 commit 要求，將先前凍結的七個 task-owned 草稿保存入庫：
 `launcher.py`、`wrapper_host.py`、`test_adaptive_wrapper_host.py`，以及

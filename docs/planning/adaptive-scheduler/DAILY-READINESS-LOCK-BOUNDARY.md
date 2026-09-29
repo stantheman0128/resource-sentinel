@@ -4,8 +4,10 @@
 [transaction boundary correction](DAILY-READINESS-TRANSACTION-DECISION.md)，
 以正式計畫的 BEGIN 前觀察／交易內 metadata 核對／native action 前再驗證，
 取代下文「每次 UDF write 重新查 native／filesystem」的觀察時點要求。
-該修正尚未實作；下列測試數字是舊契約歷史證據，不能用來宣稱新邊界或
-native promotion 通過。本輪依使用者要求暫停，最新進度以 README 為準。
+2026-09-30 已恢復 source 實作並補入該修正；最新精確 tree、回歸結果與
+剩餘缺口見 README。下列測試數字是舊契約歷史證據，不能用來宣稱新邊界或
+native promotion 通過。下文的交易內 native／filesystem 觀察時點已被批准
+的修正取代；保留原文供追溯，不再作為現行實作要求。
 
 日期：2026-09-24。狀態：**source 與 preparation 中央整合驗證已通過。**
 原契約基準為 `codex/adaptive-scheduler-implementation` 的 `41cee4d`，並保留其

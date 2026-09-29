@@ -1,8 +1,10 @@
 # Daily readiness transaction boundary decision
 
 Status: contract correction explicitly approved by the user on 2026-09-25;
-implementation remains pending. The user then requested wrap-up and a pause.
-No runtime change or promotion is authorized by this document. Baseline: `b9132cc`.
+source implementation updated on 2026-09-30 after work resumed. See README for
+the exact tested tree, scoped results and remaining provider/native gaps.
+No runtime change or promotion is authorized by this document. Historical
+contract baseline: `b9132cc`; resumed source baseline: `3d3e934`.
 
 ## Observed contradiction
 
@@ -21,7 +23,7 @@ checks and DailyReadinessAuthority.revalidate -> peer.observe(). The same issue
 exists in absence and nonce-clear checks that resolve/stat paths inside SQL.
 Passing portable tests cannot establish that this boundary is correct.
 
-## Approved correction, not yet implemented
+## Approved correction
 
 Use the formal plan's observation boundary for SQL bookkeeping, without making
 an admitted reservation sufficient authority to create or restrict work:
@@ -63,15 +65,27 @@ liveness, silently change the old tests, or declare promotion passed.
 The user selected the formal-plan boundary above, accepting this observation
 timing change while retaining the complete gate verification. The old per-write
 native tests must be updated explicitly with regression coverage for the new
-semantics, not silently removed. Current source still uses the old observation
-timing; native promotion remains blocked until the correction and caller gates
-are implemented and verified. Exact original-handle hardening is independent.
+semantics, not silently removed. The source correction moves actual observation
+to pre-BEGIN and post-SQL Create/Set checks; native promotion still requires
+the separate provider and native gate evidence. Exact original-handle hardening
+is independent.
 
 Coverage includes ordinary remote/local capacity, absent generation, nonce-only
 cleanup, daily successor and experiment cleanup/release. Both successor/cleanup
 dispatch helpers also resolve paths; checking only the principal capacity UDF
 would leave actual transaction-time filesystem probes. No changes to those
-shared files or new transaction-boundary tests were made before the pause.
+shared files or new transaction-boundary tests were made before the September 25
+pause. The September 30 batch includes these consumers, actual SQLite
+transaction spies, immutable connection/scope/deadline pins, and final native
+action checks. It also preloads release helpers before provenance attestation:
+their first import otherwise invokes filesystem auditing while SQL is open.
+
+The retained deadline is never refreshed by SQL or a second Set. Unknown
+publication/cleanup keeps the original wrapper binding and daily capacity;
+constructor failure cannot replace that binding. Nonce-only cleanup additionally
+requires positive original native release or no-entry evidence, without granting
+capacity mutation authority. Real native launch/control/recovery, overhead and
+A/B acceptance remain separate from source regression.
 
 ## Required evidence before promotion
 

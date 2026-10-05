@@ -13,7 +13,7 @@
     "capacity_ram_gib": 63.6,
     "allocatable_ram_gib": 48.0,
     "visible_cpu": 12,
-    "allocatable_cpu": 8,
+    "allocatable_cpu": 10.8,
     "disk_free_gib": 119.0,
     "allocatable_disk_gib": 80.0,
     "capabilities": {

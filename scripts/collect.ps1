@@ -65,7 +65,7 @@ $migrations = @{
     hysteresis_disk_queue = 0.5; hysteresis_disk_latency_ms = 5
     disk_queue_yellow = 2; disk_queue_orange = 4; disk_queue_red = 8
     disk_latency_yellow_ms = 20; disk_latency_orange_ms = 50; disk_latency_red_ms = 100
-    local_allocatable_cpu = 8; local_allocatable_ram_gib = 48
+    local_allocatable_cpu = 10.8; local_allocatable_ram_gib = 48
     local_commit_headroom_gib = 4; heavy_io_slots = 1
     collection_interval_sec = 30
     reservation_ttl_min = 120; queue_ttl_min = 30; reservation_grace_sec = 120

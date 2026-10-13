@@ -76,7 +76,9 @@ A CLI gets into Guardian one of three ways:
    parents and asks the daemon to move it and its children into root, provider and session job. Later children
    inherit the job. `guardctl adopt <pid> <provider> [session]` does the same by hand. Adopting is refused when a
    desktop app (Claude, Codex, Cursor or Antigravity) is among the parents, and it fails for a CLI that put itself
-   in a job of its own at start, because Windows only lets a process join a job inside its current job tree.
+   in a job of its own at start. Windows lets such a process join only a job inside its current job tree, or a job
+   that never held a process, which then nests under the CLI's job and can never join Guardian's tree (measured
+   2026-10-14).
 
 Guardian never sets the breakaway limits on its jobs (`JOB_OBJECT_LIMIT_BREAKAWAY_OK` and
 `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`; winjob.py only reads them back), so every child a controlled CLI starts

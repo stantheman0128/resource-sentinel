@@ -8,6 +8,24 @@
 - The CPUs open to agents can be changed while sessions run (dashboard, `guardctl world N`, `--world-cpus`).
 - Demos: fake sessions in a miniature world, timed or manual control on/off, and a real Claude Code CLI that
   works as an agent inside Guardian until stopped. See docs/guardian.md.
+- Guardian for every agent CLI (Claude Code, Codex, Gemini, Cursor Agent, Grok): `gagent` launches any of them
+  inside a session job; a session-start hook (`hooks/guardian-adopt.py`) and `guardctl adopt` move a running CLI
+  and its children in, refusing the desktop apps; `guardian-whereami` tells a session whether it is controlled,
+  also from inside a sandbox that blocks the daemon's pipe; `guardian-provider-check` proves it per CLI; and
+  `guardian-install-hooks` (dry run unless `--apply`) adds the hook to Codex and Grok user configs.
+- PATH wrappers for the same five CLIs: `guardian-install-shims` (dry run unless `--apply`, old Path backed up)
+  puts claude, codex, gemini, cursor-agent and grok wrappers first on the user Path, and `guardian-shim` starts the
+  real CLI suspended in the same console, has the daemon assign it, then lets it run. This also covers Claude Code
+  and Cursor Agent, which put themselves in a job of their own and so cannot be adopted by a hook. The provider
+  check gains the `shimver` and `shim` levels. The adopt sweep leaves desktop-app helpers under a CLI alone, and
+  hook session names come from the tail of time-ordered (UUIDv7) ids.
+- Wrapper fixes after the verifier pass: a `.ps1` wrapper for PowerShell (no cmd.exe in between), arguments after
+  the CLI name reach it untouched (a leading `--` included), arguments for the CLIs installed as `.cmd` are
+  written the way Rust's standard library writes batch-file arguments (a double quote or `%` in a prompt could
+  otherwise make cmd.exe run part of it), the CLI is resumed within 15 s even when the daemon never answers or
+  gives an unreadable answer, Ctrl+C during that wait no longer ends the shim, `GUARDIAN_SHIM=off` is silent, the
+  current folder no longer counts as the real CLI, the Claude app is also recognized by `CLAUDE_CODE_ENTRYPOINT`
+  (Git Bash breaks the parent chain), and `--remove` deletes only wrapper files with the guardian-shim note.
 
 ## Unreleased - 2026-09-13
 

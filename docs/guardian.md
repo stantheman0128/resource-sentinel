@@ -26,8 +26,8 @@ every tool command it runs stay inside it:
 - **Control off.** `rollback` removes every cap and puts the agents back at normal priority; the CPU limit stays.
   `resume-control` turns it back on.
 
-Guardian only controls work it launched. It reads the Claude, Codex and Cursor desktop apps but never assigns them
-to a job. Cloud sessions run on remote machines and use no local CPU, so there is nothing to control locally.
+Guardian only controls work it launched or adopted (see below). It reads the Claude, Codex and Cursor desktop apps
+but never assigns them to a job. Cloud sessions run on remote machines and use no local CPU, so there is nothing to control locally.
 
 ## The foreground probe
 
@@ -52,7 +52,62 @@ Demos (instance `onoff`, dashboard on port 8767 unless noted):
 | `guardian-demo.py` | three fake sessions in a 3-CPU miniature world (instance `demo`, port 8766) |
 | `guardian-demo-onoff.py` | timed control off / on with fake sessions; `--full` uses every CPU, `--manual` lets you toggle |
 | `guardian-demo-claude.py` | a real Claude Code CLI inside Guardian, working as an agent until Esc; `--cpus 10` |
-| `guardian-demo-workload.py` | the CPU-heavy work both sides run; prints speed, cores, priority and job membership |
+| `guardian-demo-workload.py` | the CPU-heavy work both sides run; prints speed, cores, priority and whether control is on |
+
+## Agent CLIs: launch, wrap or adopt
+
+A CLI gets into Guardian one of three ways:
+
+1. **Launch.** `python -I scripts/gagent.py <claude|codex|gemini|cursor|grok> [--session NAME] [-- CLI args]`
+   starts the CLI through srun in its own console window. The CLI is in its session job before it runs its first
+   instruction, and every tool command inherits the job. This works for all five CLIs.
+2. **Wrap.** After `python -I scripts/guardian-install-shims.py --apply`, typing `claude`, `codex`, `gemini`,
+   `cursor-agent` or `grok` in a new terminal runs a wrapper (`.ps1` for PowerShell, `.cmd` for cmd, an sh script
+   for Git Bash) that calls `scripts/guardian-shim.py`. The shim starts the real CLI suspended in the same console,
+   has the daemon assign it to root, provider and session job, then lets it run, so it is in its session from its
+   first instruction, like a launch. This is the way in for Claude Code and Cursor Agent outside gagent. Arguments
+   after the CLI name reach the CLI as the shell passed them on (PowerShell and cmd change a few things first,
+   see Known limits). The CLI runs as before, without a word, when its parent is already in
+   a Guardian session (a tool command of another CLI inherits that job), when a desktop app started it, or with
+   `GUARDIAN_SHIM=off`. When the daemon is down, refuses, or gives no answer within 15 seconds, the CLI runs anyway
+   and one `[guardian]` line says why. `GUARDIAN_SHIM_INSTANCE` picks the instance (default `main`), and
+   `GUARDIAN_SHIM_VERBOSE=1` also prints where the CLI runs.
+3. **Adopt.** A session-start hook runs `hooks/guardian-adopt.py <provider>`, which finds the CLI among its
+   parents and asks the daemon to move it and its children into root, provider and session job. Later children
+   inherit the job. `guardctl adopt <pid> <provider> [session]` does the same by hand. Adopting is refused when a
+   desktop app (Claude, Codex or Cursor) is among the parents, and it fails for a CLI that put itself in a job of
+   its own at start, because Windows only lets a process join a job inside its current job tree.
+
+Guardian never sets the breakaway limits on its jobs (`JOB_OBJECT_LIMIT_BREAKAWAY_OK` and
+`JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`; winjob.py only reads them back), so every child a controlled CLI starts
+stays in its session job. A process that Windows starts on the CLI's behalf is not its child and starts outside:
+one created through WMI (`Win32_Process.Create`), a service, or a scheduled task.
+
+`python -I scripts/guardian-whereami.py` answers from inside a session whether it is controlled; ask an agent to
+run it as a shell command. When a CLI sandbox blocks the daemon's pipe (Codex's does), it reads the named jobs
+directly. `python -I scripts/guardian-provider-check.py` checks every CLI against its own daemon instance `check`
+(port 8768): `version` starts the CLI through srun, `srun` makes the agent run whereami through srun, `hook` starts
+the CLI outside Guardian with a hook config for that run only, `shimver` and `shim` start it through the wrapper
+(written to the run's own folder, so nothing global changes) with `--version` and with the whereami prompt. Where
+no model call can run, a child of the CLI process stands in for a tool command: gemini's node.exe runs whereami
+through `NODE_OPTIONS=--require` at `--version`, and grok's session-start hook runs it at `shim`. The srun, hook
+and shim levels make one model call each.
+
+| CLI (version tested) | Launch | PATH wrapper | Adopt hook | Notes |
+|---|---|---|---|---|
+| Claude Code 2.1.296 | yes: tool command in the session | yes: tool command in the shim's session | no: claude.exe is in its own job, adopt refused | measured; use the wrapper or gagent |
+| Codex CLI 0.156.0 | yes: tool command in the session | yes: tool command in the shim's session | yes: tool command in the adopted session; node.exe and node_repl.exe children were refused (Access denied) and stay outside | sandbox blocks the daemon pipe, whereami reads the jobs |
+| Gemini CLI 0.1.3 | CLI starts in the session; tool command not tested | CLI starts in the session; a child of its node.exe (started through `NODE_OPTIONS=--require`, no model call) reports the shim's session; tool command not tested | no hooks in 0.1.3 | not signed in on 2026-10-13 (no auth type, no credentials), so no model call can run; headless shell also needs `--yolo`, which the check runs only with `--allow-yolo` |
+| Cursor Agent 2026.10.01 | yes: tool command in the session | yes: tool command in the shim's session | no: its node.exe is in its own job, adopt refused | measured; start it outside Git Bash (see Known limits) |
+| Grok 1.0.40 | CLI starts in the session; tool command not tested | grok.exe and its session-start hook (its own child) in the shim's session; no tool command ran (401) | yes: grok.exe adopted into its session; powershell.exe and conhost.exe children were refused (Access denied) and stayed outside | on 2026-10-13 grok answered 401 (invalid or expired credentials), also outside Guardian; the project hook needs a git root |
+
+To have new sessions join without gagent, Stan can run `python -I scripts/guardian-install-shims.py` from the main
+checkout: it covers all five CLIs. It prints the change and writes nothing until `--apply`, which saves the old
+user Path first; `--remove` undoes it. The `.ps1` wrappers are written only when PowerShell's execution policy
+runs local scripts (RemoteSigned for Stan's user on 2026-10-13); otherwise PowerShell uses the `.cmd` ones. As a second route for Codex and Grok, `python -I
+scripts/guardian-install-hooks.py` adds the adopt hook, with the same dry run, a backup of the file and `--remove`.
+It covers Codex (`~/.codex/hooks.json`, then trust it once with `/hooks` in codex) and Grok
+(`~/.grok/hooks/guardian.json`). Wrappers and hook only act while the daemon for that instance runs.
 
 ## Measured on this machine
 
@@ -73,4 +128,36 @@ instead of tens.
 - The dashboard page embeds the HTTP token, so any local process can read it. It listens on 127.0.0.1 only.
 - Pausing a session sets its CPU rate to 0.01%. A paused CLI cannot service its network connections either, and
   they may time out, so keep pauses short.
-- `hooks/guardian-route.py` (routing an agent's Bash calls through Guardian automatically) is not written yet.
+- Claude Code and Cursor Agent sessions started neither through gagent nor through the PATH wrapper (by full path,
+  from a terminal opened before the install, or by a tool that ignores PATH) stay outside Guardian. A session
+  started inside a desktop app's terminal is refused on purpose, as long as the app is still among its parents.
+- The wrappers sit on the user Path, which Windows puts after the system Path. A CLI installed into a system Path
+  folder is found first and bypasses its wrapper; the installer warns about that.
+- Grok reads Claude, Cursor and Codex hook files as well as its own, so one CLI may run another CLI's hooks. The
+  adopt hook then finds no CLI of its provider and does nothing.
+- cursor-agent 2026.10.01 started with Git Bash's variables (`MSYSTEM`, `SHELL` and others) runs its hooks through
+  bash but writes each hook line in PowerShell. Every hook fails, and Cursor then rejects every shell command, with
+  or without Guardian. Start it from PowerShell or cmd. The provider check removes those variables for this reason.
+- A child that Windows will not move (Access denied, usually because it already sits in a job of its own) stays
+  outside: node.exe and node_repl.exe under Codex, powershell.exe and conhost.exe under Grok. The adopt reports
+  `partial` and names them. Children started after the adopt join.
+- The desktop-app refusal follows the parent chain. A CLI whose launcher has already exited no longer shows the
+  app above it and is adopted. Git Bash starts programs through an emulated fork and exec, which leaves an exited
+  process above sh, so the wrapper also checks `CLAUDE_CODE_ENTRYPOINT=claude-desktop`, which the Claude app
+  passes to everything it starts. For the Codex app and Cursor there is no such check yet: a wrapper started under
+  them through Git Bash is taken in.
+- From cmd.exe, the `.cmd` wrapper hands its arguments to cmd again, like npm's own `.cmd` wrappers: `%NAME%` is
+  expanded, an unquoted `&` `|` `<` `>` or `^` splits the line, and after Ctrl+C cmd asks "Terminate batch job
+  (Y/N)?" once the CLI exits. PowerShell runs the `.ps1` wrapper instead, which adds none of these, but PowerShell
+  binds the arguments before the wrapper sees them, as with npm's own `.ps1` wrappers: it keeps the first bare `--`
+  for itself (write `'--'`), and it splits a single-dash option with a colon, so `-c:x` arrives as `-c:` and `x`.
+- Gemini and Cursor Agent are installed as `.cmd` files, so the shim runs them through cmd.exe
+  (`/e:ON /v:OFF /d /c`) and writes each argument the way Rust's standard library does for batch files: quoted
+  unless plain, double quotes doubled, `%` neutralized. 200 random arguments made of `" \ % & | < > ^ ( ) !`,
+  spaces and tabs arrived unchanged, and none ran as a command. cmd.exe cannot carry a line break inside an
+  argument, so the shim refuses to start such a CLI with one `[guardian]` line and exit code 2.
+- Guardian's jobs keep the default security of a new job. In the verifier's test a non-elevated process of the
+  same user opened `check.AllAgents` by name with full access, so such a process could change the limits.
+- The Guardian pipe name includes `USERNAME`, so a process with a different `USERNAME` in its environment cannot
+  reach the daemon and whereami reports it as not running.
+- Codex 0.156 cannot parse a `hooks.json` that starts with a UTF-8 byte order mark. The installer writes without one.

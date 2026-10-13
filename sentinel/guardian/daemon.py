@@ -6,8 +6,10 @@ Job tree (named in the session namespace, so a restarted daemon or `guardctl rol
     Local\\Guardian.<instance>.p.<provider>     pause or resume a whole provider (rate 1 = paused)
       Local\\Guardian.<instance>.s.<p>.<s>      per-session hard cap from weighted max-min, relative to the pool
         unnamed run job per command             cancel = TerminateJobObject; CPU, peak commit
+A CLI that was started outside Guardian joins the tree when its hook asks (op "adopt"): the daemon assigns the
+running CLI and its children to the session job, and what the CLI starts later inherits it.
 Running app UIs (Claude desktop, the Codex app, Cursor) stay where they are: a process cannot leave its job, and
-a cap on their own app job would also slow their UI. apps.py only measures them.
+a cap on their own app job would also slow their UI. apps.py only measures them, and adopt refuses them.
 Nothing here kills or suspends work on its own. Cancel happens only when the requesting client goes away or
 Stan presses cancel; pause is a CPU rate of 1/10000 that resume lifts.
 """
@@ -30,6 +32,7 @@ from multiprocessing.connection import Listener
 from pathlib import Path
 
 from . import policy as P
+from . import providers as PV
 from . import winjob as wj
 from .client import CLASSES, home_dir, pipe_name, ping, send_json
 from .ledger import Ledger
@@ -55,6 +58,12 @@ def secret(path, nbytes):
 def safe(name, default="default"):
     s = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(name or ""))[:48]
     return s or default
+
+
+def sweep_targets(pids, table, path, own=(), skip=()):
+    """The children that join an adopted CLI's job: not Guardian's own, not skipped, and neither a desktop app nor
+    a helper with an app above it, since Guardian never puts the apps in a job."""
+    return [p for p in pids if p not in own and p not in skip and not PV.app_among(p, table, path)]
 
 
 def describe(argv):
@@ -106,6 +115,17 @@ class Run:
         self.send_lock = threading.Lock()
 
 
+class Adopted:
+    """A CLI that was already running when it asked to join. Guardian did not start it, so it is never cancelled
+    from here; the row ends when the process exits."""
+
+    def __init__(self, run_id, session, pid, handle, label, coverage):
+        self.run_id, self.session, self.pid, self.handle = run_id, session, pid, handle
+        self.label, self.coverage = label, coverage
+        self.state, self.est_gib, self.est_source, self.commit_gib = "adopted", 0.0, "adopted", 0.0
+        self.proc = self.job = self.cancelled = None
+
+
 class Guardian:
     def __init__(self, instance="main", world_cpus=None, initial_cap=None, cfg_over=None, port=8765, probe=True,
                  apps=True):
@@ -123,6 +143,7 @@ class Guardian:
         self.lock = threading.RLock()
         self.ledger = Ledger(self.home / "guardian.sqlite3")
         self.sessions, self.providers, self.queue, self.live, self.lingering = {}, {}, [], {}, []
+        self.adopted = {}  # CLI pid -> Adopted
         self.hold = False
         self.inject = None
         self.media = None
@@ -307,6 +328,12 @@ class Guardian:
                         r.commit_gib = r.job.memory_usage()[0] / GiB
                     except OSError:
                         pass
+                elif r.state == "adopted":
+                    if wj.has_exited(r.handle):
+                        self.end_adopted(r)
+                    else:
+                        m = wj.process_memory(r.pid)
+                        r.commit_gib = m[0] / GiB if m else 0.0
             for r in list(self.lingering):
                 if r.job.accounting()["active"] == 0:
                     r.job.close()
@@ -463,6 +490,10 @@ class Guardian:
                 send_json(conn, {"ok": True, "instance": self.instance, "pid": os.getpid(), "world": self.world})
             elif req.get("op") == "run":
                 self.serve_run(conn, req)
+            elif req.get("op") == "adopt":
+                self.serve_adopt(conn, req)
+            elif req.get("op") == "whereis":
+                send_json(conn, self.whereis(int(req.get("pid") or 0)))
         except (EOFError, OSError):
             pass
         except Exception:
@@ -619,6 +650,127 @@ class Guardian:
         self.ledger.run_update(run.run_id, state=state, t_end=time.time(), exit_code=rc, cpu_s=cpu_s,
                                peak_commit_bytes=peak, reason=run.cancelled or run.reason or "")
 
+    # ---- adopting a CLI that is already running --------------------------------------------------------------
+    def serve_adopt(self, conn, req):
+        provider = safe(req.get("provider"), "other").lower()
+        provider = provider if provider in PROVIDERS else "other"
+        cls = req.get("cls") if req.get("cls") in CLASSES else "normal"
+        try:
+            pid = int(req["pid"])
+        except (KeyError, TypeError, ValueError):
+            return send_json(conn, {"ok": False, "state": "refused", "reason": "no pid given"})
+        skip = {int(x) for x in (req.get("skip") or [])[:64] if str(x).isdigit()}
+        send_json(conn, self.adopt(pid, provider, safe(req.get("session")), cls, safe(req.get("via"), "hook"), skip))
+
+    def own_pids(self):
+        own = {os.getpid()}
+        if self.probe_proc:
+            own.add(self.probe_proc.pid)
+        return own
+
+    def adopt_refusal(self, pid, table):
+        if pid in self.own_pids() or pid in wj.ancestors(os.getpid(), table):
+            return "that process is the Guardian daemon or one of its parents"
+        app = PV.app_among(pid, table, wj.image_path)
+        if app:
+            return f"the {app} is the process or one of its parents, and Guardian never puts the apps in a job"
+        return None
+
+    def assign_chain(self, pid, chain):
+        """Outer job first, skipping jobs the process is already in, so the nesting matches spawn_in_jobs."""
+        try:
+            for j in chain:
+                if not wj.in_job(pid, j.h):
+                    j.assign(pid)
+        except OSError as e:
+            return str(e)
+        return None
+
+    def adopt(self, pid, provider, name, cls="normal", via="hook", skip=()):
+        """Put a running CLI and everything it has started into a session job; what it starts later inherits the
+        job. state: adopted (new), already (it was in Guardian's tree before), partial (some children stayed out),
+        refused. skip: the hook process and the shells between it and the CLI, which exit in a moment anyway and
+        may sit in a job of their own (the py launcher puts python in one)."""
+        table = wj.process_table()
+        if pid not in table:
+            return {"ok": False, "state": "refused", "reason": f"process {pid} is not running"}
+        image = table[pid][1]
+        why = self.adopt_refusal(pid, table)
+        if why:
+            self.decide("adopt_refused", f"{provider}/{name}", requested={"pid": pid, "image": image, "via": via},
+                        reason=why)
+            return {"ok": False, "state": "refused", "reason": why}
+        with self.lock:
+            if wj.in_job(pid, self.root.h):
+                # started through srun, adopted before, or a tool command of another CLI Guardian already holds
+                holder = next((x for x in self.sessions.values() if wj.in_job(pid, x.job.h)), None)
+                key = holder.key if holder else "?"
+                chain = [self.root, self.providers[holder.provider]["job"], holder.job] if holder else [self.root]
+                late = [p for p in sweep_targets(wj.descendants(pid, table)[1:], table, wj.image_path,
+                                                 self.own_pids(), skip)
+                        if not wj.in_job(p, chain[-1].h) and not self.assign_chain(p, chain)]
+                return {"ok": True, "state": "already", "session": key, "pid": pid, "swept": len(late),
+                        "coverage": self.coverage_of(pid, holder), "reason": f"already in Guardian session {key}"}
+            fresh = f"{provider}/{name}" not in self.sessions
+            s = self.session(provider, name, cls)
+            chain = [self.root, self.providers[provider]["job"], s.job]
+            err = self.assign_chain(pid, chain)
+            if err:
+                if fresh:  # do not leave an empty session row behind
+                    self.sessions.pop(s.key).job.close()
+                why = ("Guardian cannot open the process (another user's, or protected)" if "OpenProcess" in err
+                       else "the CLI is in a job outside Guardian's tree; start it with gagent/srun instead")
+                self.decide("adopt_failed", s.key, requested={"pid": pid, "image": image, "via": via}, error=err,
+                            reason=why)
+                return {"ok": False, "state": "refused", "pid": pid, "reason": f"{why} ({err})"}
+            failed, moved = [], 1
+            for p in sweep_targets(wj.descendants(pid, table)[1:], table, wj.image_path, self.own_pids(), skip):
+                e = self.assign_chain(p, chain)
+                if e:
+                    failed.append({"pid": p, "image": table[p][1], "error": e})
+                else:
+                    moved += 1
+            coverage = self.coverage_of(pid, s)
+            run = Adopted(uuid.uuid4().hex[:12], s, pid, wj.open_waitable(pid), f"{image} (adopted)", coverage)
+            if run.handle:
+                self.live[run.run_id] = run
+                self.adopted[pid] = run
+                s.live_runs += 1
+                s.t_last = time.time()
+            self.ledger.run_requested({"run_id": run.run_id, "provider": provider, "session": name, "cls": s.cls,
+                                       "fingerprint": hashlib.sha1(f"{provider}|adopt".encode()).hexdigest()[:16],
+                                       "label": run.label, "est_gib": 0.0, "est_source": "adopted",
+                                       "unprofiled": False, "t_request": time.time(), "coverage": coverage})
+            self.ledger.run_update(run.run_id, state="running" if run.handle else "done", t_start=time.time(),
+                                   pid=pid)
+            state = "partial" if failed else "adopted"
+            self.decide("adopt", s.key, requested={"pid": pid, "image": image, "via": via},
+                        readback={"processes": moved, "failed": failed[:5], "coverage": coverage},
+                        reason=f"{image} and {moved - 1} child processes joined the session job")
+            return {"ok": True, "state": state, "session": s.key, "pid": pid, "run_id": run.run_id,
+                    "processes": moved, "failed": failed[:5], "coverage": coverage}
+
+    def whereis(self, pid):
+        """Which Guardian session job holds pid; what scripts/guardian-whereami.py and the provider check ask."""
+        with self.lock:
+            holder = next((x for x in self.sessions.values() if wj.in_job(pid, x.job.h)), None)
+            return {"pid": pid, "in_guardian": bool(wj.in_job(pid, self.root.h)), "in_any_job": wj.in_job(pid),
+                    "session": holder.key if holder else None, "priority": wj.priority_class(pid),
+                    "adopted": pid in self.adopted, "instance": self.instance}
+
+    def coverage_of(self, pid, s):
+        in_root, in_session = wj.in_job(pid, self.root.h), bool(s) and wj.in_job(pid, s.job.h)
+        return ("enforced" if in_root and in_session else "partial") + f", priority {wj.priority_class(pid)}"
+
+    def end_adopted(self, r):
+        self.live.pop(r.run_id, None)
+        self.adopted.pop(r.pid, None)
+        r.session.live_runs -= 1
+        wj.CloseHandle(r.handle)
+        r.state = "done"
+        self.ledger.run_update(r.run_id, state="done", t_end=time.time(), reason="the adopted CLI exited")
+        self.log(f"adopted {r.label} pid {r.pid} ({r.session.key}) exited")
+
     # ---- dashboard API ---------------------------------------------------------------------------------------
     def state(self):
         with self.lock:
@@ -654,7 +806,7 @@ class Guardian:
                            "est_gib": round(r.est_gib, 2), "numbers": r.numbers,
                            "waiting_s": round(time.monotonic() - r.t_request)} for r in self.queue],
                 "runs": [{"run_id": r.run_id, "session": r.session.key, "label": r.label, "state": r.state,
-                          "pid": r.proc.pid if r.proc else None, "coverage": r.coverage,
+                          "pid": r.proc.pid if r.proc else getattr(r, "pid", None), "coverage": r.coverage,
                           "est_gib": round(r.est_gib, 2), "est_source": r.est_source,
                           "commit_gib": round(r.commit_gib, 2)} for r in self.live.values() if r.state != "queued"],
                 "recent_runs": self.ledger.recent_runs(12),
@@ -705,7 +857,14 @@ class Guardian:
                 self.allocate()
             elif path == "/api/cancel":
                 run = self.live[b["run_id"]]
+                if isinstance(run, Adopted):
+                    raise ValueError("an adopted CLI is not cancelled from here; close it where it runs")
                 run.cancelled = "cancelled by Stan from the dashboard"
+            elif path == "/api/adopt":
+                pid, provider = int(b["pid"]), safe(b.get("provider"), "other").lower()
+                provider = provider if provider in PROVIDERS else "other"
+                return self.adopt(pid, provider, safe(b.get("session"), f"{provider}-{pid}"),
+                                  b.get("cls") if b.get("cls") in CLASSES else "normal", "guardctl")
             elif path == "/api/media":
                 level = P.media_window_level(b, self.cfg["observation"])
                 self.media = {"t": now, "level": level, "raw": b}

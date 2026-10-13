@@ -179,7 +179,7 @@ function render(s) {
   const rows = s.queue.map(q => `<tr><td>${esc(q.run_id)}</td><td>${esc(q.session)}</td><td>${esc(q.label)}</td><td class="warn">排隊 ${q.waiting_s} 秒</td>
       <td class="sub">${esc(q.reason)}</td><td>${q.est_gib} GiB</td><td><button data-cancel="${esc(q.run_id)}">取消</button></td></tr>`)
     .concat(s.runs.map(r => `<tr><td>${esc(r.run_id)}</td><td>${esc(r.session)}</td><td>${esc(r.label)}</td><td class="ok">${r.state === 'running' ? '執行中' : esc(r.state)}</td>
-      <td class="sub">pid ${r.pid} · ${esc(r.coverage)}</td><td>${r.commit_gib} / ${r.est_gib} GiB</td><td><button data-cancel="${esc(r.run_id)}">取消</button></td></tr>`));
+      <td class="sub">pid ${r.pid} · ${esc(r.coverage)}</td><td>${r.commit_gib} / ${r.est_gib} GiB</td><td>${r.state === 'adopted' ? '收編' : `<button data-cancel="${esc(r.run_id)}">取消</button>`}</td></tr>`));
   document.getElementById('runs').innerHTML = '<tr><th>編號</th><th>Session</th><th>指令</th><th>狀態</th><th>細節</th><th>記憶體（已用 / 預留）</th><th></th></tr>' + rows.join('');
 
   document.getElementById('decisions').textContent = s.decisions.map(d =>

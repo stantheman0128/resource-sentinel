@@ -505,3 +505,56 @@ def performance_info():
     ps = p.PageSize
     return {"available": p.PhysicalAvailable * ps, "physical_total": p.PhysicalTotal * ps,
             "commit_total": p.CommitTotal * ps, "commit_limit": p.CommitLimit * ps}
+
+
+# ---- adopting a process that is already running -----------------------------------------------
+SYNCHRONIZE = 0x00100000
+QueryFullProcessImageNameW = _bind("QueryFullProcessImageNameW", w.BOOL, HANDLE, w.DWORD, w.LPWSTR,
+                                   ctypes.POINTER(w.DWORD))
+WaitForSingleObject = _bind("WaitForSingleObject", w.DWORD, HANDLE, w.DWORD)
+
+
+def image_path(pid):
+    """Full path of the process image, or None when the process cannot be opened."""
+    h = OpenProcess(PROCESS_QUERY_LIMITED, False, pid)
+    if not h:
+        return None
+    try:
+        buf, n = ctypes.create_unicode_buffer(1024), w.DWORD(1024)
+        return buf.value if QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(n)) else None
+    finally:
+        CloseHandle(h)
+
+
+def ancestors(pid, table=None):
+    """pid's parent, grandparent and so on, nearest first. Stops at the first parent that has exited or repeats.
+    A parent PID can be reused after its process exits, so callers check what they find by image name."""
+    table = table or process_table()
+    out, seen = [], {pid}
+    p = table.get(pid, (None,))[0]
+    while p in table and p not in seen:
+        out.append(p)
+        seen.add(p)
+        p = table[p][0]
+    return out
+
+
+def open_waitable(pid):
+    """A handle that keeps the PID from being reused while it is open; None if the process is gone."""
+    return OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED, False, pid) or None
+
+
+def has_exited(handle):
+    return WaitForSingleObject(handle, 0) == 0  # WAIT_OBJECT_0: the process has exited
+
+
+def in_named_job(pid, name):
+    """True/False when the named job exists and pid can be checked against it, else None. Query access only, so
+    it also works where a sandbox keeps a process from reaching the daemon's pipe."""
+    h = OpenJobObjectW(JOB_OBJECT_QUERY, False, job_name(name))
+    if not h:
+        return None
+    try:
+        return in_job(pid, h)
+    finally:
+        CloseHandle(h)

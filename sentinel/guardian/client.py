@@ -1,4 +1,4 @@
-"""Client side of the Guardian pipe, used by scripts/srun.py and hooks/guardian-route.py.
+"""Client side of the Guardian pipe, used by scripts/srun.py, scripts/gagent.py and hooks/guardian-adopt.py.
 
 Messages are length-framed by multiprocessing.connection and tagged by their first byte:
 J = JSON control message, O = stdout bytes, E = stderr bytes. The daemon never unpickles anything.
@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from multiprocessing.connection import Client
 from pathlib import Path
 
@@ -18,6 +19,11 @@ CLASSES = ("focus", "normal", "batch")
 
 def home_dir(instance="main"):
     return Path.home() / ".resource-sentinel" / "guardian" / instance
+
+
+def shim_dir():
+    """Where scripts/guardian-install-shims.py puts the claude/codex/gemini/cursor-agent/grok wrappers."""
+    return Path.home() / ".resource-sentinel" / "guardian" / "shims"
 
 
 def pipe_name(instance="main"):
@@ -75,7 +81,9 @@ def run(argv, provider, session, cls="normal", est_gib=None, console=False, inst
     conn = connect(instance)
     if conn is None:
         return run_local(argv, "Guardian daemon not reachable")
-    req = {"op": "run", "argv": argv, "cwd": os.getcwd(), "env": dict(os.environ), "provider": provider,
+    # the CLI's own hooks read these, so a CLI started here reports the session it already runs in
+    env = dict(os.environ, GUARDIAN_PROVIDER=provider, GUARDIAN_SESSION=session, GUARDIAN_INSTANCE=instance)
+    req = {"op": "run", "argv": argv, "cwd": os.getcwd(), "env": env, "provider": provider,
            "session": session, "cls": cls, "est_gib": est_gib, "console": console}
     try:
         send_json(conn, req)
@@ -119,3 +127,57 @@ def run(argv, provider, session, cls="normal", est_gib=None, console=False, inst
         return 255
     finally:
         conn.close()
+
+
+def adopt(pid, provider, session, cls="normal", instance="main", via="hook", skip=(), timeout=10.0):
+    """Ask the daemon to take a running CLI (and what it has started) into a session job. Never raises; the
+    answer is a dict whose "state" is adopted, already, partial, refused, unreachable or timeout."""
+    conn = connect(instance)
+    if conn is None:
+        return {"ok": False, "state": "unreachable", "reason": f"Guardian {instance} is not running"}
+    try:
+        send_json(conn, {"op": "adopt", "pid": int(pid), "provider": provider, "session": session, "cls": cls,
+                         "via": via, "skip": [int(x) for x in skip]})
+        if not conn.poll(timeout):
+            return {"ok": False, "state": "timeout", "reason": f"no answer within {timeout:.0f} s"}
+        return json.loads(conn.recv_bytes()[1:])
+    except (EOFError, OSError, ValueError) as e:
+        return {"ok": False, "state": "unreachable", "reason": f"lost the Guardian connection ({e.__class__.__name__})"}
+    finally:
+        conn.close()
+
+
+def whereis(pid, instance="main"):
+    """The daemon's view of pid: {"in_guardian", "session", "priority", ...}, or None when it is not running."""
+    conn = connect(instance)
+    if conn is None:
+        return None
+    try:
+        send_json(conn, {"op": "whereis", "pid": int(pid)})
+        return json.loads(conn.recv_bytes()[1:]) if conn.poll(10) else None
+    except (EOFError, OSError, ValueError):
+        return None
+    finally:
+        conn.close()
+
+
+def start_daemon(instance="main", port=8765, extra=(), wait=20.0):
+    """Start the daemon in the background unless it is already running; its output goes to
+    ~/.resource-sentinel/guardian/<instance>-daemon.log. Returns its ping answer, or None if it did not come up."""
+    up = ping(instance)
+    if up:
+        return up
+    log = home_dir(instance).parent / f"{instance}-daemon.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    script = Path(__file__).resolve().parents[2] / "scripts" / "guardian.py"
+    with open(log, "a", encoding="utf-8") as f:
+        subprocess.Popen([sys.executable, "-I", str(script), "--instance", instance, "--port", str(port), *extra],
+                         stdin=subprocess.DEVNULL, stdout=f, stderr=f,
+                         creationflags=0x08000000 | 0x00000200)  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < wait:
+        up = ping(instance)
+        if up:
+            return up
+        time.sleep(0.3)
+    return None

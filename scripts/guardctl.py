@@ -6,6 +6,7 @@
   guardctl pause-provider codex | resume-provider codex
   guardctl cap 40 | world 10 | hold on | hold off | inject degraded 30 | priority normal | allocator off
   guardctl cancel <run_id> | rollback | resume-control | shutdown
+  guardctl adopt <pid> <provider> [session]     take in a CLI that is already running and has no hook
 """
 import argparse
 import json
@@ -44,6 +45,8 @@ def summary(s):
         cap = "-" if x["cap_cores"] is None else f"{x['cap_cores']:.2f}"
         lines.append(f"  session {x['key']:<24} {x['cls']:<6} {'PAUSED' if x['paused'] else '':<6} "
                      f"use {x['usage']:.2f} cap {cap} runs {x['runs']}")
+    for r in s["runs"]:
+        lines.append(f"  {r['state']:<8} {r['run_id']} {r['session']:<24} pid {r['pid']} {r['label']!r} ({r['coverage']})")
     for q in s["queue"]:
         lines.append(f"  queued {q['run_id']} {q['session']} {q['label']!r}: {q['reason']}")
     for a in s["apps"]:
@@ -72,6 +75,7 @@ def main(argv=None):
         "priority": lambda: ("/api/pool_priority", {"priority": x[0]}),
         "allocator": lambda: ("/api/allocator", {"on": x[0] == "on"}),
         "cancel": lambda: ("/api/cancel", {"run_id": x[0]}),
+        "adopt": lambda: ("/api/adopt", {"pid": int(x[0]), "provider": x[1], "session": x[2] if len(x) > 2 else None}),
         "rollback": lambda: ("/api/rollback", {}),
         "resume-control": lambda: ("/api/resume_control", {}),
         "shutdown": lambda: ("/api/shutdown", {}),

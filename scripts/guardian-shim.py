@@ -3,7 +3,7 @@
 
   python -I scripts/guardian-shim.py [--instance main] [--session NAME] [--cls normal] [--verbose] <provider> [args]
 
-scripts/guardian-install-shims.py puts small claude / codex / gemini / cursor-agent / grok wrappers ahead of the
+scripts/guardian-install-shims.py puts small claude / codex / gemini / cursor-agent / grok / agy wrappers ahead of the
 real CLIs on PATH that call this, so typing `claude` starts Claude Code under Guardian. The CLI is created
 suspended, the daemon assigns it to root > provider > session, and only then does it run. That also covers the
 CLIs that put themselves in a job of their own at start (Claude Code, Cursor Agent), which a hook cannot adopt.

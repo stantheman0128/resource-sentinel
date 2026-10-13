@@ -58,11 +58,11 @@ Demos (instance `onoff`, dashboard on port 8767 unless noted):
 
 A CLI gets into Guardian one of three ways:
 
-1. **Launch.** `python -I scripts/gagent.py <claude|codex|gemini|cursor|grok> [--session NAME] [-- CLI args]`
-   starts the CLI through srun in its own console window. The CLI is in its session job before it runs its first
-   instruction, and every tool command inherits the job. This works for all five CLIs.
+1. **Launch.** `python -I scripts/gagent.py <claude|codex|gemini|cursor|grok|antigravity> [--session NAME]
+   [-- CLI args]` starts the CLI through srun in its own console window. The CLI is in its session job before it
+   runs its first instruction, and every tool command inherits the job. This works for all six CLIs.
 2. **Wrap.** After `python -I scripts/guardian-install-shims.py --apply`, typing `claude`, `codex`, `gemini`,
-   `cursor-agent` or `grok` in a new terminal runs a wrapper (`.ps1` for PowerShell, `.cmd` for cmd, an sh script
+   `cursor-agent`, `grok` or `agy` in a new terminal runs a wrapper (`.ps1` for PowerShell, `.cmd` for cmd, an sh script
    for Git Bash) that calls `scripts/guardian-shim.py`. The shim starts the real CLI suspended in the same console,
    has the daemon assign it to root, provider and session job, then lets it run, so it is in its session from its
    first instruction, like a launch. This is the way in for Claude Code and Cursor Agent outside gagent. Arguments
@@ -75,8 +75,8 @@ A CLI gets into Guardian one of three ways:
 3. **Adopt.** A session-start hook runs `hooks/guardian-adopt.py <provider>`, which finds the CLI among its
    parents and asks the daemon to move it and its children into root, provider and session job. Later children
    inherit the job. `guardctl adopt <pid> <provider> [session]` does the same by hand. Adopting is refused when a
-   desktop app (Claude, Codex or Cursor) is among the parents, and it fails for a CLI that put itself in a job of
-   its own at start, because Windows only lets a process join a job inside its current job tree.
+   desktop app (Claude, Codex, Cursor or Antigravity) is among the parents, and it fails for a CLI that put itself
+   in a job of its own at start, because Windows only lets a process join a job inside its current job tree.
 
 Guardian never sets the breakaway limits on its jobs (`JOB_OBJECT_LIMIT_BREAKAWAY_OK` and
 `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`; winjob.py only reads them back), so every child a controlled CLI starts
@@ -90,8 +90,11 @@ directly. `python -I scripts/guardian-provider-check.py` checks every CLI agains
 the CLI outside Guardian with a hook config for that run only, `shimver` and `shim` start it through the wrapper
 (written to the run's own folder, so nothing global changes) with `--version` and with the whereami prompt. Where
 no model call can run, a child of the CLI process stands in for a tool command: gemini's node.exe runs whereami
-through `NODE_OPTIONS=--require` at `--version`, and grok's session-start hook runs it at `shim`. The srun, hook
-and shim levels make one model call each.
+through `NODE_OPTIONS=--require` at `--version`, and grok's session-start hook runs it at `shim`. agy runs a shell
+command headless only with permission rules in its global settings or with `--dangerously-skip-permissions`, so at
+`srun`, `hook` and `shim` it gets a plain prompt and a PreInvocation hook in the run folder's `.agents/hooks.json`
+runs whereami as agy's own child; `--allow-yolo` asks for the shell command instead. The srun, hook and shim levels
+make one model call each.
 
 | CLI (version tested) | Launch | PATH wrapper | Adopt hook | Notes |
 |---|---|---|---|---|
@@ -99,15 +102,18 @@ and shim levels make one model call each.
 | Codex CLI 0.156.0 | yes: tool command in the session | yes: tool command in the shim's session | yes: tool command in the adopted session; node.exe and node_repl.exe children were refused (Access denied) and stay outside | sandbox blocks the daemon pipe, whereami reads the jobs |
 | Gemini CLI 0.1.3 | CLI starts in the session; tool command not tested | CLI starts in the session; a child of its node.exe (started through `NODE_OPTIONS=--require`, no model call) reports the shim's session; tool command not tested | no hooks in 0.1.3 | not signed in on 2026-10-13 (no auth type, no credentials), so no model call can run; headless shell also needs `--yolo`, which the check runs only with `--allow-yolo` |
 | Cursor Agent 2026.10.01 | yes: tool command in the session | yes: tool command in the shim's session | no: its node.exe is in its own job, adopt refused | measured; start it outside Git Bash (see Known limits) |
-| Grok 1.0.40 | CLI starts in the session; tool command not tested | grok.exe and its session-start hook (its own child) in the shim's session; no tool command ran (401) | yes: grok.exe adopted into its session; powershell.exe and conhost.exe children were refused (Access denied) and stayed outside | on 2026-10-13 grok answered 401 (invalid or expired credentials), also outside Guardian; the project hook needs a git root |
+| Grok 1.0.40 | yes: tool command in the session | yes: tool command and its session-start hook (its own child) in the shim's session | yes: tool command in the adopted session; powershell.exe and conhost.exe children were refused (Access denied) and stayed outside | measured after Stan signed in again (report 231319); the project hook needs a git root |
+| Antigravity CLI 1.3.4 (`agy`) | agy.exe and its PreInvocation hook (its own child) in the session; tool command not tested | the same, in the shim's session | yes: agy.exe adopted (2 processes, none refused); its PreInvocation hook reports the adopted session | reports 233349 and 233824. Measured besides: hooks run through cmd.exe and need no git root; the session name comes from `conversationId`; agy starts a background updater, another agy.exe, as its child, and it replaced 1.3.3 with 1.3.4 unasked before these runs |
 
 To have new sessions join without gagent, Stan can run `python -I scripts/guardian-install-shims.py` from the main
-checkout: it covers all five CLIs. It prints the change and writes nothing until `--apply`, which saves the old
+checkout: it covers all six CLIs. It prints the change and writes nothing until `--apply`, which saves the old
 user Path first; `--remove` undoes it. The `.ps1` wrappers are written only when PowerShell's execution policy
-runs local scripts (RemoteSigned for Stan's user on 2026-10-13); otherwise PowerShell uses the `.cmd` ones. As a second route for Codex and Grok, `python -I
-scripts/guardian-install-hooks.py` adds the adopt hook, with the same dry run, a backup of the file and `--remove`.
-It covers Codex (`~/.codex/hooks.json`, then trust it once with `/hooks` in codex) and Grok
-(`~/.grok/hooks/guardian.json`). Wrappers and hook only act while the daemon for that instance runs.
+runs local scripts (RemoteSigned for Stan's user on 2026-10-13); otherwise PowerShell uses the `.cmd` ones. As a
+second route for Codex, Grok and Antigravity, `python -I scripts/guardian-install-hooks.py` adds the adopt hook,
+with the same dry run, a backup of the file and `--remove`. It covers Codex (`~/.codex/hooks.json`, then trust it
+once with `/hooks` in codex), Grok (`~/.grok/hooks/guardian.json`) and Antigravity (a named hook `guardian-adopt`
+in `~/.gemini/config/hooks.json`; the user's own hooks in that file stay). Wrappers and hook only act while the daemon
+for that instance runs.
 
 ## Measured on this machine
 

@@ -14,10 +14,10 @@ cannot be assigned; the daemon reports that instead of retrying.
 import os
 
 # Desktop apps never go into a job: a cap on them would also slow their UI. Their built-in agents (Claude Code inside
-# the Claude app, codex app-server inside the Codex app) use the same image names as the CLIs, so anything with a
-# desktop app among its parents is refused too. The Claude Code CLI is also claude.exe, so the Claude app is told
-# apart by where Windows installed it.
-APP_IMAGES = {"chatgpt.exe": "Codex app", "cursor.exe": "Cursor"}
+# the Claude app, codex app-server inside the Codex app, language_server.exe inside Antigravity) use the same image
+# names as the CLIs or run their own, so anything with a desktop app among its parents is refused too. The Claude Code
+# CLI is also claude.exe, so the Claude app is told apart by where Windows installed it.
+APP_IMAGES = {"chatgpt.exe": "Codex app", "cursor.exe": "Cursor", "antigravity.exe": "Antigravity app"}
 CLAUDE_APP_DIRS = ("\\windowsapps\\claude_", "\\anthropicclaude\\")
 
 
@@ -52,6 +52,9 @@ PROVIDERS = {
     # cursor-agent.cmd -> powershell -> %LOCALAPPDATA%\cursor-agent\versions\<v>\node.exe index.js
     "cursor": Provider("cursor", "cursor-agent", {"node.exe"}, "\\cursor-agent\\"),
     "grok": Provider("grok", "grok", {"grok.exe"}),
+    # Antigravity CLI 1.3.3 and 1.3.4: one Go binary that hosts its language server in the same process, runs hooks through
+    # cmd.exe and starts a background updater (another agy.exe) as its own child
+    "antigravity": Provider("antigravity", "agy", {"agy.exe"}),
 }
 
 
@@ -95,7 +98,7 @@ def default_session(provider):
     return f"{provider}-{os.getpid()}"
 
 
-# scripts/guardian-install-shims.py writes claude/codex/gemini/cursor-agent/grok wrappers that run
+# scripts/guardian-install-shims.py writes claude/codex/gemini/cursor-agent/grok/agy wrappers that run
 # scripts/guardian-shim.py; every wrapper names that script, which is how it is told apart from the real CLI.
 SHIM_MARK = b"guardian-shim"
 

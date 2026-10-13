@@ -22,7 +22,7 @@ def home_dir(instance="main"):
 
 
 def shim_dir():
-    """Where scripts/guardian-install-shims.py puts the claude/codex/gemini/cursor-agent/grok wrappers."""
+    """Where scripts/guardian-install-shims.py puts the claude/codex/gemini/cursor-agent/grok/agy wrappers."""
     return Path.home() / ".resource-sentinel" / "guardian" / "shims"
 
 

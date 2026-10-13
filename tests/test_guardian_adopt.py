@@ -15,6 +15,8 @@ CLAUDE_EMBEDDED = r"C:\Users\x\AppData\Roaming\Claude\claude-code\2.1.295\d2e294
 CLAUDE_CLI = r"C:\Users\x\.local\bin\claude.exe"
 CURSOR_NODE = r"C:\Users\x\AppData\Local\cursor-agent\versions\2026.10.01\node.exe"
 PLAIN_NODE = r"C:\Program Files\nodejs\node.exe"
+AGY_CLI = r"C:\Users\x\AppData\Local\Microsoft\WinGet\Packages\Google.AntigravityCLI_x\agy.exe"
+AGY_APP = r"C:\Users\x\AppData\Local\Programs\Antigravity\Antigravity.exe"
 
 
 def tree(*rows):
@@ -40,10 +42,12 @@ class ProtectedAppTests(unittest.TestCase):
         self.assertEqual(PV.protected_app("ChatGPT.exe", r"C:\x\ChatGPT.exe"), "Codex app")
         self.assertEqual(PV.protected_app("Cursor.exe", r"C:\x\Cursor.exe"), "Cursor")
         self.assertEqual(PV.protected_app("claude.exe", CLAUDE_APP), "Claude app")
+        self.assertEqual(PV.protected_app("Antigravity.exe", AGY_APP), "Antigravity app")
 
     def test_cli_images_are_not_apps(self):
         for image, path in (("claude.exe", CLAUDE_CLI), ("claude.exe", CLAUDE_EMBEDDED), ("codex.exe", r"C:\c.exe"),
-                            ("grok.exe", r"C:\Users\x\.grok\bin\grok.exe"), ("node.exe", CURSOR_NODE)):
+                            ("grok.exe", r"C:\Users\x\.grok\bin\grok.exe"), ("node.exe", CURSOR_NODE),
+                            ("agy.exe", AGY_CLI)):
             self.assertIsNone(PV.protected_app(image, path), image)
 
 
@@ -63,6 +67,19 @@ class FindCliTests(unittest.TestCase):
     def test_gemini_is_the_nearest_node(self):
         table, path = tree((20, 1, "node.exe", PLAIN_NODE), (30, 20, "cmd.exe", ""), (40, 30, "python.exe", ""))
         self.assertEqual(PV.find_cli("gemini", 40, table, path), (20, ""))
+
+    def test_agy_runs_hooks_through_cmd(self):
+        # agy 1.3.3 and 1.3.4: hook -> cmd.exe -> agy.exe; its background updater is another agy.exe beside the hook
+        table, path = tree((10, 1, "explorer.exe", ""), (20, 10, "agy.exe", AGY_CLI), (25, 20, "agy.exe", AGY_CLI),
+                           (30, 20, "cmd.exe", ""), (40, 30, "python.exe", ""))
+        self.assertEqual(PV.find_cli("antigravity", 40, table, path), (20, ""))
+
+    def test_hook_under_the_antigravity_app_is_refused(self):
+        table, path = tree((5, 1, "Antigravity.exe", AGY_APP), (6, 5, "language_server.exe", ""),
+                           (30, 6, "cmd.exe", ""), (40, 30, "python.exe", ""))
+        pid, why = PV.find_cli("antigravity", 40, table, path)
+        self.assertIsNone(pid)
+        self.assertIn("Antigravity app", why)
 
     def test_embedded_claude_code_is_refused(self):
         # the Claude app's own Claude Code: the CLI image matches, but the app is further up the chain
@@ -119,6 +136,8 @@ class HookSessionTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(self.hook.session_name("gemini", {"sessionId": "0f1e2d3c4b"}, 9), "1e2d3c4b")
             self.assertEqual(self.hook.session_name("grok", {}, 77), "pid77")
+            self.assertEqual(self.hook.session_name("antigravity", {"conversationId": "0a1b-2c3d-4e5f"}, 9),
+                             "2c3d4e5f")
 
     def test_time_ordered_ids_stay_apart(self):
         # Codex and Grok ids are UUIDv7: the first 8 hex digits are a timestamp that moves every 65 seconds
@@ -137,6 +156,40 @@ class InstallerTests(unittest.TestCase):
         theirs = {"type": "command", "command": "notes.py"}
         entries = [{"matcher": "startup", "hooks": [theirs, ours]}, {"hooks": [ours]}]
         self.assertEqual(self.inst.without_ours(entries), [{"matcher": "startup", "hooks": [theirs]}])
+
+    def test_antigravity_keeps_other_named_hooks(self):
+        theirs = {"lint": {"PostToolUse": [{"matcher": "run_command", "hooks": [{"command": "lint.cmd"}]}]}}
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(self.inst, "HOME", Path(d)):
+            f = Path(d, ".gemini", "config", "hooks.json")
+            self.assertIsNone(self.inst.plan_antigravity("main", True)[1])  # no file: nothing to remove
+            f.parent.mkdir(parents=True)
+            f.write_text(json.dumps(theirs), encoding="utf-8")
+            path, data, _ = self.inst.plan_antigravity("main", False)
+            self.assertEqual(path, f)
+            self.assertEqual(data["lint"], theirs["lint"])
+            self.assertIn("guardian-adopt.py antigravity --instance main",
+                          data["guardian-adopt"]["SessionStart"][0]["command"])
+            f.write_text(json.dumps(data), encoding="utf-8")
+            self.assertEqual(self.inst.plan_antigravity("side", False)[1].keys(), {"lint", "guardian-adopt"})
+            self.assertEqual(self.inst.plan_antigravity("main", True)[1], theirs)
+            f.write_text(json.dumps({"guardian-adopt": data["guardian-adopt"]}), encoding="utf-8")
+            self.assertIsNone(self.inst.plan_antigravity("main", True)[1])  # only ours: the file goes
+
+    def test_antigravity_keeps_the_users_commands_and_name(self):
+        ours = self.inst.command("antigravity", "main", False)
+        mixed = {"mine": {"enabled": True, "SessionStart": [{"type": "command", "command": ours},
+                                                            {"type": "command", "command": "my-own.cmd"}]},
+                 "guardian-adopt": {"SessionStart": [{"type": "command", "command": "their-guardian.cmd"}]}}
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(self.inst, "HOME", Path(d)):
+            f = Path(d, ".gemini", "config", "hooks.json")
+            f.parent.mkdir(parents=True)
+            f.write_text(json.dumps(mixed), encoding="utf-8")
+            kept = {"mine": {"enabled": True, "SessionStart": [{"type": "command", "command": "my-own.cmd"}]},
+                    "guardian-adopt": mixed["guardian-adopt"]}
+            self.assertEqual(self.inst.plan_antigravity("main", True)[1], kept)
+            data = self.inst.plan_antigravity("main", False)[1]
+            self.assertEqual({k: data[k] for k in kept}, kept)
+            self.assertEqual(data["guardian-adopt-2"]["SessionStart"][0]["command"], ours)
 
 
 class ShimTests(unittest.TestCase):

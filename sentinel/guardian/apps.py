@@ -14,7 +14,7 @@ import time
 from . import winjob as wj
 
 APP_ROOTS = {"claude.exe": "Claude", "chatgpt.exe": "Codex", "cursor.exe": "Cursor", "grok.exe": "Grok",
-             "gemini.exe": "Gemini"}
+             "gemini.exe": "Gemini", "antigravity.exe": "Antigravity"}
 
 _ntdll = ctypes.WinDLL("ntdll")
 _ntdll.NtQuerySystemInformation.restype = ctypes.c_long

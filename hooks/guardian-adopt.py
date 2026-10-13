@@ -4,8 +4,8 @@
   python -I <repo>/hooks/guardian-adopt.py <provider> [--instance main] [--cls normal] [--stdout TEXT]
 
 Wire it to the CLI's session-start hook (docs/guardian.md lists the place for each CLI). It walks up from its own
-process to the CLI (claude.exe, codex.exe, grok.exe, or the node.exe running gemini or cursor-agent) and asks the
-daemon to adopt it. Children the CLI starts afterwards inherit the job.
+process to the CLI (claude.exe, codex.exe, grok.exe, agy.exe, or the node.exe running gemini or cursor-agent) and asks
+the daemon to adopt it. Children the CLI starts afterwards inherit the job.
 
 It never blocks the CLI or changes its decisions: stdout stays empty unless --stdout gives the exact text a CLI
 expects, the exit code is always 0, and the outcome goes to ~/.resource-sentinel/guardian/<instance>/adopt.log.

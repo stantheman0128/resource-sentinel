@@ -26,6 +26,13 @@
   gives an unreadable answer, Ctrl+C during that wait no longer ends the shim, `GUARDIAN_SHIM=off` is silent, the
   current folder no longer counts as the real CLI, the Claude app is also recognized by `CLAUDE_CODE_ENTRYPOINT`
   (Git Bash breaks the parent chain), and `--remove` deletes only wrapper files with the guardian-shim note.
+- Antigravity CLI (`agy`, provider `antigravity`) joins Guardian like the other CLIs: gagent, an `agy` PATH wrapper,
+  the adopt hook as a named `guardian-adopt` hook in `~/.gemini/config/hooks.json` (installer, dry run unless
+  `--apply`; the user's own hooks in that file stay), and the provider check. The Antigravity desktop app is refused
+  like the other apps. agy 1.3.4 passed all five check levels: srun, hook and both wrapper levels in one run, the
+  version level in a rerun after the first attempt waited on RAM room until it timed out. Since agy runs a shell
+  command headless only with global permission rules or `--dangerously-skip-permissions`, the check judges it by a
+  PreInvocation hook that agy starts as its own child, and asks for the shell command only with `--allow-yolo`.
 
 ## Unreleased - 2026-09-13
 

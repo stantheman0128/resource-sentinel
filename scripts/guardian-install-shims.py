@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Put Guardian wrappers for the agent CLIs ahead of the real ones on the user Path, so typing claude, codex, gemini,
-cursor-agent or grok in a new terminal starts that CLI inside a Guardian session job (scripts/guardian-shim.py).
+cursor-agent, grok or agy in a new terminal starts that CLI inside a Guardian session job (scripts/guardian-shim.py).
 Opt-in and for Stan to run himself: without --apply it only prints what it would change.
 
   python -I scripts/guardian-install-shims.py [--remove] [--apply]

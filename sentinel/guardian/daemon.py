@@ -40,7 +40,7 @@ from .ledger import Ledger
 REPO = Path(__file__).resolve().parents[2]
 DASHBOARD = REPO / "dashboard" / "guardian.html"
 PROBE = Path(__file__).with_name("probe.py")
-PROVIDERS = ("claude", "codex", "cursor", "grok", "gemini", "other")
+PROVIDERS = ("claude", "codex", "cursor", "grok", "gemini", "antigravity", "other")
 CLASS_RANK = {"focus": 0, "normal": 1, "batch": 2}
 CREATE_NO_WINDOW, CREATE_NEW_CONSOLE = 0x08000000, 0x00000010
 GiB = 2**30

@@ -7,8 +7,9 @@
   gagent cursor --headless -- -p "explain this repo"
   gagent list                                          the CLIs Guardian knows and where they are installed
 
-Providers: claude, codex, gemini, cursor (cursor-agent), grok. Without --headless the CLI opens its own console
-window, because an interactive CLI needs a real terminal. --start starts the daemon first if it is not running.
+Providers: claude, codex, gemini, cursor (cursor-agent), grok, antigravity (agy). Without --headless the CLI opens
+its own console window, because an interactive CLI needs a real terminal. --start starts the daemon first if it is
+not running.
 """
 import argparse
 import shutil
@@ -38,7 +39,7 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.provider == "list":
         for name, p in sorted(PROVIDERS.items()):
-            print(f"{name:8} {p.command:14} {shutil.which(p.command) or 'not on PATH'}")
+            print(f"{name:12} {p.command:14} {shutil.which(p.command) or 'not on PATH'}")
         return 0
     p = PROVIDERS[a.provider]
     if not shutil.which(p.command):

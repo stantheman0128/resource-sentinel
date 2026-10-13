@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased - 2026-10-13
+
+- Add Guardian, a daemon that runs agent sessions inside Windows Job Objects: a dynamic hard cap on all agents
+  driven by a foreground probe, below-normal agent priority, per-session caps from allocation weights, pause,
+  cancel, and a control on/off switch. Includes srun, guardctl, a dashboard, and policy unit tests.
+- The CPUs open to agents can be changed while sessions run (dashboard, `guardctl world N`, `--world-cpus`).
+- Demos: fake sessions in a miniature world, timed or manual control on/off, and a real Claude Code CLI that
+  works as an agent inside Guardian until stopped. See docs/guardian.md.
+
 ## Unreleased - 2026-09-13
 
 - Publish one shared user-exemption policy for ALL Sentinel agents in status.md and

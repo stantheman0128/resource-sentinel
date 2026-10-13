@@ -1,0 +1,244 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="guardian-token" content="__GUARDIAN_TOKEN__">
+<title>Guardian 資源控管</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1d2330; --muted: #667085; --line: #e3e6ec;
+  --cap: #3b6fd8; --pool: #8fb0ef; --lag: #d9822b; --ok: #1f8a4c; --warn: #b7791f; --bad: #c0392b;
+  --s1: #3b6fd8; --s2: #1f8a4c; --s3: #b7791f; --s4: #8e44ad; --s5: #c0392b; --s6: #16a085;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12151b; --panel: #1b1f27; --ink: #e6e9ef; --muted: #98a2b3; --line: #2b313c;
+    --cap: #7aa2f7; --pool: #3d5a99; --lag: #f0a35e; --ok: #4cc38a; --warn: #e0b04a; --bad: #ef6b5b;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 "Segoe UI", "Microsoft JhengHei", system-ui, sans-serif; }
+main { max-width: 1180px; margin: 0 auto; padding: 16px; }
+h1 { font-size: 22px; margin: 0 0 4px; }
+h2 { font-size: 13px; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; }
+.sub { color: var(--muted); font-size: 12px; }
+.grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); margin: 12px 0; }
+.card, section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+section { margin: 12px 0; overflow-x: auto; }
+.k { color: var(--muted); font-size: 12px; }
+.v { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; font-weight: 600; border: 1px solid currentColor; }
+.banner { margin: 10px 0 0; padding: 10px 14px; border-radius: 8px; font-size: 18px; font-weight: 600; border: 2px solid currentColor;
+  display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: space-between; }
+.banner.on { color: var(--ok); } .banner.off { color: var(--bad); }
+.banner button { font-size: 16px; font-weight: 600; padding: 6px 16px; color: #fff; border: 0; }
+.banner.on button { background: var(--bad); } .banner.off button { background: var(--ok); }
+.how { margin: 8px 0 0; font-size: 13px; }
+details > summary { cursor: pointer; color: var(--muted); margin: 12px 0; }
+.muted { color: var(--muted); font-size: 12px; }
+.ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 5px 6px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+button, select, input { font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 3px 9px; }
+button { cursor: pointer; }
+button:hover { border-color: var(--cap); }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.bar { position: relative; height: 8px; width: 140px; background: var(--line); border-radius: 4px; }
+.bar i { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 4px; background: var(--cap); }
+.bar b { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--ink); }
+canvas { width: 100%; height: 240px; display: block; }
+.legend span { margin-right: 14px; font-size: 12px; color: var(--muted); }
+.legend i { display: inline-block; width: 10px; height: 3px; margin-right: 4px; vertical-align: middle; }
+.log { font: 12px/1.5 Consolas, monospace; max-height: 220px; overflow: auto; white-space: pre-wrap; }
+.two { display: grid; gap: 12px; grid-template-columns: 1fr 1fr; }
+@media (max-width: 760px) { .two { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Guardian 資源控管 <span id="mode" class="badge">…</span></h1>
+  <div class="sub" id="subtitle">連線中…</div>
+  <div class="banner" id="banner"><span id="bannertext">…</span><button data-act="toggle" id="toggle"></button></div>
+  <div class="how">怎麼看：關掉控管時，agent 用量會衝到頂，前景程式要等很久才輪到 CPU（畫面卡）；打開控管後，agent 被壓在上限以下，前景等候回到個位數毫秒。</div>
+  <div class="how">開放給 agent 的 CPU：<input id="worldin" type="number" min="1" step="1" style="width:56px"> / <span id="ncpu">–</span> 顆 <button data-act="world">套用</button> <span class="sub">其餘的 CPU agent 碰不到，留給前景程式（例如遠端桌面）</span></div>
+
+  <div class="grid">
+    <div class="card"><div class="k">agent 最多能用</div><div class="v" id="cap">–</div><div class="k" id="capc"></div></div>
+    <div class="card"><div class="k">agent 現在用了</div><div class="v" id="pool">–</div><div class="k" id="busy"></div></div>
+    <div class="card"><div class="k">前景程式要等多久</div><div class="v" id="probe">–</div><div class="k" id="probek"></div></div>
+    <div class="card"><div class="k">可用記憶體</div><div class="v" id="ram">–</div><div class="k" id="commit"></div></div>
+  </div>
+
+  <section>
+    <h2>最近 3 分鐘</h2>
+    <div class="sub" id="axisnote"></div>
+    <canvas id="chart" width="1100" height="240"></canvas>
+    <div class="legend" id="legend"></div>
+  </section>
+
+  <section><h2>每個 session 用了多少</h2><table id="sessions"></table></section>
+
+  <details>
+    <summary>進階操作與詳細資料</summary>
+    <section>
+      <h2>進階操作</h2>
+      <div class="row">
+        <label>上限 <input id="capin" type="number" min="10" max="95" step="5" style="width:70px">%</label><button data-act="cap">套用</button>
+        <button data-act="hold" id="holdbtn">暫停新指令</button>
+        <button data-act="inject">模擬前景變卡 30 秒</button>
+        <button data-act="priority">切換 agent 優先權</button>
+        <button data-act="allocator">切換分配器</button>
+      </div>
+      <div class="sub">新指令：<span id="adm">–</span> <span id="admr"></span></div>
+      <div class="sub" id="notes"></div>
+    </section>
+    <div class="two">
+      <section><h2>依工具分組</h2><table id="providers"></table></section>
+      <section><h2>已經在跑的 agent app（只觀察，不控管）</h2><table id="apps"></table></section>
+    </div>
+    <section><h2>排隊中與執行中的指令</h2><table id="runs"></table></section>
+    <div class="two">
+      <section><h2>調整紀錄（附 Windows 讀回值）</h2><div class="log" id="decisions"></div></section>
+      <section><h2>最近結束的指令</h2><table id="recent"></table></section>
+    </div>
+  </details>
+</main>
+<script>
+const TOKEN = document.querySelector('meta[name="guardian-token"]').content;
+const COLORS = ['--s1', '--s2', '--s3', '--s4', '--s5', '--s6'].map(v => getComputedStyle(document.documentElement).getPropertyValue(v).trim());
+const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+let S = null;
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+const f2 = x => x == null ? '–' : Number(x).toFixed(2);
+const MODE = {OBSERVED_OK: '前景順暢', PROXY_OK: '前景順暢', DEGRADED: '前景變卡', UNKNOWN: '感測資料過期', SYSTEM_ONLY: '沒有前景感測', ROLLED_BACK: '控管關閉'};
+const LEVEL = {ok: '順暢', warn: '偏慢', degraded: '卡', severe: '很卡'};
+const CLS = {focus: '重要', normal: '一般', batch: '背景'};
+const PRIO = {below_normal: '低於正常', normal: '正常'};
+
+async function api(path, body) {
+  const r = await fetch(path, {method: body ? 'POST' : 'GET', headers: {'X-Guardian-Token': TOKEN, 'Content-Type': 'application/json'},
+                               body: body ? JSON.stringify(body) : undefined});
+  if (!r.ok) throw new Error((await r.json()).error || r.status);
+  return r.json();
+}
+
+function modeClass(m) { return m === 'OBSERVED_OK' || m === 'PROXY_OK' ? 'ok' : m === 'DEGRADED' || m === 'UNKNOWN' || m === 'ROLLED_BACK' ? 'bad' : 'warn'; }
+
+function render(s) {
+  S = s;
+  const m = document.getElementById('mode'); m.textContent = MODE[s.mode] || s.mode; m.className = 'badge ' + modeClass(s.mode);
+  const scope = s.world_cpus < s.ncpu ? `示範範圍：全機 ${s.ncpu} 顆邏輯 CPU 只開放 ${s.world_cpus} 顆` : `範圍：全部 ${s.ncpu} 顆邏輯 CPU`;
+  document.getElementById('subtitle').textContent = `${scope} · agent 優先權 ${PRIO[s.pool_priority] || s.pool_priority} · 分配器 ${s.allocator ? '開' : '關'} · 執行個體 ${s.instance}`;
+  const bn = document.getElementById('banner'), bt = document.getElementById('bannertext');
+  if (s.control) { bn.className = 'banner on'; bt.textContent = `控管中：agent 加起來最多用 ${s.cap_cores} 核，而且讓前景程式先跑`; }
+  else { bn.className = 'banner off'; bt.textContent = `控管關閉：agent 想用多少 CPU 就用多少，跟前景程式搶`; }
+  document.getElementById('toggle').textContent = s.control ? '關閉控管' : '開啟控管';
+  document.getElementById('cap').textContent = s.control ? s.cap_cores + ' 核' : '無上限';
+  document.getElementById('capc').textContent = s.control ? `所有 agent 加起來，= 開放的 ${s.world_cpus} 核 × ${s.cap.toFixed(0)}%` : '控管關閉，沒有上限';
+  document.getElementById('pool').textContent = f2(s.pool_cores) + ' 核';
+  document.getElementById('busy').textContent = s.cpu_busy == null ? '' : `整台電腦 CPU 忙碌 ${(100 * s.cpu_busy).toFixed(0)}%`;
+  const p = s.experience.probe;
+  const pe = document.getElementById('probe');
+  pe.textContent = p ? `${p.lag_p95_ms} ms · ${LEVEL[s.experience.level] || '–'}` : '沒有感測';
+  pe.className = 'v ' + (s.experience.level === 'ok' ? 'ok' : s.experience.level ? 'bad' : 'warn');
+  document.getElementById('probek').textContent = p ? `一個一般程式每秒要用 CPU 60 次，最慢的 5% 等了這麼久，越小越順 · 沒準時 ${p.drop_pct}%` +
+    (s.experience.inject_left_s ? ` · 模擬變卡剩 ${s.experience.inject_left_s} 秒` : '') : '';
+  document.getElementById('ram').textContent = s.available_gib == null ? '–' : s.available_gib + ' GiB';
+  document.getElementById('commit').textContent = s.commit_headroom_gib == null ? '' : `commit 餘裕 ${s.commit_headroom_gib} GiB`;
+  const a = s.admission, ae = document.getElementById('adm');
+  ae.textContent = a.hold ? '手動暫停' : a.open ? '開放' : '暫停'; ae.className = a.open && !a.hold ? 'ok' : 'bad';
+  document.getElementById('admr').textContent = a.reason || (a.hold ? 'Stan 按了暫停' : `${s.queue.length} 個排隊中`);
+  document.getElementById('holdbtn').textContent = a.hold ? '恢復新指令' : '暫停新指令';
+  document.getElementById('notes').textContent = (s.notes || []).join(' · ');
+  if (document.activeElement.id !== 'capin') document.getElementById('capin').value = s.cap.toFixed(0);
+  const wi = document.getElementById('worldin'); wi.max = s.ncpu; document.getElementById('ncpu').textContent = s.ncpu;
+  if (document.activeElement !== wi) wi.value = s.world_cpus;
+
+  document.getElementById('providers').innerHTML = '<tr><th>工具</th><th>用掉（核）</th><th>狀態</th><th></th></tr>' +
+    s.providers.map(p => `<tr><td>${esc(p.name)}</td><td>${f2(p.cores)}</td><td>${p.paused ? '<span class="bad">已暫停</span>' : '執行中'}</td>
+      <td><button data-prov="${esc(p.name)}" data-paused="${p.paused}">${p.paused ? '恢復' : '暫停'}</button></td></tr>`).join('');
+
+  document.getElementById('apps').innerHTML = '<tr><th>App</th><th>用掉（核）</th><th>量測方式</th></tr>' +
+    s.apps.map(a => `<tr><td>${esc(a.name)}</td><td>${f2(a.cores)}</td><td class="sub">${esc(a.coverage || a.error)}</td></tr>`).join('');
+
+  const maxc = Math.max(s.cap_cores, 0.1);
+  // rebuilding the table every second would close a 重要性 menu the moment it opens; wait until it loses focus
+  const st = document.getElementById('sessions');
+  const focused = document.activeElement;
+  if (!(focused.tagName === 'SELECT' && st.contains(focused))) st.innerHTML = '<tr><th>Session（工具/名稱）</th><th>重要性</th><th>用了（核）</th><th>用量和上限</th><th>這個 session 的上限</th><th>指令數</th><th></th></tr>' +
+    s.sessions.map((x, i) => `<tr><td><i style="display:inline-block;width:8px;height:8px;border-radius:4px;background:${COLORS[i % 6]}"></i> ${esc(x.key)}</td>
+      <td><select data-cls="${esc(x.key)}">${['focus', 'normal', 'batch'].map(c => `<option value="${c}" ${c === x.cls ? 'selected' : ''}>${CLS[c]}</option>`).join('')}</select> <span class="muted">權重 ${x.allocation_weight}</span></td>
+      <td>${f2(x.usage)}</td>
+      <td><div class="bar"><i style="width:${Math.min(100, 100 * x.usage / maxc)}%;background:${COLORS[i % 6]}"></i>${x.cap_cores != null ? `<b style="left:${Math.min(100, 100 * x.cap_cores / maxc)}%"></b>` : ''}</div></td>
+      <td>${x.paused ? '<span class="bad">已暫停</span>' : x.provider_paused ? '<span class="bad">工具已暫停</span>' : x.cap_cores == null ? '不限' : f2(x.cap_cores)}</td>
+      <td>${x.runs}</td>
+      <td><button data-sess="${esc(x.key)}" data-paused="${x.paused}">${x.paused ? '恢復' : '暫停'}</button></td></tr>`).join('');
+
+  const rows = s.queue.map(q => `<tr><td>${esc(q.run_id)}</td><td>${esc(q.session)}</td><td>${esc(q.label)}</td><td class="warn">排隊 ${q.waiting_s} 秒</td>
+      <td class="sub">${esc(q.reason)}</td><td>${q.est_gib} GiB</td><td><button data-cancel="${esc(q.run_id)}">取消</button></td></tr>`)
+    .concat(s.runs.map(r => `<tr><td>${esc(r.run_id)}</td><td>${esc(r.session)}</td><td>${esc(r.label)}</td><td class="ok">${r.state === 'running' ? '執行中' : esc(r.state)}</td>
+      <td class="sub">pid ${r.pid} · ${esc(r.coverage)}</td><td>${r.commit_gib} / ${r.est_gib} GiB</td><td><button data-cancel="${esc(r.run_id)}">取消</button></td></tr>`));
+  document.getElementById('runs').innerHTML = '<tr><th>編號</th><th>Session</th><th>指令</th><th>狀態</th><th>細節</th><th>記憶體（已用 / 預留）</th><th></th></tr>' + rows.join('');
+
+  document.getElementById('decisions').textContent = s.decisions.map(d =>
+    `${new Date(d.t * 1000).toLocaleTimeString()} ${d.kind} ${d.target}  ${d.before ?? ''} → ${d.requested ?? ''} (讀回 ${d.readback ?? '–'})${d.error ? ' 錯誤 ' + d.error : ''}  ${d.reason}`).join('\n');
+  document.getElementById('recent').innerHTML = '<tr><th>Session</th><th>指令</th><th>狀態</th><th>結束碼</th><th>CPU 秒</th><th>記憶體峰值</th></tr>' +
+    s.recent_runs.map(r => `<tr><td>${esc(r.provider)}/${esc(r.session)}</td><td>${esc(r.label)}</td><td>${esc(r.state)}</td><td>${r.exit_code ?? ''}</td>
+      <td>${r.cpu_s == null ? '' : r.cpu_s.toFixed(1)}</td><td>${r.peak_commit_bytes == null ? '' : (r.peak_commit_bytes / 2 ** 20).toFixed(0) + ' MiB'}</td></tr>`).join('');
+  draw(s);
+}
+
+function draw(s) {
+  const c = document.getElementById('chart'), dpr = window.devicePixelRatio || 1;
+  const W = c.clientWidth, H = c.clientHeight; c.width = W * dpr; c.height = H * dpr;
+  const g = c.getContext('2d'); g.scale(dpr, dpr); g.clearRect(0, 0, W, H);
+  const h = s.history; if (!h.length) return;
+  document.getElementById('axisnote').textContent = `左軸：CPU 核數，最上面那條格線 = 開放的 ${s.world_cpus} 顆全部用滿。右軸：前景程式等了幾毫秒，越高越卡。`;
+  const t1 = h[h.length - 1].t, t0 = t1 - 180, ymax = s.world_cpus, L = 40, R = 48, T = 8, B = 18;
+  const X = t => L + (W - L - R) * (t - t0) / 180, Y = v => T + (H - T - B) * (1 - Math.min(v, ymax) / ymax);
+  g.fillStyle = css('--bad'); g.globalAlpha = .1;  // red background where control was off
+  for (let i = 1; i < h.length; i++) if (h[i].cap == null) g.fillRect(X(h[i - 1].t), T, X(h[i].t) - X(h[i - 1].t) + 0.5, H - T - B);
+  g.globalAlpha = 1;
+  g.strokeStyle = css('--line'); g.fillStyle = css('--muted'); g.font = '11px "Segoe UI", "Microsoft JhengHei"'; g.lineWidth = 1;
+  for (let i = 0; i <= ymax; i += Math.max(1, Math.round(ymax / 4))) { g.beginPath(); g.moveTo(L, Y(i)); g.lineTo(W - R, Y(i)); g.stroke(); g.fillText(i + ' 核', 4, Y(i) + 4); }
+  const line = (vals, color, width, dash) => { g.beginPath(); g.setLineDash(dash || []); g.strokeStyle = color; g.lineWidth = width;
+    let started = false; for (const [t, v] of vals) { if (v == null) { started = false; continue; } const x = X(t), y = Y(v); started ? g.lineTo(x, y) : g.moveTo(x, y); started = true; } g.stroke(); g.setLineDash([]); };
+  g.beginPath(); g.moveTo(X(h[0].t), Y(0)); for (const p of h) g.lineTo(X(p.t), Y(p.pool)); g.lineTo(X(t1), Y(0)); g.closePath(); g.fillStyle = css('--pool'); g.globalAlpha = .35; g.fill(); g.globalAlpha = 1;
+  const keys = s.sessions.map(x => x.key);
+  keys.forEach((k, i) => line(h.map(p => [p.t, p.sessions ? p.sessions[k] : null]), COLORS[i % 6], 1.5));
+  line(h.map(p => [p.t, p.cap == null ? null : p.cap / 100 * ymax]), css('--cap'), 2.5);
+  const lagmax = Math.max(60, Math.ceil(Math.max(...h.map(p => p.p95 || 0)) / 20) * 20), YL = v => T + (H - T - B) * (1 - Math.min(v, lagmax) / lagmax);
+  g.beginPath(); g.setLineDash([4, 3]); g.strokeStyle = css('--lag'); g.lineWidth = 1.5; let st = false;
+  for (const p of h) { if (p.p95 == null) { st = false; continue; } st ? g.lineTo(X(p.t), YL(p.p95)) : g.moveTo(X(p.t), YL(p.p95)); st = true; } g.stroke(); g.setLineDash([]);
+  g.fillStyle = css('--lag'); g.fillText(lagmax + ' ms', W - R + 4, YL(lagmax) + 4); g.fillText('10 ms', W - R + 4, YL(10) + 4);
+  document.getElementById('legend').innerHTML = `<span><i style="background:${css('--bad')};opacity:.3;height:10px"></i>紅底 = 控管關閉的時段</span>` +
+    `<span><i style="background:${css('--cap')}"></i>agent 上限</span><span><i style="background:${css('--pool')}"></i>agent 實際用量</span>` +
+    `<span><i style="background:${css('--lag')}"></i>前景等候（虛線，右軸）</span>` + keys.map((k, i) => `<span><i style="background:${COLORS[i % 6]}"></i>${esc(k)}</span>`).join('');
+}
+
+document.addEventListener('click', async e => {
+  const b = e.target.closest('button'); if (!b) return;
+  try {
+    if (b.dataset.prov) await api('/api/provider', {name: b.dataset.prov, paused: b.dataset.paused !== 'true'});
+    else if (b.dataset.sess) await api('/api/session', {key: b.dataset.sess, paused: b.dataset.paused !== 'true'});
+    else if (b.dataset.cancel) await api('/api/cancel', {run_id: b.dataset.cancel});
+    else if (b.dataset.act === 'cap') await api('/api/cap', {cap: Number(document.getElementById('capin').value)});
+    else if (b.dataset.act === 'world') await api('/api/world', {cpus: Number(document.getElementById('worldin').value)});
+    else if (b.dataset.act === 'hold') await api('/api/hold', {on: !S.admission.hold});
+    else if (b.dataset.act === 'inject') await api('/api/inject', {level: 'degraded', seconds: 30});
+    else if (b.dataset.act === 'priority') await api('/api/pool_priority', {priority: S.pool_priority === 'below_normal' ? 'normal' : 'below_normal'});
+    else if (b.dataset.act === 'allocator') await api('/api/allocator', {on: !S.allocator});
+    else if (b.dataset.act === 'toggle') await api(S.control ? '/api/rollback' : '/api/resume_control', {});
+    tick();
+  } catch (err) { alert(err.message); }
+});
+document.addEventListener('change', async e => {
+  if (e.target.dataset.cls) { await api('/api/session', {key: e.target.dataset.cls, cls: e.target.value}); e.target.blur(); tick(); }
+});
+async function tick() { try { render(await api('/api/state')); } catch (err) { document.getElementById('subtitle').textContent = '連不上 Guardian：' + err.message; } }
+tick(); setInterval(tick, 1000);
+</script>
+</body>
+</html>

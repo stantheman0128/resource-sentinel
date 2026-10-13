@@ -33,6 +33,7 @@
   version level in a rerun after the first attempt waited on RAM room until it timed out. Since agy runs a shell
   command headless only with global permission rules or `--dangerously-skip-permissions`, the check judges it by a
   PreInvocation hook that agy starts as its own child, and asks for the shell command only with `--allow-yolo`.
+  With that flag the shell command reported its session too, at srun, hook and shim (report 000722).
 
 ## Unreleased - 2026-09-13
 

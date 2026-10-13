@@ -117,7 +117,25 @@ second route for Codex, Grok and Antigravity, `python -I scripts/guardian-instal
 with the same dry run, a backup of the file and `--remove`. It covers Codex (`~/.codex/hooks.json`, then trust it
 once with `/hooks` in codex), Grok (`~/.grok/hooks/guardian.json`) and Antigravity (a named hook `guardian-adopt`
 in `~/.gemini/config/hooks.json`; the user's own hooks in that file stay). Wrappers and hook only act while the daemon
-for that instance runs.
+for that instance runs. `python -I scripts/guardian-install-autostart.py` keeps the main daemon running: it
+registers the scheduled task ResourceSentinelGuardian, which starts the daemon at logon through `conhost --headless`
+with no time limit and never a second copy, and appends its output to
+`~/.resource-sentinel/guardian/main-daemon.log`. Same dry run and `--remove`. `--port` sets the dashboard port, and
+the installer refuses one that another program holds. On Stan's machine another local server holds 8765, so the
+task uses `--port 8769` (2026-10-14).
+
+Measured 2026-10-14 with the wrappers and the autostart task: Task Scheduler starts its action in a job with no
+limits (flags 0) that refuses breakaway (a child started with `CREATE_BREAKAWAY_FROM_JOB` got Access denied), so
+Guardian's job tree nests under that job. `Stop-ScheduledTask` ended conhost only; cmd and the daemon kept running.
+With the task's daemon up, `claude`, `codex`, `cursor-agent`, `grok` and `agy` with `--version` each went through its
+wrapper into a session of its own (enforced, below_normal priority), from a cmd that Explorer opened and from a new
+Windows Terminal tab. Neither shell was in a job, though WindowsTerminal.exe itself is. A Windows Terminal that was
+already open keeps its old PATH until it is closed completely, and `wt.exe` hands a new tab the environment of the
+program that called it: a tab opened from inside the Claude app carries `CLAUDE_CODE_ENTRYPOINT=claude-desktop`, so
+its wrappers run the CLI directly. Not measured yet: the terminals inside VS Code and Cursor, whose shells sit in
+the editor's job. The wrapper first starts the CLI outside that job, which works only if the job allows breakaway;
+if it does not, the assignment should fail as the hook does for Claude Code, and the CLI runs with the one-line
+notice.
 
 ## Measured on this machine
 

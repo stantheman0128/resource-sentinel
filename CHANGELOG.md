@@ -34,6 +34,11 @@
   command headless only with global permission rules or `--dangerously-skip-permissions`, the check judges it by a
   PreInvocation hook that agy starts as its own child, and asks for the shell command only with `--allow-yolo`.
   With that flag the shell command reported its session too, at srun, hook and shim (report 000722).
+- `guardian-install-autostart` (dry run unless `--apply`, `--remove` deletes the task) registers a logon task that
+  starts the main daemon through `conhost --headless`, with no time limit and never a second copy, and refuses a
+  dashboard port that another program holds. With that daemon up, `claude`, `codex`, `cursor-agent`, `grok` and
+  `agy` started from a cmd opened through Explorer and from a new Windows Terminal tab each went through their
+  wrapper into a session of their own.
 
 ## Unreleased - 2026-09-13
 

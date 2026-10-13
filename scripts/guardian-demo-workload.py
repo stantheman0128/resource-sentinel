@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Repeatable CPU-heavy work for Guardian demos: worker processes compress data with zlib for a fixed time.
 
-Each run prints one line: throughput, cores actually used, this process's priority class and whether it sits in
-the Guardian pool job. The same script plays both sides of the demo:
+Each run prints one line: throughput, cores actually used, this process's priority class and whether Guardian
+control is on for it, with the agents' cap. The same script plays both sides of the demo:
   the agent's work   run by a Claude Code session started through srun (scripts/guardian-demo-claude.py)
   Stan's own work    run in a plain terminal, outside Guardian, to time the same work with control off and on
 """
@@ -32,13 +32,19 @@ def work(seconds):
     return done, time.process_time() - cpu0
 
 
-def in_guardian(instance):
+def guardian_state(instance):
+    """Membership alone says nothing about control: turning control off removes the limits, not the job."""
     try:
         job = wj.Job.open(f"{instance}.AllAgents")
     except OSError:
-        return False
+        return "不在 Guardian 裡"
     try:
-        return bool(wj.in_job(os.getpid(), job.h))
+        if not wj.in_job(os.getpid(), job.h):
+            return "不在 Guardian 裡"
+        cpu = job.cpu()
+        if cpu["mode"] == "hard_cap":
+            return f"Guardian 控管開，agent 上限 {cpu['cores']:.1f} 核"
+        return "Guardian 控管關，沒有上限"
     finally:
         job.close()
 
@@ -59,7 +65,7 @@ def main():
     prio = PRIORITY_ZH.get(after, "?") if after == before else \
         f"{PRIORITY_ZH.get(before, '?')}→{PRIORITY_ZH.get(after, '?')}"
     print(f"[{time.strftime('%H:%M:%S')}] {a.workers} 個行程跑 {a.seconds:g} 秒：速度 {mib / a.seconds:.0f} MiB/s，"
-          f"平均用了 {cpu / a.seconds:.1f} 核，優先權 {prio}，在 Guardian 控管內：{'是' if in_guardian(a.instance) else '否'}",
+          f"平均用了 {cpu / a.seconds:.1f} 核，優先權 {prio}，{guardian_state(a.instance)}",
           flush=True)
 
 

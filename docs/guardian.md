@@ -105,6 +105,10 @@ make one model call each.
 | Grok 1.0.40 | yes: tool command in the session | yes: tool command and its session-start hook (its own child) in the shim's session | yes: tool command in the adopted session; powershell.exe and conhost.exe children were refused (Access denied) and stayed outside | measured after Stan signed in again (report 231319); the project hook needs a git root |
 | Antigravity CLI 1.3.4 (`agy`) | agy.exe and its PreInvocation hook (its own child) in the session; tool command not tested | the same, in the shim's session | yes: agy.exe adopted (2 processes, none refused); its PreInvocation hook reports the adopted session | reports 233349 and 233824. Measured besides: hooks run through cmd.exe and need no git root; the session name comes from `conversationId`; agy starts a background updater, another agy.exe, as its child, and it replaced 1.3.3 with 1.3.4 unasked before these runs |
 
+Claude Code, Codex, Cursor Agent, Grok and agy, rerun together on one daemon (report 235302, 2026-10-13 23:53 to
+00:04): every level passed except the hook level for Claude Code and Cursor Agent, which gave LIMIT as before. Both
+passed srun and the PATH wrapper levels in the same run. Gemini CLI was left out.
+
 To have new sessions join without gagent, Stan can run `python -I scripts/guardian-install-shims.py` from the main
 checkout: it covers all six CLIs. It prints the change and writes nothing until `--apply`, which saves the old
 user Path first; `--remove` undoes it. The `.ps1` wrappers are written only when PowerShell's execution policy

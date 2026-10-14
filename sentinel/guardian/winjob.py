@@ -34,9 +34,11 @@ PRIORITY_NAME = {v: k for k, v in PRIORITY.items()}
 
 PROCESS_TERMINATE, PROCESS_SET_QUOTA = 0x0001, 0x0100
 PROCESS_VM_READ, PROCESS_SUSPEND_RESUME, PROCESS_QUERY_LIMITED = 0x0010, 0x0800, 0x1000
-JOB_OBJECT_ALL_ACCESS = 0x1F001F
+JOB_OBJECT_ASSIGN_PROCESS, JOB_OBJECT_SET_ATTRIBUTES, JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE = 0x1, 0x2, 0x4, 0x8
+JOB_OBJECT_ALL_ACCESS = 0x1F003F  # STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | 0x3F
+READ_CONTROL, WRITE_DAC = 0x00020000, 0x00040000
 CREATE_SUSPENDED, CREATE_BREAKAWAY_FROM_JOB = 0x4, 0x01000000
-ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_MORE_DATA = 5, 183, 234
+ERROR_ACCESS_DENIED, ERROR_INVALID_HANDLE, ERROR_ALREADY_EXISTS, ERROR_MORE_DATA = 5, 6, 183, 234
 NCPU = os.cpu_count() or 1
 
 
@@ -135,13 +137,86 @@ GetQueuedCompletionStatus = _bind("GetQueuedCompletionStatus", w.BOOL, HANDLE, c
                                   ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(ctypes.c_void_p), w.DWORD)
 GetSystemTimes = _bind("GetSystemTimes", w.BOOL, ctypes.POINTER(w.FILETIME), ctypes.POINTER(w.FILETIME),
                        ctypes.POINTER(w.FILETIME))
+CreateEventW = _bind("CreateEventW", HANDLE, ctypes.c_void_p, w.BOOL, w.BOOL, w.LPCWSTR)
+CompareStringOrdinal = _bind("CompareStringOrdinal", ctypes.c_int, w.LPCWSTR, ctypes.c_int, w.LPCWSTR, ctypes.c_int,
+                             w.BOOL)
+CSTR_EQUAL, OBJECT_NAME_INFORMATION = 2, 1
+
+
+class UNICODE_STRING(ctypes.Structure):
+    _fields_ = [("Length", w.USHORT), ("MaximumLength", w.USHORT), ("Buffer", ctypes.c_void_p)]
+
+
+_nt = ctypes.WinDLL("ntdll")
+NtQueryObject = _nt.NtQueryObject
+NtQueryObject.restype = ctypes.c_long  # NTSTATUS
+NtQueryObject.argtypes = [HANDLE, ctypes.c_int, ctypes.c_void_p, w.ULONG, ctypes.POINTER(w.ULONG)]
 
 
 class WinError(OSError):
-    def __init__(self, what):
-        code = ctypes.get_last_error()
-        super().__init__(code, f"{what} failed: {ctypes.FormatError(code).strip()} (winerror {code})")
+    def __init__(self, what, code=None):
+        code = ctypes.get_last_error() if code is None else code
+        self.detail = ctypes.FormatError(code).strip()
+        super().__init__(code, f"{what} failed: {self.detail} (winerror {code})")
         self.winerror = code
+
+
+class JobTaken(WinError):
+    """A named job already existed when Guardian went to create it, so Guardian holds no handle it can trust for
+    it. pids: the processes still in it, or None when they cannot be read."""
+
+    def __init__(self, name, code, pids):
+        super().__init__(f"CreateJobObject({name})", code)
+        self.name, self.pids = name, pids
+
+
+class JobLocked(JobTaken):
+    """The job exists and its DACL refused this process full access: a Guardian job, or one another process
+    created with a restrictive DACL, that some process still holds a handle to. Member processes alone do not
+    keep a name alive; it goes away with the last handle (measured 2026-10-13). guardian_dacl: True when its DACL
+    reads back as named_job_sddl() for this user, False when it reads back as something else, None when it
+    cannot be read."""
+
+    def __init__(self, name, code, pids, guardian_dacl=None):
+        super().__init__(name, code, pids)
+        self.guardian_dacl = guardian_dacl
+
+
+class JobExisted(JobTaken):
+    """The job opened with full access. For a non-elevated process its DACL is a permissive one: a Guardian
+    version from before the job DACL, or another process that made it first and may hold a full-access handle of
+    its own. An elevated process gets full access to a Guardian job too, through the Administrators entry."""
+
+
+class NameUnusable(JobTaken):
+    """CreateJobObjectW failed for the name and no job opens under it, so Guardian cannot create its job there.
+    Measured 2026-10-14 with a same-user symbolic link at the name: a link into a missing directory gives
+    ERROR_PATH_NOT_FOUND (3), one into a directory the user cannot write (\\KernelObjects, \\Windows) gives
+    ERROR_ACCESS_DENIED (5). Any other code lands here too, a resource error included. pids is None."""
+
+    def __init__(self, name, code, pids=None):
+        super().__init__(name, code, None)
+
+
+class NameNotJob(NameUnusable):
+    """The name is held by an object that is not a job, such as a mutex, event, semaphore, waitable timer or file
+    mapping: CreateJobObjectW then fails with ERROR_INVALID_HANDLE (all five measured 2026-10-14). pids is None."""
+
+
+class NameRedirected(NameUnusable):
+    """The name led to an object at another kernel path. A same-user symbolic link at the name does that: Windows
+    follows it and creates the job at the target when that name is free, or opens the job already there. Measured
+    2026-10-14 with links to another Local name, to the same last part in global \\BaseNamedObjects and into a
+    subdirectory of the session directory; each create succeeded at the target. real is the path the name led to,
+    expected the path job_name(name) has in this process's namespace. Either is None when it could not be read, and
+    the name is refused then too. pids is None."""
+
+    def __init__(self, name, code, real, expected):
+        super().__init__(name, code)
+        self.real, self.expected = real, expected
+        self.detail = (f"the name leads to {real} instead of {expected}" if real and expected else
+                       "the kernel path behind the name could not be read")
+        self.strerror = f"CreateJobObject({name}) refused: {self.detail}"
 
 
 def _check(ok, what):
@@ -154,6 +229,171 @@ def job_name(name):
     return name if "\\" in name else "Local\\Guardian." + name
 
 
+class SECURITY_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [("nLength", w.DWORD), ("lpSecurityDescriptor", ctypes.c_void_p), ("bInheritHandle", w.BOOL)]
+
+
+_adv = ctypes.WinDLL("advapi32", use_last_error=True)
+OpenProcessToken = _adv.OpenProcessToken
+OpenProcessToken.restype, OpenProcessToken.argtypes = w.BOOL, [HANDLE, w.DWORD, ctypes.POINTER(HANDLE)]
+GetTokenInformation = _adv.GetTokenInformation
+GetTokenInformation.restype = w.BOOL
+GetTokenInformation.argtypes = [HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD, ctypes.POINTER(w.DWORD)]
+ConvertSidToStringSidW = _adv.ConvertSidToStringSidW
+ConvertSidToStringSidW.restype, ConvertSidToStringSidW.argtypes = w.BOOL, [ctypes.c_void_p, ctypes.POINTER(w.LPWSTR)]
+ConvertSddlToSd = _adv.ConvertStringSecurityDescriptorToSecurityDescriptorW
+ConvertSddlToSd.restype = w.BOOL
+ConvertSddlToSd.argtypes = [w.LPCWSTR, w.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p]
+ConvertSdToSddl = _adv.ConvertSecurityDescriptorToStringSecurityDescriptorW
+ConvertSdToSddl.restype = w.BOOL
+ConvertSdToSddl.argtypes = [ctypes.c_void_p, w.DWORD, w.DWORD, ctypes.POINTER(w.LPWSTR), ctypes.c_void_p]
+GetKernelObjectSecurity = _adv.GetKernelObjectSecurity
+GetKernelObjectSecurity.restype = w.BOOL
+GetKernelObjectSecurity.argtypes = [HANDLE, w.DWORD, ctypes.c_void_p, w.DWORD, ctypes.POINTER(w.DWORD)]
+DACL_SECURITY_INFORMATION = 0x4
+LocalFree = _bind("LocalFree", ctypes.c_void_p, ctypes.c_void_p)
+TOKEN_QUERY, TOKEN_USER_CLASS, TOKEN_ELEVATION_CLASS = 0x0008, 1, 20
+
+
+def token_info(cls_id, size=256):
+    """Raw TOKEN_INFORMATION_CLASS bytes for this process's own token."""
+    tok = HANDLE()
+    _check(OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, ctypes.byref(tok)), "OpenProcessToken")
+    try:
+        buf, n = ctypes.create_string_buffer(size), w.DWORD()
+        _check(GetTokenInformation(tok, cls_id, buf, size, ctypes.byref(n)), f"GetTokenInformation({cls_id})")
+        return buf
+    finally:
+        CloseHandle(tok)
+
+
+def user_sid():
+    """String SID of the user this process runs as (TokenUser)."""
+    psid = ctypes.cast(token_info(TOKEN_USER_CLASS), ctypes.POINTER(ctypes.c_void_p))[0]
+    s = w.LPWSTR()
+    _check(ConvertSidToStringSidW(psid, ctypes.byref(s)), "ConvertSidToStringSid")
+    try:
+        return s.value
+    finally:
+        LocalFree(s)
+
+
+def is_elevated():
+    return bool(ctypes.cast(token_info(TOKEN_ELEVATION_CLASS, 4), ctypes.POINTER(w.DWORD))[0])  # exact size
+
+
+def named_job_sddl(sid=None):
+    """Protected DACL (nothing inherited from the namespace) for Guardian's named jobs. SYSTEM and Administrators
+    keep full access, so an elevated process can still recover the jobs. The user may query and wait on them, so
+    whereami can read them where a sandbox blocks the pipe. OWNER RIGHTS takes away the owner's implicit WRITE_DAC,
+    so that user cannot rewrite the DACL either. The daemon keeps the job rights through the handle
+    CreateJobObjectW returns. Measured 2026-10-13: that handle's granted access is 0x13003F, all six job rights
+    with DELETE, READ_CONTROL and SYNCHRONIZE but without WRITE_DAC or WRITE_OWNER, and a later OpenJobObjectW by
+    the same process gets only what the user's entry allows."""
+    user = JOB_OBJECT_QUERY | SYNCHRONIZE | READ_CONTROL
+    return (f"D:P(A;;0x{JOB_OBJECT_ALL_ACCESS:x};;;SY)(A;;0x{JOB_OBJECT_ALL_ACCESS:x};;;BA)"
+            f"(A;;0x{user:x};;;{sid or user_sid()})(A;;0x{READ_CONTROL:x};;;OW)")
+
+
+def _dacl_sddl(sd):
+    s = w.LPWSTR()
+    _check(ConvertSdToSddl(sd, 1, DACL_SECURITY_INFORMATION, ctypes.byref(s), None), "ConvertSecurityDescriptorToString")
+    try:
+        return s.value
+    finally:
+        LocalFree(s)
+
+
+def _has_guardian_dacl(h):
+    """Whether the job behind h carries named_job_sddl() for this user. Both sides go through the same SDDL
+    conversion, so the comparison does not depend on how Windows spells the masks. h needs READ_CONTROL."""
+    n = w.DWORD()
+    GetKernelObjectSecurity(h, DACL_SECURITY_INFORMATION, None, 0, ctypes.byref(n))
+    buf = ctypes.create_string_buffer(max(n.value, 1))
+    _check(GetKernelObjectSecurity(h, DACL_SECURITY_INFORMATION, buf, n.value, ctypes.byref(n)), "GetKernelObjectSecurity")
+    mine = ctypes.c_void_p()
+    _check(ConvertSddlToSd(named_job_sddl(), 1, ctypes.byref(mine), None), "ConvertStringSecurityDescriptor")
+    try:
+        return _dacl_sddl(buf) == _dacl_sddl(mine)
+    finally:
+        LocalFree(mine)
+
+
+def _kernel_name(h):
+    """Full kernel path of the object behind h (NtQueryObject, ObjectNameInformation), or None when it cannot be
+    read. The buffer fits the longest UNICODE_STRING, so one call is enough."""
+    buf = ctypes.create_string_buffer(0x10000 + ctypes.sizeof(UNICODE_STRING))
+    if NtQueryObject(h, OBJECT_NAME_INFORMATION, buf, len(buf), None) != 0:
+        return None
+    u = UNICODE_STRING.from_buffer(buf)
+    return ctypes.wstring_at(u.Buffer, u.Length // 2) if u.Buffer else ""
+
+
+def _same_name(a, b):
+    """Ordinal comparison that ignores case, the way the object manager matches names."""
+    return (len(a) == len(b) and "\0" not in a + b and
+            CompareStringOrdinal(a, len(a), b, len(b), True) == CSTR_EQUAL)
+
+
+def _expected_kernel_name(name):
+    """Kernel path job_name(name) has in this process's namespace, or None when it cannot be read. kernel32 turns
+    Local\\ into a directory that depends on the session and on an AppContainer, so the path is not built from the
+    session id: an event with a random name is created under the same prefix and its kernel path read back. In
+    session 1 that is \\Sessions\\1\\BaseNamedObjects, and the user can neither open the Local link there for
+    DELETE nor create another link named Local (measured 2026-10-14). Session 0 and AppContainer processes were
+    not measured; the probe takes whatever directory kernel32 resolves there. For a name with its own prefix the
+    probe goes under that prefix, so only the last part is checked."""
+    prefix, _, leaf = job_name(name).rpartition("\\")
+    probe = "Guardian.nsprobe-" + os.urandom(16).hex()
+    ctypes.set_last_error(0)
+    h = CreateEventW(None, True, False, prefix + "\\" + probe)
+    code = ctypes.get_last_error()
+    if not h:
+        return None
+    try:
+        real = _kernel_name(h) if code != ERROR_ALREADY_EXISTS else None
+    finally:
+        CloseHandle(h)
+    head, _, tail = (real or "").rpartition("\\")
+    return head + "\\" + leaf if head and _same_name(tail, probe) else None
+
+
+def _redirect(name, code, h):
+    """NameRedirected when the object behind h is not at job_name(name) in this process's namespace, else None.
+    The whole path is compared, so a link to the same last part in another directory is caught too."""
+    real, expected = _kernel_name(h), _expected_kernel_name(name)
+    if real and expected and _same_name(real, expected):
+        return None
+    return NameRedirected(name, code, real, expected)
+
+
+def _existing_job(name, code):
+    """The error for a job that opens under name for query: NameRedirected when it sits at another kernel path,
+    JobLocked otherwise. None when no job opens there."""
+    h = OpenJobObjectW(JOB_OBJECT_QUERY | READ_CONTROL, False, job_name(name))
+    readable = bool(h)
+    if not h:
+        h = OpenJobObjectW(JOB_OBJECT_QUERY, False, job_name(name))
+    if not h:
+        return None
+    j = Job(h, name)
+    try:
+        moved = _redirect(name, code, h)
+        if moved:
+            return moved
+        try:
+            pids = j.pids()
+        except OSError:
+            pids = None
+        try:
+            ours = _has_guardian_dacl(h) if readable else None
+        except OSError:
+            ours = None
+        return JobLocked(name, code, pids, ours)
+    finally:
+        j.close()
+
+
 class Job:
     """One Windows Job Object. Named jobs live in the session namespace (Local\\)."""
 
@@ -162,16 +402,46 @@ class Job:
 
     @classmethod
     def create(cls, name=None):
-        ctypes.set_last_error(0)
-        h = CreateJobObjectW(None, job_name(name) if name else None)
-        existed = ctypes.get_last_error() == ERROR_ALREADY_EXISTS
-        j = cls(_check(h, f"CreateJobObject({name})"), name)
-        j.existed = bool(h) and existed
+        """An unnamed job keeps the default security. A named job gets named_job_sddl() and must be new: an
+        existing one raises JobLocked or JobExisted, since CreateJobObjectW would otherwise just open it. Any
+        other failure for the name raises NameUnusable, or NameNotJob when another kind of object holds it. A
+        name that leads to a job at another kernel path raises NameRedirected, checked before either outcome."""
+        if not name:
+            return cls(_check(CreateJobObjectW(None, None), "CreateJobObject"), None)
+        sd = ctypes.c_void_p()
+        _check(ConvertSddlToSd(named_job_sddl(), 1, ctypes.byref(sd), None), "ConvertStringSecurityDescriptor")
+        try:
+            sa = SECURITY_ATTRIBUTES(ctypes.sizeof(SECURITY_ATTRIBUTES), sd, False)
+            ctypes.set_last_error(0)
+            h = CreateJobObjectW(ctypes.byref(sa), job_name(name))
+            code = ctypes.get_last_error()
+        finally:
+            LocalFree(sd)
+        if not h:
+            found = _existing_job(name, code) if code == ERROR_ACCESS_DENIED else None
+            if found:
+                raise found
+            if code == ERROR_INVALID_HANDLE:
+                raise NameNotJob(name, code)
+            raise NameUnusable(name, code)
+        j = cls(h, name)
+        moved = _redirect(name, code, h)
+        if moved:
+            j.close()  # a job this call created at the target goes away with it
+            raise moved
+        if code == ERROR_ALREADY_EXISTS:
+            try:
+                pids = j.pids()
+            except OSError:
+                pids = None
+            j.close()
+            raise JobExisted(name, code, pids)
         return j
 
     @classmethod
-    def open(cls, name):
-        return cls(_check(OpenJobObjectW(JOB_OBJECT_ALL_ACCESS, False, job_name(name)), f"OpenJobObject({name})"), name)
+    def open(cls, name, access=JOB_OBJECT_QUERY):
+        """Callers name the access they need. Outside the daemon only query is granted on a named Guardian job."""
+        return cls(_check(OpenJobObjectW(access, False, job_name(name)), f"OpenJobObject({name})"), name)
 
     def close(self):
         if self.h:
@@ -459,7 +729,6 @@ def system_busy():
 # ---- additions for the Guardian ---------------------------------------------------------------
 LIMIT_AFFINITY = 0x10
 PROCESS_SET_INFORMATION, PROCESS_DUP_HANDLE = 0x0200, 0x0040
-JOB_OBJECT_QUERY = 0x0004
 
 
 def set_job_affinity(job, mask):

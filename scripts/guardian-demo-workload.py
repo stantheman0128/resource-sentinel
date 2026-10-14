@@ -35,7 +35,7 @@ def work(seconds):
 def guardian_state(instance):
     """Membership alone says nothing about control: turning control off removes the limits, not the job."""
     try:
-        job = wj.Job.open(f"{instance}.AllAgents")
+        job = wj.Job.open(f"{instance}.AllAgents", wj.JOB_OBJECT_QUERY)  # in_job and cpu() only query
     except OSError:
         return "不在 Guardian 裡"
     try:

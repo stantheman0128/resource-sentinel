@@ -123,7 +123,8 @@ class Demo:
         while len(self.jobs) < len(SESSIONS) and time.time() < deadline:
             for prov, sess, _, _ in SESSIONS:
                 try:
-                    self.jobs.setdefault(f"{prov}/{sess}", wj.Job.open(f"{INSTANCE}.s.{prov}.{sess}"))
+                    self.jobs.setdefault(f"{prov}/{sess}", wj.Job.open(f"{INSTANCE}.s.{prov}.{sess}",
+                                                                         wj.JOB_OBJECT_QUERY))  # acct() reads only
                 except OSError:
                     pass
             time.sleep(0.2)

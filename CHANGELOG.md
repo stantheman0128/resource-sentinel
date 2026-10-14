@@ -26,6 +26,12 @@
   gives an unreadable answer, Ctrl+C during that wait no longer ends the shim, `GUARDIAN_SHIM=off` is silent, the
   current folder no longer counts as the real CLI, the Claude app is also recognized by `CLAUDE_CODE_ENTRYPOINT`
   (Git Bash breaks the parent chain), and `--remove` deletes only wrapper files with the guardian-shim note.
+- Guardian's named jobs get a protected DACL, so other processes of the user can only query them; the daemon keeps
+  its rights through the handle it got when it created each job. A daemon refuses to start while its AllAgents job
+  is still held open, was made with a permissive DACL, or its name is held by another kind of object or a symbolic
+  link, and refuses a srun or adopt whose job name is taken. A link counts wherever it points, a free name
+  included, since the daemon compares the kernel path of each job it creates with its own name. `Job.open` now
+  opens for query unless told otherwise.
 - Antigravity CLI (`agy`, provider `antigravity`) joins Guardian like the other CLIs: gagent, an `agy` PATH wrapper,
   the adopt hook as a named `guardian-adopt` hook in `~/.gemini/config/hooks.json` (installer, dry run unless
   `--apply`; the user's own hooks in that file stay), and the provider check. The Antigravity desktop app is refused

@@ -1,7 +1,8 @@
 """Guardian daemon: owns the one big agent job, launches agent commands into it, runs the 1 Hz control loop and
 serves the local dashboard API.
 
-Job tree (named in the session namespace, so a restarted daemon or `guardctl rollback` can reopen it):
+Job tree (named in the session namespace so whereami can find it; other processes of the user may only query it,
+and a daemon refuses to start while another process holds its AllAgents job open, see winjob.named_job_sddl):
   Local\\Guardian.<instance>.AllAgents          below_normal priority + dynamic hard cap: the one big job
     Local\\Guardian.<instance>.p.<provider>     pause or resume a whole provider (rate 1 = paused)
       Local\\Guardian.<instance>.s.<p>.<s>      per-session hard cap from weighted max-min, relative to the pool
@@ -85,6 +86,44 @@ class SpawnError(Exception):
     def __init__(self, kind, message):
         super().__init__(message)
         self.kind = kind
+
+
+class StartRefused(Exception):
+    pass
+
+
+def taken_reason(e):
+    """Why Guardian will not use a named job that was already there (wj.JobTaken), for logs and refusals. A job's
+    name lasts only while some process holds a handle to it (measured 2026-10-13: member processes alone do not
+    keep it), so an existing name means a handle is still open somewhere."""
+    who = (f"processes {', '.join(map(str, e.pids))} are in it" if e.pids else
+           "no process is in it" if e.pids == [] else "its processes cannot be read")
+    if isinstance(e, wj.NameRedirected) and e.real and e.expected:
+        return (f"the name of job {e.name} leads to {e.real} instead of {e.expected}, so a symbolic link at the name "
+                f"redirects it, and Guardian refuses the name")
+    if isinstance(e, wj.NameRedirected):
+        return (f"Guardian could not read where the name of job {e.name} leads, so it cannot rule out a symbolic link "
+                f"there and refuses the name")
+    if isinstance(e, wj.NameNotJob):
+        return (f"the name of job {e.name} is held by an object that is not a job, so some process still holds that "
+                f"object open")
+    if isinstance(e, wj.NameUnusable):
+        return (f"Guardian could not create job {e.name}: {e.detail} (winerror {e.winerror}), and no job opens under "
+                f"that name. Another process may hold a symbolic link or another object there, or this was a resource "
+                f"error")
+    if isinstance(e, wj.JobLocked):
+        return (f"job {e.name} already exists, this process may not open it with full access, and some process holds "
+                f"it open, for example a running daemon of this instance, a script reading it, or another process "
+                f"that created it with a restrictive DACL; {who}")
+    try:
+        elevated = wj.is_elevated()
+    except OSError:
+        elevated = False
+    if elevated:
+        return (f"job {e.name} already exists; this daemon runs elevated, and an elevated open cannot tell Guardian's "
+                f"DACL from a permissive one; {who}. Guardian still does not take over a job it did not create")
+    return (f"job {e.name} already exists and its DACL lets other processes change it; {who}. Guardian never takes "
+            f"over a job it did not create")
 
 
 class Session:
@@ -180,9 +219,26 @@ class Guardian:
 
     # ---- job tree --------------------------------------------------------------------------------------------
     def open_tree(self):
-        self.root = wj.Job.create(self.jobname("AllAgents"))
-        if self.root.existed:
-            self.log("reopened the AllAgents job a previous daemon left behind")
+        try:
+            self.root = wj.Job.create(self.jobname("AllAgents"))
+        except wj.JobTaken as e:
+            why = taken_reason(e)
+            self.decide("startup_refused", "AllAgents", readback={"pids": e.pids}, error=str(e), reason=why)
+            if isinstance(e, wj.NameUnusable):
+                raise StartRefused(f"{why}. End the process that created that object or link, or start with another "
+                                   f"--instance")
+            fix = (f"{why}. End the process that holds the job open (the old daemon or the script), or start with "
+                   f"another --instance")
+            dacl = getattr(e, "guardian_dacl", None)
+            if isinstance(e, wj.JobLocked) and dacl:
+                fix += (". The job carries Guardian's DACL, so an elevated prompt can still open it with full access "
+                        "to end its processes")
+            elif isinstance(e, wj.JobLocked) and dacl is False:
+                fix += ". The job does not carry Guardian's DACL"
+            elif isinstance(e, wj.JobLocked):
+                fix += (". If the job carries Guardian's DACL, an elevated prompt can still open it with full access "
+                        "to end its processes; its DACL could not be read here")
+            raise StartRefused(fix)
         self.set_pool_priority(self.pool_priority, "startup: agent work yields to the foreground (E9)")
         before = self.root.limits()["flags"] & wj.LIMIT_AFFINITY
         wj.set_job_affinity(self.root, self.mask)
@@ -241,8 +297,12 @@ class Guardian:
     def provider(self, name):
         p = self.providers.get(name)
         if p is None:
-            job = wj.Job.create(self.jobname("p", name))
-            job.set_cpu()  # a job reopened from an earlier daemon may still carry its pause
+            try:
+                job = wj.Job.create(self.jobname("p", name))
+            except wj.JobTaken as e:
+                self.decide("provider_refused", name, readback={"pids": e.pids}, error=str(e), reason=taken_reason(e))
+                raise
+            job.set_cpu()
             p = self.providers[name] = {"name": name, "job": job, "paused": False}
         return p
 
@@ -251,7 +311,11 @@ class Guardian:
         s = self.sessions.get(key)
         if s is None:
             self.provider(provider)
-            job = wj.Job.create(self.jobname("s", provider, name))
+            try:  # a name another process still holds open (a dropped session's job) or took first
+                job = wj.Job.create(self.jobname("s", provider, name))
+            except wj.JobTaken as e:
+                self.decide("session_refused", key, readback={"pids": e.pids}, error=str(e), reason=taken_reason(e))
+                raise
             job.set_cpu()
             s = self.sessions[key] = Session(provider, name, cls, job)
             self.log(f"new session {key} class {cls}")
@@ -519,7 +583,11 @@ class Guardian:
         label, head = describe(argv)
         fingerprint = hashlib.sha1(f"{provider}|{head}".encode()).hexdigest()[:16]
         with self.lock:
-            s = self.session(provider, name, cls)
+            try:
+                s = self.session(provider, name, cls)
+            except wj.JobTaken as e:  # session() logged it; the client prints the reason and runs nothing
+                return send_json(conn, {"event": "error", "kind": "session",
+                                        "message": f"Guardian refused session {provider}/{name}: {taken_reason(e)}"})
             est, src, _ = P.estimate(self.ledger.profile(fingerprint), req.get("est_gib"), self.cfg)
             run = Run(uuid.uuid4().hex[:12], s, argv, req.get("cwd"), req.get("env"), bool(req.get("console")),
                       est, src, src == "exploration", label, fingerprint)
@@ -712,7 +780,10 @@ class Guardian:
                 return {"ok": True, "state": "already", "session": key, "pid": pid, "swept": len(late),
                         "coverage": self.coverage_of(pid, holder), "reason": f"already in Guardian session {key}"}
             fresh = f"{provider}/{name}" not in self.sessions
-            s = self.session(provider, name, cls)
+            try:
+                s = self.session(provider, name, cls)
+            except wj.JobTaken as e:  # session() logged it
+                return {"ok": False, "state": "refused", "pid": pid, "reason": taken_reason(e)}
             chain = [self.root, self.providers[provider]["job"], s.job]
             err = self.assign_chain(pid, chain)
             if err:
@@ -1028,5 +1099,9 @@ def main(argv=None):
         print(f"Guardian {a.instance} is already running", file=sys.stderr)
         return 1
     over = {"cpu": {"maximum_cap_percent": a.max_cap}} if a.max_cap else {}
-    Guardian(a.instance, a.world_cpus, a.initial_cap, over, a.port, not a.no_probe, not a.no_apps).run_forever()
+    try:
+        Guardian(a.instance, a.world_cpus, a.initial_cap, over, a.port, not a.no_probe, not a.no_apps).run_forever()
+    except StartRefused as e:
+        print(f"Guardian {a.instance} refused to start: {e}", file=sys.stderr)
+        return 2
     return 0

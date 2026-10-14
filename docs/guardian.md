@@ -186,8 +186,38 @@ instead of tens.
   unless plain, double quotes doubled, `%` neutralized. 200 random arguments made of `" \ % & | < > ^ ( ) !`,
   spaces and tabs arrived unchanged, and none ran as a command. cmd.exe cannot carry a line break inside an
   argument, so the shim refuses to start such a CLI with one `[guardian]` line and exit code 2.
-- Guardian's jobs keep the default security of a new job. In the verifier's test a non-elevated process of the
-  same user opened `check.AllAgents` by name with full access, so such a process could change the limits.
+- Guardian's named jobs, AllAgents and the provider and session jobs, get a protected DACL: SYSTEM and
+  Administrators have full access, the user who runs the daemon may only query, wait and read the DACL, and an
+  OWNER RIGHTS entry takes away the owner's implicit right to rewrite it. Unnamed run jobs keep the default
+  security. Measured 2026-10-13 on instance `sec`: a separate non-elevated process of the same user, whose token
+  holds Administrators as deny-only, opens all of them with query access, while SET_ATTRIBUTES, full access,
+  WRITE_DAC, ASSIGN_PROCESS and TERMINATE fail with access denied. A low-integrity child gets query and nothing
+  else. The daemon keeps the job rights through the handle it got when it created each job. That handle's granted
+  access is 0x13003F, which has no WRITE_DAC either. From inside Codex 0.156's sandbox, whereami still reads the
+  session from the jobs.
+- A process of the same user can still open the daemon process with PROCESS_DUP_HANDLE and copy its job handle,
+  which keeps the full job rights (0x13003F), because Guardian does not lock down its own process. It can also
+  create a job, another named object or a symbolic link under a Guardian name first, which makes the daemon refuse
+  that name. Both were measured. It can end member processes one at a time, since they are its own processes
+  (Windows behavior, not measured here). Elevated processes and SYSTEM keep full access through the DACL by design.
+  A daemon started elevated therefore opens an existing AllAgents job with full access, cannot tell Guardian's DACL
+  from a permissive one, and refuses it too. An AppContainer process resolves `Local\` to its own namespace
+  (documented, not measured), so it does not find the jobs by name and whereami cannot read them there.
+- A job's name lasts only while some process holds a handle to it; member processes alone do not keep it
+  (measured). A restarted daemon therefore normally creates fresh jobs, and the old daemon's sessions run on in
+  nameless jobs that nothing controls any more. A clean shutdown removes their caps first. After a crash they keep
+  whatever cap or pause they had, and since the job has no name left, nothing can find it to lift the limit;
+  ending the CLI is the way out (measured with a paused test job). If the AllAgents name still exists at startup,
+  because the old daemon still runs with its pipe out of reach or a script holds the job open, the daemon refuses
+  to start and lists the processes in the job. It also refuses a job whose DACL is permissive, such as one made by
+  a Guardian version without the job DACL or one another process created first, and a name held by an object that
+  is not a job or by a symbolic link. That includes a link to a free name or to another job: the daemon reads the
+  kernel path of each job it gets and refuses one that does not sit under its own name. Each case was measured.
+  The way out is to end the process that holds the job, the object or the link open, or to start with another
+  `--instance`. If a provider or session name is taken that way while the daemon runs, the daemon refuses that
+  srun or adopt with a logged `provider_refused` or `session_refused` decision and keeps running (measured).
 - The Guardian pipe name includes `USERNAME`, so a process with a different `USERNAME` in its environment cannot
-  reach the daemon and whereami reports it as not running.
+  reach the daemon. Inside a Guardian session whereami still reads the session from the jobs; without
+  `GUARDIAN_PROVIDER` and `GUARDIAN_SESSION` it says only PARTLY KNOWN. Outside the pool it reports Guardian as not
+  running even while the daemon is up (measured 2026-10-14 on `sec`).
 - Codex 0.156 cannot parse a `hooks.json` that starts with a UTF-8 byte order mark. The installer writes without one.

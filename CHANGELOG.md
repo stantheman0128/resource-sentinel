@@ -32,6 +32,12 @@
   link, and refuses a srun or adopt whose job name is taken. A link counts wherever it points, a free name
   included, since the daemon compares the kernel path of each job it creates with its own name. `Job.open` now
   opens for query unless told otherwise.
+- The pipe handshake runs on each connection's own thread with a 5 s deadline instead of inside the daemon's one
+  accept thread. A client that connects and then stalls is dropped after 5 s and no longer holds up srun, gagent,
+  the adopt hook, the PATH wrappers or whereami: with one stalled client, another client's ping took 0.002 s
+  instead of 9.99 s. `client.connect()` also gives up when the daemon has not finished the challenge within 5 s.
+  The `pipe-authkey` file and the bytes on the pipe are unchanged, so old and new clients and daemons work together,
+  and clients with a wrong key or none are still refused.
 - Antigravity CLI (`agy`, provider `antigravity`) joins Guardian like the other CLIs: gagent, an `agy` PATH wrapper,
   the adopt hook as a named `guardian-adopt` hook in `~/.gemini/config/hooks.json` (installer, dry run unless
   `--apply`; the user's own hooks in that file stay), and the provider check. The Antigravity desktop app is refused

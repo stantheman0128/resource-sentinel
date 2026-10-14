@@ -54,6 +54,15 @@ Demos (instance `onoff`, dashboard on port 8767 unless noted):
 | `guardian-demo-claude.py` | a real Claude Code CLI inside Guardian, working as an agent until Esc; `--cpus 10` |
 | `guardian-demo-workload.py` | the CPU-heavy work both sides run; prints speed, cores, priority and whether control is on |
 
+srun, gagent, the adopt hook, the PATH wrappers and whereami talk to the daemon over the named pipe
+`\\.\pipe\resource-sentinel-guardian-<instance>-<USERNAME>`. A client proves it holds the instance's `pipe-authkey`
+through the HMAC challenge of Python's `multiprocessing.connection`. The daemon runs that challenge on each
+connection's own thread and drops a client that has not finished it within 5 s, so a client that connects and then
+stalls delays nobody else. A client likewise treats Guardian as not running when the daemon has not finished the
+challenge within 5 s, though waiting for a free pipe instance can still take the standard library's 20 s. A client
+that answers with the wrong key gets `#FAILURE#` and a closed pipe, and one that never answers is dropped at 5 s.
+guardctl and the dashboard use the HTTP API, not the pipe.
+
 ## Agent CLIs: launch, wrap or adopt
 
 A CLI gets into Guardian one of three ways:
@@ -152,6 +161,14 @@ Ryzen 5 7500F, 12 logical CPUs, 2026-10-13. "Late" is the probe's p95 lateness.
 
 With control on, the agents give up about a fifth of their speed and the foreground waits a few milliseconds
 instead of tens.
+
+The pipe, instance `hs`, 2026-10-13: how long one client's ping took while other clients sat on an unanswered
+challenge.
+
+| Stalled clients | Old: handshake inside the accept thread | Now: handshake per connection |
+|---|---|---|
+| 1, connected for 10 s | 9.99 s, the length of the stall | 0.002 s; the daemon dropped the stalled client at 5.1 s |
+| 2, connected for 25 s | no answer: after 20.2 s the client reported Guardian as not running | 0.001 s |
 
 ## Known limits
 

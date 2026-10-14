@@ -11,10 +11,11 @@ import shutil
 import subprocess
 import sys
 import time
-from multiprocessing.connection import Client
+from multiprocessing.connection import Client, answer_challenge, deliver_challenge
 from pathlib import Path
 
 CLASSES = ("focus", "normal", "batch")
+HANDSHAKE_SECONDS = 5.0
 
 
 def home_dir(instance="main"):
@@ -39,11 +40,44 @@ def send_json(conn, obj, lock=None):
             conn.send_bytes(data)
 
 
-def connect(instance="main"):
-    key = home_dir(instance) / "pipe-authkey"
+class _Deadline:
+    """The connection as the stdlib handshake sees it, with one deadline for the whole exchange: a peer that stops
+    answering raises TimeoutError instead of holding the thread."""
+
+    def __init__(self, conn, seconds):
+        self.conn, self.end = conn, time.monotonic() + seconds
+
+    def send_bytes(self, data):
+        self.conn.send_bytes(data)
+
+    def recv_bytes(self, maxlength=None):
+        if not self.conn.poll(max(0.0, self.end - time.monotonic())):
+            raise TimeoutError("no handshake answer before the deadline")
+        return self.conn.recv_bytes(maxlength)
+
+
+def handshake(conn, authkey, server, seconds=HANDSHAKE_SECONDS):
+    """The HMAC challenge both ways, the same bytes that Listener.accept() and Client() exchange when given an
+    authkey. Raises AuthenticationError (wrong or no key), TimeoutError, EOFError or OSError."""
+    d = _Deadline(conn, seconds)
+    if server:
+        deliver_challenge(d, authkey)
+        answer_challenge(d, authkey)
+    else:
+        answer_challenge(d, authkey)
+        deliver_challenge(d, authkey)
+
+
+def connect(instance="main", timeout=HANDSHAKE_SECONDS):
+    conn = None
     try:
-        return Client(pipe_name(instance), family="AF_PIPE", authkey=key.read_text(encoding="ascii").strip().encode())
-    except Exception:  # no key file, no pipe, busy pipe or failed handshake: all mean "not reachable"
+        key = (home_dir(instance) / "pipe-authkey").read_text(encoding="ascii").strip().encode()
+        conn = Client(pipe_name(instance), family="AF_PIPE")  # the stdlib retries a busy pipe for up to 20 s
+        handshake(conn, key, server=False, seconds=timeout)
+        return conn
+    except Exception:  # no key file, no pipe, busy pipe, failed or stalled handshake: all mean "not reachable"
+        if conn is not None:
+            conn.close()
         return None
 
 

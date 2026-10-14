@@ -2,11 +2,14 @@ import importlib.util
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
+from multiprocessing.connection import Pipe
 from pathlib import Path
 from unittest import mock
 
+from sentinel.guardian import client as GC
 from sentinel.guardian import providers as PV
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -293,6 +296,46 @@ class ShimTests(unittest.TestCase):
         with mock.patch.object(shim, "adopt", side_effect=RuntimeError("boom")):
             r = shim.adopt_within(1, "codex", "s", "normal", "check", limit=5)
         self.assertEqual((r["ok"], r["state"]), (False, "error"))
+
+
+class PipeHandshakeTests(unittest.TestCase):
+    def exchange(self, server_key, client_key):
+        a, b = Pipe()
+        out = {}
+
+        def side(name, conn, key, server):
+            try:
+                GC.handshake(conn, key, server=server, seconds=2)
+                out[name] = "ok"
+            except Exception as e:
+                out[name] = e.__class__.__name__
+
+        t = threading.Thread(target=side, args=("server", a, server_key, True))
+        t.start()
+        side("client", b, client_key, False)
+        t.join(5)
+        a.close()
+        b.close()
+        return out
+
+    def test_same_key_passes_both_ways(self):
+        self.assertEqual(self.exchange(b"k" * 64, b"k" * 64), {"server": "ok", "client": "ok"})
+
+    def test_wrong_key_is_refused_on_both_ends(self):
+        self.assertEqual(self.exchange(b"k" * 64, b"x" * 64),
+                         {"server": "AuthenticationError", "client": "AuthenticationError"})
+
+    def test_a_peer_that_never_answers_times_out(self):
+        for server in (True, False):
+            a, b = Pipe()
+            try:
+                t0 = time.monotonic()
+                with self.assertRaises(TimeoutError):
+                    GC.handshake(a, b"k" * 64, server=server, seconds=0.3)
+                self.assertLess(time.monotonic() - t0, 2)
+            finally:
+                a.close()
+                b.close()
 
 
 class WhereamiTests(unittest.TestCase):

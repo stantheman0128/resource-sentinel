@@ -35,7 +35,7 @@ from pathlib import Path
 from . import policy as P
 from . import providers as PV
 from . import winjob as wj
-from .client import CLASSES, home_dir, pipe_name, ping, send_json
+from .client import CLASSES, handshake, home_dir, pipe_name, ping, send_json
 from .ledger import Ledger
 
 REPO = Path(__file__).resolve().parents[2]
@@ -538,14 +538,25 @@ class Guardian:
 
     # ---- pipe server -----------------------------------------------------------------------------------------
     def accept_loop(self):
-        listener = Listener(pipe_name(self.instance), family="AF_PIPE", authkey=self.authkey)
+        # No authkey on the Listener: with one, accept() runs the HMAC handshake on this thread, and a client that
+        # connects and then stalls holds every other client. greet() runs it per connection, with a deadline.
+        listener = Listener(pipe_name(self.instance), family="AF_PIPE")
         while not self.stop.is_set():
             try:
                 conn = listener.accept()
-            except Exception as e:  # failed handshake from a client without the key, or a dropped connect
+            except Exception as e:  # a dropped connect
                 self.log(f"pipe accept failed: {e.__class__.__name__}")
                 continue
-            threading.Thread(target=self.serve, args=(conn,), daemon=True).start()
+            threading.Thread(target=self.greet, args=(conn,), daemon=True).start()
+
+    def greet(self, conn):
+        try:
+            handshake(conn, self.authkey, server=True)
+        except Exception as e:  # wrong or no key, no answer before the deadline, or gone
+            self.log(f"pipe handshake failed: {e.__class__.__name__}")
+            conn.close()
+            return
+        self.serve(conn)
 
     def serve(self, conn):
         try:

@@ -5,6 +5,7 @@
   guardctl pause claude/s1 | resume claude/s1 | class claude/s1 focus
   guardctl pause-provider codex | resume-provider codex
   guardctl cap 40 | world 10 | hold on | hold off | inject degraded 30 | priority normal | allocator off
+  guardctl desktop off | desktop on                 desktop jobs for the Claude and Codex apps' CLIs
   guardctl cancel <run_id> | rollback | resume-control | shutdown
   guardctl adopt <pid> <provider> [session]     take in a CLI that is already running and has no hook
 """
@@ -34,7 +35,8 @@ def call(instance, path, body=None):
 
 def summary(s):
     lines = [f"mode {s['mode']}  cap {s['cap']:.0f}% of {s['world_cpus']} CPUs = {s['cap_cores']} cores  "
-             f"pool {s['pool_cores']} cores  priority {s['pool_priority']}",
+             f"pool {s['pool_cores']} cores  priority {s['pool_priority']}  "
+             f"desktop jobs {'on' if s.get('desktop') else 'off'}",
              f"RAM available {s['available_gib']} GiB  commit headroom {s['commit_headroom_gib']} GiB  "
              f"admission {'open' if s['admission']['open'] else 'closed ' + s['admission']['reason']}"
              f"{'  HOLD' if s['admission']['hold'] else ''}",
@@ -44,7 +46,7 @@ def summary(s):
     for x in s["sessions"]:
         cap = "-" if x["cap_cores"] is None else f"{x['cap_cores']:.2f}"
         lines.append(f"  session {x['key']:<24} {x['cls']:<6} {'PAUSED' if x['paused'] else '':<6} "
-                     f"use {x['usage']:.2f} cap {cap} runs {x['runs']}")
+                     f"use {x['usage']:.2f} cap {cap} runs {x['runs']}{'  desktop job' if x.get('desktop') else ''}")
     for r in s["runs"]:
         lines.append(f"  {r['state']:<8} {r['run_id']} {r['session']:<24} pid {r['pid']} {r['label']!r} ({r['coverage']})")
     for q in s["queue"]:
@@ -74,6 +76,7 @@ def main(argv=None):
         "inject": lambda: ("/api/inject", {"level": x[0], "seconds": int(x[1]) if len(x) > 1 else 30}),
         "priority": lambda: ("/api/pool_priority", {"priority": x[0]}),
         "allocator": lambda: ("/api/allocator", {"on": x[0] == "on"}),
+        "desktop": lambda: ("/api/desktop", {"on": x[0] == "on"}),
         "cancel": lambda: ("/api/cancel", {"run_id": x[0]}),
         "adopt": lambda: ("/api/adopt", {"pid": int(x[0]), "provider": x[1], "session": x[2] if len(x) > 2 else None}),
         "rollback": lambda: ("/api/rollback", {}),

@@ -11,6 +11,9 @@ A CLI that was started outside Guardian joins the tree when its hook asks (op "a
 running CLI and its children to the session job, and what the CLI starts later inherits it.
 Running app UIs (Claude desktop, the Codex app, Cursor) stay where they are: a process cannot leave its job, and
 a cap on their own app job would also slow their UI. apps.py only measures them, and adopt refuses them.
+The CLIs the Claude app and the Codex app run for their agent sessions are the exception: each goes into a desktop
+job of its own, Local\\Guardian.<instance>.d.<p>.desk-<pid>, which nests under the app's job and so sits outside
+AllAgents. allocate() caps those jobs in absolute cores.
 Nothing here kills or suspends work on its own. Cancel happens only when the requesting client goes away or
 Stan presses cancel; pause is a CPU rate of 1/10000 that resume lifts.
 """
@@ -65,6 +68,16 @@ def sweep_targets(pids, table, path, own=(), skip=()):
     """The children that join an adopted CLI's job: not Guardian's own, not skipped, and neither a desktop app nor
     a helper with an app above it, since Guardian never puts the apps in a job."""
     return [p for p in pids if p not in own and p not in skip and not PV.app_among(p, table, path)]
+
+
+def desktop_sweep(pid, table, path, own=()):
+    """The children that join a desktop CLI's job. The app above the CLI does not count against them: the table is
+    cut at the CLI, so only an app between the CLI and a child keeps that child out."""
+    if pid not in table:
+        return []
+    cut = dict(table)
+    cut[pid] = (None, table[pid][1])
+    return sweep_targets(wj.descendants(pid, cut)[1:], cut, path, own)
 
 
 def describe(argv):
@@ -131,11 +144,13 @@ class Session:
         self.provider, self.name, self.cls, self.job = provider, name, cls, job
         self.key = f"{provider}/{name}"
         self.paused = False
-        self.applied = None        # None = no CPU control, "paused", or ("rel", fraction of the pool)
+        self.applied = None        # None = no CPU control, "paused", ("rel", fraction of the pool) or ("abs", cores)
         self.usage = 0.0
         self.prev = None
         self.live_runs = 0
         self.t_last = time.time()
+        self.desktop = False       # a desktop job under an app's job, outside AllAgents
+        self.app_pids = set()      # the desktop CLI's parents when it was placed, the app's root among them
 
 
 class Run:
@@ -167,8 +182,11 @@ class Adopted:
 
 class Guardian:
     def __init__(self, instance="main", world_cpus=None, initial_cap=None, cfg_over=None, port=8765, probe=True,
-                 apps=True):
+                 apps=True, desktop=None):
         self.instance, self.port = safe(instance, "main"), port
+        # desktop jobs: on by default for the main instance only, so a test instance never reaches into the apps
+        self.desktop_on = self.instance == "main" if desktop is None else bool(desktop)
+        self.desktop_skip = set()  # desktop CLI pids refused or failed once; not tried again while they run
         self.home = home_dir(self.instance)
         self.home.mkdir(parents=True, exist_ok=True)
         self.cfg = P.merged(P.DEFAULTS, cfg_over)
@@ -261,6 +279,9 @@ class Guardian:
         self.pool_priority_readback = self.root.limits()["priority"]
         self.pool_priority = name
         self.decide("pool_priority", "AllAgents", before, name, self.pool_priority_readback, err, reason)
+        for s in self.sessions.values():
+            if s.desktop:  # outside AllAgents, so the root's limit does not reach them
+                self.desktop_priority(s, name)
 
     def apply_cap(self, kind, reason):
         cores = self.cap.cap / 100 * self.world
@@ -283,6 +304,9 @@ class Guardian:
         # widening sets every CPU explicitly: clearing the limit would leave running members on the old, smaller mask
         mask = self.mask or (1 << wj.NCPU) - 1
         wj.set_job_affinity(self.root, mask)
+        for s in self.sessions.values():
+            if s.desktop:
+                wj.set_job_affinity(s.job, mask)
         if self.probe_proc and self.probe_proc.poll() is None:
             if not self.probe_job:
                 self.probe_job = wj.Job.create()
@@ -336,6 +360,10 @@ class Guardian:
         self.decide("provider_pause" if paused else "provider_resume", name, before.get("mode"),
                     "rate 1" if paused else "none", p["job"].cpu().get("mode"), err,
                     "Stan paused the provider: CPU rate 1/10000, processes stay alive" if paused else "resumed")
+        budget = self.cap.cap / 100 * self.world
+        for s in self.sessions.values():
+            if s.desktop and s.provider == name:  # the provider job does not hold desktop jobs
+                self.apply_session(s, self.desktop_want(s, self.alloc.caps.get(s.key), budget), budget)
 
     def apply_session(self, s, want, budget):
         err = None
@@ -344,15 +372,18 @@ class Guardian:
                 s.job.set_cpu_rate(1)
             elif want is None:
                 s.job.set_cpu()
+            elif want[0] == "abs":
+                s.job.set_cpu(max_cores=want[1])  # a desktop job's parent, the app's job, has no CPU rate
             else:
                 s.job.set_cpu(max_cores=want[1] * wj.NCPU)  # nested caps are a fraction of the parent (E8b)
         except OSError as e:
             err = str(e)
         rb = s.job.cpu()
         before, s.applied = s.applied, (s.applied if err else want)
-        shown = lambda v: v if not isinstance(v, tuple) else f"{v[1] * budget:.2f} cores"
+        shown = lambda v: v if not isinstance(v, tuple) else f"{v[1] * (1 if v[0] == 'abs' else budget):.2f} cores"
         self.ledger.decision("session_cap", s.key, shown(before), shown(want), rb.get("mode"), err,
-                             f"weighted max-min, class {s.cls}", P.POLICY_VERSION)
+                             f"weighted max-min, class {s.cls}" + (", desktop job" if s.desktop else ""),
+                             P.POLICY_VERSION)
 
     # ---- 1 Hz control loop -----------------------------------------------------------------------------------
     def experience(self, now):
@@ -380,12 +411,14 @@ class Guardian:
             self.log(f"core telemetry failed: {e}")
         cpu_s = self.root.accounting()["cpu_s"]
         dt = max(1e-3, now - prev[0])
-        self.pool_cores = max(0.0, (cpu_s - prev[1]) / dt)
+        tree = max(0.0, (cpu_s - prev[1]) / dt)
         with self.lock:
             for s in self.sessions.values():
                 a = s.job.accounting()["cpu_s"]
                 s.usage = max(0.0, (a - s.prev[1]) / max(1e-3, now - s.prev[0])) if s.prev else 0.0
                 s.prev = (now, a)
+            # desktop jobs sit outside AllAgents, so the pool adds their use to what the tree's root job counts
+            self.pool_cores = tree + sum(x.usage for x in self.sessions.values() if x.desktop)
             for r in list(self.live.values()):
                 if r.state == "running" and r.job:
                     try:
@@ -429,23 +462,36 @@ class Guardian:
     def allocate(self):
         budget = self.cap.cap / 100 * self.world
         weights = self.cfg["cpu"]["allocation_weights"]
+        # a desktop session counts as active by its use alone: its CLI runs as long as the app's tab is open, and
+        # every idle tab would otherwise ask for a share of the budget and squeeze the busy ones
         active = {k: {"allocation_weight": weights.get(s.cls, 5), "usage": s.usage,
                       "paused": s.paused or self.providers[s.provider]["paused"]}
-                  for k, s in self.sessions.items() if s.live_runs or s.usage > 0.05}
+                  for k, s in self.sessions.items() if s.usage > 0.05 or (s.live_runs and not s.desktop)}
         if self.allocator_on:
             self.alloc, _ = P.allocate(self.alloc, budget, active, self.cfg)
         else:
             self.alloc = P.AllocState()
         for k, s in self.sessions.items():
-            if s.paused:
+            cap = self.alloc.caps.get(k) if k in active else None
+            if s.desktop:
+                want = self.desktop_want(s, cap, budget)
+            elif s.paused:
                 want = "paused"
             else:
-                cap = self.alloc.caps.get(k) if k in active else None
                 want = None if cap is None or cap >= 0.98 * budget else ("rel", round(cap / budget, 3))
             same = want == s.applied or (isinstance(want, tuple) and isinstance(s.applied, tuple)
-                                         and abs(want[1] - s.applied[1]) < 0.02)
+                                         and abs(want[1] - s.applied[1]) < (0.02 * budget if s.desktop else 0.02))
             if not same:
                 self.apply_session(s, want, budget)
+
+    def desktop_want(self, s, cap, budget):
+        """A desktop job's cap in absolute cores, since the app's job above it has no CPU rate: the allocator's cap,
+        or the whole budget when it sets none. While control is on, a desktop session never runs uncapped."""
+        if s.paused or self.providers[s.provider]["paused"]:
+            return "paused"
+        if not self.control:
+            return None
+        return "abs", round(budget if cap is None else min(cap, budget), 2)
 
     def tick_loop(self):
         prev = (time.monotonic(), self.root.accounting()["cpu_s"])
@@ -485,11 +531,19 @@ class Guardian:
         while not self.stop.wait(2.0):
             try:
                 rows = obs.sample()
+                with self.lock:
+                    desk = [(x.app_pids, x.usage) for x in self.sessions.values() if x.desktop]
+                    tree = self.pool_cores - sum(u for _, u in desk)
                 for r in rows:
                     if r.get("hosts_guardian") and r.get("cores") is not None:
                         # the daemon was started from inside this app, so its job also holds the agent pool
-                        r["cores"] = round(max(0.0, r["cores"] - self.pool_cores), 2)
+                        r["cores"] = round(max(0.0, r["cores"] - tree), 2)
                         r["coverage"] += "; Guardian pool subtracted (daemon runs inside this app)"
+                    mine = [u for pids, u in desk if r.get("root_pid") in pids]
+                    if mine and r.get("cores") is not None:
+                        # a desktop job nests under the app's job, so the app's figure also holds what the pool counts
+                        r["cores"] = round(max(0.0, r["cores"] - sum(mine)), 2)
+                        r["coverage"] += "; desktop jobs subtracted (Guardian counts them in its pool)"
                 self.apps_rows = rows
             except Exception as e:
                 self.apps_rows = [{"name": "?", "error": str(e)}]
@@ -747,8 +801,11 @@ class Guardian:
             own.add(self.probe_proc.pid)
         return own
 
+    def own_or_parent(self, pid, table):
+        return pid in self.own_pids() or pid in wj.ancestors(os.getpid(), table)
+
     def adopt_refusal(self, pid, table):
-        if pid in self.own_pids() or pid in wj.ancestors(os.getpid(), table):
+        if self.own_or_parent(pid, table):
             return "that process is the Guardian daemon or one of its parents"
         app = PV.app_among(pid, table, wj.image_path)
         if app:
@@ -836,22 +893,152 @@ class Guardian:
         """Which Guardian session job holds pid; what scripts/guardian-whereami.py and the provider check ask."""
         with self.lock:
             holder = next((x for x in self.sessions.values() if wj.in_job(pid, x.job.h)), None)
-            return {"pid": pid, "in_guardian": bool(wj.in_job(pid, self.root.h)), "in_any_job": wj.in_job(pid),
-                    "session": holder.key if holder else None, "priority": wj.priority_class(pid),
-                    "adopted": pid in self.adopted, "instance": self.instance}
+            desktop = bool(holder and holder.desktop)
+            return {"pid": pid, "in_guardian": bool(wj.in_job(pid, self.root.h)) or desktop,
+                    "in_any_job": wj.in_job(pid), "session": holder.key if holder else None, "desktop": desktop,
+                    "priority": wj.priority_class(pid), "adopted": pid in self.adopted, "instance": self.instance}
 
     def coverage_of(self, pid, s):
+        if s and s.desktop:
+            return ("enforced (desktop job)" if wj.in_job(pid, s.job.h) else "partial") + \
+                f", priority {wj.priority_class(pid)}"
         in_root, in_session = wj.in_job(pid, self.root.h), bool(s) and wj.in_job(pid, s.job.h)
         return ("enforced" if in_root and in_session else "partial") + f", priority {wj.priority_class(pid)}"
 
-    def end_adopted(self, r):
+    def end_adopted(self, r, why=None):
         self.live.pop(r.run_id, None)
         self.adopted.pop(r.pid, None)
         r.session.live_runs -= 1
         wj.CloseHandle(r.handle)
         r.state = "done"
-        self.ledger.run_update(r.run_id, state="done", t_end=time.time(), reason="the adopted CLI exited")
-        self.log(f"adopted {r.label} pid {r.pid} ({r.session.key}) exited")
+        self.ledger.run_update(r.run_id, state="done", t_end=time.time(), reason=why or "the adopted CLI exited")
+        self.log(f"{r.label} pid {r.pid} ({r.session.key}): {why}" if why else
+                 f"adopted {r.label} pid {r.pid} ({r.session.key}) exited")
+
+    # ---- desktop jobs ----------------------------------------------------------------------------------------
+    # A desktop app's agent CLI already sits in the app's job, so it can only join a fresh job, which then nests
+    # under the app's job (measured 2026-10-14). These desktop jobs are outside AllAgents: the pool total holds
+    # only through allocate(), which caps each of them in absolute cores once a second.
+    def desktop_loop(self):
+        while not self.stop.wait(2.0):
+            if not self.desktop_on:
+                continue
+            try:
+                table = wj.process_table()
+                targets = PV.desktop_targets(table, wj.image_path)
+                with self.lock:
+                    if self.desktop_on:
+                        self.desktop_once(table, targets)
+            except Exception:
+                self.log("desktop poll failed: " + traceback.format_exc(limit=3).replace("\n", " | "))
+
+    def desktop_once(self, table, targets):
+        self.desktop_skip &= set(table)
+        for pid, provider in targets:
+            if f"{provider}/desk-{pid}" not in self.sessions and pid not in self.desktop_skip:
+                self.place_desktop(pid, provider, table)
+        for s in [x for x in self.sessions.values() if x.desktop and not x.live_runs]:
+            if s.job.accounting()["active"] == 0:  # the CLI has exited, and so has everything it started
+                self.sessions.pop(s.key, None)
+                s.job.close()
+                self.log(f"desktop session {s.key} ended")
+
+    def place_desktop(self, pid, provider, table):
+        """Put one desktop CLI and what it has started into a desktop job of its own; what it starts later inherits
+        the job. A refusal or failure is logged once, and that pid is not tried again while it runs."""
+        name, image = f"desk-{pid}", table[pid][1]
+        key = f"{provider}/{name}"
+
+        def refuse(why, err=None):
+            self.desktop_skip.add(pid)
+            self.decide("desktop_refused", key, requested={"pid": pid, "image": image}, error=err, reason=why)
+
+        if self.own_or_parent(pid, table):
+            return refuse("that process is the Guardian daemon or one of its parents")
+        if wj.in_job(pid, self.root.h):
+            return refuse("the process is already in Guardian's tree")
+        handle = wj.open_waitable(pid)  # holds the pid, so it cannot be reused while it is placed
+        if not handle:
+            return None  # it exited after the process table was read
+        if PV.DESKTOP_CLIS[provider][1] not in (wj.image_path(pid) or "").lower():
+            wj.CloseHandle(handle)
+            return refuse("the process is no longer the desktop CLI the scan found")
+        try:
+            self.provider(provider)  # the pause switch lives there, although its job does not hold desktop jobs
+            # a name that already exists is refused as for a session: never take over a job Guardian did not create
+            job = wj.Job.create(self.jobname("d", provider, name))
+        except (wj.JobTaken, OSError) as e:
+            wj.CloseHandle(handle)
+            return refuse(taken_reason(e) if isinstance(e, wj.JobTaken) else "Guardian could not create or open the "
+                          "desktop job", str(e))
+        err = self.assign_chain(pid, [job])
+        if err:
+            job.close()
+            wj.CloseHandle(handle)
+            return refuse("the process cannot join a fresh job (protected, or in a job that allows no nesting)", err)
+        s = self.sessions[key] = Session(provider, name, "normal", job)
+        s.desktop, s.app_pids = True, set(wj.ancestors(pid, table))
+        budget = self.cap.cap / 100 * self.world
+        try:
+            if self.control:
+                job.set_limits(priority=self.pool_priority)
+            if self.mask:
+                wj.set_job_affinity(job, self.mask)
+        except OSError as e:
+            self.log(f"desktop limits for {key} failed: {e}")
+        self.apply_session(s, self.desktop_want(s, None, budget), budget)
+        fresh = wj.process_table()
+        own = self.own_pids() | set(wj.ancestors(os.getpid(), fresh))
+        failed, moved = [], 1
+        for p in desktop_sweep(pid, fresh, wj.image_path, own):
+            e = self.assign_chain(p, [job])
+            if e:
+                failed.append({"pid": p, "image": fresh[p][1], "error": e})
+            else:
+                moved += 1
+        coverage = self.coverage_of(pid, s)
+        app = PV.DESKTOP_CLIS[provider][2]
+        run = Adopted(uuid.uuid4().hex[:12], s, pid, handle, f"{image} (desktop)", coverage)
+        run.est_source = "desktop"
+        self.live[run.run_id] = run
+        s.live_runs += 1
+        self.ledger.run_requested({"run_id": run.run_id, "provider": provider, "session": name, "cls": s.cls,
+                                   "fingerprint": hashlib.sha1(f"{provider}|desktop".encode()).hexdigest()[:16],
+                                   "label": run.label, "est_gib": 0.0, "est_source": "desktop",
+                                   "unprofiled": False, "t_request": time.time(), "coverage": coverage})
+        self.ledger.run_update(run.run_id, state="running", t_start=time.time(), pid=pid)
+        self.decide("desktop", key, requested={"pid": pid, "image": image},
+                    readback={"processes": moved, "failed": failed[:5], "coverage": coverage},
+                    reason=f"{image} and {moved - 1} child processes joined a desktop job under the {app}'s job")
+        return s
+
+    def set_desktop(self, on, reason):
+        """Off lets every desktop job go: no CPU cap, normal priority, every CPU, and no new placements."""
+        self.desktop_on = on
+        released = [s for s in self.sessions.values() if s.desktop] if not on else []
+        for s in released:
+            try:
+                s.job.set_cpu()
+                if s.job.limits()["priority"]:
+                    s.job.set_limits(priority="normal")  # clearing the limit would not restore the members (E9)
+                if s.job.limits()["flags"] & wj.LIMIT_AFFINITY:
+                    wj.set_job_affinity(s.job, (1 << wj.NCPU) - 1)  # the same holds for a narrowed CPU set
+            except OSError as e:
+                self.log(f"releasing {s.key} failed: {e}")
+            for r in [r for r in self.live.values() if r.session is s and isinstance(r, Adopted)]:
+                self.end_adopted(r, "desktop jobs switched off; the CLI keeps running outside Guardian")
+            self.sessions.pop(s.key, None)
+            s.job.close()
+        self.desktop_skip.clear()
+        self.decide("desktop", "desktop jobs", requested=on, readback={"released": len(released)},
+                    reason=f"{reason}: " + ("the Claude and Codex apps' CLIs go into desktop jobs" if on
+                                            else "desktop jobs released, none placed"))
+
+    def desktop_priority(self, s, name):
+        try:
+            s.job.set_limits(priority=name)
+        except OSError as e:
+            self.log(f"priority {name} for {s.key} failed: {e}")
 
     # ---- dashboard API ---------------------------------------------------------------------------------------
     def state(self):
@@ -873,6 +1060,7 @@ class Guardian:
                 "commit_headroom_gib": round(s.commit_headroom_gib, 1) if s and s.commit_headroom_gib else None,
                 "admission": {"open": self.cap.admission_open, "reason": self.cap.admission_reason, "hold": self.hold},
                 "pool_priority": self.pool_priority_readback, "allocator": self.allocator_on,
+                "desktop": self.desktop_on,
                 "experience": {"level": level, "kind": kind, "probe": self.probe_last,
                                "inject_left_s": round(self.inject[0] - time.monotonic())
                                if self.inject and self.inject[0] > time.monotonic() else 0},
@@ -882,7 +1070,7 @@ class Guardian:
                 "sessions": [{"key": k, "provider": x.provider, "name": x.name, "cls": x.cls,
                               "allocation_weight": c["allocation_weights"].get(x.cls, 5), "paused": x.paused,
                               "provider_paused": self.providers[x.provider]["paused"], "usage": round(x.usage, 2),
-                              "cap_cores": self.alloc.caps.get(k), "runs": x.live_runs}
+                              "cap_cores": self.alloc.caps.get(k), "runs": x.live_runs, "desktop": x.desktop}
                              for k, x in self.sessions.items()],
                 "queue": [{"run_id": r.run_id, "session": r.session.key, "label": r.label, "reason": r.reason,
                            "est_gib": round(r.est_gib, 2), "numbers": r.numbers,
@@ -937,6 +1125,8 @@ class Guardian:
                 self.decide("allocator", "sessions", requested=self.allocator_on,
                             reason="per-session caps on" if self.allocator_on else "off: kernel per-thread sharing")
                 self.allocate()
+            elif path == "/api/desktop":
+                self.set_desktop(bool(b["on"]), "set by Stan")
             elif path == "/api/cancel":
                 run = self.live[b["run_id"]]
                 if isinstance(run, Adopted):
@@ -969,6 +1159,8 @@ class Guardian:
         for s in self.sessions.values():
             self.apply_session(s, None, 1)
             s.paused = False
+            if s.desktop:  # outside AllAgents, so the root's priority below does not reach it
+                self.desktop_priority(s, "normal")
         for name, p in self.providers.items():
             p["job"].set_cpu()
             p["paused"] = False
@@ -984,6 +1176,7 @@ class Guardian:
     def shutdown(self):
         """Leave no throttle behind: work still running after the daemon exits must not stay capped or paused."""
         with self.lock:
+            self.desktop_on = False  # no desktop job placed, and capped, after the cleanup below
             try:
                 for s in self.sessions.values():
                     self.apply_session(s, None, 1)
@@ -1011,7 +1204,7 @@ class Guardian:
             while self.probe_last is None and time.monotonic() - t0 < 3:  # first decision waits for the sensor
                 time.sleep(0.1)
         server = ExclusiveHTTPServer(("127.0.0.1", self.port), make_handler(self))
-        loops = [self.tick_loop, self.admit_loop, self.accept_loop, server.serve_forever]
+        loops = [self.tick_loop, self.admit_loop, self.accept_loop, server.serve_forever, self.desktop_loop]
         if self.apps_enabled:
             loops.append(self.apps_loop)
         for f in loops:
@@ -1105,13 +1298,16 @@ def main(argv=None):
     ap.add_argument("--max-cap", type=float, help="upper cap in percent of the world (default 95)")
     ap.add_argument("--no-probe", action="store_true")
     ap.add_argument("--no-apps", action="store_true")
+    ap.add_argument("--desktop", choices=("on", "off"),
+                    help="put the Claude and Codex apps' agent CLIs in desktop jobs (default: on for main only)")
     a = ap.parse_args(argv)
     if ping(a.instance):
         print(f"Guardian {a.instance} is already running", file=sys.stderr)
         return 1
     over = {"cpu": {"maximum_cap_percent": a.max_cap}} if a.max_cap else {}
     try:
-        Guardian(a.instance, a.world_cpus, a.initial_cap, over, a.port, not a.no_probe, not a.no_apps).run_forever()
+        Guardian(a.instance, a.world_cpus, a.initial_cap, over, a.port, not a.no_probe, not a.no_apps,
+                 None if a.desktop is None else a.desktop == "on").run_forever()
     except StartRefused as e:
         print(f"Guardian {a.instance} refused to start: {e}", file=sys.stderr)
         return 2

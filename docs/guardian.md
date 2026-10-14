@@ -26,8 +26,9 @@ every tool command it runs stay inside it:
 - **Control off.** `rollback` removes every cap and puts the agents back at normal priority; the CPU limit stays.
   `resume-control` turns it back on.
 
-Guardian only controls work it launched or adopted (see below). It reads the Claude, Codex and Cursor desktop apps
-but never assigns them to a job. Cloud sessions run on remote machines and use no local CPU, so there is nothing to control locally.
+Guardian only controls work it launched, adopted or put in a desktop job (see below). It reads the Claude, Codex and
+Cursor desktop apps but never assigns the apps' own processes to a job. Cloud sessions run on remote machines and
+use no local CPU, so there is nothing to control locally.
 
 ## The foreground probe
 
@@ -63,9 +64,9 @@ challenge within 5 s, though waiting for a free pipe instance can still take the
 that answers with the wrong key gets `#FAILURE#` and a closed pipe, and one that never answers is dropped at 5 s.
 guardctl and the dashboard use the HTTP API, not the pipe.
 
-## Agent CLIs: launch, wrap or adopt
+## Agent CLIs: launch, wrap, adopt or desktop job
 
-A CLI gets into Guardian one of three ways:
+A CLI gets into Guardian one of four ways:
 
 1. **Launch.** `python -I scripts/gagent.py <claude|codex|gemini|cursor|grok|antigravity> [--session NAME]
    [-- CLI args]` starts the CLI through srun in its own console window. The CLI is in its session job before it
@@ -88,6 +89,26 @@ A CLI gets into Guardian one of three ways:
    in a job of its own at start. Windows lets such a process join only a job inside its current job tree, or a job
    that never held a process, which then nests under the CLI's job and can never join Guardian's tree (measured
    2026-10-14).
+4. **Desktop job.** The Claude app's Code tab runs each session as a claude.exe of its own
+   (`%APPDATA%\Claude\claude-code\<version>\<hash>\claude.exe`, a child of the app), and the Codex app runs
+   `%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe` under ChatGPT.exe or its node_repl.exe. Both already sit in
+   the app's job, so the rule above holds for them: a fresh job takes them and nests under the app's job. Measured
+   2026-10-14 from a Code-tab session: a busy child of it joined a fresh job, a cap of 0.25 cores read 0.224 cores,
+   an idle priority limit held, and the child's own child inherited the job. Every 2 s the daemon puts each such
+   CLI it has not placed yet, with the children it has already started, into a desktop job of its own,
+   `Local\Guardian.<instance>.d.<provider>.desk-<pid>`; what it starts later inherits the job. Only the top CLI of a
+   chain gets one, and the apps' own processes never do. A desktop job gets the pool's priority, the agents' CPU
+   set, and a hard cap in absolute cores, because the app's job above it has no CPU rate: the
+   allocator's cap for that session, or the whole pool budget when the allocator sets none. While control is on, a
+   desktop session is never uncapped. It counts as active for the allocator only while it uses more than 0.05
+   cores, since about 20 Code-tab sessions stay open at once and each idle one would otherwise take a share of the
+   budget. Pausing the session or its provider sets rate 1 on the desktop job, rollback lifts the cap and sets
+   normal priority, and a shutdown lifts the cap and keeps the priority. Desktop jobs are on by default for
+   instance `main` and off for every other instance; `--desktop on|off` at start and `guardctl desktop on|off` at
+   run time switch them. Off lifts every limit on the desktop jobs (no cap, normal priority, every CPU) and places
+   no new ones. The pool figure adds the desktop jobs' use to the tree's, and the Claude and Codex rows under apps
+   leave it out, so no core is counted twice. whereami answers `CONTROLLED: session claude/desk-<pid> (desktop job
+   under the Claude app's job, ...)`, and reads the job by name when the daemon's pipe is out of reach.
 
 Guardian never sets the breakaway limits on its jobs (`JOB_OBJECT_LIMIT_BREAKAWAY_OK` and
 `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`; winjob.py only reads them back), so every child a controlled CLI starts
@@ -143,10 +164,18 @@ wrapper into a session of its own (enforced, below_normal priority), from a cmd 
 Windows Terminal tab. Neither shell was in a job, though WindowsTerminal.exe itself is. A Windows Terminal that was
 already open keeps its old PATH until it is closed completely, and `wt.exe` hands a new tab the environment of the
 program that called it: a tab opened from inside the Claude app carries `CLAUDE_CODE_ENTRYPOINT=claude-desktop`, so
-its wrappers run the CLI directly. Not measured yet: the terminals inside VS Code and Cursor, whose shells sit in
-the editor's job. The wrapper first starts the CLI outside that job, which works only if the job allows breakaway;
-if it does not, the assignment should fail as the hook does for Claude Code, and the CLI runs with the one-line
-notice.
+its wrappers run the CLI directly. The terminals inside VS Code and Cursor have shells in the editor's job. A
+process started with such a shell as its parent (`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`, the wrappers first on PATH)
+stands in for a command typed there: in both editors its job had flags 0x800, so breakaway is allowed. From the VS
+Code terminal `claude --version` went into a session of its own (enforced). From the Cursor terminal the wrapper ran
+it directly, since Cursor.exe is among its parents and Guardian leaves the desktop apps and everything under them
+alone. An editor that was open before the PATH change gives its terminals the old PATH until it is restarted.
+
+On instance main, each CLI then made one real model call from a cmd that Explorer opened (2026-10-14). Through the
+wrappers, `claude`, `cursor-agent`, `codex`, `grok` and `agy` each ran guardian-whereami as a tool command inside
+its session. With `GUARDIAN_SHIM=off`, the global adopt hook alone placed codex, grok and agy, and the tool command
+reported the session. Codex and grok came out partial: helpers that sat in a job of their own before the hook ran
+stayed out (node.exe and node_repl.exe for codex, powershell.exe and conhost.exe for grok).
 
 ## Measured on this machine
 
@@ -169,6 +198,14 @@ challenge.
 |---|---|---|
 | 1, connected for 10 s | 9.99 s, the length of the stall | 0.002 s; the daemon dropped the stalled client at 5.1 s |
 | 2, connected for 25 s | no answer: after 20.2 s the client reported Guardian as not running | 0.001 s |
+
+Desktop jobs, instance `main`, 2026-10-14, after a restart of the daemon: it found 21 Code-tab claude.exe processes
+and placed all 21 in desktop jobs. In one of them, nine busy loops asked for 9 cores under a cap that started
+at 6 cores and that the allocator lowered to 5.28 while they ran; the session used 5.33 cores. Its
+processes ran at below normal priority, and the Claude app's own process stayed at normal. The same day, opening
+the Codex app started codex.exe under ChatGPT.exe, and the daemon placed it within 2 s. Its 28 children (node.exe,
+node_repl.exe, cmd.exe and conhost.exe) joined with it and ran at below normal, and the job's hard cap followed the
+pool budget down to 1.20 cores. The Codex app sat idle, so it put no load against that cap.
 
 ## Known limits
 
@@ -238,3 +275,16 @@ challenge.
   `GUARDIAN_PROVIDER` and `GUARDIAN_SESSION` it says only PARTLY KNOWN. Outside the pool it reports Guardian as not
   running even while the daemon is up (measured 2026-10-14 on `sec`).
 - Codex 0.156 cannot parse a `hooks.json` that starts with a UTF-8 byte order mark. The installer writes without one.
+- Desktop jobs sit under the apps' jobs, not under AllAgents, so the root's hard cap does not hold them. The pool
+  total, tree and desktop jobs together, holds only through the allocator's per-session caps, set once a second.
+  While nothing contends, each desktop session may use the whole budget, so sessions that start to burst together
+  can go over the total for up to one tick before the allocator caps them. A desktop job name that already exists
+  is refused like a session name, with a logged `desktop_refused` decision, and that CLI stays outside Guardian
+  while it runs.
+- A desktop cap under load was measured only under the Claude app. Under the Codex app, codex.exe and its children
+  joined a desktop job and got its priority and cap, but no Codex task ran against the cap.
+- Turning desktop jobs off leaves each CLI in its old desktop job, without limits and without a name once the
+  daemon closes its handle. Turning them on again nests a new desktop job under that one, so every off and on adds
+  a level. A restart nests the same way: the old desktop job loses its name when the old daemon exits, and the new
+  daemon puts the CLI in a fresh job under it (measured). As with the tree, a crashed daemon leaves its desktop caps
+  in place.

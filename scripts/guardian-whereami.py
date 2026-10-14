@@ -63,10 +63,14 @@ def main(argv=None):
         image = table.get(pid, (0, "?"))[1]
         rows.append({"pid": pid, "image": image, "priority": wj.priority_class(pid), "in_any_job": wj.in_job(pid),
                      "guardian_session": w.get("session"), "in_guardian": w.get("in_guardian"),
-                     "app": PV.protected_app(image, wj.image_path(pid))})
+                     "desktop": w.get("desktop"), "app": PV.protected_app(image, wj.image_path(pid))})
     me = rows[0] if rows else {}
     up = whereis(a.pid, a.instance) is not None
     pooled = wj.in_named_job(a.pid, f"{a.instance}.AllAgents")
+    # a desktop job sits under the app's job, outside the pool; its name holds the desktop CLI's pid
+    desk = None if up or pooled else next((f"{p}/desk-{c}" for c in chain[:16] for p in PV.DESKTOP_CLIS
+                                           if wj.in_named_job(a.pid, f"{a.instance}.d.{p}.desk-{c}")), None)
+    app = next((r["app"] for r in rows if r["app"]), "desktop app")
     if not up and pooled:
         # the daemon's pipe is out of reach (a CLI sandbox can block it), but the jobs themselves answer
         named = next((c for c in candidates(chain, a.instance)
@@ -76,8 +80,15 @@ def main(argv=None):
                   f"not reachable from here), priority {me.get('priority')}" if named else
                   f"PARTLY KNOWN: inside Guardian {a.instance}'s pool (daemon pipe not reachable from here, so the "
                   f"session is unknown), priority {me.get('priority')}")
+    elif not up and desk:
+        me["in_guardian"] = True
+        answer = (f"CONTROLLED: session {desk} (desktop job under the {app}'s job, instance {a.instance}, read from "
+                  f"the job; daemon pipe not reachable from here), priority {me.get('priority')}")
     elif not up:
         answer = f"NOT CONTROLLED: Guardian {a.instance} is not running"
+    elif me.get("guardian_session") and me.get("desktop"):
+        answer = (f"CONTROLLED: session {me['guardian_session']} (desktop job under the {app}'s job, instance "
+                  f"{a.instance}), priority {me['priority']}")
     elif me.get("guardian_session"):
         answer = f"CONTROLLED: session {me['guardian_session']} (instance {a.instance}), priority {me['priority']}"
     elif me.get("in_guardian"):

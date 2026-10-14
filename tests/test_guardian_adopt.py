@@ -356,5 +356,193 @@ class WhereamiTests(unittest.TestCase):
                                  [("claude", "my_sess_1"), ("codex", "bbbb2222"), ("codex", "aaaa1111")])
 
 
+CODEX_APP = r"C:\Program Files\WindowsApps\OpenAI.ChatGPT-Desktop_1.2026.1.0_x64__2p2nqsd0c76g0\app\ChatGPT.exe"
+CODEX_APP_CLI = r"C:\Users\x\AppData\Local\OpenAI\Codex\bin\4f2a9c7e1b0d\codex.exe"
+
+
+def desktop_tree(*extra):
+    """The Claude app with a Code-tab session (pid 200) and the Codex app with its codex.exe (pid 320)."""
+    return tree((4, 1, "svchost.exe", ""), (100, 4, "claude.exe", CLAUDE_APP), (110, 100, "claude.exe", CLAUDE_APP),
+                (200, 100, "claude.exe", CLAUDE_EMBEDDED), (210, 200, "bash.exe", ""),
+                (220, 210, "node.exe", PLAIN_NODE), (300, 4, "ChatGPT.exe", CODEX_APP),
+                (310, 300, "node_repl.exe", ""), (320, 310, "Codex.exe", CODEX_APP_CLI), *extra)
+
+
+class DesktopTargetTests(unittest.TestCase):
+    def test_code_tab_claude_and_codex_app_codex_are_picked(self):
+        self.assertEqual(PV.desktop_targets(*desktop_tree()), [(200, "claude"), (320, "codex")])
+
+    def test_app_processes_nested_targets_and_terminal_clis_are_skipped(self):
+        table, path = desktop_tree(
+            (230, 200, "claude.exe", CLAUDE_EMBEDDED),     # a second claude.exe under the Code-tab session
+            (240, 210, "codex.exe", CODEX_APP_CLI),        # the Codex app's binary, but under the Claude app
+            (400, 1, "WindowsTerminal.exe", ""), (410, 400, "pwsh.exe", ""),
+            (420, 410, "claude.exe", CLAUDE_CLI),          # Claude Code from a terminal
+            (430, 410, "claude.exe", CLAUDE_EMBEDDED),     # the app's copy, started from a terminal
+            (440, 410, "codex.exe", CODEX_APP_CLI),
+            (450, 300, "codex.exe", None),                 # path unreadable
+            # an app process whose path also matches the CLI's: still the app
+            (460, 100, "claude.exe", r"C:\Users\x\AppData\Local\AnthropicClaude\claude\claude-code\1.0\claude.exe"))
+        self.assertEqual(PV.desktop_targets(table, path), [(200, "claude"), (320, "codex")])
+
+    def test_a_parent_loop_back_to_the_target_keeps_it(self):
+        # pid reuse: the app's parent pid now belongs to the CLI itself
+        table, path = tree((500, 510, "claude.exe", CLAUDE_EMBEDDED), (510, 500, "claude.exe", CLAUDE_APP))
+        self.assertEqual(PV.desktop_targets(table, path), [(500, "claude")])
+
+    def test_the_sweep_takes_the_cli_children_but_not_an_app_it_started(self):
+        from sentinel.guardian.daemon import desktop_sweep, sweep_targets
+        table, path = desktop_tree((250, 200, "Cursor.exe", r"C:\x\Cursor.exe"), (260, 250, "node.exe", PLAIN_NODE),
+                                   (270, 210, "python.exe", ""))
+        self.assertEqual(sorted(desktop_sweep(200, table, path, own={270})), [210, 220])
+        # without the cut, the Claude app above the CLI would keep every child out
+        self.assertEqual(sweep_targets([210, 220], table, path), [])
+        self.assertEqual(desktop_sweep(999, table, path), [])
+
+
+class FakeJob:
+    def __init__(self):
+        self.calls = []
+
+    def set_cpu(self, max_cores=None):
+        self.calls.append(("cpu", max_cores))
+
+    def set_cpu_rate(self, rate):
+        self.calls.append(("rate", rate))
+
+    def cpu(self):
+        return {"mode": "fake"}
+
+
+class DesktopAllocateTests(unittest.TestCase):
+    def setUp(self):
+        from sentinel.guardian import daemon as D
+        from sentinel.guardian import policy as P
+        self.D, self.P, self.wj = D, P, D.wj
+        g = self.g = D.Guardian.__new__(D.Guardian)  # no jobs, ledger or threads: allocate() and its helpers only
+        g.cfg, g.world, g.cap, g.alloc = P.merged(P.DEFAULTS, None), 12, P.CapState(cap=10.0), P.AllocState()
+        g.allocator_on, g.control, g.sessions, g.providers, g.ledger = True, True, {}, {}, mock.Mock()
+
+    def add(self, key, usage, desktop=False, runs=1):
+        provider, name = key.split("/")
+        self.g.providers.setdefault(provider, {"name": provider, "job": FakeJob(), "paused": False})
+        s = self.g.sessions[key] = self.D.Session(provider, name, "normal", FakeJob())
+        s.usage, s.live_runs, s.desktop = usage, runs, desktop
+        return s
+
+    def test_a_desktop_cap_is_absolute_cores(self):
+        desk, tree_s = self.add("claude/desk-200", 1.2, desktop=True), self.add("codex/s1", 0.6)
+        self.g.allocate()  # budget 10% of 12 CPUs = 1.2 cores, both press for more: 0.6 cores each
+        self.assertEqual(desk.job.calls, [("cpu", 0.6)])
+        self.assertEqual(desk.applied, ("abs", 0.6))
+        self.assertEqual(tree_s.job.calls, [("cpu", 0.5 * self.wj.NCPU)])  # in the tree: half of the pool's rate
+
+    def test_without_an_allocator_cap_a_desktop_session_gets_the_whole_budget(self):
+        desk = self.add("claude/desk-200", 0.9, desktop=True)
+        self.g.allocate()  # alone, so not contended
+        self.assertEqual(desk.job.calls, [("cpu", 1.2)])
+        self.g.allocator_on = False
+        self.g.cap = self.P.CapState(cap=20.0)
+        self.g.allocate()
+        self.assertEqual(desk.job.calls[-1], ("cpu", 2.4))
+
+    def test_an_idle_desktop_session_takes_no_share(self):
+        idle = self.add("claude/desk-200", 0.0, desktop=True)
+        a, b = self.add("codex/s1", 0.6), self.add("codex/s2", 0.6)
+        self.g.allocate()
+        self.assertEqual(idle.job.calls, [("cpu", 1.2)])  # inactive: the budget, never uncapped
+        self.assertEqual(a.job.calls, [("cpu", 0.5 * self.wj.NCPU)])
+        self.assertEqual(b.job.calls, [("cpu", 0.5 * self.wj.NCPU)])
+
+    def test_pause_and_control_off(self):
+        desk = self.add("claude/desk-200", 0.3, desktop=True)
+        self.g.providers["claude"]["paused"] = True
+        self.g.allocate()
+        self.assertEqual(desk.job.calls, [("rate", 1)])
+        self.g.providers["claude"]["paused"] = False
+        self.g.control = False
+        self.g.allocate()
+        self.assertEqual(desk.job.calls[-1], ("cpu", None))
+        self.assertIsNone(desk.applied)
+
+
+class DesktopPlaceTests(unittest.TestCase):
+    def test_a_desktop_job_name_that_already_exists_is_refused(self):
+        from sentinel.guardian import daemon as D
+        wj = D.wj
+        table, path = desktop_tree()
+        g = D.Guardian.__new__(D.Guardian)  # no jobs, ledger or threads: place_desktop() and its helpers only
+        g.instance, g.sessions, g.ledger, g.log, g.desktop_skip = "main", {}, mock.Mock(), mock.Mock(), set()
+        g.providers, g.root, g.probe_proc = {"claude": {"name": "claude", "job": FakeJob(), "paused": False}}, \
+            mock.Mock(), None
+        create = mock.Mock(side_effect=wj.JobExisted("main.d.claude.desk-200", 183, [12345]))
+        opened = mock.Mock(side_effect=AssertionError("Guardian opened a desktop job it did not create"))
+        close = mock.Mock()
+        with mock.patch.object(wj.Job, "create", create), mock.patch.object(wj.Job, "open", opened), \
+                mock.patch.object(wj, "in_job", lambda *a: False), mock.patch.object(wj, "CloseHandle", close), \
+                mock.patch.object(wj, "open_waitable", lambda p: 99), mock.patch.object(wj, "image_path", path), \
+                mock.patch.object(wj, "process_table", lambda: table), \
+                mock.patch.object(wj, "is_elevated", lambda: False):
+            g.place_desktop(200, "claude", table)
+        create.assert_called_once_with("main.d.claude.desk-200")
+        opened.assert_not_called()
+        self.assertNotIn("claude/desk-200", g.sessions)
+        self.assertEqual(g.desktop_skip, {200})
+        close.assert_called_once_with(99)
+        kind, target, *_, reason, _ = g.ledger.decision.call_args.args
+        self.assertEqual((kind, target), ("desktop_refused", "claude/desk-200"))
+        self.assertIn("12345", reason)  # the reason names the process in the job
+
+
+class DesktopSwitchTests(unittest.TestCase):
+    def test_on_for_main_only_unless_given(self):
+        from sentinel.guardian import daemon as D
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(D, "home_dir", lambda inst: Path(d) / inst), \
+                mock.patch.object(D, "Ledger", mock.Mock()), mock.patch.object(D, "secret", lambda path, n: "00"):
+            self.assertTrue(D.Guardian("main").desktop_on)
+            self.assertFalse(D.Guardian("check").desktop_on)
+            self.assertTrue(D.Guardian("check", desktop=True).desktop_on)
+            self.assertFalse(D.Guardian("main", desktop=False).desktop_on)
+
+    def test_the_flag_reaches_the_daemon(self):
+        from sentinel.guardian import daemon as D
+        with mock.patch.object(D, "ping", lambda inst: False), mock.patch.object(D, "Guardian") as G:
+            D.main(["--instance", "check", "--desktop", "on"])
+            self.assertIs(G.call_args.args[7], True)
+            D.main(["--desktop", "off"])
+            self.assertIs(G.call_args.args[7], False)
+            D.main([])
+            self.assertIsNone(G.call_args.args[7])
+
+
+class DesktopWhereamiTests(unittest.TestCase):
+    def run_whereami(self, whereis, named):
+        wa = load("scripts/guardian-whereami.py", "guardian_whereami")
+        table, path = desktop_tree()
+        out = []
+        with mock.patch.object(wa, "whereis", whereis), mock.patch.object(wa.wj, "process_table", lambda: table), \
+                mock.patch.object(wa.wj, "image_path", path), mock.patch.object(wa.wj, "in_job", lambda *a: True), \
+                mock.patch.object(wa.wj, "priority_class", lambda pid: "below_normal"), \
+                mock.patch.object(wa.wj, "in_named_job", named), mock.patch("builtins.print", out.append):
+            rc = wa.main(["--pid", "210", "--instance", "main", "--json"])
+        return rc, json.loads(out[0])["answer"]
+
+    def test_a_desktop_session_is_controlled(self):
+        def whereis(pid, inst):
+            mine = pid in (210, 220, 200)
+            return {"session": "claude/desk-200" if mine else None, "in_guardian": mine, "desktop": mine}
+        rc, answer = self.run_whereami(whereis, lambda pid, name: None)
+        self.assertEqual(rc, 0)
+        self.assertEqual(answer, "CONTROLLED: session claude/desk-200 (desktop job under the Claude app's job, "
+                                 "instance main), priority below_normal")
+
+    def test_the_job_name_answers_when_the_pipe_is_out_of_reach(self):
+        rc, answer = self.run_whereami(lambda pid, inst: None,
+                                       lambda pid, name: True if name == "main.d.claude.desk-200" else None)
+        self.assertEqual(rc, 0)
+        self.assertTrue(answer.startswith("CONTROLLED: session claude/desk-200 (desktop job under the Claude app's "
+                                          "job, instance main, read from the job"), answer)
+
+
 if __name__ == "__main__":
     unittest.main()

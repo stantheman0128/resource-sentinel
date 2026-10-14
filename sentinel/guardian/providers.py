@@ -1,6 +1,6 @@
 """The agent CLIs Guardian starts and adopts, and the desktop apps it must leave alone.
 
-Three ways in, all ending in the same job tree (AllAgents > provider > session):
+Four ways in. The first three end in the same job tree (AllAgents > provider > session):
   launch   scripts/gagent.py starts the CLI through srun, so the CLI and every tool command it runs start inside
            the session job.
   shim     a wrapper on PATH (scripts/guardian-install-shims.py) runs scripts/guardian-shim.py, which starts the CLI
@@ -8,15 +8,20 @@ Three ways in, all ending in the same job tree (AllAgents > provider > session):
   adopt    a CLI started anywhere else runs hooks/guardian-adopt.py from its own hook (or Stan runs
            `guardctl adopt <pid>`); the daemon then assigns the running CLI and its children to a session job.
            Commands the CLI starts afterwards inherit the job.
+  desktop  the CLI a desktop app runs for its agent sessions (Claude Code in the Claude app's Code tab, codex.exe
+           under the Codex app) already sits in the app's own job, so it can only join a fresh job, which then nests
+           under the app's job. The daemon finds these CLIs (desktop_targets) and puts each in a desktop job of its
+           own, outside AllAgents.
 A process that already belongs to a job outside Guardian's tree (for example a sandbox job of the CLI itself)
 cannot be assigned; the daemon reports that instead of retrying.
 """
 import os
 
-# Desktop apps never go into a job: a cap on them would also slow their UI. Their built-in agents (Claude Code inside
-# the Claude app, codex app-server inside the Codex app, language_server.exe inside Antigravity) use the same image
-# names as the CLIs or run their own, so anything with a desktop app among its parents is refused too. The Claude Code
-# CLI is also claude.exe, so the Claude app is told apart by where Windows installed it.
+# The desktop apps' own processes never go into a job: a cap on them would also slow their UI. Their built-in agents
+# (Claude Code inside the Claude app, codex app-server inside the Codex app, language_server.exe inside Antigravity)
+# use the same image names as the CLIs or run their own, so launch, shim and adopt refuse anything with a desktop app
+# among its parents. The Claude app's and the Codex app's CLIs go into desktop jobs instead (desktop_targets). The
+# Claude Code CLI is also claude.exe, so the Claude app is told apart by where Windows installed it.
 APP_IMAGES = {"chatgpt.exe": "Codex app", "cursor.exe": "Cursor", "antigravity.exe": "Antigravity app"}
 CLAUDE_APP_DIRS = ("\\windowsapps\\claude_", "\\anthropicclaude\\")
 
@@ -91,6 +96,41 @@ def app_among(pid, table, image_path, max_depth=16):
             return app
         pid, depth = table[pid][0], depth + 1
     return None
+
+
+# The CLIs the desktop apps run for their agent sessions, told apart by where the app installs them: the Claude app
+# under %APPDATA%\Claude\claude-code\<version>\<hash>\, the Codex app under %LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\.
+# provider -> (image, path part, the app that must be among its parents)
+DESKTOP_CLIS = {"claude": ("claude.exe", "\\claude\\claude-code\\", "Claude app"),
+                "codex": ("codex.exe", "\\openai\\codex\\bin\\", "Codex app")}
+
+
+def desktop_targets(table, image_path, max_depth=16):
+    """The desktop apps' agent CLIs that belong in desktop jobs, as a list of (pid, provider): an image and install
+    path from DESKTOP_CLIS with its own app among its parents. The apps' own processes never count, and a target
+    under another target is left out, since it already inherits the outer one's job."""
+    paths = {}
+
+    def path(pid):
+        if pid not in paths:
+            paths[pid] = image_path(pid)
+        return paths[pid]
+
+    found = {}
+    for pid, (ppid, image) in table.items():
+        for provider, (img, part, app) in DESKTOP_CLIS.items():
+            if (image or "").lower() == img and part in (path(pid) or "").lower() \
+                    and not protected_app(image, path(pid)) and app_among(ppid, table, path, max_depth) == app:
+                found[pid] = provider
+    out = []
+    for pid, provider in found.items():
+        up, seen, depth = table[pid][0], {pid}, 0
+        while up in table and up not in seen and up not in found and depth < max_depth:
+            seen.add(up)
+            up, depth = table[up][0], depth + 1
+        if up not in found or up == pid:        # a reused parent pid can loop the chain back to pid itself
+            out.append((pid, provider))
+    return sorted(out)
 
 
 def default_session(provider):

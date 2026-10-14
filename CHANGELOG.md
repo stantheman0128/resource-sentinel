@@ -38,6 +38,13 @@
   instead of 9.99 s. `client.connect()` also gives up when the daemon has not finished the challenge within 5 s.
   The `pipe-authkey` file and the bytes on the pipe are unchanged, so old and new clients and daemons work together,
   and clients with a wrong key or none are still refused.
+- Desktop jobs: every 2 s the daemon finds the Claude Code CLIs of the Claude app's Code tab and the codex CLIs of
+  the Codex app, puts each in a fresh job of its own (it nests under the app's job, since those CLIs cannot join
+  AllAgents), and sweeps their children in. Each desktop session gets the pool priority, the agents' CPU set, and a
+  cap in absolute cores from the allocator (the whole budget while nothing contends); pause, rollback, resume and
+  shutdown treat it like the tree, and its CPU counts in the pool. On by default for the main instance only;
+  `--desktop on|off`, `guardctl desktop on|off` and `/api/desktop` switch it, and off releases every desktop job.
+  `guardian-whereami` reports such a session as controlled.
 - Antigravity CLI (`agy`, provider `antigravity`) joins Guardian like the other CLIs: gagent, an `agy` PATH wrapper,
   the adopt hook as a named `guardian-adopt` hook in `~/.gemini/config/hooks.json` (installer, dry run unless
   `--apply`; the user's own hooks in that file stay), and the provider check. The Antigravity desktop app is refused

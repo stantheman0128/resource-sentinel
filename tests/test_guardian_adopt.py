@@ -1,10 +1,13 @@
 import importlib.util
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
+import uuid
 from multiprocessing.connection import Pipe
 from pathlib import Path
 from unittest import mock
@@ -542,6 +545,399 @@ class DesktopWhereamiTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertTrue(answer.startswith("CONTROLLED: session claude/desk-200 (desktop job under the Claude app's "
                                           "job, instance main, read from the job"), answer)
+
+
+# Claude Code in a terminal (pid 20), an MCP server it started (30) and the adopt hook (40)
+TERMINAL_CLAUDE = ((10, 1, "WindowsTerminal.exe", ""), (20, 10, "claude.exe", CLAUDE_CLI),
+                   (30, 20, "node.exe", PLAIN_NODE), (40, 20, "python.exe", ""))
+
+
+class MemberJob(FakeJob):
+    """A fake job that keeps its members. refuse: "OpenProcess" or "AssignProcessToJobObject" makes assign fail
+    with that call's error, as winjob words it."""
+
+    def __init__(self, name=None, refuse=None, members=()):
+        super().__init__()
+        self.name, self.refuse, self.members, self.closed = name, refuse, set(members), False
+        self.total = len(self.members)  # TotalProcesses: every process that was ever in the job
+        self.h = self  # the in_job fake reads the members through the handle
+
+    def assign(self, pid):
+        from sentinel.guardian import winjob as wj
+        if self.refuse == "OpenProcess":
+            raise wj.WinError(f"OpenProcess({pid})", 5)
+        if self.refuse:
+            raise wj.WinError(f"AssignProcessToJobObject(pid {pid})", 5)
+        self.members.add(pid)
+        self.total += 1
+
+    def set_limits(self, priority=None):
+        self.calls.append(("limits", priority))
+
+    def limits(self):
+        return {"priority": None, "flags": 0}
+
+    def accounting(self):
+        return {"active": len(self.members), "total": self.total, "cpu_s": 0.0}
+
+    def close(self):
+        self.closed = True
+
+
+class NestedAdoptTests(unittest.TestCase):
+    """A hook-adopted CLI that sits in a job of its own (claude, cursor, gemini) cannot join the tree, so it gets a
+    fresh job, which Windows nests under the CLI's job, outside AllAgents."""
+
+    def setUp(self):
+        from sentinel.guardian import daemon as D
+        from sentinel.guardian import policy as P
+        self.D, self.wj = D, D.wj
+        g = self.g = D.Guardian.__new__(D.Guardian)  # no threads, and every job is a MemberJob
+        g.instance, g.sessions, g.providers, g.live, g.adopted = "t", {}, {}, {}, {}
+        g.ledger, g.log, g.probe_proc, g.lock = mock.Mock(), mock.Mock(), None, threading.RLock()
+        g.cfg, g.world, g.cap, g.alloc = P.merged(P.DEFAULTS, None), 12, P.CapState(cap=10.0), P.AllocState()
+        g.allocator_on, g.control, g.mask, g.pool_priority = True, True, None, "below_normal"
+        g.desktop_on, g.desktop_skip = False, set()
+        # the pool already holds work, so a process in a job of its own cannot join it
+        g.root = MemberJob("t.AllAgents", "AssignProcessToJobObject", members={5})
+        self.jobs, self.refuse = {}, {}
+        self.table, self.path = tree(*TERMINAL_CLAUDE)
+        self.created = mock.Mock(side_effect=self.make_job)
+        for p in (mock.patch.object(self.wj.Job, "create", self.created),
+                  mock.patch.object(self.wj, "in_job", lambda pid, h=None: h is None or pid in h.members),
+                  mock.patch.object(self.wj, "process_table", lambda: self.table),
+                  mock.patch.object(self.wj, "image_path", lambda pid: self.path(pid)),
+                  mock.patch.object(self.wj, "open_waitable", lambda pid: 99),
+                  mock.patch.object(self.wj, "CloseHandle", mock.Mock()),
+                  mock.patch.object(self.wj, "priority_class", lambda pid: "below_normal"),
+                  mock.patch.object(self.wj, "is_elevated", lambda: False)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def make_job(self, name=None):
+        refuse = self.refuse.get(name)
+        if isinstance(refuse, Exception):
+            raise refuse
+        j = self.jobs[name] = MemberJob(name, refuse)
+        return j
+
+    def add(self, *rows):
+        self.table, self.path = tree(*TERMINAL_CLAUDE, *rows)
+
+    def decisions(self):
+        return [c.args[:2] for c in self.g.ledger.decision.call_args_list]
+
+    def test_a_cli_in_a_job_of_its_own_gets_a_nested_job(self):
+        r = self.g.adopt(20, "claude", "abcd1234", skip={40})
+        self.assertEqual((r["ok"], r["state"], r["session"], r["nested"], r["processes"]),
+                         (True, "adopted", "claude/abcd1234", True, 2))
+        self.assertIn("AllAgents", r["reason"])
+        d = self.jobs["t.d.claude.abcd1234"]
+        self.assertEqual(d.members, {20, 30})  # the CLI and its MCP server; the hook stays out
+        self.assertTrue(self.jobs["t.s.claude.abcd1234"].closed)  # the tree session it could not join is gone
+        self.assertEqual(self.g.root.members, {5})
+        s = self.g.sessions["claude/abcd1234"]
+        self.assertIs(s.job, d)
+        self.assertTrue(s.nested and s.desktop)
+        self.assertEqual(s.live_runs, 1)
+        # capped as a desktop job: pool priority, then the whole budget in cores (10% of 12 CPUs)
+        self.assertEqual(d.calls, [("limits", "below_normal"), ("cpu", 1.2)])
+        self.assertEqual(self.decisions()[-1], ("adopt", "claude/abcd1234"))
+        self.assertTrue(r["coverage"].startswith("enforced (nested job)"), r["coverage"])
+
+    def test_no_nested_job_when_guardian_cannot_open_the_process(self):
+        self.g.root.refuse = "OpenProcess"
+        r = self.g.adopt(20, "claude", "abcd1234", skip={40})
+        self.assertEqual((r["ok"], r["state"]), (False, "refused"))
+        self.assertIn("cannot open the process", r["reason"])
+        self.assertNotIn("t.d.claude.abcd1234", self.jobs)
+        self.assertEqual(self.g.sessions, {})
+
+    def test_no_nested_job_for_a_cli_under_a_desktop_app(self):
+        self.table, self.path = desktop_tree()
+        r = self.g.adopt(200, "claude", "abcd1234")
+        self.assertEqual((r["ok"], r["state"]), (False, "refused"))
+        self.assertIn("Claude app", r["reason"])
+        self.created.assert_not_called()
+
+    def test_no_nested_job_under_a_desktop_job_name(self):
+        r = self.g.adopt(20, "claude", "desk-20", skip={40})
+        self.assertEqual((r["ok"], r["state"]), (False, "refused"))
+        self.assertIn("job outside Guardian's tree", r["reason"])
+        self.assertNotIn("t.d.claude.desk-20", self.jobs)
+
+    def test_a_nested_job_that_refuses_too_keeps_the_old_answer(self):
+        self.refuse["t.d.claude.abcd1234"] = "AssignProcessToJobObject"
+        r = self.g.adopt(20, "claude", "abcd1234", skip={40})
+        self.assertEqual((r["ok"], r["state"]), (False, "refused"))
+        self.assertIn("job outside Guardian's tree; start it with gagent/srun instead", r["reason"])
+        self.assertIn("nested job", r["reason"])
+        self.assertTrue(self.jobs["t.d.claude.abcd1234"].closed)
+        self.assertEqual(self.g.sessions, {})
+        self.assertEqual(self.decisions()[-1], ("adopt_failed", "claude/abcd1234"))
+
+    def test_a_taken_nested_name_is_refused_like_a_session(self):
+        self.refuse["t.d.claude.abcd1234"] = self.wj.JobExisted("t.d.claude.abcd1234", 183, [4242])
+        r = self.g.adopt(20, "claude", "abcd1234", skip={40})
+        self.assertEqual((r["ok"], r["state"]), (False, "refused"))
+        self.assertIn("4242", r["reason"])
+        self.assertIn(("session_refused", "claude/abcd1234"), self.decisions())
+        self.assertEqual(self.g.sessions, {})
+
+    def test_a_cli_in_a_job_never_comes_first_in_a_fresh_pool(self):
+        # a pool that has never held a process takes anyone, and the first one would put it under its own job
+        self.g.root = MemberJob("t.AllAgents")
+        r = self.g.adopt(20, "claude", "abcd1234", skip={40})
+        self.assertEqual((r["ok"], r["state"], r["nested"], r["processes"]), (True, "adopted", True, 2))
+        self.assertEqual((self.g.root.members, self.g.root.total), (set(), 0))
+        self.assertEqual(self.jobs["t.d.claude.abcd1234"].members, {20, 30})
+        self.assertTrue(self.jobs["t.s.claude.abcd1234"].closed)
+
+    def test_a_cli_in_no_job_still_joins_a_fresh_pool(self):
+        self.g.root = MemberJob("t.AllAgents")
+        with mock.patch.object(self.wj, "in_job", lambda pid, h=None: h is not None and pid in h.members):
+            r = self.g.adopt(20, "claude", "abcd1234", skip={40})
+        self.assertEqual((r["ok"], r["state"], r["nested"]), (True, "adopted", False))
+        self.assertEqual(self.g.root.members, {20, 30})
+        self.assertEqual(self.jobs["t.s.claude.abcd1234"].members, {20, 30})
+        self.assertNotIn("t.d.claude.abcd1234", self.jobs)
+
+    def test_a_fresh_pool_stays_empty_when_no_nested_job_is_possible(self):
+        self.g.root = MemberJob("t.AllAgents")
+        r = self.g.adopt(20, "claude", "desk-20", skip={40})  # a desktop job's name gets no nested job
+        self.assertEqual((r["ok"], r["state"]), (False, "refused"))
+        self.assertIn("job outside Guardian's tree", r["reason"])
+        self.g.session("claude", "queued", "normal")  # srun made it, and its run has not started yet
+        r = self.g.adopt(20, "claude", "queued", skip={40})
+        self.assertEqual((r["ok"], r["state"]), (False, "refused"))
+        self.assertIn("never held a process", r["reason"])
+        self.assertEqual(self.g.root.total, 0)
+        self.assertNotIn(20, self.jobs["t.s.claude.queued"].members)
+
+    def test_a_second_adopt_answers_already(self):
+        self.g.adopt(20, "claude", "abcd1234", skip={40})
+        made = self.created.call_count
+        self.add((50, 20, "cmd.exe", ""))  # a tool command started before the second hook ran
+        again = self.g.adopt(20, "claude", "abcd1234", skip={40})
+        self.assertEqual((again["ok"], again["state"], again["session"], again["nested"], again["swept"]),
+                         (True, "already", "claude/abcd1234", True, 1))
+        self.assertIn(50, self.jobs["t.d.claude.abcd1234"].members)
+        # /clear gives the same CLI a new session id, so the hook sends a new name
+        other = self.g.adopt(20, "claude", "ffff0000", skip={40})
+        self.assertEqual((other["state"], other["session"]), ("already", "claude/abcd1234"))
+        self.assertEqual(self.created.call_count, made)
+        self.assertEqual(list(self.g.sessions), ["claude/abcd1234"])
+
+    def test_already_sees_a_desktop_session(self):
+        s = self.g.sessions["claude/desk-20"] = self.D.Session("claude", "desk-20", "normal",
+                                                               MemberJob("t.d.claude.desk-20", members={20}))
+        s.desktop = True
+        r = self.g.adopt(20, "claude", "abcd1234", skip={40})
+        self.assertEqual((r["state"], r["session"], r["nested"]), ("already", "claude/desk-20", False))
+        self.created.assert_not_called()
+        self.assertEqual(self.g.root.members, {5})
+
+    def test_another_cli_under_a_nested_session_name_is_refused(self):
+        self.g.adopt(20, "claude", "abcd1234", skip={40})
+        self.add((60, 10, "claude.exe", CLAUDE_CLI))
+        self.g.root.refuse = None  # even a CLI the pool would take must not land there without a session
+        r = self.g.adopt(60, "claude", "abcd1234")
+        self.assertEqual((r["ok"], r["state"]), (False, "refused"))
+        self.assertNotIn(60, self.g.root.members)
+        self.assertEqual(self.jobs["t.d.claude.abcd1234"].members, {20, 30})
+
+    def test_desktop_off_keeps_nested_sessions_capped(self):
+        self.g.adopt(20, "claude", "abcd1234", skip={40})
+        desk = self.g.sessions["codex/desk-320"] = self.D.Session("codex", "desk-320", "normal",
+                                                                  MemberJob("t.d.codex.desk-320", members={320}))
+        desk.desktop = True
+        self.g.set_desktop(False, "test")
+        self.assertNotIn("codex/desk-320", self.g.sessions)
+        self.assertTrue(desk.job.closed)
+        d = self.jobs["t.d.claude.abcd1234"]
+        self.assertIn("claude/abcd1234", self.g.sessions)
+        self.assertEqual(d.calls, [("limits", "below_normal"), ("cpu", 1.2)])  # nothing released
+        self.assertFalse(d.closed)
+        self.assertIn(20, self.g.adopted)
+        kind, _, _, _, readback, *_ = self.g.ledger.decision.call_args.args
+        self.assertEqual((kind, readback), ("desktop", {"released": 1, "nested_kept": 1}))
+
+    def test_an_exited_nested_session_ends_while_desktop_is_off(self):
+        self.g.adopt(20, "claude", "abcd1234", skip={40})
+        d = self.jobs["t.d.claude.abcd1234"]
+        self.g.stop = mock.Mock()
+        with mock.patch.object(PV, "desktop_targets", mock.Mock(side_effect=AssertionError("placed while off"))):
+            self.g.stop.wait.side_effect = [False, True]
+            self.g.desktop_loop()  # the CLI still runs: the session stays
+            self.assertIn("claude/abcd1234", self.g.sessions)
+            d.members.clear()  # the CLI and its MCP server exit; tick() ends the adopted row
+            self.g.end_adopted(self.g.adopted[20])
+            self.g.stop.wait.side_effect = [False, True]
+            self.g.desktop_loop()
+        self.assertNotIn("claude/abcd1234", self.g.sessions)
+        self.assertTrue(d.closed)
+        self.assertIn("nested session claude/abcd1234 ended", [c.args[0] for c in self.g.log.call_args_list])
+
+
+class NestedWhereamiTests(unittest.TestCase):
+    def run_whereami(self, whereis, named):
+        wa = load("scripts/guardian-whereami.py", "guardian_whereami")
+        table, path = tree(*TERMINAL_CLAUDE)
+        out = []
+        with tempfile.TemporaryDirectory() as d:
+            row = {"provider": "claude", "session": "claude/abcd1234", "cli_pid": 20, "state": "adopted",
+                   "nested": True}
+            Path(d, "adopt.log").write_text(json.dumps(row) + "\n", encoding="utf-8")
+            with mock.patch.object(wa, "whereis", whereis), mock.patch.object(wa, "home_dir", lambda inst: Path(d)), \
+                    mock.patch.dict(os.environ, {"GUARDIAN_PROVIDER": "", "GUARDIAN_SESSION": ""}), \
+                    mock.patch.object(wa.wj, "process_table", lambda: table), \
+                    mock.patch.object(wa.wj, "image_path", path), mock.patch.object(wa.wj, "in_job", lambda *a: True), \
+                    mock.patch.object(wa.wj, "priority_class", lambda pid: "below_normal"), \
+                    mock.patch.object(wa.wj, "in_named_job", named), mock.patch("builtins.print", out.append):
+                rc = wa.main(["--pid", "40", "--instance", "main", "--json"])
+        return rc, json.loads(out[0])["answer"]
+
+    def test_a_nested_session_is_controlled(self):
+        def whereis(pid, inst):
+            mine = pid in (40, 20)
+            return {"session": "claude/abcd1234" if mine else None, "in_guardian": mine, "desktop": False,
+                    "nested": mine}
+        rc, answer = self.run_whereami(whereis, lambda pid, name: None)
+        self.assertEqual(rc, 0)
+        self.assertEqual(answer, "CONTROLLED: session claude/abcd1234 (nested job under the CLI's own job, instance "
+                                 "main), priority below_normal")
+
+    def test_the_nested_job_name_answers_when_the_pipe_is_out_of_reach(self):
+        named = {"main.AllAgents": False, "main.d.claude.abcd1234": True}
+        rc, answer = self.run_whereami(lambda pid, inst: None, lambda pid, name: named.get(name))
+        self.assertEqual(rc, 0)
+        self.assertTrue(answer.startswith("CONTROLLED: session claude/abcd1234 (nested job under the CLI's own job, "
+                                          "instance main, read from the job"), answer)
+        rc, answer = self.run_whereami(lambda pid, inst: None, lambda pid, name: None)
+        self.assertEqual((rc, answer), (1, "NOT CONTROLLED: Guardian main is not running"))
+
+
+SLEEPER = [sys.executable, "-I", "-c", "import time; time.sleep(60)"]
+# stands in for an agent CLI: each "spawn" line starts a child and prints its pid
+CLI_STANDIN = r"""
+import subprocess, sys
+kids = []
+for line in sys.stdin:
+    if line.strip() == "spawn":
+        kids.append(subprocess.Popen([sys.executable, "-I", "-c", "import time; time.sleep(60)"]))
+        print(kids[-1].pid, flush=True)
+"""
+
+
+@unittest.skipUnless(sys.platform == "win32", "Windows Job Objects")
+class NestedJobLiveTests(unittest.TestCase):
+    """Real jobs and only processes this test starts: a CLI stand-in in a job of its own with libuv's flags (kill on
+    close, breakaway allowed) and a pool that already holds work."""
+
+    def setUp(self):
+        self.procs, self.jobs = [], []
+
+    def tearDown(self):
+        for p in self.procs:
+            if p.poll() is None:
+                p.kill()
+                p.wait(5)
+            for f in (p.stdin, p.stdout):
+                if f:
+                    f.close()
+        for j in self.jobs:
+            j.close()  # closing the CLI's own job ends its children too
+
+    def start(self, argv, **kw):
+        p = subprocess.Popen(argv, **kw)
+        self.procs.append(p)
+        return p
+
+    def spawn(self, cli):
+        cli.stdin.write("spawn\n")
+        cli.stdin.flush()
+        return int(cli.stdout.readline())
+
+    def guardian(self):
+        """A daemon with a real, never-used pool job and no threads."""
+        from sentinel.guardian import daemon as D
+        from sentinel.guardian import policy as P
+        wj = D.wj
+        inst = f"nesttest-{uuid.uuid4().hex[:12]}"
+        g = D.Guardian.__new__(D.Guardian)
+        g.instance, g.sessions, g.providers, g.live, g.adopted = inst, {}, {}, {}, {}
+        g.ledger, g.log, g.probe_proc, g.lock = mock.Mock(), mock.Mock(), None, threading.RLock()
+        g.cfg, g.world, g.cap, g.alloc = P.merged(P.DEFAULTS, None), wj.NCPU, P.CapState(cap=10.0), P.AllocState()
+        g.allocator_on, g.control, g.mask, g.pool_priority = True, True, None, "below_normal"
+        g.desktop_on, g.desktop_skip = False, set()
+        g.root = wj.Job.create(f"{inst}.AllAgents")
+        self.jobs.append(g.root)
+        self.addCleanup(lambda: [x.close() for x in [s.job for s in g.sessions.values()] +
+                                 [p["job"] for p in g.providers.values()]])
+        return g, wj, inst
+
+    def cli_in_its_own_job(self, wj):
+        """(CLI stand-in, a child it started, its own job with libuv's flags)."""
+        cli = self.start([sys.executable, "-I", "-c", CLI_STANDIN], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         text=True)
+        early = self.spawn(cli)
+        own = wj.Job.create()
+        self.jobs.append(own)
+        e = own.extended()
+        e.Basic.LimitFlags |= wj.LIMIT_KILL_ON_JOB_CLOSE | wj.LIMIT_BREAKAWAY_OK | wj.LIMIT_SILENT_BREAKAWAY_OK
+        own._set(wj.EXTENDED_LIMIT, e)
+        own.assign(cli.pid)
+        own.assign(early)  # libuv puts each child in its job itself
+        return cli, early, own
+
+    def test_a_cli_in_its_own_job_is_adopted_into_a_nested_job(self):
+        g, wj, inst = self.guardian()
+        g.root.assign(self.start(SLEEPER).pid)
+        cli, early, own = self.cli_in_its_own_job(wj)
+        name = f"{inst}.d.claude.abcd1234"
+        with mock.patch.object(PV, "app_among", return_value=None):  # this test may run under a desktop app
+            r = g.adopt(cli.pid, "claude", "abcd1234")
+            self.assertEqual((r["ok"], r["state"], r.get("nested"), r.get("processes")), (True, "adopted", True, 2),
+                             r)
+            self.assertTrue(wj.in_named_job(cli.pid, name))
+            self.assertTrue(wj.in_named_job(early, name))
+            self.assertTrue(wj.in_job(cli.pid, own.h))  # still in its own job: the nested job sits under it
+            self.assertFalse(wj.in_job(cli.pid, g.root.h))
+            self.assertIsNone(wj.in_named_job(cli.pid, f"{inst}.s.claude.abcd1234"))  # the empty session job is gone
+            s = g.sessions["claude/abcd1234"]
+            self.assertEqual((s.job.cpu()["mode"], s.job.limits()["priority"]), ("hard_cap", "below_normal"))
+            late = self.spawn(cli)  # the nested job allows no breakaway, so the outer job's flags do not apply
+            self.assertTrue(wj.in_named_job(late, name))
+            again = g.adopt(cli.pid, "claude", "abcd1234")
+            self.assertEqual((again["state"], again["session"], again["swept"]), ("already", "claude/abcd1234", 0))
+            self.assertEqual(list(g.sessions), ["claude/abcd1234"])
+        own.close()  # kill on close: the CLI and both children end
+        cli.wait(10)
+        for run in list(g.live.values()):
+            if wj.has_exited(run.handle):
+                g.end_adopted(run)
+        deadline = time.monotonic() + 10
+        while s.job.accounting()["active"] and time.monotonic() < deadline:
+            time.sleep(0.05)
+        g.drop_ended()
+        self.assertEqual(g.sessions, {})
+        self.assertIsNone(wj.in_named_job(os.getpid(), name))  # its last handle closed, so the name is gone
+
+    def test_a_fresh_pool_never_ends_up_under_a_cli(self):
+        # a never-used pool would take the CLI and nest under its job, and every later run with it
+        g, wj, inst = self.guardian()
+        cli, early, own = self.cli_in_its_own_job(wj)
+        with mock.patch.object(PV, "app_among", return_value=None):
+            r = g.adopt(cli.pid, "claude", "abcd1234")
+        self.assertEqual((r["ok"], r["state"], r.get("nested"), r.get("processes")), (True, "adopted", True, 2), r)
+        self.assertTrue(wj.in_named_job(cli.pid, f"{inst}.d.claude.abcd1234"))
+        self.assertEqual(g.root.accounting()["total"], 0)
+        run = self.start(SLEEPER)
+        g.root.assign(run.pid)  # what launch() does with the next srun
+        self.assertFalse(wj.in_job(run.pid, own.h))
+        own.close()  # kill on close: the CLI and its children end, the run does not
+        cli.wait(10)
+        self.assertIsNone(run.poll())
 
 
 if __name__ == "__main__":

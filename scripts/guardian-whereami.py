@@ -63,13 +63,17 @@ def main(argv=None):
         image = table.get(pid, (0, "?"))[1]
         rows.append({"pid": pid, "image": image, "priority": wj.priority_class(pid), "in_any_job": wj.in_job(pid),
                      "guardian_session": w.get("session"), "in_guardian": w.get("in_guardian"),
-                     "desktop": w.get("desktop"), "app": PV.protected_app(image, wj.image_path(pid))})
+                     "desktop": w.get("desktop"), "nested": w.get("nested"),
+                     "app": PV.protected_app(image, wj.image_path(pid))})
     me = rows[0] if rows else {}
     up = whereis(a.pid, a.instance) is not None
     pooled = wj.in_named_job(a.pid, f"{a.instance}.AllAgents")
     # a desktop job sits under the app's job, outside the pool; its name holds the desktop CLI's pid
     desk = None if up or pooled else next((f"{p}/desk-{c}" for c in chain[:16] for p in PV.DESKTOP_CLIS
                                            if wj.in_named_job(a.pid, f"{a.instance}.d.{p}.desk-{c}")), None)
+    # a hook-adopted CLI in a job of its own got a nested job, also outside the pool, named after its session
+    nest = None if up or pooled or desk else next((c for c in candidates(chain, a.instance)
+                                                   if wj.in_named_job(a.pid, f"{a.instance}.d.{c[0]}.{c[1]}")), None)
     app = next((r["app"] for r in rows if r["app"]), "desktop app")
     if not up and pooled:
         # the daemon's pipe is out of reach (a CLI sandbox can block it), but the jobs themselves answer
@@ -84,10 +88,18 @@ def main(argv=None):
         me["in_guardian"] = True
         answer = (f"CONTROLLED: session {desk} (desktop job under the {app}'s job, instance {a.instance}, read from "
                   f"the job; daemon pipe not reachable from here), priority {me.get('priority')}")
+    elif not up and nest:
+        me["in_guardian"] = True
+        answer = (f"CONTROLLED: session {nest[0]}/{nest[1]} (nested job under the CLI's own job, instance "
+                  f"{a.instance}, read from the job; daemon pipe not reachable from here), "
+                  f"priority {me.get('priority')}")
     elif not up:
         answer = f"NOT CONTROLLED: Guardian {a.instance} is not running"
     elif me.get("guardian_session") and me.get("desktop"):
         answer = (f"CONTROLLED: session {me['guardian_session']} (desktop job under the {app}'s job, instance "
+                  f"{a.instance}), priority {me['priority']}")
+    elif me.get("guardian_session") and me.get("nested"):
+        answer = (f"CONTROLLED: session {me['guardian_session']} (nested job under the CLI's own job, instance "
                   f"{a.instance}), priority {me['priority']}")
     elif me.get("guardian_session"):
         answer = f"CONTROLLED: session {me['guardian_session']} (instance {a.instance}), priority {me['priority']}"

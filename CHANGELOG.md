@@ -72,6 +72,21 @@
   starts itself again as a second node.exe, and Node's libuv has already put it in a job of its own. Gemini is
   therefore marked like Claude Code and Cursor Agent (LIMIT) and joins through srun or the wrapper. Google refused
   the sign-in in the same run (`IneligibleTierError`), so Gemini CLI cannot make a model call with Stan's account.
+- The adopt hook takes a CLI that sits in a job of its own (claude.exe, and the node.exe of Cursor Agent and Gemini
+  CLI). Such a process cannot join the tree once AllAgents holds work, so the daemon now gives it a fresh job,
+  `<instance>.d.<provider>.<session>`, which Windows nests under the CLI's job. It sweeps the CLI's children in
+  and caps the job like a desktop job, outside AllAgents. A second hook for the same CLI answers `already`, also
+  for desktop jobs. A nested job ends with its CLI even while desktop jobs are off, and `guardctl desktop off`
+  leaves it capped. whereami reports it by the pipe or by the job's name, and the provider check counts it as
+  PASS. Measured with real jobs in the tests: a stand-in CLI in a job with libuv's flags was adopted, a child it
+  started afterwards stayed in the nested job, and the job's name went away after the CLI exited. While AllAgents
+  has never held a process, such a CLI goes to a nested job too: as the first process there it would put AllAgents
+  and every later run under its own job (measured). In the provider check's hook level (report 220410), Claude Code
+  and Cursor Agent passed: each was adopted into a nested job (claude.exe with 19 children, Cursor's node.exe with
+  21) and whereami, run as the agent's tool command, answered CONTROLLED for the nested session. Gemini's node.exe
+  and its 4 children joined a nested job as well, but the sign-in failed before its BeforeAgent hook, so no tool
+  command ran. All three sessions ended with their CLIs. Children the CLI starts, detached ones included, now end
+  with a CLI whose own job kills on close, and cannot break away.
 
 ## Unreleased - 2026-09-13
 

@@ -158,7 +158,8 @@ class Session:
         self.prev = None
         self.live_runs = 0
         self.t_last = time.time()
-        self.desktop = False       # a desktop job under an app's job, outside AllAgents
+        self.desktop = False       # a job outside AllAgents, capped in absolute cores: a desktop job, or a nested one
+        self.nested = False        # a hook-adopted CLI's job, nested under the job the CLI put itself in
         self.app_pids = set()      # the desktop CLI's parents when it was placed, the app's root among them
 
 
@@ -391,7 +392,8 @@ class Guardian:
         before, s.applied = s.applied, (s.applied if err else want)
         shown = lambda v: v if not isinstance(v, tuple) else f"{v[1] * (1 if v[0] == 'abs' else budget):.2f} cores"
         self.ledger.decision("session_cap", s.key, shown(before), shown(want), rb.get("mode"), err,
-                             f"weighted max-min, class {s.cls}" + (", desktop job" if s.desktop else ""),
+                             f"weighted max-min, class {s.cls}" +
+                             (", nested job" if s.nested else ", desktop job" if s.desktop else ""),
                              P.POLICY_VERSION)
 
     # ---- 1 Hz control loop -----------------------------------------------------------------------------------
@@ -833,9 +835,10 @@ class Guardian:
 
     def adopt(self, pid, provider, name, cls="normal", via="hook", skip=()):
         """Put a running CLI and everything it has started into a session job; what it starts later inherits the
-        job. state: adopted (new), already (it was in Guardian's tree before), partial (some children stayed out),
-        refused. skip: the hook process and the shells between it and the CLI, which exit in a moment anyway and
-        may sit in a job of their own (the py launcher puts python in one)."""
+        job. A CLI in a job of its own gets a nested job instead (nest()). state: adopted (new), already (it was in
+        a Guardian job before), partial (some children stayed out), refused. skip: the hook process and the shells
+        between it and the CLI, which exit in a moment anyway and may sit in a job of their own (the py launcher puts
+        python in one)."""
         table = wj.process_table()
         if pid not in table:
             return {"ok": False, "state": "refused", "reason": f"process {pid} is not running"}
@@ -846,26 +849,47 @@ class Guardian:
                         reason=why)
             return {"ok": False, "state": "refused", "reason": why}
         with self.lock:
-            if wj.in_job(pid, self.root.h):
-                # started through srun, adopted before, or a tool command of another CLI Guardian already holds
-                holder = next((x for x in self.sessions.values() if wj.in_job(pid, x.job.h)), None)
+            # started through srun, adopted before, or a tool command of another CLI Guardian already holds. A desktop
+            # or nested job holds its CLI outside the root, so every session job is asked first
+            holder = next((x for x in self.sessions.values() if wj.in_job(pid, x.job.h)), None)
+            if holder or wj.in_job(pid, self.root.h):
                 key = holder.key if holder else "?"
-                chain = [self.root, self.providers[holder.provider]["job"], holder.job] if holder else [self.root]
+                chain = [holder.job] if holder and holder.desktop else \
+                    [self.root, self.providers[holder.provider]["job"], holder.job] if holder else [self.root]
                 late = [p for p in sweep_targets(wj.descendants(pid, table)[1:], table, wj.image_path,
                                                  self.own_pids(), skip)
                         if not wj.in_job(p, chain[-1].h) and not self.assign_chain(p, chain)]
                 return {"ok": True, "state": "already", "session": key, "pid": pid, "swept": len(late),
-                        "coverage": self.coverage_of(pid, holder), "reason": f"already in Guardian session {key}"}
+                        "nested": bool(holder and holder.nested), "coverage": self.coverage_of(pid, holder),
+                        "reason": f"already in Guardian session {key}"}
             fresh = f"{provider}/{name}" not in self.sessions
             try:
                 s = self.session(provider, name, cls)
             except wj.JobTaken as e:  # session() logged it
                 return {"ok": False, "state": "refused", "pid": pid, "reason": taken_reason(e)}
+            if s.desktop:  # its job sits under another CLI's job or an app's, where this process cannot follow
+                why = (f"session {s.key} already holds another CLI in a {'nested' if s.nested else 'desktop'} job "
+                       f"outside AllAgents, and this one cannot join it; start it with gagent/srun instead")
+                self.decide("adopt_refused", s.key, requested={"pid": pid, "image": image, "via": via}, reason=why)
+                return {"ok": False, "state": "refused", "pid": pid, "reason": why}
             chain = [self.root, self.providers[provider]["job"], s.job]
-            err = self.assign_chain(pid, chain)
+            # the first process in AllAgents fixes where that job sits for good: a CLI in a job of its own would put
+            # AllAgents, and every run after it, under its job (kill on close for Node), so it gets a nested job
+            first = wj.in_job(pid) and not self.root.accounting()["total"]
+            err = "AllAgents has never held a process" if first else self.assign_chain(pid, chain)
+            if err and fresh:  # do not leave an empty session row behind
+                self.sessions.pop(s.key).job.close()
+            if err and fresh and "OpenProcess" not in err and not name.startswith("desk-") \
+                    and not wj.in_job(pid, self.root.h):
+                # the CLI sits in a job of its own, so it may only join an empty job, which then nests under that job
+                try:
+                    s = self.nest(pid, provider, name, cls)
+                    err, chain = None, [s.job]
+                except wj.JobTaken as e:  # nest() logged it
+                    return {"ok": False, "state": "refused", "pid": pid, "reason": taken_reason(e)}
+                except OSError as e:
+                    err += f"; a nested job refused it too: {e}"
             if err:
-                if fresh:  # do not leave an empty session row behind
-                    self.sessions.pop(s.key).job.close()
                 why = ("Guardian cannot open the process (another user's, or protected)" if "OpenProcess" in err
                        else "the CLI is in a job outside Guardian's tree; start it with gagent/srun instead")
                 self.decide("adopt_failed", s.key, requested={"pid": pid, "image": image, "via": via}, error=err,
@@ -892,25 +916,60 @@ class Guardian:
             self.ledger.run_update(run.run_id, state="running" if run.handle else "done", t_start=time.time(),
                                    pid=pid)
             state = "partial" if failed else "adopted"
+            reason = f"{image} and {moved - 1} child processes joined " + \
+                ("a nested job under the CLI's own job, capped outside AllAgents" if s.nested else "the session job")
             self.decide("adopt", s.key, requested={"pid": pid, "image": image, "via": via},
-                        readback={"processes": moved, "failed": failed[:5], "coverage": coverage},
-                        reason=f"{image} and {moved - 1} child processes joined the session job")
+                        readback={"processes": moved, "failed": failed[:5], "coverage": coverage}, reason=reason)
             return {"ok": True, "state": state, "session": s.key, "pid": pid, "run_id": run.run_id,
-                    "processes": moved, "failed": failed[:5], "coverage": coverage}
+                    "processes": moved, "failed": failed[:5], "coverage": coverage, "nested": s.nested,
+                    "reason": reason}
+
+    def nest(self, pid, provider, name, cls):
+        """A session for a hook-adopted CLI that sits in a job of its own: claude.exe, and the node.exe of Cursor
+        Agent and Gemini CLI. Such a process cannot join the tree once its jobs have held work (and must not be the
+        first, see adopt()), but it can join an empty job, which Windows then nests under the CLI's own job (measured
+        2026-10-15). That job sits outside AllAgents, so allocate() caps it in absolute cores as it does a desktop
+        job. Raises wj.JobTaken (logged) when the name already exists, OSError when the process will not join."""
+        key = f"{provider}/{name}"
+        try:  # a name that already exists is refused as for a session: never take over a job Guardian did not create
+            job = wj.Job.create(self.jobname("d", provider, name))
+        except wj.JobTaken as e:
+            self.decide("session_refused", key, readback={"pids": e.pids}, error=str(e), reason=taken_reason(e))
+            raise
+        try:
+            job.assign(pid)
+        except OSError:
+            job.close()
+            raise
+        s = self.sessions[key] = Session(provider, name, cls, job)
+        s.desktop = s.nested = True
+        budget = self.cap.cap / 100 * self.world
+        try:
+            if self.control:
+                job.set_limits(priority=self.pool_priority)
+            if self.mask:
+                wj.set_job_affinity(job, self.mask)
+        except OSError as e:
+            self.log(f"nested job limits for {key} failed: {e}")
+        self.apply_session(s, self.desktop_want(s, None, budget), budget)
+        self.log(f"session {key} class {cls} nested under the CLI's own job")
+        return s
 
     def whereis(self, pid):
         """Which Guardian session job holds pid; what scripts/guardian-whereami.py and the provider check ask."""
         with self.lock:
             holder = next((x for x in self.sessions.values() if wj.in_job(pid, x.job.h)), None)
-            desktop = bool(holder and holder.desktop)
-            return {"pid": pid, "in_guardian": bool(wj.in_job(pid, self.root.h)) or desktop,
-                    "in_any_job": wj.in_job(pid), "session": holder.key if holder else None, "desktop": desktop,
-                    "priority": wj.priority_class(pid), "adopted": pid in self.adopted, "instance": self.instance}
+            outside = bool(holder and holder.desktop)  # a desktop or nested job, outside the root
+            nested = bool(holder and holder.nested)
+            return {"pid": pid, "in_guardian": bool(wj.in_job(pid, self.root.h)) or outside,
+                    "in_any_job": wj.in_job(pid), "session": holder.key if holder else None,
+                    "desktop": outside and not nested, "nested": nested, "priority": wj.priority_class(pid),
+                    "adopted": pid in self.adopted, "instance": self.instance}
 
     def coverage_of(self, pid, s):
         if s and s.desktop:
-            return ("enforced (desktop job)" if wj.in_job(pid, s.job.h) else "partial") + \
-                f", priority {wj.priority_class(pid)}"
+            return (f"enforced ({'nested' if s.nested else 'desktop'} job)" if wj.in_job(pid, s.job.h) else
+                    "partial") + f", priority {wj.priority_class(pid)}"
         in_root, in_session = wj.in_job(pid, self.root.h), bool(s) and wj.in_job(pid, s.job.h)
         return ("enforced" if in_root and in_session else "partial") + f", priority {wj.priority_class(pid)}"
 
@@ -930,9 +989,11 @@ class Guardian:
     # only through allocate(), which caps each of them in absolute cores once a second.
     def desktop_loop(self):
         while not self.stop.wait(2.0):
-            if not self.desktop_on:
-                continue
             try:
+                if not self.desktop_on:
+                    with self.lock:
+                        self.drop_ended()  # a nested job does not depend on the switch, so it still ends here
+                    continue
                 table = wj.process_table()
                 targets = PV.desktop_targets(table, wj.image_path)
                 with self.lock:
@@ -946,11 +1007,14 @@ class Guardian:
         for pid, provider in targets:
             if f"{provider}/desk-{pid}" not in self.sessions and pid not in self.desktop_skip:
                 self.place_desktop(pid, provider, table)
+        self.drop_ended()
+
+    def drop_ended(self):
         for s in [x for x in self.sessions.values() if x.desktop and not x.live_runs]:
             if s.job.accounting()["active"] == 0:  # the CLI has exited, and so has everything it started
                 self.sessions.pop(s.key, None)
                 s.job.close()
-                self.log(f"desktop session {s.key} ended")
+                self.log(f"{'nested' if s.nested else 'desktop'} session {s.key} ended")
 
     def place_desktop(self, pid, provider, table):
         """Put one desktop CLI and what it has started into a desktop job of its own; what it starts later inherits
@@ -1022,9 +1086,11 @@ class Guardian:
         return s
 
     def set_desktop(self, on, reason):
-        """Off lets every desktop job go: no CPU cap, normal priority, every CPU, and no new placements."""
+        """Off lets every desktop job go: no CPU cap, normal priority, every CPU, and no new placements. A nested
+        job stays capped until its CLI exits: that CLI asked to join through its adopt hook, while the switch is
+        about Guardian reaching into the apps. Rollback and shutdown still release it."""
         self.desktop_on = on
-        released = [s for s in self.sessions.values() if s.desktop] if not on else []
+        released = [s for s in self.sessions.values() if s.desktop and not s.nested] if not on else []
         for s in released:
             try:
                 s.job.set_cpu()
@@ -1039,7 +1105,9 @@ class Guardian:
             self.sessions.pop(s.key, None)
             s.job.close()
         self.desktop_skip.clear()
-        self.decide("desktop", "desktop jobs", requested=on, readback={"released": len(released)},
+        self.decide("desktop", "desktop jobs", requested=on,
+                    readback={"released": len(released),
+                              "nested_kept": sum(1 for s in self.sessions.values() if s.nested)},
                     reason=f"{reason}: " + ("the Claude and Codex apps' CLIs go into desktop jobs" if on
                                             else "desktop jobs released, none placed"))
 
@@ -1079,7 +1147,8 @@ class Guardian:
                 "sessions": [{"key": k, "provider": x.provider, "name": x.name, "cls": x.cls,
                               "allocation_weight": c["allocation_weights"].get(x.cls, 5), "paused": x.paused,
                               "provider_paused": self.providers[x.provider]["paused"], "usage": round(x.usage, 2),
-                              "cap_cores": self.alloc.caps.get(k), "runs": x.live_runs, "desktop": x.desktop}
+                              "cap_cores": self.alloc.caps.get(k), "runs": x.live_runs,
+                              "desktop": x.desktop and not x.nested, "nested": x.nested}
                              for k, x in self.sessions.items()],
                 "queue": [{"run_id": r.run_id, "session": r.session.key, "label": r.label, "reason": r.reason,
                            "est_gib": round(r.est_gib, 2), "numbers": r.numbers,

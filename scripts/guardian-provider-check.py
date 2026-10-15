@@ -15,8 +15,8 @@ touches the instance Stan works in. Levels, per provider:
            CLI's name in a terminal; passes when guardian-shim.py says the CLI joined a session. For gemini, its
            node.exe also runs whereami as its own child (NODE_OPTIONS --require), with no model call.
   shim     the whereami prompt started through that wrapper; passes when the shell command reports the session
-           the shim opened. This is the route for claude and cursor, which a hook cannot adopt. For grok, its
-           session-start hook also runs whereami, before the model call.
+           the shim opened. This is the route that puts claude and cursor inside AllAgents; a hook can only give
+           them a nested job outside it. For grok, its session-start hook also runs whereami, before the model call.
 Antigravity CLI (agy) runs shell commands headless only with permission rules in its global settings or with
 --dangerously-skip-permissions, so by default its srun, hook and shim levels ask for a plain reply and judge by a
 PreInvocation hook in the run folder's .agents/hooks.json: that hook is a child of agy.exe started after the session
@@ -29,9 +29,10 @@ GEMINI_CLI_TRUST_WORKSPACE=true for that one process. Gemini records each folder
 ~/.gemini/trusted_hooks.json the first time it runs them, so only the hook level has hooks, always in one fixed folder
 (<instance home>/check/gemini-hook) with commands that never change: one entry there, written once.
 The srun, hook and shim levels make one real model call each and use the CLI's own login; a CLI that is not logged
-in fails with the CLI's own message. LIMIT means the hook ran but Windows would not let Guardian adopt a CLI that sits
-in a job of its own (claude, cursor, gemini); SKIP means the level cannot run for that CLI as installed. The report
-goes to ~/.resource-sentinel/guardian/<instance>/check/report-*.json.
+in fails with the CLI's own message. A CLI that sits in a job of its own (claude, cursor, gemini) cannot join the
+session job after start, so the daemon gives it a nested job under its own job, outside AllAgents; the hook level
+passes when whereami then reports that session. LIMIT means Windows refused the nested job too; SKIP means the level
+cannot run for that CLI as installed. The report goes to ~/.resource-sentinel/guardian/<instance>/check/report-*.json.
 """
 import argparse
 import importlib.util
@@ -91,7 +92,8 @@ def hook_command(provider, instance, backslash=False):
 # headless    (prompt, prefix, work, extra) -> argv for a one-shot run that may run prefix... as a shell command
 # hook        (work, provider, instance) -> (extra argv, extra env) wiring the adopt hook to session start for this
 #             run only; None when the CLI has no hooks (hook_none says why)
-# own_job     the CLI puts itself in a job of its own at start (measured), so adopting it after start is refused
+# own_job     the CLI puts itself in a job of its own at start (measured), so a hook adopts it into a nested job
+#             outside AllAgents; only a refusal of that job too is the known LIMIT
 # yolo        the only headless way to run a shell command approves every command; needs --allow-yolo
 # yolo_flag   the shell command needs this approve-everything flag: without --allow-yolo the levels ask for a plain
 #             reply and judge by `child` instead

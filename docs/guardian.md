@@ -86,10 +86,17 @@ A CLI gets into Guardian one of four ways:
 3. **Adopt.** A session-start hook runs `hooks/guardian-adopt.py <provider>`, which finds the CLI among its
    parents and asks the daemon to move it and its children into root, provider and session job. Later children
    inherit the job. `guardctl adopt <pid> <provider> [session]` does the same by hand. Adopting is refused when a
-   desktop app (Claude, Codex, Cursor or Antigravity) is among the parents, and it fails for a CLI that put itself
-   in a job of its own at start. Windows lets such a process join only a job inside its current job tree, or a job
-   that never held a process, which then nests under the CLI's job and can never join Guardian's tree (measured
-   2026-10-14).
+   desktop app (Claude, Codex, Cursor or Antigravity) is among the parents. A CLI that put itself in a job of its
+   own at start (claude.exe, and the node.exe of Cursor Agent and Gemini CLI) cannot join the tree: Windows lets such
+   a process join only a job inside its current job tree, or a job that never held a process, which then nests under
+   the CLI's job (measured 2026-10-14). The daemon then gives it such a job,
+   `Local\Guardian.<instance>.d.<provider>.<session>`, sweeps its children in as for a session job, and caps it like
+   a desktop job (below): the pool's priority, the agents' CPU set and absolute cores, outside AllAgents. The adopt
+   answers `adopted` with `nested`, a second hook for the same CLI answers `already`, and whereami answers
+   `CONTROLLED: session <provider>/<session> (nested job under the CLI's own job, ...)`, also by the job's name when
+   the daemon's pipe is out of reach. A nested job ends when its CLI and everything in it have exited: in the
+   provider check of 2026-10-15 (report 220410) the daemon logged all three nested sessions as ended once their
+   CLIs exited.
 4. **Desktop job.** The Claude app's Code tab runs each session as a claude.exe of its own
    (`%APPDATA%\Claude\claude-code\<version>\<hash>\claude.exe`, a child of the app), and the Codex app runs
    `%LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\codex.exe` under ChatGPT.exe or its node_repl.exe. Both already sit in
@@ -129,28 +136,36 @@ and `shim`, and a BeforeAgent hook runs it at `hook`; gemini's hook level always
 runs whereami at `shim`. agy runs a shell command headless only with permission rules in its global settings or
 with `--dangerously-skip-permissions`, so at `srun`, `hook` and `shim` it gets a plain prompt and a PreInvocation
 hook in the run folder's `.agents/hooks.json` runs whereami as agy's own child. For gemini and agy, `--allow-yolo`
-asks for the shell command instead. The srun, hook and shim levels make one model call each.
+asks for the shell command instead. The srun, hook and shim levels make one model call each. At `hook`, LIMIT marks
+a CLI in a job of its own that Windows kept out of a nested job too.
 
 | CLI (version tested) | Launch | PATH wrapper | Adopt hook | Notes |
 |---|---|---|---|---|
-| Claude Code 2.1.296 | yes: tool command in the session | yes: tool command in the shim's session | no: claude.exe is in its own job, adopt refused | measured; use the wrapper or gagent |
+| Claude Code 2.1.296 | yes: tool command in the session | yes: tool command in the shim's session | nested: tool command in the nested session (report 220410). claude.exe sits in a job of its own, so the adopt gives it a nested job outside AllAgents; claude.exe and 19 children joined, a bash.exe child was refused (Access denied). Until 2026-10-15 the adopt was refused | measured; the wrapper or gagent put it inside AllAgents |
 | Codex CLI 0.156.0 | yes: tool command in the session | yes: tool command in the shim's session | yes: tool command in the adopted session; node.exe and node_repl.exe children were refused (Access denied) and stay outside | sandbox blocks the daemon pipe, whereami reads the jobs |
-| Gemini CLI 0.63.0 | CLI starts in the session (`--version`); tool command not tested | CLI starts in the session (`--version`); tool command not tested | no: the SessionStart hook ran, but gemini's node.exe is in a job of Node's own, adopt refused | measured 2026-10-15 from a cmd outside any job; use the wrapper or gagent. Google refused the sign-in in that run (`IneligibleTierError`: this client no longer serves Gemini Code Assist for individuals, move to Antigravity), so no model call can run with Stan's account, and Stan uses agy. Gemini records the check folder's hooks in `~/.gemini/trusted_hooks.json`, one entry. 0.1.3, before 2026-10-13, had no hooks and was not signed in |
-| Cursor Agent 2026.10.01 | yes: tool command in the session | yes: tool command in the shim's session | no: its node.exe is in its own job, adopt refused | measured; start it outside Git Bash (see Known limits) |
+| Gemini CLI 0.63.0 | CLI starts in the session (`--version`); tool command not tested | CLI starts in the session (`--version`); tool command not tested | nested: gemini's node.exe sits in a job of Node's own, so the adopt gives it a nested job outside AllAgents. In report 220410 node.exe and 4 children joined one and none was refused; the tool command did not run, because the sign-in failed before the BeforeAgent hook. Earlier on 2026-10-15 the adopt was refused | measured 2026-10-15 from a cmd outside any job; the wrapper or gagent put it inside AllAgents. Google refused the sign-in in that run (`IneligibleTierError`: this client no longer serves Gemini Code Assist for individuals, move to Antigravity), so no model call can run with Stan's account, and Stan uses agy. Gemini records the check folder's hooks in `~/.gemini/trusted_hooks.json`, one entry. 0.1.3, before 2026-10-13, had no hooks and was not signed in |
+| Cursor Agent 2026.10.01 | yes: tool command in the session | yes: tool command in the shim's session | nested: tool command in the nested session (report 220410). Its node.exe sits in a job of its own, so the adopt gives it a nested job outside AllAgents; node.exe and 21 children joined, while wsl.exe, node.exe and two git.exe children were refused (Access denied) and a bash.exe child had already exited. Until 2026-10-15 the adopt was refused | measured; start it outside Git Bash (see Known limits) |
 | Grok 1.0.40 | yes: tool command in the session | yes: tool command and its session-start hook (its own child) in the shim's session | yes: tool command in the adopted session; powershell.exe and conhost.exe children were refused (Access denied) and stayed outside | measured after Stan signed in again (report 231319); the project hook needs a git root |
 | Antigravity CLI 1.3.4 (`agy`) | yes: tool command in the session (with `--allow-yolo`), and its PreInvocation hook (its own child) | yes: the same, in the shim's session | yes: tool command in the adopted session; agy.exe adopted (2 processes, none refused) | reports 233349 and 233824 without the flag, 000722 with it. Measured besides: hooks run through cmd.exe and need no git root; the session name comes from `conversationId`; agy starts a background updater, another agy.exe, as its child, and it replaced 1.3.3 with 1.3.4 unasked before these runs |
 
-Gemini's refusal comes from Node. The first time a node.exe starts a child, libuv, the library under Node's
+Gemini's job of its own comes from Node. The first time a node.exe starts a child, libuv, the library under Node's
 child processes, puts that node.exe in a job that kills its members when the node.exe exits, and every child it
 starts after that goes in too (libuv `src/win/process.c`). On 2026-10-15 a node.exe that only waited was in no job,
 and a node.exe that had started a child was in one, together with the child. Unless `GEMINI_CLI_NO_RELAUNCH` is
 set, Gemini 0.63.0 starts itself again as a second node.exe, which runs the session and its hooks, so the adopt hook
-finds a CLI that is already in that job. A CLI that starts inside a Guardian job is different: Windows nests
+finds a CLI that is already in that job, and the daemon gives it a nested job. libuv's job allows breakaway, but a
+child that the CLI starts after the adopt still stays in the nested job: Windows lets a child break away silently
+only when its parent's innermost job allows it, and Guardian's jobs never do. `tests/test_guardian_adopt.py`
+checks this with a job that carries libuv's flags, and in report 220410 the whereami that Cursor Agent's node.exe
+started after the adopt ran in the nested job. A CLI that starts inside a Guardian job is different: Windows nests
 Node's job inside the session job, which is why srun and the wrapper still put gemini in a session.
 
 Claude Code, Codex, Cursor Agent, Grok and agy, rerun together on one daemon (report 235302, 2026-10-13 23:53 to
 00:04): every level passed except the hook level for Claude Code and Cursor Agent, which gave LIMIT as before. Both
-passed srun and the PATH wrapper levels in the same run. Gemini CLI was left out.
+passed srun and the PATH wrapper levels in the same run. Gemini CLI was left out. Since 2026-10-15 the adopt gives
+these CLIs a nested job instead of refusing them, and the hook level passed for both in report 220410 (2026-10-15
+22:04 to 22:05). Gemini's adopt went nested in the same run, but its hook level failed: the sign-in failed before
+the BeforeAgent hook could run whereami.
 
 To have new sessions join without gagent, Stan can run `python -I scripts/guardian-install-shims.py` from the main
 checkout: it covers all six CLIs. It prints the change and writes nothing until `--apply`, which saves the old
@@ -245,7 +260,9 @@ cap set before the sample and the one set after it, by 0.20 cores on average and
 - Pausing a session sets its CPU rate to 0.01%. A paused CLI cannot service its network connections either, and
   they may time out, so keep pauses short.
 - Claude Code and Cursor Agent sessions started neither through gagent nor through the PATH wrapper (by full path,
-  from a terminal opened before the install, or by a tool that ignores PATH) stay outside Guardian. A session
+  from a terminal opened before the install, or by a tool that ignores PATH) stay outside Guardian, because
+  `guardian-install-hooks.py` adds no adopt hook for them. A hook would now take them into a nested job (see Adopt;
+  the provider check's hook level passed for both on 2026-10-15), but the installer does not add it yet. A session
   started inside a desktop app's terminal is refused on purpose, as long as the app is still among its parents.
 - The wrappers sit on the user Path, which Windows puts after the system Path. A CLI installed into a system Path
   folder is found first and bypasses its wrapper; the installer warns about that.
@@ -322,3 +339,15 @@ cap set before the sample and the one set after it, by 0.20 cores on average and
   a level. A restart nests the same way: the old desktop job loses its name when the old daemon exits, and the new
   daemon puts the CLI in a fresh job under it (measured). As with the tree, a crashed daemon leaves its desktop caps
   in place.
+- A nested job sits under the CLI's own job, outside AllAgents, so like a desktop job it is held only through the
+  allocator's per-session caps. `guardctl desktop off` leaves nested jobs capped on purpose: their CLIs asked to
+  join through the adopt hook, while the switch is about Guardian reaching into the apps. Rollback and shutdown
+  lift their caps as for any session. A second CLI that arrives under the name of a nested or desktop session is
+  refused, since it cannot join that job. A CLI's children that already sit in a job of their own when the hook
+  runs stay outside, as in the tree. The first process in AllAgents fixes where that job sits for good, so while
+  AllAgents has never held a process, a CLI in a job of its own gets a nested job as well. Joining would put
+  AllAgents and every later run under the CLI's job (measured), and a job that kills on close, as Node's does,
+  would end them all when the CLI exits. The same holds inside the nested job: when the CLI's own job kills on
+  close, every child the CLI started ends with it, detached ones included, and a child started with
+  `CREATE_BREAKAWAY_FROM_JOB` fails, since the nested job allows no breakaway. Outside Guardian, Node's job lets
+  detached children leave and survive the CLI. Measured with a test job shaped like Node's.

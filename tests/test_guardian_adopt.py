@@ -1,4 +1,6 @@
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -196,6 +198,167 @@ class InstallerTests(unittest.TestCase):
             data = self.inst.plan_antigravity("main", False)[1]
             self.assertEqual({k: data[k] for k in kept}, kept)
             self.assertEqual(data["guardian-adopt-2"]["SessionStart"][0]["command"], ours)
+
+    def run_main(self, *argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.inst.main(list(argv)), 0)
+        return out.getvalue()
+
+    def test_claude_merges_into_settings_and_remove_restores_them(self):
+        secret = "sk-fake-env-value-0123"
+        theirs = [{"hooks": [{"type": "command", "command": 'py "C:/x/context.py"'}]},
+                  {"matcher": "startup", "hooks": [{"type": "command", "command": "echo \u4f60\u597d"}]}]
+        settings = {"cleanupPeriodDays": 30, "env": {"FAKE_TOKEN": secret},
+                    "permissions": {"allow": ["Bash(git:*)"]},
+                    "hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "a.py"}]}],
+                              "SessionStart": theirs,
+                              "Stop": [{"hooks": [{"type": "command", "command": "b.py"}]}]},
+                    "language": "\u7e41\u9ad4\u4e2d\u6587", "theme": "dark"}
+        seed = (json.dumps(settings, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(self.inst, "HOME", Path(d)):
+            f = Path(d, ".claude", "settings.json")
+            self.assertIn("not present", self.run_main("claude", "--remove", "--apply"))
+            f.parent.mkdir(parents=True)
+            f.write_bytes(seed)
+            out = self.run_main("claude")  # dry run
+            self.assertEqual(f.read_bytes(), seed)
+            self.assertEqual(list(f.parent.iterdir()), [f])
+            self.assertIn("hooks.SessionStart:", out)
+            for hidden in (secret, "FAKE_TOKEN", "permissions", "a.py", "b.py"):
+                self.assertNotIn(hidden, out)
+
+            out = self.run_main("claude", "--apply")
+            self.assertNotIn(secret, out)
+            self.assertEqual(len(list(f.parent.glob("settings.json.bak-guardian-*"))), 1)
+            raw = f.read_bytes()
+            self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))
+            self.assertNotIn(b"\r\n", raw)
+            self.assertIn("\u7e41\u9ad4\u4e2d\u6587".encode("utf-8"), raw)
+            data = json.loads(raw.decode("utf-8"))
+            self.assertEqual(list(data), list(settings))
+            self.assertEqual(list(data["hooks"]), list(settings["hooks"]))
+            self.assertEqual({k: v for k, v in data.items() if k != "hooks"},
+                             {k: v for k, v in settings.items() if k != "hooks"})
+            self.assertEqual(data["hooks"]["SessionStart"][:2], theirs)
+            ours = data["hooks"]["SessionStart"][2]
+            self.assertEqual(ours["matcher"], "startup|resume")
+            self.assertEqual(ours["hooks"], [{"type": "command", "command": self.inst.command("claude", "main", False),
+                                              "timeout": 30}])
+            self.assertNotIn("\\", ours["hooks"][0]["command"])
+
+            installed = f.read_bytes()
+            self.assertIn("already as wanted", self.run_main("claude", "--apply"))
+            self.assertEqual(f.read_bytes(), installed)
+
+            out = self.run_main("claude", "--remove", "--apply")
+            self.assertNotIn(secret, out)
+            self.assertEqual(json.loads(f.read_bytes().decode("utf-8")), settings)
+            self.assertEqual(f.read_bytes(), seed)
+
+    def test_claude_adds_and_drops_the_hooks_key(self):
+        settings = {"env": {"FAKE_TOKEN": "fake"}, "theme": "dark"}
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(self.inst, "HOME", Path(d)):
+            f = Path(d, ".claude", "settings.json")
+            f.parent.mkdir(parents=True)
+            f.write_text(json.dumps(settings), encoding="utf-8")
+            self.assertIn("already as wanted", self.run_main("claude", "--remove"))
+            data = self.inst.plan_claude("main", False)[1]
+            self.assertEqual(list(data), ["env", "theme", "hooks"])
+            f.write_text(json.dumps(data), encoding="utf-8")
+            self.assertEqual(self.inst.plan_claude("main", True)[1], settings)
+            f.write_text(json.dumps(dict(settings, hooks={})), encoding="utf-8")  # an empty hooks of the user's stays
+            self.assertEqual(self.inst.plan_claude("main", True)[1], dict(settings, hooks={}))
+
+    def test_cursor_keeps_flat_entries_and_version(self):
+        pulse = {"command": "powershell.exe -File pulse-hook.ps1 -Source cursor", "timeout": 10}
+        context = {"command": 'C:/Python313/python.exe "C:/x/hooks/cursor-sentinel-context.py"', "timeout": 5}
+        old_ours = {"command": self.inst.command("cursor", "side", False), "timeout": 30}
+        original = {"hooks": {"stop": [pulse], "sessionStart": [pulse, context]}, "version": 1}
+        seed = json.dumps(original, indent=2).replace("\n", "\r\n").encode("utf-8")
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(self.inst, "HOME", Path(d)):
+            f = Path(d, ".cursor", "hooks.json")
+            f.parent.mkdir(parents=True)
+            f.write_bytes(seed)
+            self.run_main("cursor")  # dry run
+            self.assertEqual(f.read_bytes(), seed)
+            self.assertEqual(list(f.parent.iterdir()), [f])
+
+            out = self.run_main("cursor", "--apply")
+            self.assertNotIn("pulse-hook", out)
+            raw = f.read_bytes()
+            self.assertEqual(raw.count(b"\n"), raw.count(b"\r\n"))  # the file's CRLF stays
+            data = json.loads(raw)
+            ours = {"command": self.inst.command("cursor", "main", False), "timeout": 30}
+            self.assertEqual(data, {"hooks": {"stop": [pulse], "sessionStart": [pulse, context, ours]}, "version": 1})
+            self.assertEqual(list(data), ["hooks", "version"])
+
+            f.write_text(json.dumps({"hooks": {"sessionStart": [old_ours, pulse]}}), encoding="utf-8")
+            data = self.inst.plan_cursor("main", False)[1]
+            self.assertEqual(data, {"hooks": {"sessionStart": [pulse, ours]}, "version": 1})
+            f.write_text(json.dumps(data), encoding="utf-8")
+            self.assertEqual(self.inst.plan_cursor("main", True)[1], {"hooks": {"sessionStart": [pulse]}, "version": 1})
+
+            f.write_bytes(seed)
+            self.run_main("cursor", "--apply")
+            self.run_main("cursor", "--remove", "--apply")
+            self.assertEqual(json.loads(f.read_bytes()), original)
+
+    def test_changes_print_only_what_differs(self):
+        old = {"env": {"K": "secret"}, "hooks": {"SessionStart": [{"a": 1}], "Stop": [{"b": 2}]}}
+        new = {"env": {"K": "secret"}, "hooks": {"SessionStart": [{"a": 1}, {"c": 3}], "Stop": [{"b": 2}]},
+               "version": 1}
+        self.assertEqual(self.inst.changes(old, new),
+                         ["hooks.SessionStart:", '  + "(other hook, not shown)"', "version: + 1"])
+
+    def test_other_hooks_in_a_mixed_entry_are_never_printed(self):
+        side = {"type": "command", "command": self.inst.command("claude", "side", False)}
+        ours = {"matcher": "startup|resume", "hooks": [
+            {"type": "command", "command": self.inst.command("claude", "main", False), "timeout": 30}]}
+        other = '"(other hook, not shown)"'
+        gone = f'    - {{"matcher": "startup", "hooks": [{other}, {json.dumps(side)}]}}'
+        stays = f'    + {{"matcher": "startup", "hooks": [{other}]}}'
+        for theirs in ({"type": "command", "command": "curl -H 'Authorization: Bearer SEKRET' x"},
+                       {"type": "http", "url": "http://x/?token=SEKRET"}):
+            mixed = json.dumps({"hooks": {"SessionStart": [{"matcher": "startup", "hooks": [theirs, side]}]}})
+            kept = {"matcher": "startup", "hooks": [theirs]}
+            with self.subTest(theirs["type"]), tempfile.TemporaryDirectory() as d, \
+                    mock.patch.object(self.inst, "HOME", Path(d)):
+                f = Path(d, ".claude", "settings.json")
+                f.parent.mkdir(parents=True)
+                f.write_text(mixed, encoding="utf-8")
+                out = self.run_main("claude")  # dry run
+                self.assertEqual(f.read_text(encoding="utf-8"), mixed)
+                for line in (gone, stays, f"    + {json.dumps(ours)}"):
+                    self.assertIn(line, out.splitlines())
+
+                out += self.run_main("claude", "--apply")
+                self.assertEqual(json.loads(f.read_bytes()), {"hooks": {"SessionStart": [kept, ours]}})
+
+                f.write_text(mixed, encoding="utf-8")
+                removed = self.run_main("claude", "--remove", "--apply")
+                self.assertEqual(json.loads(f.read_bytes()), {"hooks": {"SessionStart": [kept]}})
+                self.assertIn(gone, removed.splitlines())
+                self.assertIn(stays, removed.splitlines())
+                self.assertNotIn("SEKRET", out + removed)
+
+    def test_other_cursor_hooks_are_never_printed(self):
+        theirs = {"command": "curl -H 'Authorization: Bearer SEKRET' x", "timeout": 5}
+        side = {"command": self.inst.command("cursor", "side", False), "timeout": 30}
+        ours = {"command": self.inst.command("cursor", "main", False), "timeout": 30}
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(self.inst, "HOME", Path(d)):
+            f = Path(d, ".cursor", "hooks.json")
+            f.parent.mkdir(parents=True)
+            f.write_text(json.dumps({"hooks": {"sessionStart": [theirs, side]}, "version": 1}), encoding="utf-8")
+            out = self.run_main("cursor") + self.run_main("cursor", "--apply")
+            self.assertIn(f"    - {json.dumps(side)}", out.splitlines())
+            self.assertEqual(json.loads(f.read_bytes()), {"hooks": {"sessionStart": [theirs, ours]}, "version": 1})
+            out += self.run_main("cursor", "--remove", "--apply")
+            self.assertEqual(json.loads(f.read_bytes()), {"hooks": {"sessionStart": [theirs]}, "version": 1})
+            self.assertNotIn("SEKRET", out)
+        # a flat list that goes as a whole prints its other hooks masked as well
+        self.assertEqual(self.inst.changes({"sessionStart": [theirs, side]}, {}),
+                         ["sessionStart:", '  - "(other hook, not shown)"', f"  - {json.dumps(side)}"])
 
 
 class ShimTests(unittest.TestCase):

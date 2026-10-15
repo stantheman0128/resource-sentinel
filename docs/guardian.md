@@ -76,9 +76,10 @@ A CLI gets into Guardian one of four ways:
    `cursor-agent`, `grok` or `agy` in a new terminal runs a wrapper (`.ps1` for PowerShell, `.cmd` for cmd, an sh script
    for Git Bash) that calls `scripts/guardian-shim.py`. The shim starts the real CLI suspended in the same console,
    has the daemon assign it to root, provider and session job, then lets it run, so it is in its session from its
-   first instruction, like a launch. This is the way in for Claude Code and Cursor Agent outside gagent. Arguments
-   after the CLI name reach the CLI as the shell passed them on (PowerShell and cmd change a few things first,
-   see Known limits). The CLI runs as before, without a word, when its parent is already in
+   first instruction, like a launch. Outside gagent, Claude Code and Cursor Agent get in this way or through the
+   adopt hook that `guardian-install-hooks.py` adds, which takes them in when their session starts, into a nested
+   job (see Adopt). Arguments after the CLI name reach the CLI as the shell passed them on (PowerShell and cmd
+   change a few things first, see Known limits). The CLI runs as before, without a word, when its parent is already in
    a Guardian session (a tool command of another CLI inherits that job), when a desktop app started it, or with
    `GUARDIAN_SHIM=off`. When the daemon is down, refuses, or gives no answer within 15 seconds, the CLI runs anyway
    and one `[guardian]` line says why. `GUARDIAN_SHIM_INSTANCE` picks the instance (default `main`), and
@@ -171,10 +172,16 @@ To have new sessions join without gagent, Stan can run `python -I scripts/guardi
 checkout: it covers all six CLIs. It prints the change and writes nothing until `--apply`, which saves the old
 user Path first; `--remove` undoes it. The `.ps1` wrappers are written only when PowerShell's execution policy
 runs local scripts (RemoteSigned for Stan's user on 2026-10-13); otherwise PowerShell uses the `.cmd` ones. As a
-second route for Codex, Grok and Antigravity, `python -I scripts/guardian-install-hooks.py` adds the adopt hook,
-with the same dry run, a backup of the file and `--remove`. It covers Codex (`~/.codex/hooks.json`, then trust it
-once with `/hooks` in codex), Grok (`~/.grok/hooks/guardian.json`) and Antigravity (a named hook `guardian-adopt`
-in `~/.gemini/config/hooks.json`; the user's own hooks in that file stay). Wrappers and hook only act while the daemon
+second route, `python -I scripts/guardian-install-hooks.py` adds the adopt hook, with the same dry run, a backup
+of the file and `--remove`. It covers Claude Code (a SessionStart entry for startup and resume in
+`~/.claude/settings.json`), Codex (`~/.codex/hooks.json`, then trust it once with `/hooks` in codex), Cursor Agent
+(a sessionStart entry in `~/.cursor/hooks.json`), Grok (`~/.grok/hooks/guardian.json`) and Antigravity (a named
+hook `guardian-adopt` in `~/.gemini/config/hooks.json`). The user's own keys and hooks in these files stay where
+they were, and the dry run and `--apply` print only the hook event that changes, so the env block of
+`~/.claude/settings.json` never shows. The Claude app's Code tab and Cursor's editor read the same files as the
+CLIs; there the hook finds the app among its parents and only logs a refusal. The Claude app's sessions go into
+desktop jobs instead, while Cursor's editor has none. Gemini CLI gets no hook from this installer, since
+`~/.gemini/settings.json` also holds other tools' hooks. Wrappers and hook only act while the daemon
 for that instance runs. `python -I scripts/guardian-install-autostart.py` keeps the main daemon running: it
 registers the scheduled task ResourceSentinelGuardian, which starts the daemon at logon through `conhost --headless`
 with no time limit and never a second copy, and appends its output to
@@ -260,9 +267,9 @@ cap set before the sample and the one set after it, by 0.20 cores on average and
 - Pausing a session sets its CPU rate to 0.01%. A paused CLI cannot service its network connections either, and
   they may time out, so keep pauses short.
 - Claude Code and Cursor Agent sessions started neither through gagent nor through the PATH wrapper (by full path,
-  from a terminal opened before the install, or by a tool that ignores PATH) stay outside Guardian, because
-  `guardian-install-hooks.py` adds no adopt hook for them. A hook would now take them into a nested job (see Adopt;
-  the provider check's hook level passed for both on 2026-10-15), but the installer does not add it yet. A session
+  from a terminal opened before the install, or by a tool that ignores PATH) join Guardian only through the adopt
+  hook that `guardian-install-hooks.py` adds, and then in a nested job outside AllAgents (see Adopt; the provider
+  check's hook level passed for both on 2026-10-15). Without that hook they stay outside Guardian. A session
   started inside a desktop app's terminal is refused on purpose, as long as the app is still among its parents.
 - The wrappers sit on the user Path, which Windows puts after the system Path. A CLI installed into a system Path
   folder is found first and bypasses its wrapper; the installer warns about that.

@@ -87,6 +87,11 @@
   and its 4 children joined a nested job as well, but the sign-in failed before its BeforeAgent hook, so no tool
   command ran. All three sessions ended with their CLIs. Children the CLI starts, detached ones included, now end
   with a CLI whose own job kills on close, and cannot break away.
+- `guardian-install-hooks` also adds the adopt hook for Claude Code (SessionStart in `~/.claude/settings.json`) and
+  Cursor Agent (sessionStart in `~/.cursor/hooks.json`), keeping every other key and hook in those files. Its dry
+  run and `--apply` output show only the hook event that changes, never the rest of the file, and any hook in it
+  that is not Guardian's appears as `(other hook, not shown)`. Files keep their line endings and non-ASCII text.
+  Gemini CLI stays without a hook from it.
 
 ## Unreleased - 2026-09-13
 

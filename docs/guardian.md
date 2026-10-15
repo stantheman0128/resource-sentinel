@@ -180,7 +180,13 @@ hook `guardian-adopt` in `~/.gemini/config/hooks.json`). The user's own keys and
 they were, and the dry run and `--apply` print only the hook event that changes, so the env block of
 `~/.claude/settings.json` never shows. The Claude app's Code tab and Cursor's editor read the same files as the
 CLIs; there the hook finds the app among its parents and only logs a refusal. The Claude app's sessions go into
-desktop jobs instead, while Cursor's editor has none. Gemini CLI gets no hook from this installer, since
+desktop jobs instead, while Cursor's editor has none. On 2026-10-15 both hooks were run live from Stan's own
+files. A claude.exe and a cursor-agent, each started by full path from a plain console and given no prompt,
+joined a nested session of the main daemon when their session started, enforced at below_normal. claude.exe
+brought 8 children. cursor-agent's node.exe brought 32; 4 more were refused with Access denied and 1 had already
+exited. cursor-agent asks whether to trust a folder it has not seen, and its sessionStart hook runs only after that
+answer. Git's bash was first on PATH for this run, so the imported plugin hooks that call a bare `bash` could not
+start WSL. Gemini CLI gets no hook from this installer, since
 `~/.gemini/settings.json` also holds other tools' hooks. Wrappers and hook only act while the daemon
 for that instance runs. `python -I scripts/guardian-install-autostart.py` keeps the main daemon running: it
 registers the scheduled task ResourceSentinelGuardian, which starts the daemon at logon through `conhost --headless`

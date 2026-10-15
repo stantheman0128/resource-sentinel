@@ -58,6 +58,14 @@
   dashboard port that another program holds. With that daemon up, `claude`, `codex`, `cursor-agent`, `grok` and
   `agy` started from a cmd opened through Explorer and from a new Windows Terminal tab each went through their
   wrapper into a session of their own.
+- The daemon leaves the job it starts in. The logon task's daemon sat in Task Scheduler's job, which refuses
+  breakaway, so once AllAgents held an adopted CLI, srun and gagent runs could not join it and ran without control.
+  A daemon started inside a job with its output going to a file now starts itself again outside any job through
+  WMI's `Win32_Process.Create` and appends to the same log, and the first copy exits. `--stay-in-job` keeps it
+  where it is. It also stays and warns with stdout on a console or a pipe, when its command line holds a `%` (the
+  headless conhost would expand `%NAME%`), and when the new copy exits within 3 s. After the restart, srun put a
+  stand-in for an API script into its session job for all six providers, and `--version` of all six CLIs ran
+  enforced through srun and through the wrappers.
 
 ## Unreleased - 2026-09-13
 

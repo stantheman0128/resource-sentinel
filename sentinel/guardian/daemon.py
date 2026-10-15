@@ -48,6 +48,15 @@ PROVIDERS = ("claude", "codex", "cursor", "grok", "gemini", "antigravity", "othe
 CLASS_RANK = {"focus": 0, "normal": 1, "batch": 2}
 CREATE_NO_WINDOW, CREATE_NEW_CONSOLE = 0x08000000, 0x00000010
 GiB = 2**30
+CONHOST = r"C:\Windows\System32\conhost.exe"
+POWERSHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+# Win32_Process.Create starts the command under the WMI provider host, in no job and in the caller's session
+# (measured 2026-10-15). Command line and directory arrive through the environment, so nothing is quoted into the
+# script. conhost --headless expands %NAME% in the command line it runs when NAME is a defined variable; Create keeps
+# both the command line and the directory as given (measured 2026-10-15).
+WMI_CREATE = ("$ErrorActionPreference = 'Stop'; $r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create "
+              "-Arguments @{CommandLine = $env:GUARDIAN_RELAUNCH_COMMAND; "
+              "CurrentDirectory = $env:GUARDIAN_RELAUNCH_CWD}; \"$($r.ReturnValue) $($r.ProcessId)\"")
 
 
 def secret(path, nbytes):
@@ -1289,6 +1298,98 @@ def make_handler(g):
     return Api
 
 
+def stdout_path():
+    """The disk file stdout writes to, or None for a console, a pipe or no stdout at all."""
+    try:
+        return wj.disk_file_path(sys.stdout.fileno())
+    except (AttributeError, OSError, ValueError):  # no stdout, or a stream without a descriptor
+        return None
+
+
+def relaunch_command(log):
+    """This process's command line under a headless conhost, with --stay-in-job and its output appended to log. The
+    new copy gets the default user environment, not this one, so UTF-8 mode is passed on as -X utf8."""
+    utf8 = ["-X", "utf8"] if sys.flags.utf8_mode else []
+    return subprocess.list2cmdline([CONHOST, "--headless", sys.executable, *utf8, *sys.orig_argv[1:],
+                                    "--stay-in-job", "--log", log])
+
+
+def relaunch_outside_job(cmd):
+    """Start cmd through WMI. Returns the pid of the new conhost; raises OSError or ValueError when that fails."""
+    env = dict(os.environ, GUARDIAN_RELAUNCH_COMMAND=cmd, GUARDIAN_RELAUNCH_CWD=os.getcwd())
+    try:
+        r = subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", WMI_CREATE], env=env,
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace", timeout=30,
+                           creationflags=CREATE_NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        raise OSError("powershell did not answer within 30 s") from None
+    if r.returncode:
+        raise OSError(f"powershell exited with {r.returncode}: {' '.join(r.stderr.split())[:300]}")
+    code, _, pid = r.stdout.strip().partition(" ")
+    if code != "0":
+        raise OSError(f"Win32_Process.Create returned {code or 'nothing'}")
+    return int(pid)
+
+
+def leave_job(stay):
+    """True when this process started itself again outside its job and should exit now. Runs the daemon spawns
+    inherit its job, and once AllAgents holds a process from outside that job, such as an adopted CLI, they cannot
+    join AllAgents (Access is denied) and srun runs them without control."""
+    if not wj.in_job(os.getpid()):
+        return False
+    log = None if stay else stdout_path()
+    cmd = relaunch_command(log) if log else ""
+    why = ("--stay-in-job keeps it there" if stay else
+           "with stdout going to a file it would start again outside" if not log else
+           "it stays there because conhost would expand %NAME% in its command line" if "%" in cmd else "")
+    if why:
+        print("[guardian] warning: the daemon runs inside a job, so runs started through srun or gagent cannot enter "
+              "Guardian's jobs once it adopts a process from outside that job; " + why, file=sys.stderr, flush=True)
+        return False
+    # before Create, while nothing else writes to the log: once the new copy runs, this copy only writes if it died
+    print("[guardian] leaving the job: starting again outside it through WMI", flush=True)
+    try:
+        pid = relaunch_outside_job(cmd)
+    except (OSError, ValueError) as e:
+        print(f"[guardian] warning: could not leave the job, so runs started through srun or gagent may not enter "
+              f"Guardian's jobs ({e})", file=sys.stderr, flush=True)
+        return False
+    # conhost, not ping: in a scheduled task the new copy waits in open_log until this copy's cmd lets go of the log
+    if not exited_within(pid, 3.0):
+        return True
+    sys.stdout.flush()
+    os.lseek(sys.stdout.fileno(), 0, os.SEEK_END)  # the new copy may have appended to the file before it died
+    print(f"[guardian] warning: the copy started outside the job (conhost pid {pid}) exited at once, so this one runs "
+          f"in place and runs started through srun or gagent may not enter Guardian's jobs", file=sys.stderr,
+          flush=True)
+    return False
+
+
+def exited_within(pid, seconds):
+    """True when process pid ends within seconds or is gone already."""
+    h = wj.open_waitable(pid)
+    if not h:
+        return True
+    try:
+        return wj.WaitForSingleObject(h, int(seconds * 1000)) == 0  # WAIT_OBJECT_0: it has exited
+    finally:
+        wj.CloseHandle(h)
+
+
+def open_log(path, wait=30.0):
+    """path opened for appending, line-buffered, in the encoding a redirect gives stdout: the locale's, or UTF-8 in
+    UTF-8 mode, which the old copy passes on with -X utf8. The copy that left a job retries while the old copy's cmd
+    still holds the file, which it shares for reading only (measured 2026-10-15)."""
+    t0 = time.monotonic()
+    while True:
+        try:
+            return open(path, "a", buffering=1, errors="backslashreplace")
+        except PermissionError:
+            if time.monotonic() - t0 > wait:
+                raise
+            time.sleep(0.1)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Guardian daemon: one big job for agent work, foreground first.")
     ap.add_argument("--instance", default="main")
@@ -1300,10 +1401,17 @@ def main(argv=None):
     ap.add_argument("--no-apps", action="store_true")
     ap.add_argument("--desktop", choices=("on", "off"),
                     help="put the Claude and Codex apps' agent CLIs in desktop jobs (default: on for main only)")
+    ap.add_argument("--stay-in-job", action="store_true", help="never start again outside the job this runs in")
+    ap.add_argument("--log", metavar="PATH", help="append stdout and stderr to PATH")
     a = ap.parse_args(argv)
+    if a.log:  # the copy that left a job: its console is headless
+        sys.stdout = sys.stderr = open_log(a.log)
     if ping(a.instance):
         print(f"Guardian {a.instance} is already running", file=sys.stderr)
         return 1
+    # only with argv from the command line: the new copy gets this process's own command line
+    if argv is None and leave_job(a.stay_in_job):
+        return 0
     over = {"cpu": {"maximum_cap_percent": a.max_cap}} if a.max_cap else {}
     try:
         Guardian(a.instance, a.world_cpus, a.initial_cap, over, a.port, not a.no_probe, not a.no_apps,

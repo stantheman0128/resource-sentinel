@@ -6,6 +6,7 @@ a job, so a job attached to a live app must not be able to kill it.
 """
 import ctypes
 import ctypes.wintypes as w
+import msvcrt
 import os
 import subprocess
 
@@ -827,3 +828,23 @@ def in_named_job(pid, name):
         return in_job(pid, h)
     finally:
         CloseHandle(h)
+
+
+# ---- the file behind a descriptor ------------------------------------------------------------------------------
+FILE_TYPE_DISK = 1
+GetFileType = _bind("GetFileType", w.DWORD, HANDLE)
+GetFinalPathNameByHandleW = _bind("GetFinalPathNameByHandleW", w.DWORD, HANDLE, w.LPWSTR, w.DWORD, w.DWORD)
+
+
+def disk_file_path(fd):
+    """Full path of the disk file behind C descriptor fd, or None for a console, a pipe, NUL or a path that cannot
+    be read. OSError when fd is not open."""
+    h = msvcrt.get_osfhandle(fd)
+    if GetFileType(h) != FILE_TYPE_DISK:
+        return None
+    buf = ctypes.create_unicode_buffer(32768)
+    n = GetFinalPathNameByHandleW(h, buf, len(buf), 0)  # FILE_NAME_NORMALIZED | VOLUME_NAME_DOS
+    if not n or n >= len(buf):
+        return None
+    p = buf.value
+    return "\\\\" + p[8:] if p.startswith("\\\\?\\UNC\\") else p[4:] if p.startswith("\\\\?\\") else p

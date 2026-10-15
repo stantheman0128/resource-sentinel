@@ -43,6 +43,7 @@ probe reports lateness.
 python -I scripts/guardian.py --instance main                     # daemon + dashboard on http://127.0.0.1:8765/
 python -I scripts/srun.py --provider claude --session s1 -- <cmd>  # run a command inside Guardian
 python -I scripts/srun.py --provider claude --session s1 --console -- claude   # a whole interactive CLI
+python -I scripts/srun.py --provider codex --session api1 -- python my_api.py   # an API or SDK script
 python -I scripts/guardctl.py status | pause claude/s1 | class claude/s1 focus | cap 40 | world 10 | rollback
 ```
 
@@ -132,7 +133,7 @@ make one model call each.
 |---|---|---|---|---|
 | Claude Code 2.1.296 | yes: tool command in the session | yes: tool command in the shim's session | no: claude.exe is in its own job, adopt refused | measured; use the wrapper or gagent |
 | Codex CLI 0.156.0 | yes: tool command in the session | yes: tool command in the shim's session | yes: tool command in the adopted session; node.exe and node_repl.exe children were refused (Access denied) and stay outside | sandbox blocks the daemon pipe, whereami reads the jobs |
-| Gemini CLI 0.1.3 | CLI starts in the session; tool command not tested | CLI starts in the session; a child of its node.exe (started through `NODE_OPTIONS=--require`, no model call) reports the shim's session; tool command not tested | no hooks in 0.1.3 | not signed in on 2026-10-13 (no auth type, no credentials), so no model call can run; headless shell also needs `--yolo`, which the check runs only with `--allow-yolo` |
+| Gemini CLI 0.1.3, not retested since | CLI starts in the session; tool command not tested | CLI starts in the session; a child of its node.exe (started through `NODE_OPTIONS=--require`, no model call) reports the shim's session; tool command not tested | no hooks in 0.1.3 | Stan uses agy instead, so Gemini CLI stays untested. 0.63.0 replaced 0.1.3 on 2026-10-13 at 23:10, after these checks; on 2026-10-15 its `--version` started in a session through srun and through the wrapper, and its hook events, such as SessionStart and BeforeTool, were not tried. 0.1.3 was not signed in (no auth type, no credentials), so no model call could run; headless shell also needs `--yolo`, which the check runs only with `--allow-yolo` |
 | Cursor Agent 2026.10.01 | yes: tool command in the session | yes: tool command in the shim's session | no: its node.exe is in its own job, adopt refused | measured; start it outside Git Bash (see Known limits) |
 | Grok 1.0.40 | yes: tool command in the session | yes: tool command and its session-start hook (its own child) in the shim's session | yes: tool command in the adopted session; powershell.exe and conhost.exe children were refused (Access denied) and stayed outside | measured after Stan signed in again (report 231319); the project hook needs a git root |
 | Antigravity CLI 1.3.4 (`agy`) | yes: tool command in the session (with `--allow-yolo`), and its PreInvocation hook (its own child) | yes: the same, in the shim's session | yes: tool command in the adopted session; agy.exe adopted (2 processes, none refused) | reports 233349 and 233824 without the flag, 000722 with it. Measured besides: hooks run through cmd.exe and need no git root; the session name comes from `conversationId`; agy starts a background updater, another agy.exe, as its child, and it replaced 1.3.3 with 1.3.4 unasked before these runs |
@@ -157,8 +158,7 @@ the installer refuses one that another program holds. On Stan's machine another 
 task uses `--port 8769` (2026-10-14).
 
 Measured 2026-10-14 with the wrappers and the autostart task: Task Scheduler starts its action in a job with no
-limits (flags 0) that refuses breakaway (a child started with `CREATE_BREAKAWAY_FROM_JOB` got Access denied), so
-Guardian's job tree nests under that job. `Stop-ScheduledTask` ended conhost only; cmd and the daemon kept running.
+limits (flags 0) that refuses breakaway (a child started with `CREATE_BREAKAWAY_FROM_JOB` got Access denied).
 With the task's daemon up, `claude`, `codex`, `cursor-agent`, `grok` and `agy` with `--version` each went through its
 wrapper into a session of its own (enforced, below_normal priority), from a cmd that Explorer opened and from a new
 Windows Terminal tab. Neither shell was in a job, though WindowsTerminal.exe itself is. A Windows Terminal that was
@@ -170,6 +170,21 @@ stands in for a command typed there: in both editors its job had flags 0x800, so
 Code terminal `claude --version` went into a session of its own (enforced). From the Cursor terminal the wrapper ran
 it directly, since Cursor.exe is among its parents and Guardian leaves the desktop apps and everything under them
 alone. An editor that was open before the PATH change gives its terminals the old PATH until it is restarted.
+
+A daemon left in Task Scheduler's job passes that job on to every run it starts. Once AllAgents holds a process
+from outside the job, such as an adopted CLI, those runs cannot join AllAgents: on 2026-10-15
+`AssignProcessToJobObject` returned Access is denied, and srun ran codex, grok, cursor, antigravity and gemini runs
+without control. A daemon that starts inside a job with its output going to a file therefore starts itself again
+through WMI's `Win32_Process.Create`, which puts the new copy in no job and in the same session. The new copy
+appends to the same log and the task's copy exits, so Task Scheduler shows the task as Ready while the daemon runs,
+and `guardctl shutdown` stops it. The daemon stays in the job and warns when stdout is on a console or a pipe, with
+`--stay-in-job`, or when its command line holds a `%`, since the headless conhost would expand `%NAME%` in it. If
+the new copy exits within 3 s, the first copy warns and runs in place. API and SDK scripts have no CLI to wrap or
+hook, so they join through srun. After the main daemon was restarted through the task on 2026-10-15, srun put
+guardian-whereami, standing in for such a script, into its session job for claude, codex, cursor, grok,
+antigravity and gemini. `--version` of Claude Code, Codex, Gemini CLI 0.63.0, Cursor Agent, Grok and agy 1.3.4
+went into a session of its own (enforced) both through srun and through its wrapper, run from a cmd outside any
+job and outside the Claude app.
 
 On instance main, each CLI then made one real model call from a cmd that Explorer opened (2026-10-14). Through the
 wrappers, `claude`, `cursor-agent`, `codex`, `grok` and `agy` each ran guardian-whereami as a tool command inside
@@ -206,6 +221,13 @@ processes ran at below normal priority, and the Claude app's own process stayed 
 the Codex app started codex.exe under ChatGPT.exe, and the daemon placed it within 2 s. Its 28 children (node.exe,
 node_repl.exe, cmd.exe and conhost.exe) joined with it and ran at below normal, and the job's hard cap followed the
 pool budget down to 1.20 cores. The Codex app sat idle, so it put no load against that cap.
+
+On 2026-10-15 a task in the Codex app ran four busy loops for 194 s, enough to keep 4 cores busy. Their load landed
+in one of the app's two codex.exe desktop jobs. Over the run that job used 0.82 cores on average under a cap that
+averaged 0.85, although the machine had 3.23 cores idle on average. The allocator changed the cap every second,
+between 0.17 and 3.08 cores, while the controller raised the pool budget from 10% to 34% of the machine. Second by
+second the cap held less tightly: in 46 of 170 one-second samples the job used more than 0.05 cores above both the
+cap set before the sample and the one set after it, by 0.20 cores on average and 0.65 at most.
 
 ## Known limits
 
@@ -281,8 +303,10 @@ pool budget down to 1.20 cores. The Codex app sat idle, so it put no load agains
   can go over the total for up to one tick before the allocator caps them. A desktop job name that already exists
   is refused like a session name, with a logged `desktop_refused` decision, and that CLI stays outside Guardian
   while it runs.
-- A desktop cap under load was measured only under the Claude app. Under the Codex app, codex.exe and its children
-  joined a desktop job and got its priority and cap, but no Codex task ran against the cap.
+- Over a whole run a desktop cap holds, but a single second can go over it. Under the Codex app on 2026-10-15 the
+  allocator changed the cap every second, and in about a quarter of the one-second samples the job ran above the
+  caps set around that second, by 0.20 cores on average. The samples do not show whether Windows applies a new cap
+  late or a sample spans two caps.
 - Turning desktop jobs off leaves each CLI in its old desktop job, without limits and without a name once the
   daemon closes its handle. Turning them on again nests a new desktop job under that one, so every off and on adds
   a level. A restart nests the same way: the old desktop job loses its name when the old daemon exits, and the new

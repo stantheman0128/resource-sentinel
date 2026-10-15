@@ -10,8 +10,8 @@ second copy. --apply registers it, replacing an earlier version, and starts it w
 --remove deletes the task and leaves a running daemon alone. Run it from the main checkout: the task calls the
 guardian.py that sits next to this script, with the Python that runs this script.
 
-Task Scheduler puts the action in a job of its own (no limits, no breakaway, measured 2026-10-14), so Guardian's
-jobs nest under that job. Stop-ScheduledTask ends only conhost; cmd and the daemon keep running.
+Task Scheduler puts the action in a job of its own (no limits, no breakaway, measured 2026-10-14), so the daemon
+starts itself again outside any job through WMI, appending to the same log, and the copy in the task exits.
 """
 import argparse
 import os

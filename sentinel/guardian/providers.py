@@ -52,7 +52,9 @@ class Provider:
 PROVIDERS = {
     "claude": Provider("claude", "claude", {"claude.exe"}),
     "codex": Provider("codex", "codex", {"codex.exe"}),
-    # npm installs: gemini.cmd -> node.exe .../@google/gemini-cli/dist/index.js
+    # npm installs (0.63): gemini.cmd -> node.exe .../@google/gemini-cli/bundle/gemini.js, which relaunches itself as
+    # a child node.exe unless GEMINI_CLI_NO_RELAUNCH is set; find_cli takes the node.exe nearest the hook, the one
+    # that runs it
     "gemini": Provider("gemini", "gemini", {"node.exe"}),
     # cursor-agent.cmd -> powershell -> %LOCALAPPDATA%\cursor-agent\versions\<v>\node.exe index.js
     "cursor": Provider("cursor", "cursor-agent", {"node.exe"}, "\\cursor-agent\\"),

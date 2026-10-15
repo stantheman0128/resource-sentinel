@@ -66,6 +66,12 @@
   headless conhost would expand `%NAME%`), and when the new copy exits within 3 s. After the restart, srun put a
   stand-in for an API script into its session job for all six providers, and `--version` of all six CLIs ran
   enforced through srun and through the wrappers.
+- The provider check covers Gemini CLI 0.63.0. Its hook level writes the hooks to one fixed folder, so gemini's
+  `~/.gemini/trusted_hooks.json` gets a single entry, and every provider's hook level now starts the real CLI
+  instead of the wrapper. Run from a cmd outside any job, the SessionStart hook ran and adopt was refused: gemini
+  starts itself again as a second node.exe, and Node's libuv has already put it in a job of its own. Gemini is
+  therefore marked like Claude Code and Cursor Agent (LIMIT) and joins through srun or the wrapper. Google refused
+  the sign-in in the same run (`IneligibleTierError`), so Gemini CLI cannot make a model call with Stan's account.
 
 ## Unreleased - 2026-09-13
 

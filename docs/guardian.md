@@ -122,21 +122,31 @@ directly. `python -I scripts/guardian-provider-check.py` checks every CLI agains
 (port 8768): `version` starts the CLI through srun, `srun` makes the agent run whereami through srun, `hook` starts
 the CLI outside Guardian with a hook config for that run only, `shimver` and `shim` start it through the wrapper
 (written to the run's own folder, so nothing global changes) with `--version` and with the whereami prompt. Where
-no model call can run, a child of the CLI process stands in for a tool command: gemini's node.exe runs whereami
-through `NODE_OPTIONS=--require` at `--version`, and grok's session-start hook runs it at `shim`. agy runs a shell
-command headless only with permission rules in its global settings or with `--dangerously-skip-permissions`, so at
-`srun`, `hook` and `shim` it gets a plain prompt and a PreInvocation hook in the run folder's `.agents/hooks.json`
-runs whereami as agy's own child; `--allow-yolo` asks for the shell command instead. The srun, hook and shim levels
-make one model call each.
+no model call can run, or a shell command needs a flag that approves every command, a child of the CLI process
+stands in for a tool command. Gemini's node.exe runs whereami through `NODE_OPTIONS=--require` at `version`, `srun`
+and `shim`, and a BeforeAgent hook runs it at `hook`; gemini's hook level always uses one folder,
+`<instance home>/check/gemini-hook`, so gemini's list of trusted hooks gets one entry. Grok's session-start hook
+runs whereami at `shim`. agy runs a shell command headless only with permission rules in its global settings or
+with `--dangerously-skip-permissions`, so at `srun`, `hook` and `shim` it gets a plain prompt and a PreInvocation
+hook in the run folder's `.agents/hooks.json` runs whereami as agy's own child. For gemini and agy, `--allow-yolo`
+asks for the shell command instead. The srun, hook and shim levels make one model call each.
 
 | CLI (version tested) | Launch | PATH wrapper | Adopt hook | Notes |
 |---|---|---|---|---|
 | Claude Code 2.1.296 | yes: tool command in the session | yes: tool command in the shim's session | no: claude.exe is in its own job, adopt refused | measured; use the wrapper or gagent |
 | Codex CLI 0.156.0 | yes: tool command in the session | yes: tool command in the shim's session | yes: tool command in the adopted session; node.exe and node_repl.exe children were refused (Access denied) and stay outside | sandbox blocks the daemon pipe, whereami reads the jobs |
-| Gemini CLI 0.1.3, not retested since | CLI starts in the session; tool command not tested | CLI starts in the session; a child of its node.exe (started through `NODE_OPTIONS=--require`, no model call) reports the shim's session; tool command not tested | no hooks in 0.1.3 | Stan uses agy instead, so Gemini CLI stays untested. 0.63.0 replaced 0.1.3 on 2026-10-13 at 23:10, after these checks; on 2026-10-15 its `--version` started in a session through srun and through the wrapper, and its hook events, such as SessionStart and BeforeTool, were not tried. 0.1.3 was not signed in (no auth type, no credentials), so no model call could run; headless shell also needs `--yolo`, which the check runs only with `--allow-yolo` |
+| Gemini CLI 0.63.0 | CLI starts in the session (`--version`); tool command not tested | CLI starts in the session (`--version`); tool command not tested | no: the SessionStart hook ran, but gemini's node.exe is in a job of Node's own, adopt refused | measured 2026-10-15 from a cmd outside any job; use the wrapper or gagent. Google refused the sign-in in that run (`IneligibleTierError`: this client no longer serves Gemini Code Assist for individuals, move to Antigravity), so no model call can run with Stan's account, and Stan uses agy. Gemini records the check folder's hooks in `~/.gemini/trusted_hooks.json`, one entry. 0.1.3, before 2026-10-13, had no hooks and was not signed in |
 | Cursor Agent 2026.10.01 | yes: tool command in the session | yes: tool command in the shim's session | no: its node.exe is in its own job, adopt refused | measured; start it outside Git Bash (see Known limits) |
 | Grok 1.0.40 | yes: tool command in the session | yes: tool command and its session-start hook (its own child) in the shim's session | yes: tool command in the adopted session; powershell.exe and conhost.exe children were refused (Access denied) and stayed outside | measured after Stan signed in again (report 231319); the project hook needs a git root |
 | Antigravity CLI 1.3.4 (`agy`) | yes: tool command in the session (with `--allow-yolo`), and its PreInvocation hook (its own child) | yes: the same, in the shim's session | yes: tool command in the adopted session; agy.exe adopted (2 processes, none refused) | reports 233349 and 233824 without the flag, 000722 with it. Measured besides: hooks run through cmd.exe and need no git root; the session name comes from `conversationId`; agy starts a background updater, another agy.exe, as its child, and it replaced 1.3.3 with 1.3.4 unasked before these runs |
+
+Gemini's refusal comes from Node. The first time a node.exe starts a child, libuv, the library under Node's
+child processes, puts that node.exe in a job that kills its members when the node.exe exits, and every child it
+starts after that goes in too (libuv `src/win/process.c`). On 2026-10-15 a node.exe that only waited was in no job,
+and a node.exe that had started a child was in one, together with the child. Unless `GEMINI_CLI_NO_RELAUNCH` is
+set, Gemini 0.63.0 starts itself again as a second node.exe, which runs the session and its hooks, so the adopt hook
+finds a CLI that is already in that job. A CLI that starts inside a Guardian job is different: Windows nests
+Node's job inside the session job, which is why srun and the wrapper still put gemini in a session.
 
 Claude Code, Codex, Cursor Agent, Grok and agy, rerun together on one daemon (report 235302, 2026-10-13 23:53 to
 00:04): every level passed except the hook level for Claude Code and Cursor Agent, which gave LIMIT as before. Both

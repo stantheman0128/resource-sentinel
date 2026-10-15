@@ -22,10 +22,16 @@ Antigravity CLI (agy) runs shell commands headless only with permission rules in
 PreInvocation hook in the run folder's .agents/hooks.json: that hook is a child of agy.exe started after the session
 began (and after the SessionStart adopt hook finished), and runs whereami. --allow-yolo adds the flag and the shell
 command instead.
+Gemini CLI 0.63 runs a shell command in -p mode only with --yolo, so it works the same way: srun and shim judge by
+whereami run from gemini's own node.exe at start (NODE_OPTIONS --require), the hook level by a BeforeAgent hook, which
+runs after the SessionStart adopt hook and before the model call. -p refuses an untrusted folder, so these levels set
+GEMINI_CLI_TRUST_WORKSPACE=true for that one process. Gemini records each folder's hooks in
+~/.gemini/trusted_hooks.json the first time it runs them, so only the hook level has hooks, always in one fixed folder
+(<instance home>/check/gemini-hook) with commands that never change: one entry there, written once.
 The srun, hook and shim levels make one real model call each and use the CLI's own login; a CLI that is not logged
 in fails with the CLI's own message. LIMIT means the hook ran but Windows would not let Guardian adopt a CLI that sits
-in a job of its own (claude, cursor); SKIP means the level cannot run for that CLI as installed. The report goes to
-~/.resource-sentinel/guardian/<instance>/check/report-*.json.
+in a job of its own (claude, cursor, gemini); SKIP means the level cannot run for that CLI as installed. The report
+goes to ~/.resource-sentinel/guardian/<instance>/check/report-*.json.
 """
 import argparse
 import importlib.util
@@ -43,7 +49,7 @@ if str(ROOT) not in sys.path:
 
 from sentinel.guardian import winjob as wj
 from sentinel.guardian.client import home_dir, start_daemon
-from sentinel.guardian.providers import PROVIDERS
+from sentinel.guardian.providers import PROVIDERS, real_cli
 
 PY = Path(sys.executable).as_posix()
 WHEREAMI = (ROOT / "scripts" / "guardian-whereami.py").as_posix()
@@ -91,6 +97,9 @@ def hook_command(provider, instance, backslash=False):
 #             reply and judge by `child` instead
 # child       (work, command) -> extra env; makes the CLI run command as its own child once the session has begun
 # level_dirs  each level runs in its own folder, so hook files one level writes do not run in the next
+# hook_child  like child, for the hook level only
+# hook_dir    (instance) -> the one folder the hook level always runs in, for a CLI that keeps a global list of every
+#             folder whose hooks it ran; srun then leaves the hook out, so no other folder has hooks
 def claude_headless(prompt, prefix, work, extra):
     return ["claude", "-p", prompt, "--model", "sonnet", "--max-turns", "4", "--allowedTools", f"Bash({prefix}:*)",
             *extra]
@@ -118,8 +127,42 @@ def codex_hook(work, provider, instance):
 
 
 def gemini_headless(prompt, prefix, work, extra):
-    # gemini 0.1.3 drops its shell tool in non-interactive mode unless --yolo, and has no per-command allow rule
-    return ["gemini", "-p", prompt, "--yolo", *extra]
+    # gemini 0.63 -p turns every tool call that needs approval into a deny, so the shell command needs --yolo
+    return ["gemini", "-p", prompt, *extra]
+
+
+# -p stops in an untrusted folder; this trusts it for one process and writes nothing. --skip-trust would come too
+# late: gemini reads the folder's settings, hooks included, before it parses its arguments.
+GEMINI_TRUST = {"GEMINI_CLI_TRUST_WORKSPACE": "true"}
+
+
+def gemini_workspace_hook(work, name, event, command):
+    # A hook in .gemini/settings.json is a project hook: gemini runs it only in a trusted folder and adds
+    # "name:command" under the folder to ~/.gemini/trusted_hooks.json the first time, hence hook_dir and fixed
+    # commands. It runs through powershell -Command as a child of gemini's node.exe, with gemini's environment;
+    # timeout is in ms.
+    f = work / ".gemini" / "settings.json"
+    f.parent.mkdir(exist_ok=True)
+    data = json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+    data.setdefault("hooks", {})[event] = [{"hooks": [{"name": name, "type": "command", "command": command,
+                                                        "timeout": 30000}]}]
+    f.write_text(json.dumps(data, indent=1), encoding="utf-8")
+
+
+def gemini_hook(work, provider, instance):
+    gemini_workspace_hook(work, "guardian-adopt", "SessionStart", hook_command(provider, instance))
+    return [], dict(GEMINI_TRUST)
+
+
+def gemini_hook_child(work, command):
+    # BeforeAgent fires after the SessionStart hooks finished and right before the model call
+    gemini_workspace_hook(work, "guardian-probe", "BeforeAgent", command)
+    return {}
+
+
+def gemini_child(work, command):
+    # srun and shim: no hooks, so no folder but hook_dir enters the trust list
+    return {**node_probe(work, command), **GEMINI_TRUST}
 
 
 def node_probe(work, command):
@@ -199,8 +242,9 @@ def agy_child(work, command):
 SPECS = {
     "claude": {"python": PY, "headless": claude_headless, "hook": claude_hook, "own_job": True},
     "codex": {"python": PY, "headless": codex_headless, "hook": codex_hook},
-    "gemini": {"python": PY, "headless": gemini_headless, "hook": None, "yolo": True, "version_probe": node_probe,
-               "hook_none": "gemini-cli 0.1.3 has no hooks (they arrive in 0.15 and are on by default from 0.24)"},
+    "gemini": {"python": PY, "headless": gemini_headless, "hook": gemini_hook, "hook_child": gemini_hook_child,
+               "child": gemini_child, "yolo_flag": "--yolo", "version_probe": node_probe, "own_job": True,
+               "hook_dir": lambda instance: home_dir(instance) / "check" / "gemini-hook"},
     "cursor": {"python": "python", "headless": cursor_headless, "hook": cursor_hook, "own_job": True},
     "grok": {"python": "python", "headless": grok_headless, "hook": grok_hook, "probe": grok_probe},
     "antigravity": {"python": PY, "headless": agy_headless, "hook": agy_hook, "child": agy_child,
@@ -298,7 +342,8 @@ def level_srun(p, spec, a, work):
     log = home_dir(a.instance) / "adopt.log"
     seen = len(read_jsonl(log))
     tool, allow = tool_route(spec, a)
-    extra_argv, extra_env = spec["hook"](work, p.name, a.instance) if spec.get("hook") else ([], {})
+    wire = spec.get("hook") and not spec.get("hook_dir")  # hooks only ever in hook_dir
+    extra_argv, extra_env = spec["hook"](work, p.name, a.instance) if wire else ([], {})
     prefix = f"{spec['python']} -I {WHEREAMI}"
     cmd = f"{prefix} --instance {a.instance} --out {out_file.as_posix()}"
     child_file, child_env = wire_child(spec.get("child"), work, prefix, a, f"{p.name}-srun")
@@ -321,9 +366,14 @@ def level_hook(p, spec, a, work):
     extra_argv, extra_env = spec["hook"](work, p.name, a.instance)
     prefix = f"{spec['python']} -I {WHEREAMI}"
     cmd = f"{prefix} --instance {a.instance} --out {out_file.as_posix()}"
-    child_file, child_env = wire_child(spec.get("child"), work, prefix, a, f"{p.name}-hook")
+    child_file, child_env = wire_child(spec.get("hook_child") or spec.get("child"), work, prefix, a, f"{p.name}-hook")
+    for f in (out_file, child_file):
+        f.unlink(missing_ok=True)  # a hook_dir still holds the last run's rows
     argv = spec["headless"](tool_prompt(cmd) if tool else PLAIN_PROMPT, prefix, work, extra_argv + allow)
     console = work / f"{p.name}-hook.out"
+    # the real CLI, not a Guardian wrapper ahead of it on PATH: a wrapper would put the CLI in a session before its
+    # hook runs, and the hook would only find it already adopted
+    argv[0] = real_cli(argv[0]) or argv[0]
     pid = launch_detached(argv, work, {**clean_env(), **extra_env, **child_env}, console)
     finished = wait_exit(pid, a.timeout)
     rows, child = read_jsonl(out_file), read_jsonl(child_file)
@@ -400,7 +450,7 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=8768)
     ap.add_argument("--timeout", type=int, default=240, help="seconds per model run")
     ap.add_argument("--allow-yolo", action="store_true",
-                    help="let a CLI whose only headless shell route approves everything (gemini 0.1.3, agy without "
+                    help="let a CLI whose only headless shell route approves everything (gemini 0.63 -p, agy without "
                          "global permission rules) run its shell command")
     a = ap.parse_args(argv)
     levels = a.levels.split(",")
@@ -422,6 +472,8 @@ def main(argv=None):
         spec = SPECS.get(name)
         for lv in levels:
             wd = work / lv if spec and spec.get("level_dirs") else work
+            if lv == "hook" and spec and spec.get("hook_dir"):
+                wd = spec["hook_dir"](a.instance)
             wd.mkdir(exist_ok=True)
             if lv == "version":
                 r = level_version(p, a, wd)

@@ -36,6 +36,13 @@ Guardian only controls work it launched, adopted or put in a desktop job (see be
 Cursor desktop apps but never assigns the apps' own processes to a job. Cloud sessions run on remote machines and
 use no local CPU, so there is nothing to control locally.
 
+What else loads the machine is on the dashboard too, in the table 「Guardian 控管外的負載」, and on the last line of
+`guardctl status`. Every 2 seconds the daemon reads the CPU time of every process in one SystemProcessInformation
+call, protected ones such as Defender included, leaves out the processes in its jobs and itself, and lists the top
+five image names with their cores and process counts. Under them are the whole machine's busy cores and the part
+that belongs to no process row: interrupt and DPC time, and processes that start and end between two samples. A new
+process counts from its second sample.
+
 ## The foreground probe
 
 `probe.py` is a normal-priority process that asks for the CPU 60 times a second, does 1 ms of work each time, and
@@ -304,6 +311,13 @@ Disk and memory priority, 2026-10-17, test instance `r6live`: a srun run (python
 conhost) read low I/O and low memory priority within a second. `guardctl io-priority normal` set I/O back to normal
 on all three and left memory low; rollback set I/O, memory and CPU priority to normal, and `resume-control` brought
 low back. In a unit test a process set to low passed low I/O and memory priority to a child it started afterwards.
+
+Load outside Guardian, 2026-10-17, test instance `r6b`: one SystemProcessInformation call read 612 processes in
+about 7 ms, and its CPU seconds matched GetProcessTimes on all 422 processes that GetProcessTimes could open. The
+other 190 or so gave GetProcessTimes no reading, Defender and services among them; Defender's MsMpEng.exe was
+the top row, at 0.45 to 2.7 cores while tests ran. Over three 4-second windows the processes added up to 2.0 to
+3.0 cores against 2.7 to 5.3 busy cores from GetSystemTimes; the dashboard shows that gap as its own row. The
+daemon, without the probe, used 0.015 cores over 20 s with the sampler running.
 
 ## Known limits
 

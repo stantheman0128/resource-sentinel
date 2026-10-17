@@ -221,6 +221,7 @@ class Guardian:
         self.history = collections.deque(maxlen=300)
         self.events = collections.deque(maxlen=200)
         self.apps_rows = []
+        self.outside = None  # CPU of the processes outside Guardian's jobs, top image names first
         self.last_launch, self.launch_starts = -1e9, []
         self.pool_priority = c["pool_priority"]
         self.pool_priority_readback = None
@@ -541,9 +542,15 @@ class Guardian:
                 self.probe_last, self.probe_t = w, time.monotonic()
 
     def apps_loop(self):
-        from .apps import AppObserver
-        obs = AppObserver()
+        from .apps import AppObserver, LoadObserver
+        obs, load = AppObserver(), LoadObserver()
         while not self.stop.wait(2.0):
+            try:
+                with self.lock:
+                    members = self.members()
+                self.outside = load.sample(members | {os.getpid()})
+            except Exception as e:
+                self.outside = {"error": str(e)}
             try:
                 rows = obs.sample()
                 with self.lock:
@@ -1256,7 +1263,7 @@ class Guardian:
                           "est_gib": round(r.est_gib, 2), "est_source": r.est_source,
                           "commit_gib": round(r.commit_gib, 2)} for r in self.live.values() if r.state != "queued"],
                 "recent_runs": self.ledger.recent_runs(12),
-                "apps": self.apps_rows, "decisions": self.ledger.recent_decisions(25),
+                "apps": self.apps_rows, "outside": self.outside, "decisions": self.ledger.recent_decisions(25),
                 "events": list(self.events)[:30], "history": list(self.history)[-180:],
             }
 

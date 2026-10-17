@@ -85,6 +85,32 @@ def _process_cpu_s(pid):
         wj.CloseHandle(h)
 
 
+def _process_times():
+    """{pid: (image name, kernel+user CPU seconds)} for every process from one SystemProcessInformation call, so
+    elevated and protected processes (Defender, services) are counted too. x64 SYSTEM_PROCESS_INFORMATION offsets;
+    measured 2026-10-17: 612 processes in about 7 ms, CPU seconds equal to GetProcessTimes on all 422 readable."""
+    size = 1 << 22
+    while True:
+        buf = ctypes.create_string_buffer(size)
+        need = ctypes.c_ulong()
+        st = _ntdll.NtQuerySystemInformation(5, buf, size, ctypes.byref(need)) & 0xFFFFFFFF
+        if st == 0:
+            break
+        if st != 0xC0000004 or size > 1 << 28:
+            raise OSError(f"NtQuerySystemInformation status {st:#x}")
+        size = max(size * 2, need.value + (1 << 20))
+    out, off = {}, 0
+    while True:
+        at = lambda t, o: t.from_buffer(buf, off + o).value
+        cpu = at(ctypes.c_longlong, 0x28) + at(ctypes.c_longlong, 0x30)  # UserTime + KernelTime, 100 ns
+        name_len, name_ptr = at(ctypes.c_ushort, 0x38), at(ctypes.c_void_p, 0x40)  # ImageName
+        out[at(ctypes.c_size_t, 0x50)] = (ctypes.wstring_at(name_ptr, name_len // 2) if name_ptr else "", cpu / 1e7)
+        nxt = ctypes.c_ulong.from_buffer(buf, off).value
+        if not nxt:
+            return out
+        off += nxt
+
+
 class AppObserver:
     """Finds each app's root process and its widest self-held job, then reports CPU cores and coverage."""
 
@@ -164,3 +190,44 @@ class AppObserver:
             row["cores"] = round(max(0.0, (cpu_s - prev[1]) / (now - prev[0])), 2) if prev and now > prev[0] else None
             out.append(row)
         return out
+
+
+class LoadObserver:
+    """CPU of every process outside Guardian's jobs, grouped by image name, so the dashboard shows what else is
+    loading the machine (a browser, Raycast, Defender) next to what the agents use."""
+
+    def __init__(self, times=None, busy=None, cpus=None):
+        self._times = times or _process_times
+        self._busy = busy or wj.system_busy()  # whole-machine busy fraction since the previous call
+        self._cpus = cpus or os.cpu_count()
+        self._prev = None  # (t, {pid: (name, cpu_s)})
+
+    def sample(self, members, now=None, top=5):
+        now = time.monotonic() if now is None else now
+        cur, busy = self._times(), self._busy()
+        prev, self._prev = self._prev, (now, cur)
+        if not prev or now <= prev[0]:
+            return None
+        groups, in_jobs = {}, 0.0
+        for pid, (name, cpu_s) in cur.items():
+            old = prev[1].get(pid)
+            # pid 0 is the idle process; a pid seen for the first time, or reused by another image, waits a sample
+            if pid == 0 or not old or old[0] != name:
+                continue
+            cores = max(0.0, cpu_s - old[1]) / (now - prev[0])
+            if pid in members:
+                in_jobs += cores
+                continue
+            g = groups.setdefault(name.lower(), [name, 0.0, 0])
+            g[1] += cores
+            g[2] += 1
+        rows = sorted(groups.values(), key=lambda g: -g[1])
+        outside = sum(g[1] for g in rows)
+        machine = None if busy is None else busy * self._cpus
+        return {"cores": round(outside, 2), "processes": sum(g[2] for g in rows),
+                "top": [{"name": n, "cores": round(c, 2), "processes": k} for n, c, k in rows[:top] if c >= 0.01],
+                "machine_cores": None if machine is None else round(machine, 2),
+                # interrupts and DPCs, and processes that started and ended between two samples, belong to no row
+                "unattributed_cores": None if machine is None else round(max(0.0, machine - outside - in_jobs), 2),
+                "coverage": "observed: every process outside Guardian's jobs, protected ones too; "
+                            "a new process counts from its second sample"}

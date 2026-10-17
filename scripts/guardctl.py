@@ -57,6 +57,14 @@ def summary(s):
         lines.append(f"  queued {q['run_id']} {q['session']} {q['label']!r}: {q['reason']}")
     for a in s["apps"]:
         lines.append(f"  app {a.get('name')}: {a.get('cores')} cores, {a.get('coverage')}")
+    o = s.get("outside")
+    if o and "error" in o:
+        lines.append(f"outside Guardian: {o['error']}")
+    elif o:
+        lines.append(f"outside Guardian {o['cores']} cores in {o['processes']} processes: "
+                     + ", ".join(f"{t['name']} {t['cores']}" for t in o["top"])
+                     + (f"  (machine {o['machine_cores']}, in no process {o['unattributed_cores']})"
+                        if o.get("machine_cores") is not None else ""))
     return "\n".join(lines)
 
 

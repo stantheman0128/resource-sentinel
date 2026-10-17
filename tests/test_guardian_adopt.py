@@ -744,6 +744,33 @@ class AgentPriorityTests(unittest.TestCase):
             p.wait()
 
 
+class OutsideLoadTests(unittest.TestCase):
+    def test_groups_by_image_and_skips_members_idle_new_and_reused_pids(self):
+        from sentinel.guardian.apps import LoadObserver
+        samples = iter([
+            {0: ("", 100.0), 10: ("chrome.exe", 5.0), 11: ("Chrome.exe", 1.0), 12: ("node.exe", 0.0),
+             13: ("raycast.exe", 2.0), 14: ("old.exe", 9.0)},
+            {0: ("", 120.0), 10: ("chrome.exe", 7.0), 11: ("Chrome.exe", 2.0), 12: ("node.exe", 4.0),
+             13: ("raycast.exe", 2.5), 14: ("new.exe", 9.5), 15: ("fresh.exe", 3.0)},
+        ])
+        busy = iter([None, 0.5])
+        obs = LoadObserver(times=lambda: next(samples), busy=lambda: next(busy), cpus=12)
+        self.assertIsNone(obs.sample(set(), now=0.0))
+        out = obs.sample({12}, now=2.0)  # node.exe 12 is in a Guardian job
+        self.assertEqual(out["top"], [{"name": "chrome.exe", "cores": 1.5, "processes": 2},
+                                      {"name": "raycast.exe", "cores": 0.25, "processes": 1}])
+        self.assertEqual((out["cores"], out["processes"]), (1.75, 3))
+        # 6 busy cores: 1.75 outside, 2.0 in the job, the rest is in no process row
+        self.assertEqual((out["machine_cores"], out["unattributed_cores"]), (6.0, 2.25))
+
+    def test_one_system_call_reads_this_process_like_getprocesstimes(self):
+        from sentinel.guardian import apps
+        sum(range(2_000_000))
+        name, cpu_s = apps._process_times()[os.getpid()]
+        self.assertEqual(name.lower(), Path(sys.executable).name.lower())
+        self.assertLess(abs(cpu_s - apps._process_cpu_s(os.getpid())), 0.1)
+
+
 class FakeJob:
     def __init__(self):
         self.calls = []

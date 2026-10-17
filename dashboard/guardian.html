@@ -98,6 +98,7 @@ canvas { width: 100%; height: 240px; display: block; }
       <section><h2>依工具分組</h2><table id="providers"></table></section>
       <section><h2>已經在跑的 agent app（只觀察，不控管）</h2><table id="apps"></table></section>
     </div>
+    <section><h2>Guardian 控管外的負載（只觀察）</h2><table id="outside"></table></section>
     <section><h2>排隊中與執行中的指令</h2><table id="runs"></table></section>
     <div class="two">
       <section><h2>調整紀錄（附 Windows 讀回值）</h2><div class="log" id="decisions"></div></section>
@@ -163,6 +164,14 @@ function render(s) {
 
   document.getElementById('apps').innerHTML = '<tr><th>App</th><th>用掉（核）</th><th>量測方式</th></tr>' +
     s.apps.map(a => `<tr><td>${esc(a.name)}</td><td>${f2(a.cores)}</td><td class="sub">${esc(a.coverage || a.error)}</td></tr>`).join('');
+  const o = s.outside;
+  document.getElementById('outside').innerHTML = !o ? '<tr><td class="sub">量測中</td></tr>'
+    : o.error ? `<tr><td class="sub">${esc(o.error)}</td></tr>`
+    : '<tr><th>程式</th><th>用掉（核）</th><th>程序數</th></tr>' +
+      o.top.map(t => `<tr><td>${esc(t.name)}</td><td>${f2(t.cores)}</td><td>${t.processes}</td></tr>`).join('') +
+      `<tr><td class="sub">合計，${o.processes} 個程序</td><td>${f2(o.cores)}</td><td></td></tr>` +
+      (o.machine_cores == null ? '' : `<tr><td class="sub">算不到個別程序（中斷、兩次取樣間就結束的程序）</td><td>${f2(o.unattributed_cores)}</td><td></td></tr>` +
+        `<tr><td class="sub">整台電腦</td><td>${f2(o.machine_cores)}</td><td></td></tr>`);
 
   const maxc = Math.max(s.cap_cores, 0.1);
   // rebuilding the table every second would close a 重要性 menu the moment it opens; wait until it loses focus

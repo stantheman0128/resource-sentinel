@@ -12,6 +12,9 @@
 - Agent processes get low I/O and low memory priority. The daemon sets both once on each process that shows up in
   one of its jobs, and children started afterwards inherit them. `guardctl io-priority` and `memory-priority` change
   the level, the dashboard shows it, rollback restores normal, and a shutdown keeps it low.
+- The dashboard and `guardctl status` show the load outside Guardian: the top five image names by CPU among the
+  processes not in its jobs, protected ones included, next to the whole machine's busy cores and the part no process
+  row accounts for.
 
 ## Unreleased - 2026-10-13
 

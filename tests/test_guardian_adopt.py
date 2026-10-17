@@ -761,13 +761,14 @@ class CursorAppTests(unittest.TestCase):
     def test_the_topmost_marked_process_under_cursor_is_an_agent_command(self):
         table, path = cursor_tree((600, 4, "pwsh.exe", ""), (610, 600, "python.exe", ""))
         read = []
-        env = cursor_env({530, 540, 610, 500, 510})
+        env = cursor_env({530, 540, 610, 500})
 
         def environment(pid):
             read.append(pid)
             return env(pid)
         self.assertEqual(PV.agent_commands(table, path, environment), [(530, "cursor", CHAT)])
-        self.assertFalse({500, 510} & set(read))  # Cursor's own processes are never read
+        # of Cursor's own processes only the one right above the command is read, for whether it has the mark too
+        self.assertEqual((read.count(510), read.count(500)), (1, 0))
         self.assertNotIn(610, read)  # nothing outside Cursor is read either
 
     def test_covered_and_unreadable_processes_are_left_out(self):
@@ -1802,6 +1803,100 @@ class MemoryLadderPauseTests(unittest.TestCase):
         self.assertNotIn(("rate", 1), self.small.job.calls)
         self.assertEqual((self.trimmed, g.mem_paused), ([], set()))
         g.root.set_cpu.assert_called_once_with()  # the shutdown's release only: no cap applied after it
+
+
+class CursorCommandPlacementTests(unittest.TestCase):
+    """The real desktop loop, desktop_once, place_desktop, join_desktop and track_desktop on fake jobs and a fake
+    Cursor process table: each agent command is placed once, and nothing under a Cursor that carries the mark."""
+    make_job = NestedAdoptTests.make_job
+    # Cursor (500), an extension host (510) and Stan's own terminal shell (550)
+    HOST = ((4, 1, "svchost.exe", ""), (500, 4, "Cursor.exe", CURSOR_APP), (510, 500, "Cursor.exe", CURSOR_APP),
+            (550, 510, "pwsh.exe", ""))
+    COMMAND = ((530, 510, "pwsh.exe", ""), (540, 530, "node.exe", PLAIN_NODE))  # an agent command and its child
+    WORKER = ((520, 510, "node.exe", CURSOR_WORKER), (525, 520, "conhost.exe", ""), (527, 520, "pwsh.exe", ""))
+    CHAT_JOB = "t.d.cursor.chat-0c9f6a1e3b2d"
+
+    def setUp(self):
+        NestedAdoptTests.setUp(self)
+        self.g.desktop_on, self.g.marked_apps = True, set()
+        self.env = cursor_env(set())
+        p = mock.patch.object(self.wj, "environment", lambda pid: self.env(pid))  # made-up pids: never read for real
+        p.start()
+        self.addCleanup(p.stop)
+
+    def scan(self, *rows):
+        """One pass of the desktop loop over Cursor with these processes added."""
+        self.table, self.path = tree(*self.HOST, *rows)
+        self.g.stop = mock.Mock()
+        self.g.stop.wait.side_effect = [False, True]
+        self.g.desktop_loop()
+        self.assertFalse([c for c in self.g.log.call_args_list if "desktop poll failed" in c.args[0]])
+
+    def test_a_new_workers_marked_child_stays_in_its_job_and_the_chat_takes_a_second_command(self):
+        self.env = cursor_env({527, 530, 540, 560})
+        self.scan(*self.COMMAND)
+        chat = self.jobs[self.CHAT_JOB]
+        self.assertEqual(chat.members, {530, 540})
+        # the worker shows up with a child that already carries the mark, next to a second command of the chat
+        second = (560, 510, "python.exe", "")
+        self.scan(*self.COMMAND, *self.WORKER, second)
+        self.assertEqual(sorted(self.jobs), [self.CHAT_JOB, "t.d.cursor.desk-520", "t.p.cursor"])
+        self.assertEqual(self.jobs["t.d.cursor.desk-520"].members, {520, 525, 527})
+        self.assertEqual(chat.members, {530, 540, 560})  # the second command joined; the worker's child did not
+        self.assertEqual([self.g.sessions[k].live_runs for k in ("cursor/chat-0c9f6a1e3b2d", "cursor/desk-520")],
+                         [2, 1])
+        made = self.created.call_count
+        self.scan(*self.COMMAND, *self.WORKER, second)
+        self.assertEqual(self.created.call_count, made)
+        self.assertEqual(chat.members, {530, 540, 560})
+
+    def test_a_command_under_a_worker_gets_no_job_of_its_own(self):
+        self.env = cursor_env({527})
+        self.scan(*self.WORKER)  # the chat has no job yet
+        self.assertEqual(sorted(self.jobs), ["t.d.cursor.desk-520", "t.p.cursor"])
+        self.assertEqual(self.jobs["t.d.cursor.desk-520"].members, {520, 525, 527})
+
+    def test_a_command_under_a_refused_worker_is_left_alone(self):
+        self.env = cursor_env({527})
+        self.g.desktop_skip.add(520)
+        self.scan(*self.WORKER)
+        self.created.assert_not_called()
+
+    def test_a_command_another_command_swept_in_this_pass_is_not_placed_again(self):
+        # a marked command (530), an unmarked child (540), and under it a marked command without a chat id (545)
+        self.env = lambda pid: ({"CURSOR_AGENT": "1", "CURSOR_CONVERSATION_ID": CHAT} if pid == 530 else
+                                {"CURSOR_AGENT": "1"} if pid == 545 else {})
+        self.scan(*self.COMMAND, (545, 540, "python.exe", ""))
+        self.assertEqual(sorted(self.jobs), [self.CHAT_JOB, "t.p.cursor"])
+        self.assertEqual(self.jobs[self.CHAT_JOB].members, {530, 540, 545})
+
+    def test_nothing_under_a_cursor_that_carries_the_mark_is_a_command(self):
+        # `cursor .` run by an agent command: Cursor starts with the mark, and everything under it inherits it
+        table, path = tree(*self.HOST, *self.COMMAND, *self.WORKER)
+        env, read, apps = cursor_env({500, 510, 520, 525, 527, 530, 540, 550}), [], {}
+
+        def environment(pid):
+            read.append(pid)
+            return env(pid)
+        self.assertEqual(PV.agent_commands(table, path, environment, marked_apps=apps), [])
+        self.assertEqual(apps, {510: True})
+        self.assertEqual((read.count(510), read.count(500)), (1, 0))  # the nearest app process only, once
+        # an extension host without the mark lets its commands count, whatever the process above it has
+        self.assertEqual(PV.agent_commands(table, path, cursor_env({500, 530, 540})), [(530, "cursor", CHAT)])
+        # one whose environment cannot be read keeps them out too
+        apps = {}
+        self.assertEqual(PV.agent_commands(table, path, lambda pid: None if pid == 510 else env(pid),
+                                           marked_apps=apps), [])
+        self.assertEqual(apps, {510: None})
+
+    def test_a_marked_cursor_keeps_its_commands_out_and_says_so_once(self):
+        self.env = cursor_env({500, 510, 520, 525, 527, 530, 540, 550})
+        for _ in range(3):
+            self.scan(*self.COMMAND, *self.WORKER)
+        self.assertEqual(sorted(self.jobs), ["t.d.cursor.desk-520", "t.p.cursor"])  # the worker is found by its path
+        said = [c.args[0] for c in self.g.log.call_args_list if "pid 510" in c.args[0]]
+        self.assertEqual(said, ["Cursor.exe pid 510 carries the agent mark itself, so every process under it has it: "
+                                "its agent commands stay out of desktop jobs"])
 
 
 if __name__ == "__main__":

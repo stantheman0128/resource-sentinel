@@ -205,6 +205,7 @@ class Guardian:
         # desktop jobs: on by default for the main instance only, so a test instance never reaches into the apps
         self.desktop_on = self.instance == "main" if desktop is None else bool(desktop)
         self.desktop_skip = set()  # desktop CLI pids refused or failed once; not tried again while they run
+        self.marked_apps = set()   # app pids that keep their agent commands out (see agent_commands), logged once
         self.home = home_dir(self.instance)
         self.home.mkdir(parents=True, exist_ok=True)
         self.cfg = P.merged(P.DEFAULTS, cfg_over)
@@ -1164,10 +1165,18 @@ class Guardian:
                         except OSError:
                             pass
                 # environments are read outside the lock: a few processes under the apps, about 1 ms each
-                commands = PV.agent_commands(table, wj.image_path, wj.environment, inside | {p for p, _ in targets})
+                marked = {}
+                commands = PV.agent_commands(table, wj.image_path, wj.environment, inside | {p for p, _ in targets},
+                                             marked_apps=marked)
                 with self.lock:
                     if self.desktop_on:
                         self.desktop_once(table, targets, commands)
+                    for pid in sorted(marked.keys() - self.marked_apps):  # once for each app process, not every pass
+                        self.log(f"{table[pid][1]} pid {pid} " + (
+                            "carries the agent mark itself, so every process under it has it" if marked[pid] else
+                            "has an environment Guardian cannot read, so its mark is unknown") +
+                            ": its agent commands stay out of desktop jobs")
+                    self.marked_apps = (self.marked_apps & set(table)) | marked.keys()
             except Exception:
                 self.log("desktop poll failed: " + traceback.format_exc(limit=3).replace("\n", " | "))
 
@@ -1176,7 +1185,14 @@ class Guardian:
         for pid, provider in targets:
             if f"{provider}/desk-{pid}" not in self.sessions and pid not in self.desktop_skip:
                 self.place_desktop(pid, provider, table)
+        clis = {p for p, _ in targets}
         for pid, provider, chat in commands:
+            # a command under a desktop CLI is left to that CLI's job, as desktop_targets leaves a target under another
+            # target, and one that a sweep of this pass already put in a desktop job stays there: a job placed for it
+            # would nest inside that one, and the pool figure would count its CPU twice
+            if clis & set(wj.ancestors(pid, table)) or \
+                    any(wj.in_job(pid, s.job.h) for s in self.sessions.values() if s.desktop):
+                continue
             if pid not in self.desktop_skip and pid not in self.adopted:
                 self.place_command(pid, provider, chat, table)
         self.drop_ended()

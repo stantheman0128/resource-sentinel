@@ -105,6 +105,17 @@ def app_among(pid, table, image_path, max_depth=16):
     return None
 
 
+def app_process(pid, table, image_path, max_depth=16):
+    """The nearest process that is pid itself or one of its parents and belongs to a desktop app, or None."""
+    seen, depth = set(), 0
+    while pid in table and pid not in seen and depth <= max_depth:
+        seen.add(pid)
+        if app_of(pid, table[pid][1], image_path):
+            return pid
+        pid, depth = table[pid][0], depth + 1
+    return None
+
+
 # The CLIs the desktop apps run for their agent sessions, told apart by where the app installs them: the Claude app
 # under %APPDATA%\Claude\claude-code\<version>\<hash>\, the Codex app under %LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\,
 # and Cursor 3.25 its bundled cursor-agent CLI under %APPDATA%\Cursor\User\globalStorage\anysphere.cursor-agent-worker\
@@ -148,13 +159,17 @@ def desktop_targets(table, image_path, max_depth=16):
     return sorted(out)
 
 
-def agent_commands(table, image_path, environment, inside=(), max_depth=16):
+def agent_commands(table, image_path, environment, inside=(), max_depth=16, marked_apps=None):
     """Agent commands under a desktop app that no desktop job holds yet, as a sorted list of (pid, provider, chat):
     a process with the app among its parents and the app's mark in its environment (AGENT_ENV), whose parent lacks
-    the mark, since the children of the topmost one inherit its job. The apps' own processes are never read.
-    environment(pid) returns a dict or None; chat is the id from the chat variable, or None. inside: pids to leave
-    out, such as those already in a desktop job."""
-    paths, envs = {}, {}
+    the mark, since the children of the topmost one inherit its job. The nearest app process above it must lack the
+    mark as well: an app that started with the mark (`cursor .` run by an agent command) passes it to everything it
+    starts, Stan's own terminal shells too, so nothing under it counts, and neither does anything under an app
+    process whose environment cannot be read. Of the apps' own processes only that nearest one is read, and only
+    whether it has the mark is kept. environment(pid) returns a dict or None; chat is the id from the chat variable,
+    or None. inside: pids to leave out, such as those already in a desktop job. marked_apps: a dict that receives,
+    for each app process that kept commands out, True (it has the mark) or None (it cannot be read)."""
+    paths, envs, apps = {}, {}, {}
 
     def path(pid):
         if pid not in paths:
@@ -166,16 +181,27 @@ def agent_commands(table, image_path, environment, inside=(), max_depth=16):
             envs[pid] = environment(pid) or {}
         return envs[pid].get(var) == value
 
+    def app_marked(pid, var, value):
+        if (pid, var) not in apps:
+            env = environment(pid)
+            apps[pid, var] = None if env is None else env.get(var) == value
+        return apps[pid, var]
+
     out = []
     for pid, (ppid, image) in table.items():
         if pid in inside or app_of(pid, image, path):
             continue
         for provider, (var, value, chat_var, app) in AGENT_ENV.items():
-            if app_among(ppid, table, path, max_depth) != app or not marked(pid, var, value):
+            up = app_process(ppid, table, path, max_depth)
+            if up is None or app_of(up, table[up][1], path) != app or not marked(pid, var, value):
                 continue
             parent = table.get(ppid)
             if parent and not app_of(ppid, parent[1], path) and marked(ppid, var, value):
                 continue  # not the topmost marked process
+            if app_marked(up, var, value) is not False:  # the mark came from the app itself, or it cannot be told
+                if marked_apps is not None:
+                    marked_apps[up] = apps[up, var]
+                continue
             out.append((pid, provider, envs[pid].get(chat_var) or None))
     return sorted(out, key=lambda x: x[0])
 

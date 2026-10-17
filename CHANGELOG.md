@@ -48,6 +48,11 @@
 - `guardian.py --policy FILE` checks the file against the policy defaults before the daemon starts. An unknown
   key, a wrong type, a level outside its set or an allocation weight that is not above 0 stops it with exit code 2
   and a message naming the key. `guardian-sim.py` no longer fails on a ledger exactly `--seconds` long.
+- Each Cursor agent command is placed once. A command under a Cursor agent worker, or one an earlier command
+  already swept into a chat job, no longer gets a job of its own, so its CPU is not counted twice. A Cursor started
+  with `CURSOR_AGENT=1` passes the mark to every process under it, so the daemon also reads the mark of the nearest
+  Cursor.exe above a command and places nothing under one that carries it or cannot be read. It logs that once per
+  Cursor.exe.
 
 ## Unreleased - 2026-10-13
 

@@ -231,12 +231,15 @@ A CLI gets into Guardian one of four ways:
    that node.exe like the Claude and Codex CLIs above (`cursor/desk-<pid>`). Some agent commands start outside the
    worker, straight from the extension host. Those carry `CURSOR_AGENT=1` and the chat's id in
    `CURSOR_CONVERSATION_ID`, which Cursor's agent code sets and which commands Stan types in Cursor's terminal do
-   not have. Every 2 s the daemon reads the environment of the processes under Cursor that no desktop job holds
-   yet (from the process's PEB, about 3 ms for 620 processes), and puts the topmost marked one of each chain into a
-   desktop job named after the chat, `cursor/chat-<first 12 letters and digits of the id>`. More commands of the same
-   chat join that job; one that cannot join it (it sits in another job) gets `chat-<id>-<pid>`, and a marked
-   command without a chat id gets `cmd-<pid>`. Cursor's own processes and unmarked commands are never placed.
-   whereami finds these jobs by name too.
+   not have. A Cursor that itself started with the mark (`cursor .` run by an agent command while Cursor was closed)
+   passes it to every process it starts, Stan's terminal shells too, so the daemon checks the Cursor.exe right above
+   each marked process, keeping only whether it has the mark, and places nothing under one that has it or cannot be
+   read; the log says so once per Cursor.exe. Every 2 s the daemon reads the environment of the processes under
+   Cursor that no desktop job holds yet (from the process's PEB, about 3 ms for 620 processes), and puts the topmost
+   marked one of each chain into a desktop job named after the chat,
+   `cursor/chat-<first 12 letters and digits of the id>`. More commands of the same chat join that job; one that
+   cannot join it (it sits in another job) gets `chat-<id>-<pid>`, and a marked command without a chat id gets
+   `cmd-<pid>`. Cursor's own processes and unmarked commands are never placed. whereami finds these jobs by name too.
 
 Guardian never sets the breakaway limits on its jobs (`JOB_OBJECT_LIMIT_BREAKAWAY_OK` and
 `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`; winjob.py only reads them back), so every child a controlled CLI starts
@@ -391,15 +394,17 @@ between 0.17 and 3.08 cores, while the controller raised the pool budget from 10
 second the cap held less tightly: in 46 of 170 one-second samples the job used more than 0.05 cores above both the
 cap set before the sample and the one set after it, by 0.20 cores on average and 0.65 at most.
 
-Cursor app, 2026-10-17, on a test instance that knew only Cursor (`--desktop on`, so main kept the Claude and Codex
-CLIs): within 2 s of start it placed both workspace workers (node.exe and a child each) in `desk-<pid>` jobs. Five
-commands were then started with a Cursor extension host as parent (`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`), each a
-python with one python child. Three carried `CURSOR_AGENT=1` and the same chat id, two of them under one extension
-host and one under the other; all three and their children went into one `chat-7d3e9a105b2c` job. One marked
-without a chat id went into `cmd-<pid>`, and the unmarked one stayed out at normal priority. The placed processes
-ran at below normal. In the same minutes a real chat in Cursor ran powershell.exe and python.exe commands; the
-daemon placed each in `chat-938e5e53d86a` within 2 s, and ended the session when they exited. With the pipe cut
-off, whereami still answered CONTROLLED for the chat and `cmd-` jobs and for a child of a placed command.
+Cursor app, 2026-10-17, on a test instance with `--desktop on`. The daemon has no option that limits desktop jobs to
+one app, so the instance ran from a scratch launcher that left only cursor in the desktop CLI table (`DESKTOP_CLIS`
+in providers.py), and main kept the Claude and Codex CLIs. Within 2 s of start the instance placed both workspace
+workers (node.exe and a child each) in `desk-<pid>` jobs. Five commands were then started with a Cursor extension
+host as parent (`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`), each a python with one python child. Three carried
+`CURSOR_AGENT=1` and the same chat id, two of them under one extension host and one under the other; all three and
+their children went into one `chat-7d3e9a105b2c` job. One marked without a chat id went into `cmd-<pid>`, and the
+unmarked one stayed out at normal priority. The placed processes ran at below normal. In the same minutes a real chat
+in Cursor ran powershell.exe and python.exe commands; the daemon placed each in `chat-938e5e53d86a` within 2 s, and
+ended the session when they exited. With the pipe cut off, whereami still answered CONTROLLED for the chat and `cmd-`
+jobs and for a child of a placed command.
 
 Disk and memory priority, 2026-10-17, test instance `r6live`: a srun run (python with one python child, and its
 conhost) read low I/O and low memory priority within a second. `guardctl io-priority normal` set I/O back to normal

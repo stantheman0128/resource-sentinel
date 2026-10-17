@@ -486,6 +486,54 @@ prompt line as "UserPromptSubmit hook additional context". Claude Code makes up 
 run was stopped at 150 s, and it left no process behind. For Codex and Cursor only unit tests check the output shape
 their docs give: a live Codex run needs its hook trust, and cursor-agent asks to trust a new folder.
 
+The acceptance run, 2026-10-17, test instance `acc` in a 4-CPU world with desktop jobs on. A harness that WMI
+started outside every job stood in for Stan, at normal priority on the agents' 4 CPUs: a 60 fps loop with about
+3 ms of work per frame, a 4 KiB write and flush every 250 ms, and every 10 s a command that compresses 4 MiB twice
+(242 ms on the idle machine). The agents' load came through srun: four busy loops each in `claude/build` and
+`codex/tests`, two writers of 32 MiB/s in `other/disk`, and 3 GiB held in `other/memory` under a 2 GiB memory
+budget. A python with two busy loops, started with Cursor's main process as parent and `CURSOR_AGENT=1`, stood in
+for a Cursor agent command; the daemon put it and its children in desktop job `cursor/chat-acc192333` at below
+normal and low I/O. The per-prompt line for a `claude/build` process read `Guardian: claude/build normal, CPU cap
+0.59 of 4 cores, 19.8 GiB RAM available`. Four blocks of 60 s, each measured from 15 s in, switched control with
+rollback and resume-control. A frame is on time when it ends within 16.7 ms of its slot.
+
+| | Idle | Off | On | On | Off |
+|---|---|---|---|---|---|
+| Frames on time | 100% | 0.0% | 99.9% | 100% | 0.0% |
+| Frame time p95 | 4.6 ms | 133.1 ms | 6.0 ms | 6.1 ms | 127.9 ms |
+| Stan's command, median | 242 ms | 1982 ms | 275 ms | 328 ms | 1968 ms |
+| Daemon probe p95 | 1.6 ms | 62.9 ms | 1.5 ms | 1.5 ms | 63.2 ms |
+| Cores: claude, codex, cursor | | 1.50, 1.48, 0.74 | 0.53, 0.54, 0.55 | 0.93, 0.93, 0.92 | 1.48, 1.48, 0.75 |
+| Agent writes | | 64.0 MiB/s | 30.0 MiB/s | 31.8 MiB/s | 73.6 MiB/s |
+| Stan's flush p50 / p99 | 0.44 / 0.65 ms | 1.29 / 28.8 ms | 2.41 / 17.5 ms | 2.55 / 79.8 ms | 3.13 / 209.9 ms |
+
+With control off the agents took the 4 CPUs: every frame missed its slot, and Stan's command took 8 times as
+long. With control on the agents used 1.7 and then 2.9 of the 4 cores as the cap rose, frames stayed at 6 ms p95 against
+4.6 ms idle, and the command took 14% to 35% longer than idle. Under control the Cursor command got the same share as
+the two srun sessions, although it ran two loops to their four. The budget trimmed 3.0 GiB from 22 processes every
+30 s while control was on. The memory load touched all its pages every 20 s and took them back, so available RAM
+(19.4 and 17.7 GiB on, 18.5 and 17.4 GiB off) followed the rest of the machine more than the trims. In the off
+blocks Stan's flush probe itself ran short of CPU, 129 and 145 flushes where about 180 were due, so this run cannot
+say what the low I/O priority does for Stan's disk. Killing the srun clients cancelled the four runs, `guardctl
+desktop off` released the Cursor job, and no job, process or temporary file was left.
+
+A second run on the same instance, without desktop jobs, kept control on and ran only the disk agent, so the CPUs
+stayed mostly idle. It switched only the agents' I/O priority, low, normal, normal, low, and read it back from the
+writers in each block. Stan's probe wrote and flushed 4 KiB every 50 ms.
+
+| | Idle | Low | Normal | Normal | Low |
+|---|---|---|---|---|---|
+| Agent writes | | 27.9 MiB/s | 64.0 MiB/s | 64.0 MiB/s | 37.7 MiB/s |
+| Stan's flush p50 | 0.43 ms | 0.52 ms | 0.60 ms | 0.39 ms | 0.42 ms |
+| Stan's flush p95 | 0.58 ms | 8.55 ms | 12.14 ms | 10.08 ms | 5.16 ms |
+| Stan's flush p99 | 0.67 ms | 14.76 ms | 20.24 ms | 21.88 ms | 12.44 ms |
+
+Low I/O priority cut Stan's p95 and p99 flush time by 27% to 49% and left the median where it was, but the tail
+stayed 9 to 22 times the idle one. It also cost the agent 41% to 56% of its write rate, with only Stan's probe and
+the rest of the machine writing at the same time. The run cannot separate the priority's own effect from the agent
+writing less. Whether that trade is worth it is Stan's call; `guardctl io-priority normal` gives the agents
+their full write rate back.
+
 ## Known limits
 
 - The dashboard page embeds the HTTP token, so any local process can read it. It listens on 127.0.0.1 only.

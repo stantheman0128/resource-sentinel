@@ -39,6 +39,8 @@
   `whereis` answers with the session's budget, and `guardian-install-hooks.py --context --status` installs both
   hooks, as a dry run until `--apply`. Measured with a real `claude -p` on a test instance: both texts reached the
   model's request, which a local server answered with 401.
+- The acceptance run is in docs/guardian.md: control off and on under a mixed agent load in a 4-CPU world,
+  a Cursor-style agent command included, and a second run that switches only the agents' I/O priority.
 
 ## Unreleased - 2026-10-13
 

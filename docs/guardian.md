@@ -32,7 +32,8 @@ every tool command it runs stay inside it:
 - **Disk and memory priority.** Every process in a Guardian job, desktop and nested jobs included, gets low I/O
   priority, so Stan's disk reads and writes go first, and low memory priority, so the agents' pages leave the
   standby list before his. A job has no limit for either, but a process passes both to the children it starts
-  afterwards, so the daemon sets each process once, when it first shows up in a job (checked every second).
+  afterwards, so the daemon sets each process once, when it first shows up in a job (checked every second). A
+  process Windows refuses is not tried again (see Known limits).
   `guardctl io-priority very_low|low|normal` and `guardctl memory-priority very_low|low|medium|below_normal|normal`
   change the level for every member; the dashboard's subtitle shows it.
 - **Control off.** `rollback` removes every cap and puts the agents back at normal CPU, I/O and memory priority;
@@ -230,7 +231,8 @@ A CLI gets into Guardian one of four ways:
    desktop job named after the chat, `cursor/chat-<first 12 letters and digits of the id>`. More commands of the same
    chat join that job; one that cannot join it (it sits in another job) gets `chat-<id>-<pid>`, and a marked
    command without a chat id gets `cmd-<pid>`. Cursor's own processes and unmarked commands are never placed.
-   whereami finds these jobs by name too.
+   Once the daemon holds a command open, it checks it again before placing it (see Known limits). whereami finds
+   these jobs by name too.
 
 Guardian never sets the breakaway limits on its jobs (`JOB_OBJECT_LIMIT_BREAKAWAY_OK` and
 `JOB_OBJECT_LIMIT_SILENT_BREAKAWAY_OK`; winjob.py only reads them back), so every child a controlled CLI starts
@@ -633,3 +635,25 @@ their full write rate back.
   close, every child the CLI started ends with it, detached ones included, and a child started with
   `CREATE_BREAKAWAY_FROM_JOB` fails, since the nested job allows no breakaway. Outside Guardian, Node's job lets
   detached children leave and survive the CLI. Measured with a test job shaped like Node's.
+- Before it places a Cursor agent command, the daemon opens the process, which keeps its pid from being reused,
+  and reads it again: it must not be one of Cursor's own processes, Cursor must still be the nearest app among its
+  parents with each parent started before its child, and the mark must still be there. The process table has no
+  start times, and a process whose parent has exited still names the parent's pid, which a later process can take.
+  The 2-second scan trusts the table, so when a Cursor process takes such a pid, the scan counts the orphan as
+  under Cursor and reads its environment for the mark. It is not placed, because the check above sees the later
+  start. A desktop CLI (the Claude and Codex app CLIs, Cursor's worker) is checked again by its install path only:
+  if the same binary, started outside its app, took the pid in that moment, it would be placed. Unit tests cover
+  the agent command check, with fakes; it has not been seen live.
+- `winjob.environment` reads at most 1 MiB of a block. The entry cut there is dropped, not returned in part, and
+  the entries after it are not read, so a mark past the cut is missed and that command stays outside Guardian.
+- On a 32-bit Python the daemon reads no environment, so it places no Cursor agent commands, and the load outside
+  Guardian shows an error instead of figures: both readers use x64 structure offsets.
+- The daemon records by pid which members it has given the agents' I/O and memory priority, and it does not try
+  a refused member again. Windows refuses when Guardian may not open the process to set it: a protected process,
+  or one that runs elevated or as another user. That stays true while the process runs, and a member that exits
+  drops out of the record at the next sweep, so a bounded retry would most likely fail a second time. Leaving it
+  out is a design choice, not a measurement. The pid key has its own gap: when a member exits and a new
+  member takes its pid before the next sweep (one second), the new one takes over the old record, so it is not set
+  and the dashboard counts it with the old result. A child of a member that was set already has both priorities
+  from its parent, so the gap is a new member whose parent was not set. Closing it would mean reading every
+  member's start time each second.

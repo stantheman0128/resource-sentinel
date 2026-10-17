@@ -22,8 +22,7 @@ _ntdll.NtQuerySystemInformation.argtypes = [ctypes.c_ulong, ctypes.c_void_p, cty
                                             ctypes.POINTER(ctypes.c_ulong)]
 DuplicateHandle = wj._bind("DuplicateHandle", w.BOOL, wj.HANDLE, wj.HANDLE, wj.HANDLE,
                            ctypes.POINTER(wj.HANDLE), w.DWORD, w.BOOL, w.DWORD)
-GetProcessTimes = wj._bind("GetProcessTimes", w.BOOL, wj.HANDLE, ctypes.POINTER(w.FILETIME),
-                           ctypes.POINTER(w.FILETIME), ctypes.POINTER(w.FILETIME), ctypes.POINTER(w.FILETIME))
+GetProcessTimes = wj.GetProcessTimes
 
 
 class _HandleEntry(ctypes.Structure):
@@ -86,9 +85,13 @@ def _process_cpu_s(pid):
 
 
 def _process_times():
-    """{pid: (image name, kernel+user CPU seconds)} for every process from one SystemProcessInformation call, so
-    elevated and protected processes (Defender, services) are counted too. x64 SYSTEM_PROCESS_INFORMATION offsets;
-    measured 2026-10-17: 612 processes in about 7 ms, CPU seconds equal to GetProcessTimes on all 422 readable."""
+    """{pid: (image name, kernel+user CPU seconds, start time)} for every process from one SystemProcessInformation
+    call, so elevated and protected processes (Defender, services) are counted too. The start time (CreateTime, as
+    winjob.created) tells a reused pid apart. x64 SYSTEM_PROCESS_INFORMATION offsets, so a 32-bit Python gets
+    OSError; measured 2026-10-17: 612 processes in about 7 ms, CPU seconds equal to GetProcessTimes on all 422
+    readable."""
+    if not wj.X64:
+        raise OSError("the SystemProcessInformation offsets here are x64 ones; this Python is 32-bit")
     size = 1 << 22
     while True:
         buf = ctypes.create_string_buffer(size)
@@ -104,7 +107,8 @@ def _process_times():
         at = lambda t, o: t.from_buffer(buf, off + o).value
         cpu = at(ctypes.c_longlong, 0x28) + at(ctypes.c_longlong, 0x30)  # UserTime + KernelTime, 100 ns
         name_len, name_ptr = at(ctypes.c_ushort, 0x38), at(ctypes.c_void_p, 0x40)  # ImageName
-        out[at(ctypes.c_size_t, 0x50)] = (ctypes.wstring_at(name_ptr, name_len // 2) if name_ptr else "", cpu / 1e7)
+        out[at(ctypes.c_size_t, 0x50)] = (ctypes.wstring_at(name_ptr, name_len // 2) if name_ptr else "", cpu / 1e7,
+                                          at(ctypes.c_longlong, 0x20))  # CreateTime
         nxt = ctypes.c_ulong.from_buffer(buf, off).value
         if not nxt:
             return out
@@ -209,10 +213,11 @@ class LoadObserver:
         if not prev or now <= prev[0]:
             return None
         groups, in_jobs = {}, 0.0
-        for pid, (name, cpu_s) in cur.items():
+        for pid, (name, cpu_s, born) in cur.items():
             old = prev[1].get(pid)
-            # pid 0 is the idle process; a pid seen for the first time, or reused by another image, waits a sample
-            if pid == 0 or not old or old[0] != name:
+            # pid 0 is the idle process; a pid seen for the first time, or reused by a later process (another start
+            # time, even with the same image), waits a sample
+            if pid == 0 or not old or old[0] != name or old[2] != born:
                 continue
             cores = max(0.0, cpu_s - old[1]) / (now - prev[0])
             if pid in members:

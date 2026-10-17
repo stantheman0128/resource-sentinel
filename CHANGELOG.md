@@ -2,6 +2,13 @@
 
 ## Unreleased - 2026-10-17
 
+- Low-severity fixes from the 2026-10-17 review. Before placing a Cursor agent command, the daemon now checks that
+  the process it holds is not one of Cursor's own, still has Cursor above it with each parent started before its
+  child, and still carries the mark, so a reused pid of the command or of a parent no longer gets it placed.
+  `winjob.environment` matches names in any case (they come back in upper case) and drops an entry cut at 1 MiB
+  instead of returning part of its value. The load outside Guardian tells a pid reused by the same image apart by
+  its start time. On a 32-bit Python the two readers of x64 structures decline instead of misreading. A refused
+  I/O or memory priority is still not retried; docs/guardian.md says why, along with the gaps left open.
 - Guardian controls the Cursor app's agent. The bundled cursor-agent worker (one node.exe per open workspace) goes
   into a desktop job like the Claude and Codex app CLIs, and the agent commands Cursor starts outside the worker are
   told apart from Stan's own terminal commands by `CURSOR_AGENT=1` in their environment, read from the process's

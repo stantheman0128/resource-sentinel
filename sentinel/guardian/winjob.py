@@ -814,6 +814,25 @@ def open_waitable(pid):
     return OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED, False, pid) or None
 
 
+GetProcessTimes = _bind("GetProcessTimes", w.BOOL, HANDLE, ctypes.POINTER(w.FILETIME), ctypes.POINTER(w.FILETIME),
+                        ctypes.POINTER(w.FILETIME), ctypes.POINTER(w.FILETIME))
+
+
+def created(pid):
+    """When the process started (FILETIME, 100 ns units), or None when it cannot be opened. A later process that
+    reuses the pid has a later start, which the process table alone does not show."""
+    h = OpenProcess(PROCESS_QUERY_LIMITED, False, pid)
+    if not h:
+        return None
+    try:
+        t = [w.FILETIME() for _ in range(4)]
+        if not GetProcessTimes(h, *(ctypes.byref(x) for x in t)):
+            return None
+        return (t[0].dwHighDateTime << 32) | t[0].dwLowDateTime
+    finally:
+        CloseHandle(h)
+
+
 def has_exited(handle):
     return WaitForSingleObject(handle, 0) == 0  # WAIT_OBJECT_0: the process has exited
 
@@ -872,8 +891,10 @@ IsWow64Process = _bind("IsWow64Process", w.BOOL, HANDLE, ctypes.POINTER(w.BOOL))
 SetProcessInformation = _bind("SetProcessInformation", w.BOOL, HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD)
 GetProcessInformation = _bind("GetProcessInformation", w.BOOL, HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD)
 EmptyWorkingSet = _bind("K32EmptyWorkingSet", w.BOOL, HANDLE)
-# x64 offsets (public symbols): PEB.ProcessParameters, RTL_USER_PROCESS_PARAMETERS.Environment and .EnvironmentSize
+# x64 offsets (public symbols): PEB.ProcessParameters, RTL_USER_PROCESS_PARAMETERS.Environment and .EnvironmentSize.
+# They, and the SYSTEM_PROCESS_INFORMATION offsets in apps.py, hold only when this Python is 64-bit.
 PEB_PARAMS, PARAMS_ENV, PARAMS_ENV_SIZE = 0x20, 0x80, 0x3F0
+X64 = ctypes.sizeof(ctypes.c_void_p) == 8
 PROCESS_IO_PRIORITY, PROCESS_MEMORY_PRIORITY = 33, 0  # NtSetInformationProcess class, SetProcessInformation class
 IO_PRIORITY = {"very_low": 0, "low": 1, "normal": 2}
 MEMORY_PRIORITY = {"very_low": 1, "low": 2, "medium": 3, "below_normal": 4, "normal": 5}
@@ -888,8 +909,11 @@ def _read(h, addr, n):
 
 def environment(pid, max_bytes=1 << 20):
     """The environment block of a 64-bit process as a dict, read from its PEB; None when the process is gone, cannot
-    be opened for reading (protected, another user) or is 32-bit. Names keep their case. A process can change its
-    own block while it is read, so a torn read comes back as None or as a block with a missing entry."""
+    be opened for reading (protected, another user) or is 32-bit. A 32-bit Python always gets None, since the
+    offsets differ there. parse_environment covers names and a block longer than max_bytes. A process can change
+    its own block while it is read, so a torn read comes back as None or as a block with a missing entry."""
+    if not X64:
+        return None
     h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
     if not h:
         return None
@@ -911,13 +935,23 @@ def environment(pid, max_bytes=1 << 20):
             return None
     finally:
         CloseHandle(h)
+    return parse_environment(block)
+
+
+def parse_environment(block):
+    """An environment block (UTF-16 bytes) as a dict. Windows matches names without regard to case, so they come
+    back in upper case, as in os.environ; of two that differ only in case, the first is kept. A block cut inside an
+    entry (longer than environment's max_bytes) drops that entry instead of returning part of its value."""
+    items = block.decode("utf-16-le", errors="replace").split("\0")
+    if "" not in items:
+        items.pop()  # no end and no empty entry: the last one was cut
     out = {}
-    for item in block.decode("utf-16-le", errors="replace").split("\0"):
+    for item in items:
         if not item:
             break  # two NULs end the block
         k, sep, v = item[1:].partition("=")  # entries such as "=C:=C:\x" start with "="
         if sep:
-            out[item[0] + k] = v
+            out.setdefault((item[0] + k).upper(), v)
     return out
 
 

@@ -105,6 +105,24 @@ def app_among(pid, table, image_path, max_depth=16):
     return None
 
 
+def under_app(pid, app, table, image_path, created, max_depth=16):
+    """True when app is the nearest desktop app among pid's parents and each process on the way started before its
+    child. A parent that exited leaves its pid in the child's row, and any later process, the app's own too, can
+    take it; its later start breaks the chain, which app_among cannot see. created(pid) gives a start time, or None
+    when it cannot read one, which also gives False."""
+    born, up, seen, depth = created(pid), table.get(pid, (None,))[0], {pid}, 0
+    while born is not None and up in table and up not in seen and depth <= max_depth:
+        t = created(up)
+        if t is None or t > born:
+            return False
+        found = app_of(up, table[up][1], image_path)
+        if found:
+            return found == app
+        seen.add(up)
+        born, up, depth = t, table[up][0], depth + 1
+    return False
+
+
 # The CLIs the desktop apps run for their agent sessions, told apart by where the app installs them: the Claude app
 # under %APPDATA%\Claude\claude-code\<version>\<hash>\, the Codex app under %LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\,
 # and Cursor 3.25 its bundled cursor-agent CLI under %APPDATA%\Cursor\User\globalStorage\anysphere.cursor-agent-worker\

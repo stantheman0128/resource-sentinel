@@ -1174,8 +1174,13 @@ class Guardian:
         """An agent command an app started outside its agent CLI (Cursor's extension host runs some itself): it goes
         into the desktop job of its chat, so one chat is one session, or into a job of its own when it sits under
         another host than the chat's first command, since a job nests under one parent job only."""
-        var, value = PV.AGENT_ENV[provider][:2]
-        still = lambda: (wj.environment(pid) or {}).get(var) == value
+        var, value, _, app = PV.AGENT_ENV[provider]
+
+        def still():  # pid is held open: is the process now at pid still a marked command under the app?
+            fresh = wj.process_table()
+            return pid in fresh and not PV.app_of(pid, fresh[pid][1], wj.image_path) \
+                and PV.under_app(pid, app, fresh, wj.image_path, wj.created) \
+                and (wj.environment(pid) or {}).get(var) == value
         if not chat:
             return self.place_desktop(pid, provider, table, f"cmd-{pid}", still, "agent command")
         name = PV.chat_session(chat)
@@ -1331,7 +1336,8 @@ class Guardian:
     def nice_sweep(self, members=None):
         """Give each process that has joined a Guardian job the agents' I/O and memory priority. A job has no limit
         for either, but a process passes both on to the children it starts afterwards (measured 2026-10-17), so a
-        pid is set once, when it first shows up in a job, and is read again only after it leaves."""
+        pid is set once, when it first shows up in a job, and is read again only after it leaves. A refusal is not
+        tried again either (docs/guardian.md, Known limits, says why)."""
         members = self.members() if members is None else members
         for pid in members - self.niced.keys():
             self.niced[pid] = wj.set_io_priority(pid, self.agent_io) & wj.set_memory_priority(pid, self.agent_memory)

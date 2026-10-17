@@ -803,6 +803,40 @@ class CursorAppTests(unittest.TestCase):
         g.place_command(580, "cursor", None, table)
         self.assertEqual(g.place_desktop.call_args.args[3], "cmd-580")
 
+    def test_a_command_is_placed_only_while_it_still_sits_under_cursor(self):
+        from sentinel.guardian import daemon as D
+        table, path = cursor_tree()
+        g = D.Guardian.__new__(D.Guardian)
+        g.sessions, g.place_desktop = {}, mock.Mock()
+        g.place_command(530, "cursor", None, table)
+        still = g.place_desktop.call_args.args[4]
+        born, read = {4: 1, 500: 10, 510: 20, 530: 30, 600: 5}, []
+
+        def check(fresh, times=born, marked=(530,)):
+            env = cursor_env(set(marked))
+            with mock.patch.object(D.wj, "process_table", lambda: fresh), mock.patch.object(D.wj, "image_path", path), \
+                    mock.patch.object(D.wj, "created", times.get), \
+                    mock.patch.object(D.wj, "environment", lambda pid: read.append(pid) or env(pid)):
+                return still()
+        self.assertTrue(check(table))
+        self.assertFalse(check(table, marked=()))
+        # pid 530 reused by a marked process outside Cursor
+        self.assertFalse(check({4: (1, "svchost.exe"), 600: (4, "pwsh.exe"), 530: (600, "pwsh.exe")}))
+        # 530's parent exited and a later Cursor process took the parent's pid
+        self.assertFalse(check(table, {**born, 510: 35}))
+        self.assertFalse(check(table, {**born, 510: None}))  # a start time that cannot be read
+        read.clear()
+        self.assertFalse(check({**table, 530: (510, "Cursor.exe")}))  # now Cursor's own process
+        self.assertEqual(read, [])  # whose environment is not read
+
+    def test_a_block_matches_names_in_any_case_and_drops_a_cut_entry(self):
+        from sentinel.guardian import winjob as wj
+        block = lambda s: s.encode("utf-16-le")  # noqa: E731
+        self.assertEqual(wj.parse_environment(block("=C:=C:\\x\0Path=a\0PATH=b\0cursor_agent=1\0\0")),
+                         {"=C:": "C:\\x", "PATH": "a", "CURSOR_AGENT": "1"})
+        self.assertEqual(wj.parse_environment(block("A=1\0CURSOR_CONVERSATION_ID=0c9f")), {"A": "1"})  # cut inside
+        self.assertEqual(wj.parse_environment(block("A=1\0B=2\0")), {"A": "1", "B": "2"})  # cut after an entry
+
     def test_whereami_reads_a_chat_or_command_job_by_name(self):
         wa = load("scripts/guardian-whereami.py", "guardian_whereami")
         table, path = cursor_tree()
@@ -831,7 +865,7 @@ class CursorAppTests(unittest.TestCase):
 
     def test_the_environment_of_a_live_process_is_read(self):
         from sentinel.guardian import winjob as wj
-        env = dict(os.environ, GUARDIAN_TEST_MARK="m=1;x")
+        env = dict(os.environ, GUARDIAN_TEST_MARK="m=1;x", guardian_test_case="c")
         p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], env=env)
         try:
             for _ in range(50):
@@ -839,7 +873,7 @@ class CursorAppTests(unittest.TestCase):
                 if got:
                     break
                 time.sleep(0.05)
-            self.assertEqual(got.get("GUARDIAN_TEST_MARK"), "m=1;x")
+            self.assertEqual((got.get("GUARDIAN_TEST_MARK"), got.get("GUARDIAN_TEST_CASE")), ("m=1;x", "c"))
             self.assertIsNone(wj.environment(0))
         finally:
             p.kill()
@@ -915,10 +949,11 @@ class OutsideLoadTests(unittest.TestCase):
     def test_groups_by_image_and_skips_members_idle_new_and_reused_pids(self):
         from sentinel.guardian.apps import LoadObserver
         samples = iter([
-            {0: ("", 100.0), 10: ("chrome.exe", 5.0), 11: ("Chrome.exe", 1.0), 12: ("node.exe", 0.0),
-             13: ("raycast.exe", 2.0), 14: ("old.exe", 9.0)},
-            {0: ("", 120.0), 10: ("chrome.exe", 7.0), 11: ("Chrome.exe", 2.0), 12: ("node.exe", 4.0),
-             13: ("raycast.exe", 2.5), 14: ("new.exe", 9.5), 15: ("fresh.exe", 3.0)},
+            {0: ("", 100.0, 0), 10: ("chrome.exe", 5.0, 1), 11: ("Chrome.exe", 1.0, 1), 12: ("node.exe", 0.0, 1),
+             13: ("raycast.exe", 2.0, 1), 14: ("old.exe", 9.0, 1), 16: ("git.exe", 1.0, 1)},
+            {0: ("", 120.0, 0), 10: ("chrome.exe", 7.0, 1), 11: ("Chrome.exe", 2.0, 1), 12: ("node.exe", 4.0, 1),
+             13: ("raycast.exe", 2.5, 1), 14: ("new.exe", 9.5, 2), 15: ("fresh.exe", 3.0, 2),
+             16: ("git.exe", 3.0, 2)},  # reused by the same image: a later start time
         ])
         busy = iter([None, 0.5])
         obs = LoadObserver(times=lambda: next(samples), busy=lambda: next(busy), cpus=12)
@@ -933,9 +968,20 @@ class OutsideLoadTests(unittest.TestCase):
     def test_one_system_call_reads_this_process_like_getprocesstimes(self):
         from sentinel.guardian import apps
         sum(range(2_000_000))
-        name, cpu_s = apps._process_times()[os.getpid()]
+        name, cpu_s, born = apps._process_times()[os.getpid()]
         self.assertEqual(name.lower(), Path(sys.executable).name.lower())
         self.assertLess(abs(cpu_s - apps._process_cpu_s(os.getpid())), 0.1)
+        self.assertEqual(born, apps.wj.created(os.getpid()))
+
+    def test_a_32_bit_python_reads_neither_x64_layout(self):
+        from sentinel.guardian import apps
+        with mock.patch.object(apps.wj, "X64", False), \
+                mock.patch.object(apps.wj, "OpenProcess", mock.Mock(side_effect=AssertionError("opened a process"))), \
+                mock.patch.object(apps, "_ntdll", mock.Mock(**{"NtQuerySystemInformation.side_effect":
+                                                               AssertionError("queried the system")})):
+            self.assertIsNone(apps.wj.environment(os.getpid()))
+            with self.assertRaises(OSError):
+                apps._process_times()
 
 
 class FakeJob:

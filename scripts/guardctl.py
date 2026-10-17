@@ -45,17 +45,22 @@ def summary(s):
              f"admission {'open' if s['admission']['open'] else 'closed ' + s['admission']['reason']}"
              f"{'  HOLD' if s['admission']['hold'] else ''}  queue order {s.get('queue_order')}",
              f"experience {s['experience']['level']} ({s['experience']['kind']})  probe {s['experience']['probe']}"]
+    # what is in effect, then the configured value when it differs: control off leaves it for resume-control
+    later = lambda now, conf: f" (configured {conf}, applied when control is on)" if conf != now else ""
     if s.get("memory"):
         m = s["memory"]
         gib = lambda v: "off" if v is None else f"{v:g} GiB"
+        hard = gib(m["hard_limit_gib"])
         lines.insert(2, f"agent memory {m['agents_gib']} GiB  budget {gib(m['budget_gib'])}  rung {m['rung']}  "
                         f"trim {'on' if m['trim'] else 'off'}  pause {'on' if m['pause'] else 'off'}  "
-                        f"hard limit {gib(m['hard_limit_gib'])}  trimmed {m['trimmed_gib']} GiB"
+                        f"hard limit {hard}{later(hard, gib(m.get('hard_limit_configured_gib', m['hard_limit_gib'])))}"
+                        f"  trimmed {m['trimmed_gib']} GiB"
                         + (f"  paused {', '.join(m['paused'])}" if m["paused"] else ""))
     if s.get("agent_priority"):
         a = s["agent_priority"]
-        lines.insert(1, f"agent I/O priority {a['io']}  memory priority {a['memory']}  set on {a['set']} processes"
-                        f"{'  refused ' + str(a['refused']) if a['refused'] else ''}")
+        lines.insert(1, f"agent I/O priority {a['io']}{later(a['io'], a.get('io_configured', a['io']))}  "
+                        f"memory priority {a['memory']}{later(a['memory'], a.get('memory_configured', a['memory']))}  "
+                        f"set on {a['set']} processes{'  refused ' + str(a['refused']) if a['refused'] else ''}")
     for p in s["providers"]:
         lines.append(f"  provider {p['name']:<8} {'PAUSED' if p['paused'] else 'running':<8} {p['cores']} cores")
     for x in s["sessions"]:

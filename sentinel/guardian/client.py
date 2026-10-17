@@ -68,11 +68,14 @@ def handshake(conn, authkey, server, seconds=HANDSHAKE_SECONDS):
         deliver_challenge(d, authkey)
 
 
-def connect(instance="main", timeout=HANDSHAKE_SECONDS):
+def connect(instance="main", timeout=HANDSHAKE_SECONDS, end=None):
+    """end: a time.monotonic() deadline the caller set for its whole exchange, which the handshake keeps too."""
     conn = None
     try:
         key = (home_dir(instance) / "pipe-authkey").read_text(encoding="ascii").strip().encode()
         conn = Client(pipe_name(instance), family="AF_PIPE")  # the stdlib retries a busy pipe for up to 20 s
+        if end is not None:
+            timeout = min(timeout, end - time.monotonic())
         handshake(conn, key, server=False, seconds=timeout)
         return conn
     except Exception:  # no key file, no pipe, busy pipe, failed or stalled handshake: all mean "not reachable"
@@ -183,13 +186,15 @@ def adopt(pid, provider, session, cls="normal", instance="main", via="hook", ski
 
 def whereis(pid, instance="main", timeout=10.0):
     """The daemon's view of pid: {"in_guardian", "session", "priority", "budget", ...}, or None when it is not
-    running or does not answer within timeout."""
-    conn = connect(instance, timeout=min(timeout, HANDSHAKE_SECONDS))
+    running or does not answer within timeout, one deadline for the handshake and the answer together. The stdlib's
+    wait for a busy pipe, up to 20 s, can still run past it, so the hooks call this on a thread of their own."""
+    end = time.monotonic() + timeout
+    conn = connect(instance, end=end)
     if conn is None:
         return None
     try:
         send_json(conn, {"op": "whereis", "pid": int(pid)})
-        return json.loads(conn.recv_bytes()[1:]) if conn.poll(timeout) else None
+        return json.loads(conn.recv_bytes()[1:]) if conn.poll(max(0.0, end - time.monotonic())) else None
     except (EOFError, OSError, ValueError):
         return None
     finally:
@@ -227,11 +232,13 @@ def budget_text(where, long=False):
     srun = Path(__file__).resolve().parents[2] / "scripts" / "srun.py"
     workers = "" if not b["control"] or b["cls"] == "exempt" else (
         f" About {max(1, int(cap))} parallel workers fit in that cap.")
+    instance = where.get("instance") or "main"
     return (f"This session runs under Guardian, the resource controller on Stan's machine. {short}."
             f" The agents together may use {pool:g} cores. Their processes run at {where.get('priority') or '?'}"
-            f" CPU priority and {b['io']} I/O priority, so Stan's own apps go first.{workers}"
-            f" A long build or test can wait for room instead of slowing the machine:"
-            f" python -I {srun.as_posix()} --provider {provider} --session {session} -- <command>.")
+            f" CPU priority and {b['io']} I/O priority" + (", so Stan's own apps go first." if b["control"] else ".") +
+            f"{workers} A long build or test can wait for room instead of slowing the machine:"
+            f" python -I {srun.as_posix()} --provider {provider} --session {session}"
+            + ("" if instance == "main" else f" --instance {instance}") + " -- <command>.")
 
 
 def hook_output(provider, event, text):

@@ -53,6 +53,13 @@
   with `CURSOR_AGENT=1` passes the mark to every process under it, so the daemon also reads the mark of the nearest
   Cursor.exe above a command and places nothing under one that carries it or cannot be read. It logs that once per
   Cursor.exe.
+- Exempt runs of desktop and nested sessions start outside AllAgents too. Their in-tree job chain was refused by
+  Windows, so they ran without Guardian. A session or provider pause now reaches outside runs, one that starts
+  during the pause included, with control on or off. While control is off, the dashboard, `guardctl status` and the
+  agent's budget text show the I/O priority, memory priority and hard limit in effect, with the configured value
+  beside them. The load outside Guardian leaves out the daemon, its probe and outside runs. The budget text's srun
+  line names a test instance, `whereis` keeps one deadline, and the adopt hook stops waiting after about 3.5 s.
+  Known limits says that any local process can get the HTTP token.
 
 ## Unreleased - 2026-10-13
 

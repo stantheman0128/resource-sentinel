@@ -34,9 +34,11 @@ every tool command it runs stay inside it:
   standby list before Stan's. A job has no limit for either, but a process passes both to the children it starts
   afterwards, so the daemon sets each process once, when it first shows up in a job (checked every second).
   `guardctl io-priority very_low|low|normal` and `guardctl memory-priority very_low|low|medium|below_normal|normal`
-  change the level for every member; the dashboard's subtitle shows it.
+  change the level for every member; the dashboard's subtitle and `guardctl status` show the level in effect.
 - **Control off.** `rollback` removes every cap and puts the agents back at normal CPU, I/O and memory priority;
-  the CPU limit stays. `resume-control` turns it back on. A shutdown lifts the caps and keeps the low priorities.
+  the CPU limit stays. The daemon does not lower the I/O and memory priority of processes that join while control
+  is off, so the dashboard and `guardctl status` show normal, with the configured level next to it.
+  `resume-control` turns control back on. A shutdown lifts the caps and keeps the low priorities.
 
 Guardian only controls work it launched, adopted or put in a desktop job (see below). It reads the Claude, Codex and
 Cursor desktop apps but never assigns the apps' own processes to a job. Cloud sessions run on remote machines and
@@ -44,10 +46,10 @@ use no local CPU, so there is nothing to control locally.
 
 What else loads the machine is on the dashboard too, in the table 「Guardian 控管外的負載」, and on the last line of
 `guardctl status`. Every 2 seconds the daemon reads the CPU time of every process in one SystemProcessInformation
-call, protected ones such as Defender included, leaves out the processes in its jobs and itself, and lists the top
-five image names with their cores and process counts. Under them are the whole machine's busy cores and the part
-that belongs to no process row: interrupt and DPC time, and processes that start and end between two samples. A new
-process counts from its second sample.
+call, protected ones such as Defender included, leaves out the processes in its jobs (the run jobs of exempt
+sessions among them), itself and its probe, and lists the top five image names with their cores and process counts.
+Under them are the whole machine's busy cores and the part that belongs to no process row: interrupt and DPC time,
+and processes that start and end between two samples. A new process counts from its second sample.
 
 ## The foreground probe
 
@@ -80,10 +82,15 @@ and first word that is not an option). A command without one counts as 60 s. The
 `guardctl class <session> exempt [minutes]`, or 豁免 in the dashboard's class menu, exempts a session for 60
 minutes unless told otherwise, at most 1440. While it lasts, the session job has no cap and takes no share of the
 pool, its queued commands go first and skip the memory and launch gates, and each command it starts goes into a run
-job outside AllAgents, at normal priority, where the pool cap does not reach. What the session started before stays
-under the pool cap. When the time is up the session goes back to its old class, and the commands started outside
-the pool stay there until they end. A pause still holds an exempt session. Only the dashboard and guardctl, which
-use the HTTP API and its token, can set it: srun, the hooks and adopt accept focus, normal and batch only.
+job outside AllAgents, at normal priority, where the pool cap does not reach. This holds for a desktop or nested
+session too. What the session started before stays in its session job: under the pool cap for a session in the tree,
+and without any cap for a desktop or nested session, whose job sits outside AllAgents. When the time is up the
+session goes back to its old class, and the commands started outside the pool stay there until they end. A pause
+of the session or of its provider still holds an exempt session and the commands it started outside the pool, with
+control on or off and also after the exemption has ended. A command admitted just before such a pause is paused
+as soon as it starts. Only the HTTP API, which the dashboard and guardctl use with its token, can set it: srun, the
+hooks and adopt accept focus, normal and batch only. Any process that gets the token can call that API, though (see
+Known limits).
 
 ## Memory
 
@@ -109,19 +116,22 @@ it the agents' allocations fail, and it does not reach desktop and nested jobs. 
 `memory-trim on|off`, `memory-pause on|off` and `memory-limit 8|off` change these at run time. In the dashboard,
 進階操作 sets the budget, trim and pause and shows the rung, and the RAM card shows what the agents hold. Rollback
 clears the ladder and removes the hard limit, `resume-control` puts the limit back, and a shutdown removes it.
+While control is off, the dashboard and `guardctl status` show the hard limit as off, with the configured limit
+next to it.
 
 ## The agent's own budget
 
 An agent that knows its CPU cap can start as many parallel workers as fit in it. With `--context`, the adopt hook
 asks the daemon about the CLI it has just placed and gives the answer to the model when the session starts: the
 session and its class, its CPU cap against the machine's cores, what the agents may use together, the CPU and I/O
-priority, the free RAM, and the srun line for a long build or test. `hooks/guardian-status.py` gives a one-line form
-before each prompt, such as `Guardian: claude/7162daab normal, CPU cap 6 of 12 cores, 22.1 GiB RAM available`, and
-adds `paused`, `new srun commands wait (REASON)`, `memory pressure` or `N queued` when they apply. The two hooks
-read `whereis`, which answers with the budget of the session holding the process. Outside a Guardian session, or
-when the daemon does not answer within about 3 s, they print nothing, and they always exit 0. A CLI that a desktop
-app runs is refused adoption, but when the daemon already holds it in a desktop job the hook still gives the
-context.
+priority, the free RAM, and the srun line for a long build or test, with `--instance` when the daemon is not main.
+`hooks/guardian-status.py` gives a one-line form before each prompt, such as
+`Guardian: claude/7162daab normal, CPU cap 6 of 12 cores, 22.1 GiB RAM available`, and adds `paused`,
+`new srun commands wait (REASON)`, `memory pressure` or `N queued` when they apply. The two hooks read `whereis`,
+which answers with the budget of the session holding the process. Outside a Guardian session, or when the daemon
+does not answer in time, they print nothing, and they always exit 0. The adopt hook waits about 3.5 s for the
+context and the status hook about 2.5 s, a busy pipe and the handshake included. A CLI that a desktop app runs is
+refused adoption, but when the daemon already holds it in a desktop job the hook still gives the context.
 
 Each CLI's hook docs, read on 2026-10-17, say what it does with a hook's stdout:
 
@@ -547,7 +557,11 @@ their full write rate back.
 
 ## Known limits
 
-- The dashboard page embeds the HTTP token, so any local process can read it. It listens on 127.0.0.1 only.
+- Any local process can get the HTTP token. A process running as Stan, an agent included, can read the http-token
+  file, and any local process can fetch the dashboard page, which embeds the token. With it a process can use
+  guardctl and the HTTP API, so an agent can exempt its own session, lift its cap, turn control off or shut the
+  daemon down. The token and the Host check keep out web pages in a browser, not local processes. The HTTP server
+  listens on 127.0.0.1 only.
 - Pausing a session sets its CPU rate to 0.01%. A paused CLI cannot service its network connections either, and
   they may time out, so keep pauses short.
 - A trim or a pause does not lower private commit, so pressure from an agent memory budget lasts until work ends

@@ -127,6 +127,9 @@ const CLS = {exempt: '豁免', focus: '重要', normal: '一般', batch: '背景
 const QORDER = {class_fifo: '先比重要性再比先來後到', fifo: '先來後到', sjf: '預估最短的先', hrrn: '短的先、等越久越優先', fair: '用得最少的 session 先'};
 const PRIO = {below_normal: '低於正常', normal: '正常'};
 const NICE = {very_low: '很低', low: '低', medium: '中', below_normal: '低於正常', normal: '正常'};
+// what is in effect, and the configured value when it differs (control off): it takes effect once control is on again
+const later = (now, set, name) => set != null && set !== now ? `（設定 ${name(set)}，開啟控管後生效）` : '';
+const nice = (now, set) => (NICE[now] || now) + later(now, set, v => NICE[v] || v);
 
 async function api(path, body) {
   const r = await fetch(path, {method: body ? 'POST' : 'GET', headers: {'X-Guardian-Token': TOKEN, 'Content-Type': 'application/json'},
@@ -141,7 +144,7 @@ function render(s) {
   S = s;
   const m = document.getElementById('mode'); m.textContent = MODE[s.mode] || s.mode; m.className = 'badge ' + modeClass(s.mode);
   const scope = s.world_cpus < s.ncpu ? `示範範圍：全機 ${s.ncpu} 顆邏輯 CPU 只開放 ${s.world_cpus} 顆` : `範圍：全部 ${s.ncpu} 顆邏輯 CPU`;
-  document.getElementById('subtitle').textContent = `${scope} · agent 優先權 ${PRIO[s.pool_priority] || s.pool_priority}${s.agent_priority ? ` · 磁碟 ${NICE[s.agent_priority.io] || s.agent_priority.io} · 記憶體 ${NICE[s.agent_priority.memory] || s.agent_priority.memory}` : ''} · 分配器 ${s.allocator ? '開' : '關'} · 執行個體 ${s.instance}`;
+  document.getElementById('subtitle').textContent = `${scope} · agent 優先權 ${PRIO[s.pool_priority] || s.pool_priority}${s.agent_priority ? ` · 磁碟 ${nice(s.agent_priority.io, s.agent_priority.io_configured)} · 記憶體 ${nice(s.agent_priority.memory, s.agent_priority.memory_configured)}` : ''} · 分配器 ${s.allocator ? '開' : '關'} · 執行個體 ${s.instance}`;
   const bn = document.getElementById('banner'), bt = document.getElementById('bannertext');
   if (s.control) { bn.className = 'banner on'; bt.textContent = `控管中：agent 加起來最多用 ${s.cap_cores} 核，而且讓前景程式先跑`; }
   else { bn.className = 'banner off'; bt.textContent = `控管關閉：agent 想用多少 CPU 就用多少，跟前景程式搶`; }
@@ -166,7 +169,7 @@ function render(s) {
     document.getElementById('memtrim').textContent = mm.trim ? '記憶體壓力時不要清 working set' : '記憶體壓力時清 working set';
     document.getElementById('mempause').textContent = mm.pause ? '記憶體壓力時不要暫停 session' : '記憶體壓力時暫停最大的 session';
     document.getElementById('memstate').textContent = `記憶體控管：${['沒有壓力', '清 working set 中', '清 working set 並暫停最大的 session'][mm.rung]}` +
-      ` · 預算 ${mm.budget_gib == null ? '不設（只替 Stan 留可用記憶體）' : mm.budget_gib + ' GiB'} · 硬上限 ${mm.hard_limit_gib == null ? '關' : mm.hard_limit_gib + ' GiB'}` +
+      ` · 預算 ${mm.budget_gib == null ? '不設（只替 Stan 留可用記憶體）' : mm.budget_gib + ' GiB'} · 硬上限 ${mm.hard_limit_gib == null ? '關' : mm.hard_limit_gib + ' GiB'}${later(mm.hard_limit_gib, mm.hard_limit_configured_gib, v => v + ' GiB')}` +
       ` · 累計清出 ${mm.trimmed_gib} GiB（commit 不會變少）` + (mm.paused.length ? ` · 被暫停：${mm.paused.join('、')}` : '');
   }
   const a = s.admission, ae = document.getElementById('adm');

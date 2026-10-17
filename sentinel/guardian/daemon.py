@@ -409,9 +409,23 @@ class Guardian:
                     "rate 1" if paused else "none", p["job"].cpu().get("mode"), err,
                     "Stan paused the provider: CPU rate 1/10000, processes stay alive" if paused else "resumed")
         budget = self.cap.cap / 100 * self.world
-        for s in self.sessions.values():
-            if s.desktop and s.provider == name:  # the provider job does not hold desktop jobs
+        for s in [x for x in self.sessions.values() if x.provider == name]:
+            if s.desktop:  # the provider job does not hold desktop jobs
                 self.apply_session(s, self.desktop_want(s, self.alloc.caps.get(s.key), budget), budget)
+            else:  # nor the runs a session started outside the tree while exempt; this holds with control off too
+                self.hold_outside(s, paused or s.paused or (s.cls != "exempt" and s.key in self.mem_paused))
+
+    def hold_outside(self, s, held):
+        """Pause or release the runs session s started while it was exempt. Each sits in a run job of its own outside
+        the tree, where neither the session's job nor its provider's job reaches. Returns the first error."""
+        err = None
+        for r in self.live.values():
+            if r.session is s and getattr(r, "outside", False) and r.job and r.state == "running":
+                try:
+                    r.job.set_cpu_rate(1) if held else r.job.set_cpu()
+                except OSError as e:
+                    err = err or str(e)
+        return err
 
     def apply_session(self, s, want, budget):
         err = None
@@ -426,13 +440,8 @@ class Guardian:
                 s.job.set_cpu(max_cores=want[1] * wj.NCPU)  # nested caps are a fraction of the parent (E8b)
         except OSError as e:
             err = str(e)
-        if s.cls == "exempt" or want == "paused" or s.applied == "paused":
-            for r in self.live.values():  # runs outside the tree have no session job above them
-                if r.session is s and getattr(r, "outside", False) and r.job and r.state == "running":
-                    try:
-                        r.job.set_cpu_rate(1) if want == "paused" else r.job.set_cpu()
-                    except OSError as e:
-                        err = err or str(e)
+        # the runs it started while exempt follow the pause of the session and of its provider, whatever its class now
+        err = self.hold_outside(s, want == "paused" or self.providers[s.provider]["paused"]) or err
         rb = s.job.cpu()
         before, s.applied = s.applied, (s.applied if err else want)
         shown = lambda v: v if not isinstance(v, tuple) else f"{v[1] * (1 if v[0] == 'abs' else budget):.2f} cores"
@@ -670,8 +679,14 @@ class Guardian:
         while not self.stop.wait(2.0):
             try:
                 with self.lock:
-                    members = self.members()
-                self.outside = load.sample(members | {os.getpid()})
+                    members = self.members() | self.own_pids()  # the daemon and its probe
+                    for r in list(self.live.values()) + self.lingering:  # runs outside the tree: run jobs of their own
+                        if getattr(r, "outside", False) and r.job:
+                            try:
+                                members.update(r.job.pids())
+                            except OSError:
+                                pass
+                self.outside = load.sample(members)
             except Exception as e:
                 self.outside = {"error": str(e)}
             try:
@@ -882,7 +897,8 @@ class Guardian:
     def launch(self, run):
         s = run.session
         run.job = wj.Job.create()
-        run.outside = s.cls == "exempt" and not s.desktop
+        # a desktop or nested session too: its job sits under another job, so the tree's chain could not reach it
+        run.outside = s.cls == "exempt"
         chain = [run.job] if run.outside else [self.root, self.providers[s.provider]["job"], s.job, run.job]
         kw = {"cwd": run.cwd or None, "env": run.env or None}
         if run.console:
@@ -898,7 +914,12 @@ class Guardian:
         except OSError as e:
             raise SpawnError("spawn", f"cannot start {os.path.basename(run.argv[0])}: {e}")
         pid = run.proc.pid
-        run.t_start, run.state = time.monotonic(), "running"
+        with self.lock:  # a pause after the admission either finds the run running or is found here
+            run.t_start, run.state = time.monotonic(), "running"
+            if run.outside and (s.paused or self.providers[s.provider]["paused"]):
+                err = self.hold_outside(s, True)
+                self.log(f"run {run.run_id} ({s.key}) starts paused, outside the pool"
+                         + (f" [error {err}]" if err else ""))
         in_root, in_session = wj.in_job(pid, self.root.h), wj.in_job(pid, s.job.h)
         prio = wj.priority_class(pid)
         if run.outside:
@@ -1120,7 +1141,8 @@ class Guardian:
         smp = getattr(self, "sample", None)
         return {"key": s.key, "cls": s.cls, "cap_cores": self.alloc.caps.get(s.key),
                 "pool_cap_cores": round(self.cap.cap / 100 * self.world, 2), "world_cpus": self.world,
-                "control": self.control, "priority": self.pool_priority, "io": self.agent_io,
+                "control": self.control, "priority": self.pool_priority,
+                "io": self.agent_io if self.control else "normal", "io_configured": self.agent_io,
                 "admission_open": self.cap.admission_open, "admission_reason": self.cap.admission_reason,
                 "queued": sum(1 for r in self.queue if r.session is s),
                 "paused": s.paused or s.key in self.mem_paused, "memory_rung": self.mem.rung,
@@ -1327,6 +1349,9 @@ class Guardian:
                 self.restore_priority(s.job.pids())
             except OSError as e:
                 self.log(f"releasing {s.key} failed: {e}")
+            err = self.hold_outside(s, False)  # its runs started while exempt: no pause reaches them once it is gone
+            if err:
+                self.log(f"releasing the runs of {s.key} outside the pool failed: {err}")
             for r in [r for r in self.live.values() if r.session is s and isinstance(r, Adopted)]:
                 self.end_adopted(r, "desktop jobs switched off; the CLI keeps running outside Guardian")
             self.sessions.pop(s.key, None)
@@ -1406,13 +1431,18 @@ class Guardian:
                 "commit_headroom_gib": round(s.commit_headroom_gib, 1) if s and s.commit_headroom_gib else None,
                 "admission": {"open": self.cap.admission_open, "reason": self.cap.admission_reason, "hold": self.hold},
                 "pool_priority": self.pool_priority_readback, "allocator": self.allocator_on,
-                "agent_priority": {"io": self.agent_io, "memory": self.agent_memory,
+                # in effect: rollback puts the members back at normal, and nothing lowers them while control is off
+                "agent_priority": {"io": self.agent_io if self.control else "normal",
+                                   "memory": self.agent_memory if self.control else "normal",
+                                   "io_configured": self.agent_io, "memory_configured": self.agent_memory,
                                    "set": sum(1 for v in self.niced.values() if v),
                                    "refused": sum(1 for v in self.niced.values() if not v)},
                 "desktop": self.desktop_on,
                 "memory": {"agents_gib": round(self.agents_gib, 2), "budget_gib": m["agent_memory_budget_gib"],
                            "rung": self.mem.rung, "trim": m["pressure_trim"], "pause": m["pressure_pause"],
-                           "hard_limit_gib": m["job_commit_hard_limit_gib"], "paused": sorted(self.mem_paused),
+                           "hard_limit_gib": m["job_commit_hard_limit_gib"] if self.control else None,
+                           "hard_limit_configured_gib": m["job_commit_hard_limit_gib"],
+                           "paused": sorted(self.mem_paused),
                            "trimmed_gib": round(self.trimmed_gib, 2)},
                 "experience": {"level": level, "kind": kind, "probe": self.probe_last,
                                "inject_left_s": round(self.inject[0] - time.monotonic())
@@ -1555,6 +1585,8 @@ class Guardian:
         clearing a priority limit does not restore the processes it already changed (E9)."""
         self.control = False
         self.mem, self.mem_paused = P.MemState(), set()
+        for p in self.providers.values():  # first, so that apply_session also releases the runs outside the tree
+            p["paused"] = False
         for s in self.sessions.values():
             self.apply_session(s, None, 1)
             s.paused = False
@@ -1562,7 +1594,6 @@ class Guardian:
                 self.desktop_priority(s, "normal")
         for name, p in self.providers.items():
             p["job"].set_cpu()
-            p["paused"] = False
         self.root.set_cpu()
         self.root.set_limits(priority="normal", clear_mem=True)
         self.pool_priority_readback = self.root.limits()["priority"]
@@ -1581,6 +1612,8 @@ class Guardian:
             self.control = False
             self.mem, self.mem_paused = P.MemState(), set()
             try:
+                for p in self.providers.values():  # first, so apply_session also releases the runs outside the tree
+                    p["paused"] = False
                 for s in self.sessions.values():
                     self.apply_session(s, None, 1)
                 for p in self.providers.values():

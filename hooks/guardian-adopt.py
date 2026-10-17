@@ -69,13 +69,28 @@ def log(instance, row):
         pass
 
 
-def context(provider, row, instance):
+def context(provider, row, instance, wait=3.0):
     """--context: the budget of the session holding the CLI, or the hook itself when no CLI was adopted, in the
-    shape the CLI's hook output takes; "" when there is none."""
+    shape the CLI's hook output takes; "" when there is none or the daemon does not answer within wait seconds."""
     try:
         from sentinel.guardian.client import budget_text, hook_output, whereis
-        where = whereis(row.get("cli_pid") or os.getpid(), instance, timeout=3.0)
-        row["context"] = budget_text(where, long=True)
+        pid, box = row.get("cli_pid") or os.getpid(), []
+
+        def ask():
+            try:
+                box.append(whereis(pid, instance, timeout=wait))
+            except Exception as e:  # handed to the caller's thread, which logs it
+                box.append(e)
+
+        # whereis keeps its own deadline, but the stdlib waits up to 20 s for a busy pipe before the handshake starts
+        t = threading.Thread(target=ask, daemon=True)
+        t.start()
+        t.join(wait + 0.5)
+        if not box:
+            raise TimeoutError(f"no answer from Guardian within {wait + 0.5:g} s")
+        if isinstance(box[0], Exception):
+            raise box[0]
+        row["context"] = budget_text(box[0], long=True)
         return hook_output(provider, row.get("event") or "SessionStart", row["context"])
     except Exception as e:  # never break the CLI over the context
         row["context_error"] = f"{e.__class__.__name__}: {e}"

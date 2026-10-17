@@ -1899,5 +1899,192 @@ class CursorCommandPlacementTests(unittest.TestCase):
                                 "its agent commands stay out of desktop jobs"])
 
 
+class OutsideRunAndControlOffTests(unittest.TestCase):
+    """Review package D: the runs an exempt session starts outside the tree follow every pause, control off reports
+    what is in effect, the outside load leaves Guardian's own processes out, and the hooks keep one deadline."""
+    add, run_in = DesktopAllocateTests.add, ExemptTests.run_in
+
+    def setUp(self):
+        ExemptTests.setUp(self)
+        self.g.desktop_skip, self.g.niced = set(), {}
+
+    def outside_run(self, s):
+        r = self.run_in(s, 0, 1)
+        r.job, r.outside, r.state = RunJob(), True, "running"
+        self.g.live[r.run_id] = r
+        return r
+
+    def launch(self, s):
+        """launch() a run of s as serve_run does, with every Windows call patched; returns the run and its chain."""
+        chains, proc = [], mock.Mock(pid=4242)  # never reaches Windows: spawn, in_job and priority_class are patched
+        spawn = lambda argv, chain, **kw: (chains.append(chain), proc)[1]
+        with mock.patch.object(self.wj.Job, "create", lambda *a: RunJob()), \
+                mock.patch.object(self.wj, "spawn_in_jobs", spawn), \
+                mock.patch.object(self.wj, "in_job", lambda pid, h: False), \
+                mock.patch.object(self.wj, "priority_class", lambda pid: "normal"):
+            run = self.run_in(s, 0, 1)
+            self.g.live[run.run_id] = run
+            self.g.launch(run)
+        return run, chains[0]
+
+    def test_an_exempt_desktop_session_runs_outside_and_desktop_off_lets_the_runs_go(self):
+        s = self.add("claude/desk-200", 0.0, desktop=True)
+        s.job = MemberJob("t.d.claude.desk-200")
+        self.g.set_exempt(s, 5, "set by Stan")
+        run, chain = self.launch(s)
+        self.assertEqual(chain, [run.job])  # the tree's chain fails: the desktop job sits under the app's job
+        self.assertTrue(run.outside)
+        s.paused = True
+        self.g.allocate()
+        self.assertEqual(run.job.calls[-1], ("rate", 1))
+        self.g.set_desktop(False, "test")
+        self.assertNotIn(s.key, self.g.sessions)
+        self.assertEqual(run.job.calls[-1], ("cpu", None))  # no pause reaches it once its session is gone
+
+    def test_a_run_admitted_before_a_pause_starts_paused(self):
+        s = self.add("codex/a", 0.0)
+        s.job = RunJob()
+        self.g.set_exempt(s, 5, "set by Stan")
+        run, _ = self.launch(s)
+        self.assertEqual(run.job.calls, [])
+        for held in ("session", "provider"):
+            s.paused, self.g.providers["codex"]["paused"] = held == "session", held == "provider"
+            run, chain = self.launch(s)
+            self.assertEqual((chain, run.job.calls), ([run.job], [("rate", 1)]), held)
+            self.assertIn("starts paused", self.g.log.call_args.args[0])
+
+    def test_a_provider_pause_reaches_the_runs_outside_with_control_on_or_off(self):
+        s, other = self.add("codex/a", 0.0), self.add("claude/b", 0.0)
+        self.g.set_exempt(s, 5, "set by Stan")
+        self.g.set_exempt(other, 5, "set by Stan")
+        run, theirs = self.outside_run(s), self.outside_run(other)
+        act = self.g.action
+        for control in (False, True):
+            self.g.control = control
+            act("/api/provider", {"name": "codex", "paused": True})
+            self.assertEqual(run.job.calls[-1], ("rate", 1), control)
+            act("/api/provider", {"name": "codex", "paused": False})
+            self.assertEqual(run.job.calls[-1], ("cpu", None), control)
+        self.assertEqual(theirs.job.calls, [])  # another provider's run is left alone
+        # after the exemption: resuming the session under a paused provider, or the provider under Stan's own
+        # pause of the session, keeps the run held
+        s.cls, s.exempt_until = "normal", None
+        act("/api/provider", {"name": "codex", "paused": True})
+        act("/api/session", {"key": "codex/a", "paused": True})
+        act("/api/session", {"key": "codex/a", "paused": False})
+        self.assertEqual(run.job.calls[-1], ("rate", 1))
+        act("/api/session", {"key": "codex/a", "paused": True})
+        act("/api/provider", {"name": "codex", "paused": False})
+        self.assertEqual(run.job.calls[-1], ("rate", 1))
+        act("/api/session", {"key": "codex/a", "paused": False})
+        self.assertEqual(run.job.calls[-1], ("cpu", None))
+
+    def test_rollback_releases_the_runs_outside_that_a_provider_pause_held(self):
+        s = self.add("codex/a", 0.0)
+        self.g.set_exempt(s, 5, "set by Stan")
+        run = self.outside_run(s)
+        self.g.action("/api/provider", {"name": "codex", "paused": True})
+        self.assertEqual(run.job.calls[-1], ("rate", 1))
+        root = self.g.root = mock.Mock()
+        root.limits.return_value, root.pids.return_value, root.cpu.return_value = {"priority": "normal"}, [], {}
+        self.g.mask = None
+        with mock.patch.object(self.wj, "set_job_affinity", mock.Mock()):
+            self.g.rollback("test")
+        self.assertEqual(run.job.calls[-1], ("cpu", None))
+        self.assertFalse(self.g.providers["codex"]["paused"])
+
+    def test_control_off_reports_the_priorities_and_the_limit_in_effect(self):
+        g, s = self.g, self.add("codex/a", 0.0)
+        g.agent_io, g.agent_memory, g.pool_priority = "low", "very_low", "below_normal"
+        g.pool_priority_readback = "normal"
+        g.cfg["memory"]["job_commit_hard_limit_gib"] = 8.0
+        g.experience = lambda now: (None, None)
+        g.instance, g.sample, g.pool_cores, g.desktop_on, g.agents_gib = "t", None, 0.0, False, 0.0
+        g.mem, g.trimmed_gib, g.probe_last, g.inject = self.P.MemState(), 0.0, None, None
+        g.apps_rows, g.outside, g.events, g.history = [], None, [], []
+        guardctl = load("scripts/guardctl.py", "guardctl")
+        for control, io_, memory, hard in ((True, "low", "very_low", 8.0), (False, "normal", "normal", None)):
+            g.control = control
+            st = g.state()
+            a, m = st["agent_priority"], st["memory"]
+            self.assertEqual((a["io"], a["memory"], a["io_configured"], a["memory_configured"]),
+                             (io_, memory, "low", "very_low"), control)
+            self.assertEqual((m["hard_limit_gib"], m["hard_limit_configured_gib"]), (hard, 8.0), control)
+            b = g.budget_of(s)
+            self.assertEqual((b["io"], b["io_configured"]), (io_, "low"), control)
+            text, told = guardctl.summary(st), GC.budget_text({"budget": b, "priority": "normal"}, long=True)
+            if control:
+                self.assertIn("agent I/O priority low  memory priority very_low  set on", text)
+                self.assertIn("hard limit 8 GiB  trimmed", text)
+                self.assertIn("low I/O priority, so Stan's own apps go first.", told)
+            else:
+                self.assertIn("agent I/O priority normal (configured low, applied when control is on)  "
+                              "memory priority normal (configured very_low, applied when control is on)", text)
+                self.assertIn("hard limit off (configured 8 GiB, applied when control is on)", text)
+                self.assertIn("normal I/O priority. ", told)
+
+    def test_the_outside_load_leaves_out_the_probe_and_the_runs_outside(self):
+        g, s = self.g, self.add("codex/a", 0.0)
+        inside, out, broken, gone = (self.outside_run(s) for _ in range(4))
+        inside.outside, inside.job, out.job = False, MemJob([600]), MemJob([500, 501])
+        broken.job = mock.Mock(**{"pids.side_effect": OSError("job closed")})
+        gone.job, gone.state, g.lingering = MemJob([502]), "done", [g.live.pop(gone.run_id)]
+        g.members, g.probe_proc, g.pool_cores, g.stop = (lambda: {10}), mock.Mock(pid=77), 0.0, mock.Mock()
+        g.stop.wait.side_effect = [False, True]
+        load_obs = mock.Mock()
+        with mock.patch("sentinel.guardian.apps.LoadObserver", return_value=load_obs), \
+                mock.patch("sentinel.guardian.apps.AppObserver", return_value=mock.Mock(**{"sample.return_value": []})):
+            g.apps_loop()
+        self.assertEqual(load_obs.sample.call_args.args[0], {10, 77, os.getpid(), 500, 501, 502})
+        self.assertIs(g.outside, load_obs.sample.return_value)
+
+    def test_the_srun_line_names_an_instance_other_than_main(self):
+        plain = "--session abc12345 -- <command>."
+        for instance, tail in (("pd", "--session abc12345 --instance pd -- <command>."), ("main", plain), (None, plain)):
+            where = BudgetContextTests.where(self)
+            if instance:
+                where["instance"] = instance
+            self.assertTrue(GC.budget_text(where, long=True).endswith(tail), instance)
+
+    def test_whereis_keeps_one_deadline_for_the_handshake_and_the_answer(self):
+        key = b"k" * 64
+
+        def daemon_side(conn, delay, answer, got):
+            try:
+                time.sleep(delay)
+                GC.handshake(conn, key, server=True, seconds=5)
+                got.append(conn.recv_bytes())
+                if answer:
+                    conn.send_bytes(b"J" + json.dumps({"pid": 1}).encode())
+            except Exception:  # the client gave up first
+                pass
+
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "pipe-authkey").write_text(key.decode(), encoding="ascii")
+            # the daemon answers; it accepts late and never answers; its handshake comes after the deadline
+            for delay, answer, want, asked in ((0.0, True, {"pid": 1}, True), (0.6, False, None, True),
+                                               (1.5, False, None, False)):
+                a, b, got = *Pipe(), []
+                t = threading.Thread(target=daemon_side, args=(a, delay, answer, got), daemon=True)
+                with mock.patch.object(GC, "home_dir", lambda instance: Path(d)), \
+                        mock.patch.object(GC, "Client", lambda *args, **kw: b):
+                    t.start()
+                    t0 = time.monotonic()
+                    self.assertEqual(GC.whereis(1, "t", timeout=1.0), want, delay)
+                    took = time.monotonic() - t0
+                t.join(5)
+                a.close()
+                self.assertLess(took, 1.4, delay)  # 1.0 s in all, not 1.0 s after a handshake of up to 5 s
+                self.assertEqual(bool(got) and json.loads(got[0][1:])["op"] == "whereis", asked, delay)
+
+    def test_the_adopt_hook_stops_waiting_for_the_context_in_time(self):
+        hook, row = load_hook(), {"cli_pid": 4242, "event": "SessionStart"}
+        with mock.patch.object(GC, "whereis", side_effect=lambda *a, **k: time.sleep(3)):  # a busy pipe
+            t0 = time.monotonic()
+            self.assertEqual(hook.context("claude", row, "main", wait=0.2), "")
+            self.assertLess(time.monotonic() - t0, 1.5)
+        self.assertIn("TimeoutError", row["context_error"])
+
+
 if __name__ == "__main__":
     unittest.main()

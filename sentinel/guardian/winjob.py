@@ -848,3 +848,143 @@ def disk_file_path(fd):
         return None
     p = buf.value
     return "\\\\" + p[8:] if p.startswith("\\\\?\\UNC\\") else p[4:] if p.startswith("\\\\?\\") else p
+
+
+# ---- another process's environment, I/O and memory priority, working set ----------------------------------------
+PROCESS_QUERY_INFORMATION = 0x0400
+
+
+class PROCESS_BASIC_INFORMATION(ctypes.Structure):
+    _fields_ = [("ExitStatus", ctypes.c_long), ("PebBaseAddress", ctypes.c_void_p), ("AffinityMask", ctypes.c_size_t),
+                ("BasePriority", ctypes.c_long), ("UniqueProcessId", ctypes.c_size_t),
+                ("InheritedFromUniqueProcessId", ctypes.c_size_t)]
+
+
+NtQueryInformationProcess = _nt.NtQueryInformationProcess
+NtQueryInformationProcess.restype = ctypes.c_long
+NtQueryInformationProcess.argtypes = [HANDLE, ctypes.c_int, ctypes.c_void_p, w.ULONG, ctypes.POINTER(w.ULONG)]
+NtSetInformationProcess = _nt.NtSetInformationProcess
+NtSetInformationProcess.restype = ctypes.c_long
+NtSetInformationProcess.argtypes = [HANDLE, ctypes.c_int, ctypes.c_void_p, w.ULONG]
+ReadProcessMemory = _bind("ReadProcessMemory", w.BOOL, HANDLE, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                          ctypes.POINTER(ctypes.c_size_t))
+IsWow64Process = _bind("IsWow64Process", w.BOOL, HANDLE, ctypes.POINTER(w.BOOL))
+SetProcessInformation = _bind("SetProcessInformation", w.BOOL, HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD)
+GetProcessInformation = _bind("GetProcessInformation", w.BOOL, HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD)
+EmptyWorkingSet = _bind("K32EmptyWorkingSet", w.BOOL, HANDLE)
+# x64 offsets (public symbols): PEB.ProcessParameters, RTL_USER_PROCESS_PARAMETERS.Environment and .EnvironmentSize
+PEB_PARAMS, PARAMS_ENV, PARAMS_ENV_SIZE = 0x20, 0x80, 0x3F0
+PROCESS_IO_PRIORITY, PROCESS_MEMORY_PRIORITY = 33, 0  # NtSetInformationProcess class, SetProcessInformation class
+IO_PRIORITY = {"very_low": 0, "low": 1, "normal": 2}
+MEMORY_PRIORITY = {"very_low": 1, "low": 2, "medium": 3, "below_normal": 4, "normal": 5}
+
+
+def _read(h, addr, n):
+    buf, got = ctypes.create_string_buffer(n), ctypes.c_size_t()
+    if not ReadProcessMemory(h, ctypes.c_void_p(addr), buf, n, ctypes.byref(got)) or got.value != n:
+        return None
+    return buf.raw
+
+
+def environment(pid, max_bytes=1 << 20):
+    """The environment block of a 64-bit process as a dict, read from its PEB; None when the process is gone, cannot
+    be opened for reading (protected, another user) or is 32-bit. Names keep their case. A process can change its
+    own block while it is read, so a torn read comes back as None or as a block with a missing entry."""
+    h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, False, pid)
+    if not h:
+        return None
+    try:
+        wow, pbi = w.BOOL(), PROCESS_BASIC_INFORMATION()
+        if not IsWow64Process(h, ctypes.byref(wow)) or wow.value:
+            return None
+        if NtQueryInformationProcess(h, 0, ctypes.byref(pbi), ctypes.sizeof(pbi), None) or not pbi.PebBaseAddress:
+            return None
+        raw = _read(h, pbi.PebBaseAddress + PEB_PARAMS, 8)
+        params = int.from_bytes(raw, "little") if raw else 0
+        head = _read(h, params + PARAMS_ENV, 8) if params else None
+        size = _read(h, params + PARAMS_ENV_SIZE, 8) if params else None
+        env, size = (int.from_bytes(head, "little") if head else 0), (int.from_bytes(size, "little") if size else 0)
+        if not env or not size:
+            return None
+        block = _read(h, env, min(size, max_bytes) & ~1)
+        if block is None:
+            return None
+    finally:
+        CloseHandle(h)
+    out = {}
+    for item in block.decode("utf-16-le", errors="replace").split("\0"):
+        if not item:
+            break  # two NULs end the block
+        k, sep, v = item[1:].partition("=")  # entries such as "=C:=C:\x" start with "="
+        if sep:
+            out[item[0] + k] = v
+    return out
+
+
+def set_io_priority(pid, name):
+    """Lower (or restore) the I/O priority hint of one process; a process cannot be raised above normal without a
+    privilege, so only very_low, low and normal exist here. True when Windows took it."""
+    h = OpenProcess(PROCESS_SET_INFORMATION, False, pid)
+    if not h:
+        return False
+    try:
+        v = w.ULONG(IO_PRIORITY[name])
+        return NtSetInformationProcess(h, PROCESS_IO_PRIORITY, ctypes.byref(v), 4) == 0
+    finally:
+        CloseHandle(h)
+
+
+def io_priority(pid):
+    h = OpenProcess(PROCESS_QUERY_LIMITED, False, pid)
+    if not h:
+        return None
+    try:
+        v = w.ULONG()
+        if NtQueryInformationProcess(h, PROCESS_IO_PRIORITY, ctypes.byref(v), 4, None):
+            return None
+        return {n: k for k, n in IO_PRIORITY.items()}.get(v.value, str(v.value))
+    finally:
+        CloseHandle(h)
+
+
+def set_memory_priority(pid, name):
+    """Memory priority of the pages the process touches from now on: lower pages leave the standby list first."""
+    h = OpenProcess(PROCESS_SET_INFORMATION, False, pid)
+    if not h:
+        return False
+    try:
+        v = w.ULONG(MEMORY_PRIORITY[name])
+        return bool(SetProcessInformation(h, PROCESS_MEMORY_PRIORITY, ctypes.byref(v), 4))
+    finally:
+        CloseHandle(h)
+
+
+def memory_priority(pid):
+    h = OpenProcess(PROCESS_QUERY_LIMITED, False, pid)
+    if not h:
+        return None
+    try:
+        v = w.ULONG()
+        if not GetProcessInformation(h, PROCESS_MEMORY_PRIORITY, ctypes.byref(v), 4):
+            return None
+        return {n: k for k, n in MEMORY_PRIORITY.items()}.get(v.value, str(v.value))
+    finally:
+        CloseHandle(h)
+
+
+def trim_working_set(pid):
+    """Move the process's pages out of RAM (to the standby and modified lists); it faults back what it still uses.
+    Returns the working set bytes released, or None when the process cannot be opened."""
+    before = process_memory(pid)
+    h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA, False, pid)
+    if not h or not before:
+        if h:
+            CloseHandle(h)
+        return None
+    try:
+        if not EmptyWorkingSet(h):
+            return None
+    finally:
+        CloseHandle(h)
+    after = process_memory(pid)
+    return max(0, before[1] - after[1]) if after else before[1]

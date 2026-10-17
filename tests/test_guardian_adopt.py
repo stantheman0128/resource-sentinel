@@ -566,6 +566,119 @@ class DesktopTargetTests(unittest.TestCase):
         self.assertEqual(desktop_sweep(999, table, path), [])
 
 
+CURSOR_APP = r"C:\Users\x\AppData\Local\Programs\cursor\Cursor.exe"
+CURSOR_WORKER = (r"C:\Users\x\AppData\Roaming\Cursor\User\globalStorage\anysphere.cursor-agent-worker\agent-cli"
+                 r"\.local\share\cursor-agent\versions\2026.10.16-e3cb207\node.exe")
+CHAT = "0c9f6a1e-3b2d-4f7a-9e11-5d2c8b7a6f30"
+
+
+def cursor_tree(*extra):
+    """Cursor (500) with an extension host (510) that runs the agent-cli worker (520), an agent command in a shell
+    (530, marked) with a child (540, marked too), and Stan's own terminal shell (550, unmarked)."""
+    return tree((4, 1, "svchost.exe", ""), (500, 4, "Cursor.exe", CURSOR_APP), (510, 500, "Cursor.exe", CURSOR_APP),
+                (520, 510, "node.exe", CURSOR_WORKER), (525, 520, "conhost.exe", ""),
+                (530, 510, "pwsh.exe", ""), (540, 530, "node.exe", PLAIN_NODE), (550, 510, "pwsh.exe", ""), *extra)
+
+
+def cursor_env(marked):
+    return lambda pid: ({"CURSOR_AGENT": "1", "CURSOR_CONVERSATION_ID": CHAT, "Path": "x"} if pid in marked
+                        else {"Path": "x"})
+
+
+class CursorAppTests(unittest.TestCase):
+    def test_the_agent_cli_worker_is_a_desktop_target(self):
+        table, path = cursor_tree((600, 4, "pwsh.exe", ""), (610, 600, "node.exe", CURSOR_NODE),
+                                  (620, 600, "node.exe", CURSOR_WORKER))  # the worker's binary, outside Cursor
+        self.assertEqual(PV.desktop_targets(table, path), [(520, "cursor")])
+
+    def test_the_topmost_marked_process_under_cursor_is_an_agent_command(self):
+        table, path = cursor_tree((600, 4, "pwsh.exe", ""), (610, 600, "python.exe", ""))
+        read = []
+        env = cursor_env({530, 540, 610, 500, 510})
+
+        def environment(pid):
+            read.append(pid)
+            return env(pid)
+        self.assertEqual(PV.agent_commands(table, path, environment), [(530, "cursor", CHAT)])
+        self.assertFalse({500, 510} & set(read))  # Cursor's own processes are never read
+        self.assertNotIn(610, read)  # nothing outside Cursor is read either
+
+    def test_covered_and_unreadable_processes_are_left_out(self):
+        table, path = cursor_tree()
+        self.assertEqual(PV.agent_commands(table, path, cursor_env({530, 540}), inside={530, 540}), [])
+        self.assertEqual(PV.agent_commands(table, path, lambda pid: None), [])
+        # the parent's block cannot be read: the marked child counts as the topmost one
+        env = cursor_env({540})
+        self.assertEqual(PV.agent_commands(table, path, env), [(540, "cursor", CHAT)])
+
+    def test_a_command_without_a_chat_id_has_none(self):
+        table, path = cursor_tree()
+        self.assertEqual(PV.agent_commands(table, path, lambda pid: {"CURSOR_AGENT": "1"} if pid == 530 else {}),
+                         [(530, "cursor", None)])
+
+    def test_commands_of_one_chat_share_a_session(self):
+        from sentinel.guardian import daemon as D
+        table, _ = cursor_tree()
+        g = D.Guardian.__new__(D.Guardian)
+        g.sessions = {}
+        g.place_desktop, g.join_desktop = mock.Mock(return_value="placed"), mock.Mock(return_value=True)
+        g.place_command(530, "cursor", CHAT, table)
+        name = "chat-0c9f6a1e3b2d"
+        self.assertEqual(g.place_desktop.call_args.args[:4], (530, "cursor", table, name))
+        s = g.sessions["cursor/" + name] = D.Session("cursor", name, "normal", FakeJob())
+        s.desktop = True
+        g.place_desktop.reset_mock()
+        self.assertIs(g.place_command(560, "cursor", CHAT, table), s)
+        g.place_desktop.assert_not_called()
+        g.join_desktop.return_value = False  # under another extension host's job
+        g.place_command(570, "cursor", CHAT, table)
+        self.assertEqual(g.place_desktop.call_args.args[3], name + "-570")
+        g.place_command(580, "cursor", None, table)
+        self.assertEqual(g.place_desktop.call_args.args[3], "cmd-580")
+
+    def test_whereami_reads_a_chat_or_command_job_by_name(self):
+        wa = load("scripts/guardian-whereami.py", "guardian_whereami")
+        table, path = cursor_tree()
+
+        def answer(env, named):
+            out = []
+            with tempfile.TemporaryDirectory() as d, mock.patch.object(wa, "whereis", lambda pid, inst: None), \
+                    mock.patch.object(wa, "home_dir", lambda inst: Path(d)), \
+                    mock.patch.dict(os.environ, {"GUARDIAN_PROVIDER": "", "GUARDIAN_SESSION": ""}), \
+                    mock.patch.object(wa.wj, "process_table", lambda: table), \
+                    mock.patch.object(wa.wj, "image_path", path), mock.patch.object(wa.wj, "in_job", lambda *a: True), \
+                    mock.patch.object(wa.wj, "priority_class", lambda pid: "below_normal"), \
+                    mock.patch.object(wa.wj, "environment", env), \
+                    mock.patch.object(wa.wj, "in_named_job", lambda pid, name: name in named), \
+                    mock.patch("builtins.print", out.append):
+                wa.main(["--pid", "540", "--instance", "main", "--json"])
+            return json.loads(out[0])["answer"]
+        self.assertTrue(answer(cursor_env({530, 540}), {"main.d.cursor.chat-0c9f6a1e3b2d"}).startswith(
+            "CONTROLLED: session cursor/chat-0c9f6a1e3b2d (desktop job under the Cursor's job"))
+        self.assertTrue(answer(cursor_env({530, 540}), {"main.d.cursor.chat-0c9f6a1e3b2d-530"}).startswith(
+            "CONTROLLED: session cursor/chat-0c9f6a1e3b2d-530 "))
+        no_chat = lambda pid: {"CURSOR_AGENT": "1"}  # noqa: E731
+        self.assertTrue(answer(no_chat, {"main.d.cursor.cmd-530"}).startswith("CONTROLLED: session cursor/cmd-530 "))
+        self.assertEqual(answer(cursor_env(set()), {"main.d.cursor.cmd-530"}),
+                         "NOT CONTROLLED: Guardian main is not running")
+
+    def test_the_environment_of_a_live_process_is_read(self):
+        from sentinel.guardian import winjob as wj
+        env = dict(os.environ, GUARDIAN_TEST_MARK="m=1;x")
+        p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"], env=env)
+        try:
+            for _ in range(50):
+                got = wj.environment(p.pid)
+                if got:
+                    break
+                time.sleep(0.05)
+            self.assertEqual(got.get("GUARDIAN_TEST_MARK"), "m=1;x")
+            self.assertIsNone(wj.environment(0))
+        finally:
+            p.kill()
+            p.wait()
+
+
 class FakeJob:
     def __init__(self):
         self.calls = []

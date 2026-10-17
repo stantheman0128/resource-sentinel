@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased - 2026-10-17
+
+- Guardian controls the Cursor app's agent. The bundled cursor-agent worker (one node.exe per open workspace) goes
+  into a desktop job like the Claude and Codex app CLIs, and the agent commands Cursor starts outside the worker are
+  told apart from Stan's own terminal commands by `CURSOR_AGENT=1` in their environment, read from the process's
+  PEB. Each chat gets one desktop job, `cursor/chat-<id>`, that its commands share; whereami finds these jobs by
+  name. Measured live on a test instance: both workers, three spoofed commands of one chat, one without a chat id,
+  and the commands of a real Cursor chat were placed within 2 s; an unmarked command was left alone.
+- winjob gains `environment(pid)`, I/O and memory priority setters and readers, and `trim_working_set(pid)`.
+
 ## Unreleased - 2026-10-13
 
 - Add Guardian, a daemon that runs agent sessions inside Windows Job Objects: a dynamic hard cap on all agents

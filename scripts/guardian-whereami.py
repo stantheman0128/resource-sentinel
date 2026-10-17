@@ -71,6 +71,12 @@ def main(argv=None):
     # a desktop job sits under the app's job, outside the pool; its name holds the desktop CLI's pid
     desk = None if up or pooled else next((f"{p}/desk-{c}" for c in chain[:16] for p in PV.DESKTOP_CLIS
                                            if wj.in_named_job(a.pid, f"{a.instance}.d.{p}.desk-{c}")), None)
+    if not (up or pooled or desk):  # an app's agent command: its desktop job is named after the chat, or the command
+        env = wj.environment(a.pid) or {}
+        names = [(p, n) for p, v in PV.AGENT_ENV.items() if env.get(v[0]) == v[1]
+                 for chat in [PV.chat_session(env[v[2]]) if env.get(v[2]) else None]
+                 for n in ([chat] if chat else []) + [f"{chat}-{c}" if chat else f"cmd-{c}" for c in chain[:16]]]
+        desk = next((f"{p}/{n}" for p, n in names if wj.in_named_job(a.pid, f"{a.instance}.d.{p}.{n}")), None)
     # a hook-adopted CLI in a job of its own got a nested job, also outside the pool, named after its session
     nest = None if up or pooled or desk else next((c for c in candidates(chain, a.instance)
                                                    if wj.in_named_job(a.pid, f"{a.instance}.d.{c[0]}.{c[1]}")), None)

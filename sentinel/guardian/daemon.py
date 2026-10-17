@@ -997,17 +997,44 @@ class Guardian:
                 table = wj.process_table()
                 targets = PV.desktop_targets(table, wj.image_path)
                 with self.lock:
+                    inside = set(self.desktop_skip)
+                    for s in [x for x in self.sessions.values() if x.desktop]:
+                        try:
+                            inside.update(s.job.pids())
+                        except OSError:
+                            pass
+                # environments are read outside the lock: a few processes under the apps, about 1 ms each
+                commands = PV.agent_commands(table, wj.image_path, wj.environment, inside | {p for p, _ in targets})
+                with self.lock:
                     if self.desktop_on:
-                        self.desktop_once(table, targets)
+                        self.desktop_once(table, targets, commands)
             except Exception:
                 self.log("desktop poll failed: " + traceback.format_exc(limit=3).replace("\n", " | "))
 
-    def desktop_once(self, table, targets):
+    def desktop_once(self, table, targets, commands=()):
         self.desktop_skip &= set(table)
         for pid, provider in targets:
             if f"{provider}/desk-{pid}" not in self.sessions and pid not in self.desktop_skip:
                 self.place_desktop(pid, provider, table)
+        for pid, provider, chat in commands:
+            if pid not in self.desktop_skip and pid not in self.adopted:
+                self.place_command(pid, provider, chat, table)
         self.drop_ended()
+
+    def place_command(self, pid, provider, chat, table):
+        """An agent command an app started outside its agent CLI (Cursor's extension host runs some itself): it goes
+        into the desktop job of its chat, so one chat is one session, or into a job of its own when it sits under
+        another host than the chat's first command, since a job nests under one parent job only."""
+        var, value = PV.AGENT_ENV[provider][:2]
+        still = lambda: (wj.environment(pid) or {}).get(var) == value
+        if not chat:
+            return self.place_desktop(pid, provider, table, f"cmd-{pid}", still, "agent command")
+        name = PV.chat_session(chat)
+        s = self.sessions.get(f"{provider}/{name}")
+        if s is not None and s.desktop and not s.nested and self.join_desktop(s, pid, table, still):
+            return s
+        return self.place_desktop(pid, provider, table, name if s is None else f"{name}-{pid}", still,
+                                  "agent command")
 
     def drop_ended(self):
         for s in [x for x in self.sessions.values() if x.desktop and not x.live_runs]:
@@ -1016,11 +1043,13 @@ class Guardian:
                 s.job.close()
                 self.log(f"{'nested' if s.nested else 'desktop'} session {s.key} ended")
 
-    def place_desktop(self, pid, provider, table):
-        """Put one desktop CLI and what it has started into a desktop job of its own; what it starts later inherits
-        the job. A refusal or failure is logged once, and that pid is not tried again while it runs."""
-        name, image = f"desk-{pid}", table[pid][1]
+    def place_desktop(self, pid, provider, table, name=None, still=None, what="desktop CLI"):
+        """Put one desktop CLI (or one agent command, see place_command) and what it has started into a desktop job of
+        its own; what it starts later inherits the job. still() tells whether pid is still the process the scan
+        found. A refusal or failure is logged once, and that pid is not tried again while it runs."""
+        name, image = name or f"desk-{pid}", table[pid][1]
         key = f"{provider}/{name}"
+        still = still or (lambda: PV.DESKTOP_CLIS[provider][1] in (wj.image_path(pid) or "").lower())
 
         def refuse(why, err=None):
             self.desktop_skip.add(pid)
@@ -1033,9 +1062,9 @@ class Guardian:
         handle = wj.open_waitable(pid)  # holds the pid, so it cannot be reused while it is placed
         if not handle:
             return None  # it exited after the process table was read
-        if PV.DESKTOP_CLIS[provider][1] not in (wj.image_path(pid) or "").lower():
+        if not still():
             wj.CloseHandle(handle)
-            return refuse("the process is no longer the desktop CLI the scan found")
+            return refuse(f"the process is no longer the {what} the scan found")
         try:
             self.provider(provider)  # the pause switch lives there, although its job does not hold desktop jobs
             # a name that already exists is refused as for a session: never take over a job Guardian did not create
@@ -1060,30 +1089,50 @@ class Guardian:
         except OSError as e:
             self.log(f"desktop limits for {key} failed: {e}")
         self.apply_session(s, self.desktop_want(s, None, budget), budget)
+        self.track_desktop(s, pid, handle, image, what)
+        return s
+
+    def join_desktop(self, s, pid, table, still):
+        """Add one more agent command to an existing desktop session. False when it cannot join that job (another
+        host's job, or it is not the command the scan found), so the caller gives it a job of its own."""
+        if self.own_or_parent(pid, table) or wj.in_job(pid, self.root.h):
+            return False
+        handle = wj.open_waitable(pid)
+        if not handle:
+            return True  # it exited after the scan: nothing left to place
+        if not still() or self.assign_chain(pid, [s.job]):
+            wj.CloseHandle(handle)
+            return False
+        self.track_desktop(s, pid, handle, table[pid][1], "agent command")
+        return True
+
+    def track_desktop(self, s, pid, handle, image, what):
+        """Sweep pid's children into the session's job, then keep a run row for pid until it exits."""
         fresh = wj.process_table()
         own = self.own_pids() | set(wj.ancestors(os.getpid(), fresh))
         failed, moved = [], 1
         for p in desktop_sweep(pid, fresh, wj.image_path, own):
-            e = self.assign_chain(p, [job])
+            e = self.assign_chain(p, [s.job])
             if e:
                 failed.append({"pid": p, "image": fresh[p][1], "error": e})
             else:
                 moved += 1
         coverage = self.coverage_of(pid, s)
-        app = PV.DESKTOP_CLIS[provider][2]
-        run = Adopted(uuid.uuid4().hex[:12], s, pid, handle, f"{image} (desktop)", coverage)
+        app = (PV.DESKTOP_CLIS.get(s.provider) or PV.AGENT_ENV.get(s.provider) or ("app",))[-1]
+        run = Adopted(uuid.uuid4().hex[:12], s, pid, handle,
+                      f"{image} ({'desktop' if what == 'desktop CLI' else what})", coverage)
         run.est_source = "desktop"
         self.live[run.run_id] = run
         s.live_runs += 1
-        self.ledger.run_requested({"run_id": run.run_id, "provider": provider, "session": name, "cls": s.cls,
-                                   "fingerprint": hashlib.sha1(f"{provider}|desktop".encode()).hexdigest()[:16],
+        self.ledger.run_requested({"run_id": run.run_id, "provider": s.provider, "session": s.name, "cls": s.cls,
+                                   "fingerprint": hashlib.sha1(f"{s.provider}|desktop".encode()).hexdigest()[:16],
                                    "label": run.label, "est_gib": 0.0, "est_source": "desktop",
                                    "unprofiled": False, "t_request": time.time(), "coverage": coverage})
         self.ledger.run_update(run.run_id, state="running", t_start=time.time(), pid=pid)
-        self.decide("desktop", key, requested={"pid": pid, "image": image},
+        self.decide("desktop", s.key, requested={"pid": pid, "image": image},
                     readback={"processes": moved, "failed": failed[:5], "coverage": coverage},
-                    reason=f"{image} and {moved - 1} child processes joined a desktop job under the {app}'s job")
-        return s
+                    reason=f"{what} {image} and {moved - 1} child processes joined a desktop job under the {app}'s "
+                           f"job")
 
     def set_desktop(self, on, reason):
         """Off lets every desktop job go: no CPU cap, normal priority, every CPU, and no new placements. A nested
@@ -1108,7 +1157,7 @@ class Guardian:
         self.decide("desktop", "desktop jobs", requested=on,
                     readback={"released": len(released),
                               "nested_kept": sum(1 for s in self.sessions.values() if s.nested)},
-                    reason=f"{reason}: " + ("the Claude and Codex apps' CLIs go into desktop jobs" if on
+                    reason=f"{reason}: " + ("the desktop apps' agent CLIs and agent commands go into desktop jobs" if on
                                             else "desktop jobs released, none placed"))
 
     def desktop_priority(self, s, name):
@@ -1469,7 +1518,8 @@ def main(argv=None):
     ap.add_argument("--no-probe", action="store_true")
     ap.add_argument("--no-apps", action="store_true")
     ap.add_argument("--desktop", choices=("on", "off"),
-                    help="put the Claude and Codex apps' agent CLIs in desktop jobs (default: on for main only)")
+                    help="put the Claude, Codex and Cursor apps' agent CLIs and Cursor's agent commands in desktop "
+                         "jobs (default: on for main only)")
     ap.add_argument("--stay-in-job", action="store_true", help="never start again outside the job this runs in")
     ap.add_argument("--log", metavar="PATH", help="append stdout and stderr to PATH")
     a = ap.parse_args(argv)

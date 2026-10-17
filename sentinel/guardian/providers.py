@@ -88,12 +88,17 @@ def find_cli(provider, start_pid, table, image_path, max_depth=16):
     return found, ""
 
 
+def app_of(pid, image, image_path):
+    """protected_app for one process; the path is read only for claude.exe, the one image it decides on."""
+    return protected_app(image, image_path(pid) if (image or "").lower() == "claude.exe" else None)
+
+
 def app_among(pid, table, image_path, max_depth=16):
     """Name of a desktop app that is pid itself or one of its parents, or None."""
     seen, depth = set(), 0
     while pid in table and pid not in seen and depth <= max_depth:
         seen.add(pid)
-        app = protected_app(table[pid][1], image_path(pid))
+        app = app_of(pid, table[pid][1], image_path)
         if app:
             return app
         pid, depth = table[pid][0], depth + 1
@@ -101,10 +106,18 @@ def app_among(pid, table, image_path, max_depth=16):
 
 
 # The CLIs the desktop apps run for their agent sessions, told apart by where the app installs them: the Claude app
-# under %APPDATA%\Claude\claude-code\<version>\<hash>\, the Codex app under %LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\.
+# under %APPDATA%\Claude\claude-code\<version>\<hash>\, the Codex app under %LOCALAPPDATA%\OpenAI\Codex\bin\<hash>\,
+# and Cursor 3.25 its bundled cursor-agent CLI under %APPDATA%\Cursor\User\globalStorage\anysphere.cursor-agent-worker\
+# agent-cli\: one node.exe `worker start` per open workspace, under an extension host (seen 2026-10-17).
 # provider -> (image, path part, the app that must be among its parents)
 DESKTOP_CLIS = {"claude": ("claude.exe", "\\claude\\claude-code\\", "Claude app"),
-                "codex": ("codex.exe", "\\openai\\codex\\bin\\", "Codex app")}
+                "codex": ("codex.exe", "\\openai\\codex\\bin\\", "Codex app"),
+                "cursor": ("node.exe", "\\anysphere.cursor-agent-worker\\agent-cli\\", "Cursor")}
+
+# The commands an app's agent starts carry a mark in their environment that Stan's own commands in the same app do
+# not: Cursor's agent code (its extensions and the agent-cli, read 2026-10-17) adds CURSOR_AGENT=1, and the chat's id
+# in CURSOR_CONVERSATION_ID. provider -> (variable, value, the variable that names the chat, the app above them)
+AGENT_ENV = {"cursor": ("CURSOR_AGENT", "1", "CURSOR_CONVERSATION_ID", "Cursor")}
 
 
 def desktop_targets(table, image_path, max_depth=16):
@@ -133,6 +146,43 @@ def desktop_targets(table, image_path, max_depth=16):
         if up not in found or up == pid:        # a reused parent pid can loop the chain back to pid itself
             out.append((pid, provider))
     return sorted(out)
+
+
+def agent_commands(table, image_path, environment, inside=(), max_depth=16):
+    """Agent commands under a desktop app that no desktop job holds yet, as a sorted list of (pid, provider, chat):
+    a process with the app among its parents and the app's mark in its environment (AGENT_ENV), whose parent lacks
+    the mark, since the children of the topmost one inherit its job. The apps' own processes are never read.
+    environment(pid) returns a dict or None; chat is the id from the chat variable, or None. inside: pids to leave
+    out, such as those already in a desktop job."""
+    paths, envs = {}, {}
+
+    def path(pid):
+        if pid not in paths:
+            paths[pid] = image_path(pid)
+        return paths[pid]
+
+    def marked(pid, var, value):
+        if pid not in envs:
+            envs[pid] = environment(pid) or {}
+        return envs[pid].get(var) == value
+
+    out = []
+    for pid, (ppid, image) in table.items():
+        if pid in inside or app_of(pid, image, path):
+            continue
+        for provider, (var, value, chat_var, app) in AGENT_ENV.items():
+            if app_among(ppid, table, path, max_depth) != app or not marked(pid, var, value):
+                continue
+            parent = table.get(ppid)
+            if parent and not app_of(ppid, parent[1], path) and marked(ppid, var, value):
+                continue  # not the topmost marked process
+            out.append((pid, provider, envs[pid].get(chat_var) or None))
+    return sorted(out, key=lambda x: x[0])
+
+
+def chat_session(chat):
+    """Session name of an app chat's desktop job: the first 12 letters and digits of the chat id."""
+    return "chat-" + "".join(c for c in str(chat) if c.isascii() and c.isalnum())[:12].lower()
 
 
 def default_session(provider):

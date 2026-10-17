@@ -316,5 +316,65 @@ class MemoryLadderTests(unittest.TestCase):
         self.assertEqual((st.rung, d), (0, None))
 
 
+class MemoryLadderSettingsTests(unittest.TestCase):
+    """The rung follows pressure_trim and pressure_pause on every step, so a step Stan turns off ends while pressure
+    lasts; the episode keeps its start, and the release margin is unchanged."""
+
+    def cfg(self, **memory):
+        return P.merged(P.DEFAULTS, {"memory": dict(agent_memory_budget_gib=4, **memory)})
+
+    def test_turning_pause_off_lowers_the_rung_while_pressure_lasts(self):
+        cfg = self.cfg(pressure_pause=True)
+        st, _ = P.memory_step(P.MemState(), sample(0), 5.0, cfg)
+        st, _ = P.memory_step(st, sample(20), 5.0, cfg)
+        self.assertEqual(st, P.MemState(0, 2))
+        cfg["memory"]["pressure_pause"] = False  # guardctl memory-pause off
+        st, d = P.memory_step(st, sample(21), 5.0, cfg)
+        self.assertEqual((st, d["kind"], d["rung"]), (P.MemState(0, 1), "memory_pressure", 1))
+        self.assertIn("budget 4: pressure_pause turned off, trim the agents' working sets", d["reason"])
+        st, d = P.memory_step(st, sample(22), 5.0, cfg)
+        self.assertEqual((st, d), (P.MemState(0, 1), None))
+        cfg["memory"]["pressure_pause"] = True  # on again: the pressure has lasted 23 s, so the pause is due at once
+        st, d = P.memory_step(st, sample(23), 5.0, cfg)
+        self.assertEqual((st, d["rung"]), (P.MemState(0, 2), 2))
+
+    def test_turning_trim_off_ends_the_trims_and_with_both_off_no_step_is_left(self):
+        cfg = self.cfg()
+        st, _ = P.memory_step(P.MemState(), sample(0), 5.0, cfg)
+        cfg["memory"]["pressure_trim"] = False
+        st, d = P.memory_step(st, sample(5), 5.0, cfg)
+        self.assertEqual((st, d["rung"]), (P.MemState(0, 0), 0))
+        self.assertIn("pressure_trim turned off, no step taken", d["reason"])
+        cfg["memory"].update(pressure_trim=True, pressure_pause=True)
+        st, _ = P.memory_step(st, sample(30), 5.0, cfg)
+        self.assertEqual(st, P.MemState(0, 2))
+        cfg["memory"].update(pressure_trim=False, pressure_pause=False)
+        st, d = P.memory_step(st, sample(31), 5.0, cfg)
+        self.assertEqual((st, d["rung"]), (P.MemState(0, 0), 0))
+        self.assertIn("pressure_pause turned off, no step taken", d["reason"])
+        st, d = P.memory_step(st, sample(32), 2.5, cfg)  # at rung 0 the end of the pressure needs no decision
+        self.assertEqual((st, d), (P.MemState(), None))
+
+    def test_inside_the_line_but_not_the_margin_the_rung_holds_unless_a_step_is_turned_off(self):
+        cfg = self.cfg(pressure_pause=True)
+        st, _ = P.memory_step(P.MemState(), sample(0), 5.0, cfg)
+        st, d = P.memory_step(st, sample(25), 3.5, cfg)  # 20 s have passed, but the band only holds the rung
+        self.assertEqual((st, d), (P.MemState(0, 1), None))
+        st, _ = P.memory_step(st, sample(26), 5.0, cfg)
+        self.assertEqual(st.rung, 2)
+        cfg["memory"]["pressure_pause"] = False
+        st, d = P.memory_step(st, sample(27), 3.5, cfg)
+        self.assertEqual((st, d["rung"]), (P.MemState(0, 1), 1))
+        self.assertIn("not 1 GiB inside the line yet: pressure_pause turned off", d["reason"])
+        st, d = P.memory_step(st, sample(28), 2.5, cfg)
+        self.assertEqual((st, d["kind"]), (P.MemState(), "memory_relief"))
+        cfg["memory"]["pressure_pause"] = True
+        st, _ = P.memory_step(st, sample(30), 5.0, cfg)  # a new episode at the trim rung
+        cfg["memory"]["pressure_trim"] = False
+        st, d = P.memory_step(st, sample(55), 3.5, cfg)  # in the band the pause, due by now, is not added either
+        self.assertEqual((st, d["rung"]), (P.MemState(30, 0), 0))
+        self.assertIn("pressure_trim turned off, no step taken", d["reason"])
+
+
 if __name__ == "__main__":
     unittest.main()

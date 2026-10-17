@@ -41,6 +41,10 @@
   model's request, which a local server answered with 401.
 - The acceptance run is in docs/guardian.md: control off and on under a mixed agent load in a 4-CPU world,
   a Cursor-style agent command included, and a second run that switches only the agents' I/O priority.
+- The memory ladder follows its settings while pressure lasts. Turning `memory-trim` or `memory-pause` off stops
+  that step on the next tick, and a ladder pause also ends when its session ends, is exempted, leaves with the
+  desktop jobs or is paused by Stan. The ladder never picks a session that holds no private commit, and a tick that
+  runs after shutdown trims and pauses nothing.
 
 ## Unreleased - 2026-10-13
 

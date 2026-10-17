@@ -563,6 +563,7 @@ class Guardian:
         self.decide("session_class", s.key, s.cls_before, "exempt", f"until {until}", None,
                     f"{reason} for {minutes:g} minutes: no session cap, queue gates skipped, new runs outside the pool")
         s.cls = "exempt"
+        self.end_memory_pause(s.key, "Stan exempted the session")
 
     def end_exemptions(self):
         for s in self.sessions.values():
@@ -572,13 +573,14 @@ class Guardian:
                             "exemption ended; runs already started outside the pool stay there until they end")
 
     def memory_ladder(self, mem, now):
-        """Act on memory_step's rung. Rung 1 trims working sets, largest first, each process at most once per
-        spacing. Rung 2 also pauses the session holding the most private commit, one session, until the pressure is
-        over; a pause stops growth but frees nothing, and an exempt session or one Stan paused is never picked."""
+        """Act on memory_step's rung. Rung 1 trims working sets while pressure_trim is on, largest first, each process
+        at most once per spacing. Rung 2 also pauses the session holding the most private commit, one session, until
+        the pressure is over or the rung drops; a pause stops growth but frees nothing, and an exempt session, one
+        Stan paused or one holding no private commit is never picked."""
         m = self.cfg["memory"]
         for pid in self.trimmed.keys() - mem.keys():
             del self.trimmed[pid]
-        if self.mem.rung >= 1:
+        if self.mem.rung >= 1 and m["pressure_trim"]:
             freed = n = 0
             for pid, x in sorted(mem.items(), key=lambda kv: -(kv[1][1] if kv[1] else 0)):
                 if x and now - self.trimmed.get(pid, -1e9) >= m["pressure_trim_spacing_seconds"]:
@@ -599,7 +601,9 @@ class Guardian:
                     pids = x.job.pids()
                 except OSError:
                     continue
-                held[k] = sum(mem[p][0] for p in pids if mem.get(p))
+                got = sum(mem[p][0] for p in pids if mem.get(p))
+                if got:  # pausing a session that holds nothing frees nothing and would block every other pause
+                    held[k] = got
             if held:
                 k = max(held, key=held.get)
                 self.mem_paused.add(k)
@@ -607,9 +611,16 @@ class Guardian:
                             reason="memory pressure lasted: the session holding the most private commit is paused, "
                                    "and its processes keep their memory")
         elif self.mem.rung < 2 and self.mem_paused:
+            why = "memory pressure over" if self.mem.since is None else "pressure_pause turned off"
             for k in sorted(self.mem_paused):
-                self.decide("memory_resume", k, reason="memory pressure over")
-            self.mem_paused.clear()
+                self.end_memory_pause(k, why)
+
+    def end_memory_pause(self, key, why):
+        """Take key off the ladder's pause. The ladder pauses one session at a time, so while pressure lasts its next
+        pass may pick the next largest session."""
+        if key in self.mem_paused:
+            self.mem_paused.discard(key)
+            self.decide("memory_resume", key, reason=why)
 
     def desktop_want(self, s, cap, budget):
         """A desktop job's cap in absolute cores, since the app's job above it has no CPU rate: the allocator's cap,
@@ -1191,6 +1202,7 @@ class Guardian:
                 self.sessions.pop(s.key, None)
                 s.job.close()
                 self.log(f"{'nested' if s.nested else 'desktop'} session {s.key} ended")
+                self.end_memory_pause(s.key, "the session ended")
 
     def place_desktop(self, pid, provider, table, name=None, still=None, what="desktop CLI"):
         """Put one desktop CLI (or one agent command, see place_command) and what it has started into a desktop job of
@@ -1303,6 +1315,7 @@ class Guardian:
                 self.end_adopted(r, "desktop jobs switched off; the CLI keeps running outside Guardian")
             self.sessions.pop(s.key, None)
             s.job.close()
+            self.end_memory_pause(s.key, "desktop jobs switched off, so the session left Guardian")
         self.desktop_skip.clear()
         self.decide("desktop", "desktop jobs", requested=on,
                     readback={"released": len(released),
@@ -1437,6 +1450,8 @@ class Guardian:
                     self.decide("session_pause" if s.paused else "session_resume", s.key, reason=
                                 "Stan paused the session: CPU rate 1/10000, processes stay alive" if s.paused
                                 else "resumed")
+                    if s.paused:  # Stan's resume leaves a ladder pause alone
+                        self.end_memory_pause(s.key, "Stan paused the session, and that pause holds it now")
                 self.allocate()
             elif path == "/api/provider":
                 self.set_provider_paused(safe(b["name"]), bool(b["paused"]))
@@ -1546,6 +1561,9 @@ class Guardian:
         """Leave no throttle behind: work still running after the daemon exits must not stay capped or paused."""
         with self.lock:
             self.desktop_on = False  # no desktop job placed, and capped, after the cleanup below
+            # nor capped, trimmed or paused by a tick that was waiting for the lock: tick acts only under control
+            self.control = False
+            self.mem, self.mem_paused = P.MemState(), set()
             try:
                 for s in self.sessions.values():
                     self.apply_session(s, None, 1)

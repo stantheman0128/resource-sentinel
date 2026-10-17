@@ -1669,5 +1669,140 @@ class NestedJobLiveTests(unittest.TestCase):
         self.assertIsNone(run.poll())
 
 
+class MemoryLadderPauseTests(unittest.TestCase):
+    """R2: a ladder pause follows the settings and ends with its session, an exemption or Stan's own pause, so the
+    ladder can pause the next largest session; trims wait for pressure_trim, and a shutdown leaves no ladder behind."""
+    add = DesktopAllocateTests.add
+
+    def setUp(self):
+        MemoryLadderTests.setUp(self)
+        g, GiB = self.g, self.GiB
+        g.desktop_on, g.desktop_skip, g.niced, g.agents_gib = True, set(), {}, 5.0
+        g.cfg["memory"].update(agent_memory_budget_gib=4, pressure_pause=True)
+        g.mem = self.P.MemState(since=0.0, rung=2)
+        self.trimmed = []
+        for p in (mock.patch.object(self.wj, "trim_working_set", lambda pid: self.trimmed.append(pid)),
+                  # the pids here are made up: never let them reach a real process
+                  mock.patch.object(self.wj, "set_io_priority", lambda pid, name: True),
+                  mock.patch.object(self.wj, "set_memory_priority", lambda pid, name: True)):
+            p.start()
+            self.addCleanup(p.stop)
+        # a desktop chat session (4 GiB in two processes) and a session in the tree (3 GiB)
+        self.big, self.small = self.add("cursor/chat-a", 0.5, desktop=True, runs=0), self.add("codex/small", 0.5)
+        self.big.job, self.small.job = MemberJob("t.d.cursor.chat-a", members={1, 2}), MemJob([3])
+        self.mem = {1: (2 * GiB, GiB), 2: (2 * GiB, GiB), 3: (3 * GiB, GiB)}
+
+    def resumed(self):
+        return [(c.args[1], c.args[6]) for c in self.g.ledger.decision.call_args_list if c.args[0] == "memory_resume"]
+
+    def test_memory_pause_off_resumes_while_the_pressure_lasts(self):
+        g, P = self.g, self.P
+        g.mem = P.MemState()
+        for t in (0.0, 20.0, 21.0):  # what tick() does each second
+            if t == 21.0:
+                g.action("/api/memory", {"pause": False})  # guardctl memory-pause off
+            g.mem, _ = P.memory_step(g.mem, P.Sample(t=t, age_s=0.5, available_gib=30.0), g.agents_gib, g.cfg)
+            g.memory_ladder(self.mem, t)
+            if t == 20.0:
+                self.assertEqual(g.mem_paused, {"cursor/chat-a"})
+        self.assertEqual((g.mem.rung, g.mem_paused), (1, set()))
+        self.assertEqual(self.resumed(), [("cursor/chat-a", "pressure_pause turned off")])
+        g.allocate()
+        self.assertEqual(self.big.job.calls, [("cpu", 1.2)])
+
+    def test_the_pause_rung_trims_only_while_trim_is_on(self):
+        self.g.cfg["memory"]["pressure_trim"] = False
+        self.g.memory_ladder(self.mem, 50.0)
+        self.assertEqual((self.trimmed, self.g.mem_paused), ([], {"cursor/chat-a"}))
+        self.g.cfg["memory"]["pressure_trim"] = True
+        self.g.memory_ladder(self.mem, 51.0)
+        self.assertEqual(sorted(self.trimmed), [1, 2, 3])
+
+    def test_a_paused_session_that_ends_lets_the_ladder_pause_the_next(self):
+        g = self.g
+        g.memory_ladder(self.mem, 50.0)
+        self.assertEqual(g.mem_paused, {"cursor/chat-a"})
+        self.big.job.members.clear()  # the chat's last command exited
+        g.drop_ended()
+        self.assertNotIn("cursor/chat-a", g.sessions)
+        self.assertEqual(self.resumed(), [("cursor/chat-a", "the session ended")])
+        g.memory_ladder({3: self.mem[3]}, 51.0)
+        self.assertEqual(g.mem_paused, {"codex/small"})
+        again = self.add("cursor/chat-a", 0.5, desktop=True)  # a later command of the same chat gets the same key
+        g.allocate()
+        self.assertNotIn(("rate", 1), again.job.calls)
+
+    def test_desktop_jobs_switched_off_end_the_pause_of_a_desktop_session(self):
+        g = self.g
+        g.memory_ladder(self.mem, 50.0)
+        g.set_desktop(False, "test")
+        self.assertNotIn("cursor/chat-a", g.sessions)
+        self.assertEqual(self.resumed(), [("cursor/chat-a", "desktop jobs switched off, so the session left Guardian")])
+        g.memory_ladder({3: self.mem[3]}, 51.0)
+        self.assertEqual(g.mem_paused, {"codex/small"})
+
+    def test_an_exempted_session_leaves_the_ladder(self):
+        g = self.g
+        g.memory_ladder(self.mem, 50.0)
+        g.allocate()
+        self.assertEqual(self.big.job.calls[-1], ("rate", 1))
+        g.action("/api/session", {"key": "cursor/chat-a", "cls": "exempt"})
+        self.assertEqual(self.resumed(), [("cursor/chat-a", "Stan exempted the session")])
+        self.assertEqual(self.big.job.calls[-1], ("cpu", None))  # an exempt desktop job runs without a cap
+        g.pool_priority, g.agent_io, g.sample = "below_normal", "low", None
+        self.assertFalse(g.budget_of(self.big)["paused"])
+        g.memory_ladder(self.mem, 51.0)
+        self.assertEqual(g.mem_paused, {"codex/small"})  # the next largest; an exempt session is never picked
+
+    def test_stans_resume_keeps_a_ladder_pause_and_his_own_pause_takes_it_over(self):
+        g = self.g
+        g.memory_ladder(self.mem, 50.0)
+        g.allocate()
+        g.action("/api/session", {"key": "cursor/chat-a", "paused": False})
+        self.assertEqual((g.mem_paused, self.resumed()), ({"cursor/chat-a"}, []))
+        self.assertEqual(self.big.job.calls[-1], ("rate", 1))
+        g.action("/api/session", {"key": "cursor/chat-a", "paused": True})
+        self.assertEqual(self.resumed(),
+                         [("cursor/chat-a", "Stan paused the session, and that pause holds it now")])
+        self.assertEqual(self.big.job.calls[-1], ("rate", 1))
+        g.memory_ladder(self.mem, 51.0)
+        self.assertEqual(g.mem_paused, {"codex/small"})
+        g.action("/api/session", {"key": "cursor/chat-a", "paused": False})  # now Stan's resume runs it again
+        self.assertEqual(self.big.job.calls[-1][0], "cpu")
+
+    def test_a_session_holding_no_private_commit_is_never_the_one_paused(self):
+        g = self.g
+        g.memory_ladder({1: None, 2: (0, 0), 3: None}, 50.0)  # nothing held, or nothing readable: a pause frees nothing
+        self.assertEqual(g.mem_paused, set())
+        g.memory_ladder({1: None, 2: (0, 0), 3: (self.GiB, 0)}, 51.0)
+        self.assertEqual(g.mem_paused, {"codex/small"})
+
+    def test_a_tick_after_shutdown_pauses_and_trims_nothing(self):
+        g, D, GiB = self.g, self.D, self.GiB
+        g.memory_ladder(self.mem, 50.0)
+        g.allocate()
+        self.assertEqual(self.big.job.calls[-1], ("rate", 1))
+        g.root = mock.Mock()
+        g.root.accounting.return_value, g.root.pids.return_value = {"cpu_s": 3.0}, [3]
+        self.small.job.accounting = lambda: {"cpu_s": 1.0, "active": 1}
+        g.busy_fn, g.last_core_ok, g.lingering, g.history, g.apps_rows = (lambda: 0.5), 0.0, [], [], []
+        g.probe_enabled, g.probe_proc, g.inject, g.media, g.probe_last = False, None, None, None, None
+        g.pool_priority_readback, g.stop, g.agent_io, g.agent_memory = "below_normal", threading.Event(), "low", "low"
+        perf = {"available": 30 * GiB, "commit_limit": 64 * GiB, "commit_total": 16 * GiB}
+        with mock.patch.object(D.os, "_exit") as exit_, mock.patch.object(D.time, "sleep"), \
+                mock.patch.object(self.wj, "performance_info", lambda: perf), \
+                mock.patch.object(self.wj, "process_memory", lambda pid: self.mem.get(pid)):
+            g.shutdown()
+            exit_.assert_called_once_with(0)
+            self.assertEqual(self.big.job.calls[-1], ("cpu", None))
+            self.assertEqual((g.control, g.mem, g.mem_paused), (False, self.P.MemState(), set()))
+            self.trimmed.clear()
+            g.tick((time.monotonic() - 1, 0.0))  # a tick that waited for the lock while shutdown() held it
+        self.assertEqual(self.big.job.calls[-1], ("cpu", None))
+        self.assertNotIn(("rate", 1), self.small.job.calls)
+        self.assertEqual((self.trimmed, g.mem_paused), ([], set()))
+        g.root.set_cpu.assert_called_once_with()  # the shutdown's release only: no cap applied after it
+
+
 if __name__ == "__main__":
     unittest.main()

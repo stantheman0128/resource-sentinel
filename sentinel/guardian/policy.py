@@ -443,22 +443,28 @@ def memory_pressure(s, agents_gib, cfg, margin=0.0):
 def memory_step(st, s, agents_gib, cfg):
     """The ladder for work that already runs, since a CPU cap returns no memory: trim the agents' working sets
     (their pages go to the standby and modified lists, which hands RAM back but not commit), then, if Stan turned
-    it on and pressure lasts, pause the session holding the most. Returns (state, decision or None)."""
+    it on and pressure lasts, pause the session holding the most. The rung follows pressure_trim and pressure_pause on
+    every step, so a step turned off ends while pressure lasts. Returns (state, decision or None)."""
     m = cfg["memory"]
-    why = memory_pressure(s, agents_gib, cfg)
+    why, held = memory_pressure(s, agents_gib, cfg), None
     if not why:
         if not st.rung:
             return MemState(), None
-        if not memory_pressure(s, agents_gib, cfg, m["pressure_release_margin_gib"]):
+        why = memory_pressure(s, agents_gib, cfg, m["pressure_release_margin_gib"])
+        if not why:
             return MemState(), {"kind": "memory_relief", "rung": 0,
                                 "reason": f"{m['pressure_release_margin_gib']:g} GiB inside the line again"}
-        return st, None  # inside the line but not by the margin yet: hold the rung
+        # inside the line but not by the margin yet: hold the rung, so no step is added, but a step turned off ends
+        why, held = f"{why}, not {m['pressure_release_margin_gib']:g} GiB inside the line yet", st.rung
     since = s.t if st.since is None else st.since
     rung = 1 if m["pressure_trim"] else 0
-    if m["pressure_pause"] and s.t - since >= m["pressure_pause_after_seconds"]:
+    if m["pressure_pause"] and s.t - since >= m["pressure_pause_after_seconds"] and held in (None, 2):
         rung = 2
-    new = MemState(since, max(rung, st.rung))
+    new = MemState(since, rung if held is None else min(rung, held))
     if new.rung == st.rung:
         return new, None
-    what = {1: "trim the agents' working sets", 2: "pause the session holding the most memory"}.get(new.rung)
-    return new, {"kind": "memory_pressure", "rung": new.rung, "reason": f"{why}: {what}" if what else why}
+    what = {0: "no step taken", 1: "trim the agents' working sets",
+            2: "pause the session holding the most memory"}[new.rung]
+    if new.rung < st.rung:  # pressure lasts, and the time it lasted only grows: a step was turned off
+        what = f"{'pressure_pause' if st.rung == 2 else 'pressure_trim'} turned off, {what}"
+    return new, {"kind": "memory_pressure", "rung": new.rung, "reason": f"{why}: {what}"}

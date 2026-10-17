@@ -31,7 +31,7 @@ every tool command it runs stay inside it:
   agents to the top N logical CPUs. The rest stay free for the foreground, for example a remote desktop session.
 - **Disk and memory priority.** Every process in a Guardian job, desktop and nested jobs included, gets low I/O
   priority, so Stan's disk reads and writes go first, and low memory priority, so the agents' pages leave the
-  standby list before his. A job has no limit for either, but a process passes both to the children it starts
+  standby list before Stan's. A job has no limit for either, but a process passes both to the children it starts
   afterwards, so the daemon sets each process once, when it first shows up in a job (checked every second).
   `guardctl io-priority very_low|low|normal` and `guardctl memory-priority very_low|low|medium|below_normal|normal`
   change the level for every member; the dashboard's subtitle shows it.
@@ -95,8 +95,11 @@ budget that is off unless Stan sets one.
 1. Trim (`pressure_trim`, on by default). The daemon empties the agents' working sets, largest first, each process
    at most once per 30 s. Their pages move to the standby and modified lists, so RAM comes back but commit stays.
 2. Pause (`pressure_pause`, off by default). Pressure that lasts 20 s pauses the session holding the most private
-   commit, one session at a time, skipping exempt sessions and sessions Stan paused. Its processes keep their
-   memory.
+   commit, one session at a time, skipping exempt sessions, sessions Stan paused and sessions holding no private
+   commit. Its processes keep their memory. The pause ends when memory is 1 GiB inside the threshold again, when
+   `memory-pause` is turned off, when the session is exempted or ends, when desktop jobs are switched off and
+   release it, or on rollback. Stan's own resume does not end it. If Stan pauses the session, that pause holds it
+   from then on, and the ladder may pause the next largest session.
 
 Pressure ends when memory is 1 GiB inside the threshold again, and the ladder then resumes what it paused. A budget
 is also an admission gate: a command waits with `AGENT_MEMORY_BUDGET` while the budget, minus what the agents hold
@@ -540,7 +543,8 @@ their full write rate back.
 - Pausing a session sets its CPU rate to 0.01%. A paused CLI cannot service its network connections either, and
   they may time out, so keep pauses short.
 - A trim or a pause does not lower private commit, so pressure from an agent memory budget lasts until work ends
-  or Stan raises the budget, and a session the ladder paused stays paused until then (measured 2026-10-17).
+  or Stan raises the budget (measured 2026-10-17). A session the ladder paused stays paused for that long unless
+  Stan turns `memory-pause` off, exempts the session or rolls back, or the session ends (see Memory).
 - Claude Code and Cursor Agent sessions started neither through gagent nor through the PATH wrapper (by full path,
   from a terminal opened before the install, or by a tool that ignores PATH) join Guardian only through the adopt
   hook that `guardian-install-hooks.py` adds, and then in a nested job outside AllAgents (see Adopt; the provider

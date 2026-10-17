@@ -3,6 +3,8 @@
 
   guardctl status
   guardctl pause claude/s1 | resume claude/s1 | class claude/s1 focus
+  guardctl class claude/s1 exempt [minutes]     no session cap, queue gates skipped, new runs outside the pool
+  guardctl queue-order sjf                      class_fifo (default), fifo, sjf, hrrn or fair
   guardctl pause-provider codex | resume-provider codex
   guardctl cap 40 | world 10 | hold on | hold off | inject degraded 30 | priority normal | allocator off
   guardctl desktop off | desktop on                 desktop jobs for the Claude and Codex apps' CLIs
@@ -39,7 +41,7 @@ def summary(s):
              f"desktop jobs {'on' if s.get('desktop') else 'off'}",
              f"RAM available {s['available_gib']} GiB  commit headroom {s['commit_headroom_gib']} GiB  "
              f"admission {'open' if s['admission']['open'] else 'closed ' + s['admission']['reason']}"
-             f"{'  HOLD' if s['admission']['hold'] else ''}",
+             f"{'  HOLD' if s['admission']['hold'] else ''}  queue order {s.get('queue_order')}",
              f"experience {s['experience']['level']} ({s['experience']['kind']})  probe {s['experience']['probe']}"]
     if s.get("agent_priority"):
         a = s["agent_priority"]
@@ -50,11 +52,13 @@ def summary(s):
     for x in s["sessions"]:
         cap = "-" if x["cap_cores"] is None else f"{x['cap_cores']:.2f}"
         lines.append(f"  session {x['key']:<24} {x['cls']:<6} {'PAUSED' if x['paused'] else '':<6} "
-                     f"use {x['usage']:.2f} cap {cap} runs {x['runs']}{'  desktop job' if x.get('desktop') else ''}")
+                     f"use {x['usage']:.2f} cap {cap} runs {x['runs']}{'  desktop job' if x.get('desktop') else ''}"
+                     + (f"  exempt {x['exempt_left_s'] // 60} min left" if x.get("exempt_left_s") is not None else ""))
     for r in s["runs"]:
         lines.append(f"  {r['state']:<8} {r['run_id']} {r['session']:<24} pid {r['pid']} {r['label']!r} ({r['coverage']})")
     for q in s["queue"]:
-        lines.append(f"  queued {q['run_id']} {q['session']} {q['label']!r}: {q['reason']}")
+        est = f", about {q['est_s']} s ({q['est_s_source']})" if q.get("est_s") is not None else ""
+        lines.append(f"  queued {q['run_id']} {q['session']} {q['label']!r}{est}: {q['reason']}")
     for a in s["apps"]:
         lines.append(f"  app {a.get('name')}: {a.get('cores')} cores, {a.get('coverage')}")
     o = s.get("outside")
@@ -79,7 +83,8 @@ def main(argv=None):
     routes = {
         "pause": lambda: ("/api/session", {"key": x[0], "paused": True}),
         "resume": lambda: ("/api/session", {"key": x[0], "paused": False}),
-        "class": lambda: ("/api/session", {"key": x[0], "cls": x[1]}),
+        "class": lambda: ("/api/session", {"key": x[0], "cls": x[1],
+                                           **({"minutes": float(x[2])} if len(x) > 2 else {})}),
         "pause-provider": lambda: ("/api/provider", {"name": x[0], "paused": True}),
         "resume-provider": lambda: ("/api/provider", {"name": x[0], "paused": False}),
         "cap": lambda: ("/api/cap", {"cap": float(x[0])}),
@@ -93,6 +98,7 @@ def main(argv=None):
         "desktop": lambda: ("/api/desktop", {"on": x[0] == "on"}),
         "cancel": lambda: ("/api/cancel", {"run_id": x[0]}),
         "adopt": lambda: ("/api/adopt", {"pid": int(x[0]), "provider": x[1], "session": x[2] if len(x) > 2 else None}),
+        "queue-order": lambda: ("/api/queue_order", {"order": x[0]}),
         "rollback": lambda: ("/api/rollback", {}),
         "resume-control": lambda: ("/api/resume_control", {}),
         "shutdown": lambda: ("/api/shutdown", {}),

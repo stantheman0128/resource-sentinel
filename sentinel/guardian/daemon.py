@@ -14,6 +14,9 @@ a cap on their own app job would also slow their UI. apps.py only measures them,
 The CLIs the Claude app and the Codex app run for their agent sessions are the exception: each goes into a desktop
 job of its own, Local\\Guardian.<instance>.d.<p>.desk-<pid>, which nests under the app's job and so sits outside
 AllAgents. allocate() caps those jobs in absolute cores.
+A session Stan marks exempt (dashboard or guardctl, never srun or a hook) gets no session cap for a set time, its
+queued runs skip the admission gates, and the runs it starts meanwhile go into run jobs outside the tree, so the pool
+cap does not reach them either; what already runs inside the tree stays under the pool cap.
 Nothing here kills or suspends work on its own. Cancel happens only when the requesting client goes away or
 Stan presses cancel; pause is a CPU rate of 1/10000 that resume lifts.
 """
@@ -45,7 +48,6 @@ REPO = Path(__file__).resolve().parents[2]
 DASHBOARD = REPO / "dashboard" / "guardian.html"
 PROBE = Path(__file__).with_name("probe.py")
 PROVIDERS = ("claude", "codex", "cursor", "grok", "gemini", "antigravity", "other")
-CLASS_RANK = {"focus": 0, "normal": 1, "batch": 2}
 CREATE_NO_WINDOW, CREATE_NEW_CONSOLE = 0x08000000, 0x00000010
 GiB = 2**30
 CONHOST = r"C:\Windows\System32\conhost.exe"
@@ -161,6 +163,10 @@ class Session:
         self.desktop = False       # a job outside AllAgents, capped in absolute cores: a desktop job, or a nested one
         self.nested = False        # a hook-adopted CLI's job, nested under the job the CLI put itself in
         self.app_pids = set()      # the desktop CLI's parents when it was placed, the app's root among them
+        self.exempt_until = None   # wall time an exemption ends; cls is "exempt" until then
+        self.cls_before = None     # the class to go back to when it ends
+        self.cpu_s = 0.0           # CPU seconds so far, runs outside the tree included (fair queue order)
+        self.outside_done_s = 0.0  # CPU seconds of runs outside the tree that have ended
 
 
 class Run:
@@ -169,6 +175,8 @@ class Run:
         self.console, self.est_gib, self.est_source, self.unprofiled = console, est, src, unprofiled
         self.label, self.fingerprint = label, fingerprint
         self.state, self.reason, self.numbers = "queued", "", {}
+        self.est_s, self.est_s_source = None, None
+        self.outside = False       # started while its session was exempt: a run job outside the tree
         self.t_request = time.monotonic()
         self.t_start = None
         self.admitted = threading.Event()
@@ -200,6 +208,8 @@ class Guardian:
         self.home = home_dir(self.instance)
         self.home.mkdir(parents=True, exist_ok=True)
         self.cfg = P.merged(P.DEFAULTS, cfg_over)
+        if self.cfg["queue"]["order"] not in P.QUEUE_ORDERS:
+            raise SystemExit(f"queue order must be one of {', '.join(P.QUEUE_ORDERS)}")
         c = self.cfg["cpu"]
         self.world = max(1, min(wj.NCPU, int(world_cpus or wj.NCPU)))
         self.mask = sum(1 << i for i in range(wj.NCPU - self.world, wj.NCPU)) if self.world < wj.NCPU else None
@@ -392,11 +402,18 @@ class Guardian:
                 s.job.set_cpu(max_cores=want[1] * wj.NCPU)  # nested caps are a fraction of the parent (E8b)
         except OSError as e:
             err = str(e)
+        if s.cls == "exempt" or want == "paused" or s.applied == "paused":
+            for r in self.live.values():  # runs outside the tree have no session job above them
+                if r.session is s and getattr(r, "outside", False) and r.job and r.state == "running":
+                    try:
+                        r.job.set_cpu_rate(1) if want == "paused" else r.job.set_cpu()
+                    except OSError as e:
+                        err = err or str(e)
         rb = s.job.cpu()
         before, s.applied = s.applied, (s.applied if err else want)
         shown = lambda v: v if not isinstance(v, tuple) else f"{v[1] * (1 if v[0] == 'abs' else budget):.2f} cores"
         self.ledger.decision("session_cap", s.key, shown(before), shown(want), rb.get("mode"), err,
-                             f"weighted max-min, class {s.cls}" +
+                             ("exempt: no session cap" if s.cls == "exempt" else f"weighted max-min, class {s.cls}") +
                              (", nested job" if s.nested else ", desktop job" if s.desktop else ""),
                              P.POLICY_VERSION)
 
@@ -428,12 +445,16 @@ class Guardian:
         dt = max(1e-3, now - prev[0])
         tree = max(0.0, (cpu_s - prev[1]) / dt)
         with self.lock:
+            outside = collections.Counter()
+            for r in self.live.values():
+                if getattr(r, "outside", False) and r.job and r.state == "running":
+                    outside[r.session.key] += r.job.accounting()["cpu_s"]
             for s in self.sessions.values():
-                a = s.job.accounting()["cpu_s"]
+                a = s.cpu_s = s.job.accounting()["cpu_s"] + s.outside_done_s + outside[s.key]
                 s.usage = max(0.0, (a - s.prev[1]) / max(1e-3, now - s.prev[0])) if s.prev else 0.0
                 s.prev = (now, a)
             # desktop jobs sit outside AllAgents, so the pool adds their use to what the tree's root job counts
-            self.pool_cores = tree + sum(x.usage for x in self.sessions.values() if x.desktop)
+            self.pool_cores = tree + sum(x.usage for x in self.sessions.values() if x.desktop and x.cls != "exempt")
             for r in list(self.live.values()):
                 if r.state == "running" and r.job:
                     try:
@@ -457,6 +478,7 @@ class Guardian:
             s = P.Sample(t=now, age_s=now - self.last_core_ok, cpu_busy=busy, pool_cores=self.pool_cores,
                          available_gib=avail, commit_headroom_gib=head, experience=level, experience_kind=kind,
                          pool_priority=self.pool_priority_readback, ncpu=self.world, machine_cpus=wj.NCPU)
+            self.end_exemptions()
             if self.control:
                 self.cap, d = P.cap_step(self.cap, s, self.cfg)
                 if d:
@@ -482,14 +504,17 @@ class Guardian:
         # every idle tab would otherwise ask for a share of the budget and squeeze the busy ones
         active = {k: {"allocation_weight": weights.get(s.cls, 5), "usage": s.usage,
                       "paused": s.paused or self.providers[s.provider]["paused"]}
-                  for k, s in self.sessions.items() if s.usage > 0.05 or (s.live_runs and not s.desktop)}
+                  for k, s in self.sessions.items()
+                  if s.cls != "exempt" and (s.usage > 0.05 or (s.live_runs and not s.desktop))}
         if self.allocator_on:
             self.alloc, _ = P.allocate(self.alloc, budget, active, self.cfg)
         else:
             self.alloc = P.AllocState()
         for k, s in self.sessions.items():
             cap = self.alloc.caps.get(k) if k in active else None
-            if s.desktop:
+            if s.cls == "exempt":
+                want = "paused" if s.paused or self.providers[s.provider]["paused"] else None
+            elif s.desktop:
                 want = self.desktop_want(s, cap, budget)
             elif s.paused:
                 want = "paused"
@@ -500,12 +525,28 @@ class Guardian:
             if not same:
                 self.apply_session(s, want, budget)
 
+    def set_exempt(self, s, minutes, reason):
+        if s.cls != "exempt":
+            s.cls_before = s.cls
+        s.exempt_until = time.time() + minutes * 60
+        until = time.strftime("%H:%M", time.localtime(s.exempt_until))
+        self.decide("session_class", s.key, s.cls_before, "exempt", f"until {until}", None,
+                    f"{reason} for {minutes:g} minutes: no session cap, queue gates skipped, new runs outside the pool")
+        s.cls = "exempt"
+
+    def end_exemptions(self):
+        for s in self.sessions.values():
+            if s.cls == "exempt" and time.time() >= s.exempt_until:
+                s.cls, s.exempt_until = s.cls_before or "normal", None
+                self.decide("session_class", s.key, "exempt", s.cls, s.cls, None,
+                            "exemption ended; runs already started outside the pool stay there until they end")
+
     def desktop_want(self, s, cap, budget):
         """A desktop job's cap in absolute cores, since the app's job above it has no CPU rate: the allocator's cap,
         or the whole budget when it sets none. While control is on, a desktop session never runs uncapped."""
         if s.paused or self.providers[s.provider]["paused"]:
             return "paused"
-        if not self.control:
+        if not self.control or s.cls == "exempt":
             return None
         return "abs", round(budget if cap is None else min(cap, budget), 2)
 
@@ -581,7 +622,10 @@ class Guardian:
             return
         unused = sum(max(0.0, r.est_gib - r.commit_gib) for r in self.live.values()
                      if r.state in ("admitted", "running"))
-        for run in sorted(self.queue, key=lambda r: (CLASS_RANK.get(r.session.cls, 1), r.t_request)):
+        weights = self.cfg["cpu"]["allocation_weights"]
+        waiting = [{"run": r, "cls": r.session.cls, "t_request": r.t_request, "est_s": r.est_s,
+                    "share": r.session.cpu_s / weights.get(r.session.cls, 5)} for r in self.queue]
+        for run in [x["run"] for x in P.queue_order(waiting, self.cfg["queue"]["order"], now)]:
             ok, reason = self.can_admit(run, now, unused)
             if ok:
                 self.queue.remove(run)
@@ -601,6 +645,8 @@ class Guardian:
             return False, "PROVIDER_PAUSED"
         if s.paused:
             return False, "SESSION_PAUSED"
+        if s.cls == "exempt":
+            return True, ""
         ok, reason, run.numbers = P.admission(run.est_gib, self.sample, unused, unused, self.cap, self.cfg, self.hold)
         if not ok:
             return False, reason
@@ -678,6 +724,7 @@ class Guardian:
             est, src, _ = P.estimate(self.ledger.profile(fingerprint), req.get("est_gib"), self.cfg)
             run = Run(uuid.uuid4().hex[:12], s, argv, req.get("cwd"), req.get("env"), bool(req.get("console")),
                       est, src, src == "exploration", label, fingerprint)
+            run.est_s, run.est_s_source = P.estimate_seconds(self.ledger.durations(fingerprint), self.cfg)
             self.ledger.run_requested({"run_id": run.run_id, "provider": provider, "session": name, "cls": s.cls,
                                        "fingerprint": fingerprint, "cwd": run.cwd, "label": label, "est_gib": est,
                                        "est_source": src, "unprofiled": run.unprofiled, "t_request": time.time()})
@@ -752,7 +799,8 @@ class Guardian:
     def launch(self, run):
         s = run.session
         run.job = wj.Job.create()
-        chain = [self.root, self.providers[s.provider]["job"], s.job, run.job]
+        run.outside = s.cls == "exempt" and not s.desktop
+        chain = [run.job] if run.outside else [self.root, self.providers[s.provider]["job"], s.job, run.job]
         kw = {"cwd": run.cwd or None, "env": run.env or None}
         if run.console:
             kw["creationflags"] = CREATE_NEW_CONSOLE
@@ -770,7 +818,10 @@ class Guardian:
         run.t_start, run.state = time.monotonic(), "running"
         in_root, in_session = wj.in_job(pid, self.root.h), wj.in_job(pid, s.job.h)
         prio = wj.priority_class(pid)
-        run.coverage = ("enforced" if in_root and in_session else "partial") + f", priority {prio}"
+        if run.outside:
+            run.coverage = ("exempt, outside the pool" if not in_root else "partial") + f", priority {prio}"
+        else:
+            run.coverage = ("enforced" if in_root and in_session else "partial") + f", priority {prio}"
         self.ledger.run_update(run.run_id, state="running", t_start=time.time(), pid=pid, coverage=run.coverage)
 
     def cancel(self, run, why):
@@ -796,6 +847,8 @@ class Guardian:
         with self.lock:
             self.live.pop(run.run_id, None)
             run.session.live_runs -= 1
+            if run.outside and cpu_s:
+                run.session.outside_done_s += cpu_s
             run.state = state
             if run.job:
                 if lingering and state != "cancelled":
@@ -1253,11 +1306,19 @@ class Guardian:
                               "allocation_weight": c["allocation_weights"].get(x.cls, 5), "paused": x.paused,
                               "provider_paused": self.providers[x.provider]["paused"], "usage": round(x.usage, 2),
                               "cap_cores": self.alloc.caps.get(k), "runs": x.live_runs,
-                              "desktop": x.desktop and not x.nested, "nested": x.nested}
+                              "desktop": x.desktop and not x.nested, "nested": x.nested,
+                              "exempt_left_s": max(0, round(x.exempt_until - time.time()))
+                              if x.cls == "exempt" else None}
                              for k, x in self.sessions.items()],
+                "queue_order": self.cfg["queue"]["order"],
                 "queue": [{"run_id": r.run_id, "session": r.session.key, "label": r.label, "reason": r.reason,
                            "est_gib": round(r.est_gib, 2), "numbers": r.numbers,
-                           "waiting_s": round(time.monotonic() - r.t_request)} for r in self.queue],
+                           "est_s": round(r.est_s) if r.est_s is not None else None, "est_s_source": r.est_s_source,
+                           "waiting_s": round(time.monotonic() - r.t_request)}
+                          for r in [x["run"] for x in P.queue_order(
+                              [{"run": r, "cls": r.session.cls, "t_request": r.t_request, "est_s": r.est_s,
+                                "share": r.session.cpu_s / c["allocation_weights"].get(r.session.cls, 5)}
+                               for r in self.queue], self.cfg["queue"]["order"], time.monotonic())]],
                 "runs": [{"run_id": r.run_id, "session": r.session.key, "label": r.label, "state": r.state,
                           "pid": r.proc.pid if r.proc else getattr(r, "pid", None), "coverage": r.coverage,
                           "est_gib": round(r.est_gib, 2), "est_source": r.est_source,
@@ -1272,9 +1333,15 @@ class Guardian:
             now = time.monotonic()
             if path == "/api/session":
                 s = self.sessions[b["key"]]
-                if b.get("cls") in CLASSES and b["cls"] != s.cls:
-                    self.decide("session_class", s.key, s.cls, b["cls"], b["cls"], None, "set by Stan")
-                    s.cls = b["cls"]
+                if b.get("cls") == "exempt":
+                    minutes = float(self.cfg["queue"]["exempt_minutes"] if b.get("minutes") is None else b["minutes"])
+                    if not 0 < minutes <= 24 * 60:
+                        raise ValueError("an exemption lasts more than 0 and at most 1440 minutes")
+                    self.set_exempt(s, minutes, "set by Stan")
+                elif b.get("cls") in CLASSES and b["cls"] != s.cls:
+                    self.decide("session_class", s.key, s.cls, b["cls"], b["cls"], None, "set by Stan" +
+                                ("; exemption ended early" if s.cls == "exempt" else ""))
+                    s.cls, s.exempt_until = b["cls"], None
                 if "paused" in b and bool(b["paused"]) != s.paused:
                     s.paused = bool(b["paused"])
                     self.decide("session_pause" if s.paused else "session_resume", s.key, reason=
@@ -1290,6 +1357,12 @@ class Guardian:
                 self.apply_cap("manual_cap", f"set by Stan to {v:.0f}%")
             elif path == "/api/world":
                 self.set_world(b["cpus"], "set by Stan")
+            elif path == "/api/queue_order":
+                if b.get("order") not in P.QUEUE_ORDERS:
+                    raise ValueError(f"order must be one of {', '.join(P.QUEUE_ORDERS)}")
+                self.decide("queue_order", "queue", self.cfg["queue"]["order"], b["order"], b["order"],
+                            reason="set by Stan")
+                self.cfg["queue"]["order"] = b["order"]
             elif path == "/api/hold":
                 self.hold = bool(b["on"])
                 self.decide("admission_hold", "queue", requested=self.hold, reason="set by Stan")

@@ -72,6 +72,13 @@ class Ledger:
                        (fingerprint, limit))
         return [r[0] / 2**30 for r in rows]
 
+    def durations(self, fingerprint, limit=20):
+        """Wall seconds of earlier successful runs with the same fingerprint, newest first."""
+        rows = self._x("SELECT t_end - t_start FROM runs WHERE fingerprint=? AND state='done' AND exit_code=0 "
+                       "AND t_start IS NOT NULL AND t_end IS NOT NULL ORDER BY t_end DESC LIMIT ?",
+                       (fingerprint, limit))
+        return [r[0] for r in rows]
+
     def decision(self, kind, target, before=None, requested=None, readback=None, error=None, reason="",
                  policy_version=""):
         enc = lambda v: None if v is None else json.dumps(v, default=str)

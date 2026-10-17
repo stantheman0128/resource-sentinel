@@ -99,7 +99,9 @@ canvas { width: 100%; height: 240px; display: block; }
       <section><h2>已經在跑的 agent app（只觀察，不控管）</h2><table id="apps"></table></section>
     </div>
     <section><h2>Guardian 控管外的負載（只觀察）</h2><table id="outside"></table></section>
-    <section><h2>排隊中與執行中的指令</h2><table id="runs"></table></section>
+    <section><h2>排隊中與執行中的指令</h2>
+      <div class="sub">排隊順序 <select id="qorder"></select></div>
+      <table id="runs"></table></section>
     <div class="two">
       <section><h2>調整紀錄（附 Windows 讀回值）</h2><div class="log" id="decisions"></div></section>
       <section><h2>最近結束的指令</h2><table id="recent"></table></section>
@@ -115,7 +117,8 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '
 const f2 = x => x == null ? '–' : Number(x).toFixed(2);
 const MODE = {OBSERVED_OK: '前景順暢', PROXY_OK: '前景順暢', DEGRADED: '前景變卡', UNKNOWN: '感測資料過期', SYSTEM_ONLY: '沒有前景感測', ROLLED_BACK: '控管關閉'};
 const LEVEL = {ok: '順暢', warn: '偏慢', degraded: '卡', severe: '很卡'};
-const CLS = {focus: '重要', normal: '一般', batch: '背景'};
+const CLS = {exempt: '豁免', focus: '重要', normal: '一般', batch: '背景'};
+const QORDER = {class_fifo: '先比重要性再比先來後到', fifo: '先來後到', sjf: '預估最短的先', hrrn: '短的先、等越久越優先', fair: '用得最少的 session 先'};
 const PRIO = {below_normal: '低於正常', normal: '正常'};
 const NICE = {very_low: '很低', low: '低', medium: '中', below_normal: '低於正常', normal: '正常'};
 
@@ -179,7 +182,7 @@ function render(s) {
   const focused = document.activeElement;
   if (!(focused.tagName === 'SELECT' && st.contains(focused))) st.innerHTML = '<tr><th>Session（工具/名稱）</th><th>重要性</th><th>用了（核）</th><th>用量和上限</th><th>這個 session 的上限</th><th>指令數</th><th></th></tr>' +
     s.sessions.map((x, i) => `<tr><td><i style="display:inline-block;width:8px;height:8px;border-radius:4px;background:${COLORS[i % 6]}"></i> ${esc(x.key)}</td>
-      <td><select data-cls="${esc(x.key)}">${['focus', 'normal', 'batch'].map(c => `<option value="${c}" ${c === x.cls ? 'selected' : ''}>${CLS[c]}</option>`).join('')}</select> <span class="muted">權重 ${x.allocation_weight}</span></td>
+      <td><select data-cls="${esc(x.key)}">${Object.keys(CLS).map(c => `<option value="${c}" ${c === x.cls ? 'selected' : ''}>${CLS[c]}</option>`).join('')}</select> <span class="muted">${x.exempt_left_s != null ? `豁免剩 ${Math.ceil(x.exempt_left_s / 60)} 分` : `權重 ${x.allocation_weight}`}</span></td>
       <td>${f2(x.usage)}</td>
       <td><div class="bar"><i style="width:${Math.min(100, 100 * x.usage / maxc)}%;background:${COLORS[i % 6]}"></i>${x.cap_cores != null ? `<b style="left:${Math.min(100, 100 * x.cap_cores / maxc)}%"></b>` : ''}</div></td>
       <td>${x.paused ? '<span class="bad">已暫停</span>' : x.provider_paused ? '<span class="bad">工具已暫停</span>' : x.cap_cores == null ? '不限' : f2(x.cap_cores)}</td>
@@ -187,9 +190,11 @@ function render(s) {
       <td><button data-sess="${esc(x.key)}" data-paused="${x.paused}">${x.paused ? '恢復' : '暫停'}</button></td></tr>`).join('');
 
   const rows = s.queue.map(q => `<tr><td>${esc(q.run_id)}</td><td>${esc(q.session)}</td><td>${esc(q.label)}</td><td class="warn">排隊 ${q.waiting_s} 秒</td>
-      <td class="sub">${esc(q.reason)}</td><td>${q.est_gib} GiB</td><td><button data-cancel="${esc(q.run_id)}">取消</button></td></tr>`)
+      <td class="sub">${esc(q.reason)}${q.est_s != null ? ` · 預估 ${q.est_s} 秒` : ''}</td><td>${q.est_gib} GiB</td><td><button data-cancel="${esc(q.run_id)}">取消</button></td></tr>`)
     .concat(s.runs.map(r => `<tr><td>${esc(r.run_id)}</td><td>${esc(r.session)}</td><td>${esc(r.label)}</td><td class="ok">${r.state === 'running' ? '執行中' : esc(r.state)}</td>
       <td class="sub">pid ${r.pid} · ${esc(r.coverage)}</td><td>${r.commit_gib} / ${r.est_gib} GiB</td><td>${r.state === 'adopted' ? '收編' : `<button data-cancel="${esc(r.run_id)}">取消</button>`}</td></tr>`));
+  const qo = document.getElementById('qorder');
+  if (document.activeElement !== qo) qo.innerHTML = Object.keys(QORDER).map(o => `<option value="${o}" ${o === s.queue_order ? 'selected' : ''}>${QORDER[o]}</option>`).join('');
   document.getElementById('runs').innerHTML = '<tr><th>編號</th><th>Session</th><th>指令</th><th>狀態</th><th>細節</th><th>記憶體（已用 / 預留）</th><th></th></tr>' + rows.join('');
 
   document.getElementById('decisions').textContent = s.decisions.map(d =>
@@ -246,6 +251,7 @@ document.addEventListener('click', async e => {
 });
 document.addEventListener('change', async e => {
   if (e.target.dataset.cls) { await api('/api/session', {key: e.target.dataset.cls, cls: e.target.value}); e.target.blur(); tick(); }
+  if (e.target.id === 'qorder') { await api('/api/queue_order', {order: e.target.value}); e.target.blur(); tick(); }
 });
 async function tick() { try { render(await api('/api/state')); } catch (err) { document.getElementById('subtitle').textContent = '連不上 Guardian：' + err.message; } }
 tick(); setInterval(tick, 1000);

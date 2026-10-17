@@ -792,7 +792,7 @@ class DesktopAllocateTests(unittest.TestCase):
         self.D, self.P, self.wj = D, P, D.wj
         g = self.g = D.Guardian.__new__(D.Guardian)  # no jobs, ledger or threads: allocate() and its helpers only
         g.cfg, g.world, g.cap, g.alloc = P.merged(P.DEFAULTS, None), 12, P.CapState(cap=10.0), P.AllocState()
-        g.allocator_on, g.control, g.sessions, g.providers, g.ledger = True, True, {}, {}, mock.Mock()
+        g.allocator_on, g.control, g.sessions, g.providers, g.ledger, g.live = True, True, {}, {}, mock.Mock(), {}
 
     def add(self, key, usage, desktop=False, runs=1):
         provider, name = key.split("/")
@@ -835,6 +835,121 @@ class DesktopAllocateTests(unittest.TestCase):
         self.g.allocate()
         self.assertEqual(desk.job.calls[-1], ("cpu", None))
         self.assertIsNone(desk.applied)
+
+
+class RunJob(FakeJob):
+    h = 7
+
+    def accounting(self):
+        return {"cpu_s": 3.0, "active": 0}
+
+    def limits(self):
+        return {"peak_job_mem_bytes": 0}
+
+    def close(self):
+        self.calls.append(("close",))
+
+
+class ExemptTests(unittest.TestCase):
+    """Stan's exempt class: no session cap, no queue gates, new runs outside the tree. Not reachable from srun."""
+    add = DesktopAllocateTests.add
+
+    def setUp(self):
+        DesktopAllocateTests.setUp(self)
+        g = self.g
+        g.log, g.lock, g.queue, g.hold, g.sample = mock.Mock(), threading.RLock(), [], False, object()
+        g.last_launch, g.launch_starts, g.root = -1e9, [], RunJob()
+
+    def run_in(self, s, t, est_s):
+        r = self.D.Run(uuid.uuid4().hex[:6], s, ["x"], None, None, False, 1.0, "requested", False, "x", "f")
+        r.t_request, r.est_s = t, est_s
+        return r
+
+    def test_an_exempt_session_takes_no_share_and_gets_no_cap(self):
+        a, b, c = self.add("codex/a", 0.6), self.add("codex/b", 0.6), self.add("codex/c", 0.6)
+        self.g.allocate()  # 1.2 cores for three: a third each
+        self.assertEqual(c.job.calls[-1], ("cpu", round(1 / 3, 3) * self.wj.NCPU))
+        self.g.set_exempt(c, 5, "set by Stan")
+        self.g.allocate()  # c leaves the split: a and b share the budget
+        self.assertEqual(c.job.calls[-1], ("cpu", None))
+        self.assertEqual(a.job.calls[-1], ("cpu", 0.5 * self.wj.NCPU))
+        self.assertIn("exempt: no session cap", self.g.ledger.decision.call_args.args[6])
+        self.assertIsNone(self.g.desktop_want(c, 0.3, 1.2))  # an exempt desktop job runs without a cap
+        c.paused = True
+        self.assertEqual(self.g.desktop_want(c, 0.3, 1.2), "paused")  # pause still holds
+
+    def test_an_exemption_ends_back_in_the_old_class(self):
+        s = self.add("codex/a", 0.0)
+        s.cls = "focus"
+        self.g.set_exempt(s, 5, "set by Stan")
+        self.assertEqual(s.cls, "exempt")
+        self.assertAlmostEqual(s.exempt_until, time.time() + 300, delta=2)
+        self.g.end_exemptions()
+        self.assertEqual(s.cls, "exempt")
+        s.exempt_until = time.time() - 1
+        self.g.end_exemptions()
+        self.assertEqual((s.cls, s.exempt_until), ("focus", None))
+
+    def test_exempt_skips_the_admission_gates_but_not_a_pause(self):
+        s = self.add("codex/a", 0.0)
+        run = self.run_in(s, 0, 10)
+        self.g.set_exempt(s, 5, "set by Stan")
+        with mock.patch.object(self.P, "admission", side_effect=AssertionError("gates ran for an exempt run")):
+            self.assertEqual(self.g.can_admit(run, 0, 0.0), (True, ""))
+            s.paused = True
+            self.assertEqual(self.g.can_admit(run, 0, 0.0), (False, "SESSION_PAUSED"))
+
+    def test_admission_walks_the_queue_in_the_chosen_order(self):
+        heavy, light = self.add("codex/heavy", 0.0), self.add("codex/light", 0.0)
+        heavy.cpu_s, light.cpu_s = 500.0, 10.0
+        first, second = self.run_in(heavy, 0, 5), self.run_in(light, 1, 50)
+        self.g.queue = [first, second]
+        seen = []
+        self.g.can_admit = lambda run, now, unused: (seen.append(run), (False, "WAIT"))[1]
+        for order, want in (("fifo", [first, second]), ("sjf", [first, second]), ("fair", [second, first])):
+            seen.clear()
+            self.g.cfg["queue"]["order"] = order
+            self.g.admit_once(10)
+            self.assertEqual(seen, want, order)
+
+    def test_an_exempt_run_starts_outside_the_tree(self):
+        s = self.add("codex/a", 0.0)
+        s.job = RunJob()
+        chains = []
+        proc = mock.Mock(pid=4242)  # never reaches Windows: spawn, in_job and priority_class are patched
+        spawn = lambda argv, chain, **kw: (chains.append(chain), proc)[1]
+        with mock.patch.object(self.wj.Job, "create", lambda *a: RunJob()), \
+                mock.patch.object(self.wj, "spawn_in_jobs", spawn), \
+                mock.patch.object(self.wj, "in_job", lambda pid, h: False), \
+                mock.patch.object(self.wj, "priority_class", lambda pid: "normal"):
+            inside = self.run_in(s, 0, 1)
+            self.g.launch(inside)
+            self.g.set_exempt(s, 5, "set by Stan")
+            outside = self.run_in(s, 0, 1)
+            self.g.launch(outside)
+        self.assertEqual(len(chains[0]), 4)
+        self.assertEqual(chains[1], [outside.job])
+        self.assertTrue(outside.outside)
+        self.assertEqual(outside.coverage, "exempt, outside the pool, priority normal")
+        self.g.live[outside.run_id] = outside
+        s.live_runs = 1
+        self.g.finish(outside, "done", 0)
+        self.assertEqual(s.outside_done_s, 3.0)  # its CPU still counts for the session's fair share
+
+    def test_only_stan_sets_it_and_only_for_a_bounded_time(self):
+        self.assertNotIn("exempt", GC.CLASSES)  # srun, the adopt pipe and /api/adopt keep to CLASSES
+        s = self.add("codex/a", 0.0)
+        for bad in (0, -5, 24 * 60 + 1):
+            with self.assertRaises(ValueError):
+                self.g.action("/api/session", {"key": "codex/a", "cls": "exempt", "minutes": bad})
+        self.g.action("/api/session", {"key": "codex/a", "cls": "exempt"})
+        self.assertAlmostEqual(s.exempt_until, time.time() + 60 * 60, delta=2)  # the default hour
+        self.g.action("/api/session", {"key": "codex/a", "cls": "batch"})
+        self.assertEqual((s.cls, s.exempt_until), ("batch", None))
+        with self.assertRaises(ValueError):
+            self.g.action("/api/queue_order", {"order": "lifo"})
+        self.g.action("/api/queue_order", {"order": "hrrn"})
+        self.assertEqual(self.g.cfg["queue"]["order"], "hrrn")
 
 
 class DesktopPlaceTests(unittest.TestCase):

@@ -74,6 +74,11 @@ DEFAULTS = {
         "media_drop_warning_fraction": 0.01,
         "sensor_valid_seconds": 5,
     },
+    "queue": {
+        "order": "class_fifo",                   # R3: one of QUEUE_ORDERS, see queue_order
+        "default_run_seconds": 60,               # expected length of a command that has no finished run yet
+        "exempt_minutes": 60,                    # how long Stan's exemption lasts when he names no time
+    },
     "unknown_work": {
         "maximum_simultaneous_launch_observations": 2,
         "launch_spacing_ms": 500,
@@ -357,3 +362,47 @@ def estimate(profile_rows, requested_gib, cfg):
     if n:
         return rows[-1] * 1.2, f"max of {n} x1.2", n
     return cfg["memory"]["exploration_reservation_gib"], "exploration", 0
+
+
+# ---- the srun queue ------------------------------------------------------------------------------
+
+CLASS_RANK = {"exempt": -1, "focus": 0, "normal": 1, "batch": 2}
+QUEUE_ORDERS = ("class_fifo", "fifo", "sjf", "hrrn", "fair")
+
+
+def estimate_seconds(durations, cfg):
+    """Expected wall seconds of a new run: the median of earlier successful runs of the same command."""
+    rows = sorted(d for d in durations if d is not None and d >= 0)
+    n = len(rows)
+    if not n:
+        return float(cfg["queue"]["default_run_seconds"]), "default"
+    return (rows[n // 2] if n % 2 else (rows[n // 2 - 1] + rows[n // 2]) / 2), f"median of {n}"
+
+
+def queue_order(runs, order, now):
+    """Waiting runs in the order admission tries them. A run is a dict with cls, t_request, est_s (from
+    estimate_seconds) and share (CPU seconds its session has used, over its class weight). Stan's exempt runs come
+    first in every order. Admission still tries each run in turn, so a small run starts while a bigger one ahead
+    of it waits for memory.
+      class_fifo  class rank, then arrival (the order of 10-13)
+      fifo        arrival only
+      sjf         shortest expected run first; a long run waits for as long as short ones keep arriving
+      hrrn        highest response ratio (wait + expected) / expected: short runs first, and waiting lifts a
+                  long one until it goes
+      fair        the session that used the least CPU per class weight first"""
+    if order not in QUEUE_ORDERS:
+        raise ValueError(f"queue order must be one of {', '.join(QUEUE_ORDERS)}")
+
+    def key(r):
+        late = r["cls"] != "exempt"
+        if order == "fifo":
+            return late, r["t_request"]
+        if order == "sjf":
+            return late, r["est_s"], r["t_request"]
+        if order == "hrrn":
+            est = max(r["est_s"], 1.0)
+            return late, -(now - r["t_request"] + est) / est, r["t_request"]
+        if order == "fair":
+            return late, r["share"], r["t_request"]
+        return late, CLASS_RANK.get(r["cls"], 1), r["t_request"]
+    return sorted(runs, key=key)

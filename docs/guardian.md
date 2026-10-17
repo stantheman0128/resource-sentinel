@@ -26,6 +26,7 @@ every tool command it runs stay inside it:
   the CPUs open to agents: the machine's idle CPUs minus the ones kept from them.
 - **Allocation weights.** focus 8, normal 5, batch 2. Weighted max-min turns them into per-session hard caps; a
   light session lends what it does not use and gets it back when it resumes. A cap is a ceiling, not a guarantee.
+  A session Stan exempts has no cap and takes no share (see The srun queue).
 - **CPUs open to agents.** `--world-cpus N` at start, or the dashboard / `guardctl world N` at run time, limits the
   agents to the top N logical CPUs. The rest stay free for the foreground, for example a remote desktop session.
 - **Disk and memory priority.** Every process in a Guardian job, desktop and nested jobs included, gets low I/O
@@ -55,6 +56,35 @@ reports how late the slowest 5% of those wake-ups were. It stands in for any ord
 does not see the GPU, the display pipeline or a browser, which is why a GPU-decoded video can look fine while the
 probe reports lateness.
 
+## The srun queue
+
+A command started through srun waits in Guardian's queue until its memory estimate fits. The estimate is
+`--est-gib`, or one from the peaks of earlier runs of the same command, or 0.5 GiB the first time. The RAM room is
+the available RAM minus Stan's 6 GiB, a 2 GiB margin and what running commands reserved but have not used yet; the
+commit headroom gets the same test with 4 and 1 GiB. A command with neither history nor `--est-gib` also waits for
+a launch slot. Four times a second the daemon walks
+the queue in one order and starts every command that fits, so a small command can pass a large one that does not
+fit yet. `guardctl queue-order <order>`, or the menu above the dashboard's queue table, picks the order:
+
+| Order | First in line |
+|---|---|
+| `class_fifo` (default) | the more important class (focus, normal, batch), then the earlier request |
+| `fifo` | the earlier request |
+| `sjf` | the shortest expected length |
+| `hrrn` | the highest (wait + expected length) / expected length, so a long wait catches up with a short job |
+| `fair` | the session with the fewest CPU seconds per allocation weight |
+
+The expected length is the median wall time of the last 20 successful runs of the same command (provider, program
+and first word that is not an option). A command without one counts as 60 s. The queue table shows the figure.
+
+`guardctl class <session> exempt [minutes]`, or 豁免 in the dashboard's class menu, exempts a session for 60
+minutes unless told otherwise, at most 1440. While it lasts, the session job has no cap and takes no share of the
+pool, its queued commands go first and skip the memory and launch gates, and each command it starts goes into a run
+job outside AllAgents, at normal priority, where the pool cap does not reach. What the session started before stays
+under the pool cap. When the time is up the session goes back to its old class, and the commands started outside
+the pool stay there until they end. A pause still holds an exempt session. Only the dashboard and guardctl, which
+use the HTTP API and its token, can set it: srun, the hooks and adopt accept focus, normal and batch only.
+
 ## Running it
 
 ```
@@ -65,6 +95,7 @@ python -I scripts/srun.py --provider codex --session api1 -- python my_api.py   
 python -I scripts/guardctl.py status | pause claude/s1 | class claude/s1 focus | cap 40 | world 10 | rollback
 python -I scripts/guardian.py --instance t1 --policy my.json     # JSON merged over the policy defaults
 python scripts/guardian-sim.py --ledger ~/.resource-sentinel/guardian/main/guardian.sqlite3   # cap settings, offline
+python scripts/guardian-queue-sim.py --load 0.9 --seeds 20       # queue orders, offline
 ```
 
 Demos (instance `onoff`, dashboard on port 8767 unless noted):
@@ -346,6 +377,34 @@ The rules reach the agents' demand within seconds where the 10-13 controller tak
 a side cannot tell whether the late windows changed. Both rules stay off by default, and
 `{"cpu": {"backoff_idle_cores": 2, "recover_idle_cores": 1, "increase_spacing_seconds": 5, "decrease_factor": 0.5}}`
 in a `--policy` file turns on the tested setting.
+
+The srun queue orders, 2026-10-17. `guardian-queue-sim.py --seeds 20` replays the queue on a made-up mix from four
+sessions: 60% tests of about 20 s, 30% builds of about 2 minutes and 10% long jobs of about 15 minutes, with 6 GiB
+of room and estimates off by a log-normal error. Mean wait in seconds, the longest wait in brackets:
+
+| Order | Load 0.9 | Load 0.7 | Focus wait, load 0.9 | Batch wait, load 0.9 |
+|---|---|---|---|---|
+| `class_fifo` | 335.9 (3752.2) | 204.7 (2294.7) | 146.7 | 637.3 |
+| `fifo` | 392.2 (2228.6) | 226.9 (1470.8) | 366.0 | 401.8 |
+| `sjf` | 230.6 (3233.8) | 158.7 (1791.2) | 179.5 | 277.6 |
+| `hrrn` | 249.4 (2637.8) | 164.9 (1587.9) | 206.6 | 284.0 |
+| `fair` | 330.4 (3794.4) | 209.9 (2269.9) | 186.0 | 569.6 |
+
+In the model, sjf and hrrn cut the mean wait by 19% to 31% against class_fifo, and hrrn keeps the longest wait below
+sjf's at both loads. class_fifo gives focus the shortest wait and batch the longest, and fifo has the lowest
+maximum.
+
+A live run on test instance `r3q` raised Stan's reserve until the RAM room held one command of 2 GiB, sometimes two
+as free RAM moved, and sent the same burst under each order: a blocker, then a focus command of 20 s (L), a normal
+one of 8 s (M) and three batch ones of 3 s (S1 to S3), each run once before so it had an expected length. After the
+blocker, class_fifo, fifo and fair started L M S1 S2 S3, and sjf and hrrn started S1 S2 S3 M L. The commands only
+slept, so no session had used CPU and fair fell back to arrival order. The waits are not compared across orders,
+because the room changed between one and two commands. class_fifo stays the default.
+
+In the exempt run, a command of session `other/vip` queued behind a blocker that held the room, and `guardctl class
+other/vip exempt 5` ran 1.5 s later. The command started at 1.7 s, outside the pool at normal priority, while the
+blocker stayed under the cap at below normal. The session showed no cap and 295 s left, and its next command waited
+0.1 s.
 
 ## Known limits
 

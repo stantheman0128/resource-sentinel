@@ -242,5 +242,35 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(P.estimate([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], None, CFG)[0], 9)
 
 
+class QueueTests(unittest.TestCase):
+    def runs(self, *rows):
+        return [{"id": i, "cls": c, "t_request": t, "est_s": e, "share": sh} for i, c, t, e, sh in rows]
+
+    def order(self, runs, order, now):
+        return "".join(r["id"] for r in P.queue_order(runs, order, now))
+
+    def test_each_order_and_exempt_first(self):
+        runs = self.runs(("a", "normal", 0, 100, 5), ("b", "batch", 1, 5, 0.1), ("c", "focus", 2, 50, 3),
+                         ("x", "exempt", 3, 500, 99))
+        self.assertEqual(self.order(runs, "class_fifo", 10), "xcab")
+        self.assertEqual(self.order(runs, "fifo", 10), "xabc")
+        self.assertEqual(self.order(runs, "sjf", 10), "xbca")
+        self.assertEqual(self.order(runs, "fair", 10), "xbca")
+        with self.assertRaises(ValueError):
+            P.queue_order(runs, "lifo", 10)
+
+    def test_hrrn_lets_a_long_wait_pass_a_short_job(self):
+        long_wait = self.runs(("a", "normal", 0, 100, 0), ("d", "normal", 990, 5, 0))
+        self.assertEqual(self.order(long_wait, "sjf", 1000), "da")
+        self.assertEqual(self.order(long_wait, "hrrn", 1000), "ad")  # (1000 + 100) / 100 beats (10 + 5) / 5
+        both_fresh = self.runs(("a", "normal", 0, 100, 0), ("d", "normal", 9, 5, 0))
+        self.assertEqual(self.order(both_fresh, "hrrn", 10), "da")
+
+    def test_expected_length_is_the_median_of_earlier_runs(self):
+        self.assertEqual(P.estimate_seconds([], CFG), (60.0, "default"))
+        self.assertEqual(P.estimate_seconds([30, 10, None, 20], CFG), (20, "median of 3"))
+        self.assertEqual(P.estimate_seconds([10, 20, -1], CFG), (15.0, "median of 2"))
+
+
 if __name__ == "__main__":
     unittest.main()

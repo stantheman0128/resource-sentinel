@@ -20,6 +20,12 @@
   seconds instead of 20, by a step that hands the agents half of the idle CPUs. `guardian.py --policy FILE` merges a
   JSON file over the policy defaults, and `scripts/guardian-sim.py` replays the controller over a ledger to compare
   settings offline. The simulation and a live ABBA run are in docs/guardian.md.
+- The srun queue has five orders, picked with `guardctl queue-order` or the dashboard: class then arrival (the
+  default), arrival, shortest expected run, highest response ratio, and least CPU per allocation weight. The
+  expected run is the median wall time of the last 20 successful runs of the same command. Stan can exempt a session
+  for up to 24 hours from the dashboard or `guardctl class KEY exempt [minutes]`. While it lasts the session has no
+  cap, its queued commands skip the memory and launch gates, and its new commands run outside AllAgents at normal
+  priority. srun, the hooks and adopt cannot set it. `scripts/guardian-queue-sim.py` compares the orders offline.
 
 ## Unreleased - 2026-10-13
 

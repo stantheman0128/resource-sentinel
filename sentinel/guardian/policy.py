@@ -19,6 +19,7 @@ chosen because a hard cap is predictable and can be read back, and because nativ
 under the parent cap Guardian needs. Foreground protection = pool priority below_normal plus the dynamic
 parent cap. A cap is a ceiling: it does not promise the session that much CPU.
 """
+import json
 import math
 from dataclasses import dataclass, field, replace
 
@@ -103,6 +104,41 @@ def merged(base, over):
     for k, v in (over or {}).items():
         out[k] = merged(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else v
     return out
+
+
+def check_over(over, base=None, path=""):
+    """Raise ValueError naming the key path unless `over` (a --policy file) only uses keys of DEFAULTS with values the
+    daemon can apply: sections stay objects, a number stays a number, a None default (a rule or limit that is off)
+    takes a number or null, a bool stays a bool, and a string stays in its allowed set. Returns `over`."""
+    from . import winjob as wj  # only its name tables; this module stays free of Win32 calls
+    choices = {"cpu.pool_priority": ("below_normal", "normal"), "io.agent_io_priority": tuple(wj.IO_PRIORITY),
+               "memory.agent_memory_priority": tuple(wj.MEMORY_PRIORITY), "queue.order": QUEUE_ORDERS}
+    base = DEFAULTS if base is None else base
+    if not isinstance(over, dict):
+        raise ValueError(f"{path} must be an object" if path else "the file must hold a JSON object")
+    for k, v in over.items():
+        where = f"{path}.{k}" if path else k
+        if k not in base:
+            raise ValueError(f"{where}: unknown key")
+        d = base[k]
+        number = isinstance(v, (int, float)) and not isinstance(v, bool)
+        if isinstance(d, dict):
+            check_over(v, d, where)
+        elif isinstance(d, bool):
+            if not isinstance(v, bool):
+                raise ValueError(f"{where} must be true or false, not {json.dumps(v)}")
+        elif d is None:
+            if v is not None and not number:
+                raise ValueError(f"{where} must be a number or null, not {json.dumps(v)}")
+        elif isinstance(d, (int, float)):
+            if not number:
+                raise ValueError(f"{where} must be a number, not {json.dumps(v)}")
+            if path == "cpu.allocation_weights" and v <= 0:
+                raise ValueError(f"{where} must be more than 0")
+        elif not isinstance(v, str) or (where in choices and v not in choices[where]):
+            raise ValueError(f"{where} must be " + (f"one of {', '.join(choices[where])}" if where in choices else
+                                                    "a string") + f", not {json.dumps(v)}")
+    return over
 
 
 # ---- experience: turn sensor windows into ok / warn / degraded / severe ------------------------------

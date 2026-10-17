@@ -151,6 +151,9 @@ python scripts/guardian-sim.py --ledger ~/.resource-sentinel/guardian/main/guard
 python scripts/guardian-queue-sim.py --load 0.9 --seeds 20       # queue orders, offline
 ```
 
+The daemon checks a `--policy` file against the defaults before it starts and refuses a file that does not fit them
+with a message naming the bad key.
+
 Demos (instance `onoff`, dashboard on port 8767 unless noted):
 
 | Script | What it shows |

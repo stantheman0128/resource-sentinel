@@ -45,6 +45,9 @@
   that step on the next tick, and a ladder pause also ends when its session ends, is exempted, leaves with the
   desktop jobs or is paused by Stan. The ladder never picks a session that holds no private commit, and a tick that
   runs after shutdown trims and pauses nothing.
+- `guardian.py --policy FILE` checks the file against the policy defaults before the daemon starts. An unknown
+  key, a wrong type, a level outside its set or an allocation weight that is not above 0 stops it with exit code 2
+  and a message naming the key. `guardian-sim.py` no longer fails on a ledger exactly `--seconds` long.
 
 ## Unreleased - 2026-10-13
 

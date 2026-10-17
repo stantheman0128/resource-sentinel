@@ -58,7 +58,7 @@ def ledger_trace(path, ncpu, seconds, pick):
     if len(o) < seconds:
         raise SystemExit(f"the ledger has {len(o)} samples, fewer than {seconds}")
     acc = list(itertools.accumulate(o, initial=0.0))
-    means = sorted(((acc[i + seconds] - acc[i]) / seconds, i) for i in range(0, len(o) - seconds, 60))
+    means = sorted(((acc[i + seconds] - acc[i]) / seconds, i) for i in range(0, len(o) - seconds + 1, 60))
     i = means[-1][1] if pick == "busiest" else means[len(means) // 2][1]
     return o[i:i + seconds]
 

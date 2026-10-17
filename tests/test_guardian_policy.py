@@ -1,6 +1,13 @@
+import contextlib
+import io
+import json
 import math
+import tempfile
 import unittest
+from pathlib import Path
+from unittest import mock
 
+from sentinel.guardian import daemon as D
 from sentinel.guardian import policy as P
 
 CFG = P.merged(P.DEFAULTS, {})
@@ -374,6 +381,73 @@ class MemoryLadderSettingsTests(unittest.TestCase):
         st, d = P.memory_step(st, sample(55), 3.5, cfg)  # in the band the pause, due by now, is not added either
         self.assertEqual((st, d["rung"]), (P.MemState(30, 0), 0))
         self.assertIn("pressure_trim turned off, no step taken", d["reason"])
+
+
+class PolicyFileTests(unittest.TestCase):
+    def refused(self, over):
+        with self.assertRaises(ValueError) as e:
+            P.check_over(over)
+        return str(e.exception)
+
+    def test_unknown_keys_are_refused_with_their_path(self):
+        self.assertEqual(self.refused({"cpu": {"backoff_idle_core": 2}}), "cpu.backoff_idle_core: unknown key")
+        self.assertEqual(self.refused({"cpuu": {"decrease_factor": 0.5}}), "cpuu: unknown key")
+        self.assertEqual(self.refused({"cpu": {"allocation_weights": {"exempt": 1}}}),
+                         "cpu.allocation_weights.exempt: unknown key")
+
+    def test_wrong_types_are_refused(self):
+        self.assertEqual(self.refused({"cpu": {"decrease_factor": "1"}}),
+                         'cpu.decrease_factor must be a number, not "1"')
+        self.assertEqual(self.refused({"cpu": 5}), "cpu must be an object")
+        self.assertIn("must be a number or null", self.refused({"cpu": {"backoff_idle_cores": True}}))
+        self.assertIn("must be true or false", self.refused({"safety": {"auto_kill_user_work": 1}}))
+        self.assertIn("must be more than 0", self.refused({"cpu": {"allocation_weights": {"focus": 0}}}))
+        self.assertEqual(self.refused([{"cpu": {}}]), "the file must hold a JSON object")
+
+    def test_levels_outside_their_set_are_refused(self):
+        self.assertIn("io.agent_io_priority must be one of very_low, low, normal",
+                      self.refused({"io": {"agent_io_priority": "below_normal"}}))
+        self.assertIn("memory.agent_memory_priority", self.refused({"memory": {"agent_memory_priority": "Low"}}))
+        self.assertIn("queue.order", self.refused({"queue": {"order": "lifo"}}))
+        self.assertIn("cpu.pool_priority", self.refused({"cpu": {"pool_priority": "high"}}))
+
+    def test_good_files_pass_unchanged(self):
+        over = {"cpu": {"backoff_idle_cores": 2, "recover_idle_cores": None, "decrease_factor": 1,
+                        "allocation_weights": {"focus": 9.5}},
+                "memory": {"agent_memory_priority": "very_low", "pressure_pause": True, "agent_memory_budget_gib": 8},
+                "io": {"agent_io_priority": "very_low"}, "queue": {"order": "hrrn"}}
+        self.assertIs(P.check_over(over), over)
+        P.check_over(P.DEFAULTS)
+        P.check_over({})
+
+    def main(self, text, encoding="utf-8"):
+        """daemon.main with a --policy file holding text (None: no file); nothing real starts."""
+        err, out = io.StringIO(), io.StringIO()
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "policy.json"
+            if text is not None:
+                path.write_text(text, encoding=encoding)
+            with mock.patch.object(D, "ping", return_value=False), mock.patch.object(D, "leave_job") as leave, \
+                    mock.patch.object(D, "Guardian") as guardian, contextlib.redirect_stderr(err), \
+                    contextlib.redirect_stdout(out):
+                rc = D.main(["--instance", "pc", "--policy", str(path)])
+        leave.assert_not_called()
+        return rc, guardian, err.getvalue()
+
+    def test_main_refuses_a_bad_file_before_any_guardian(self):
+        for text in ('{"cpu": {"backoff_idle_core": 2}}', '{"io": {"agent_io_priority": "below_normal"}}', "",
+                     "{not json", "[]", None):
+            rc, guardian, err = self.main(text)
+            self.assertEqual(rc, 2, text)
+            guardian.assert_not_called()
+            self.assertTrue(err.startswith("Guardian pc: bad --policy "), err)
+        self.assertIn("cpu.backoff_idle_core: unknown key", self.main('{"cpu": {"backoff_idle_core": 2}}')[2])
+
+    def test_main_takes_a_file_with_a_bom(self):
+        over = {"cpu": {"backoff_idle_cores": 2}}
+        rc, guardian, err = self.main(json.dumps(over), encoding="utf-8-sig")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(guardian.call_args.args[3], over)
 
 
 if __name__ == "__main__":

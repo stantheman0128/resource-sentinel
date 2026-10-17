@@ -1792,10 +1792,15 @@ def main(argv=None):
     if ping(a.instance):
         print(f"Guardian {a.instance} is already running", file=sys.stderr)
         return 1
+    # before leave_job, so the message reaches the console Stan typed into; utf-8-sig takes what PowerShell 5.1 writes
+    try:
+        over = P.check_over(json.loads(Path(a.policy).read_text(encoding="utf-8-sig"))) if a.policy else {}
+    except (OSError, ValueError) as e:
+        print(f"Guardian {a.instance}: bad --policy {a.policy}: {e}", file=sys.stderr)
+        return 2
     # only with argv from the command line: the new copy gets this process's own command line
     if argv is None and leave_job(a.stay_in_job):
         return 0
-    over = json.loads(Path(a.policy).read_text(encoding="utf-8")) if a.policy else {}
     if a.max_cap:
         over = P.merged(over, {"cpu": {"maximum_cap_percent": a.max_cap}})
     if over:

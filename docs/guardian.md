@@ -36,7 +36,9 @@ every tool command it runs stay inside it:
   `guardctl io-priority very_low|low|normal` and `guardctl memory-priority very_low|low|medium|below_normal|normal`
   change the level for every member; the dashboard's subtitle shows it.
 - **Control off.** `rollback` removes every cap and puts the agents back at normal CPU, I/O and memory priority;
-  the CPU limit stays. `resume-control` turns it back on. A shutdown lifts the caps and keeps the low priorities.
+  the CPU limit stays. While it is off no cap comes back: a cap Stan sets is stored for later, and only a pause
+  still holds a session. `resume-control` turns control back on with the stored cap. A shutdown lifts the caps and
+  keeps the low priorities.
 
 Guardian only controls work it launched, adopted or put in a desktop job (see below). It reads the Claude, Codex and
 Cursor desktop apps but never assigns the apps' own processes to a job. Cloud sessions run on remote machines and

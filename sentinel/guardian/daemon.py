@@ -536,9 +536,9 @@ class Guardian:
                       "paused": s.paused or k in self.mem_paused or self.providers[s.provider]["paused"]}
                   for k, s in self.sessions.items()
                   if s.cls != "exempt" and (s.usage > 0.05 or (s.live_runs and not s.desktop))}
-        if self.allocator_on:
+        if self.allocator_on and self.control:
             self.alloc, _ = P.allocate(self.alloc, budget, active, self.cfg)
-        else:
+        else:  # control off caps no session, as desktop_want: only a pause still holds
             self.alloc = P.AllocState()
         for k, s in self.sessions.items():
             cap = self.alloc.caps.get(k) if k in active else None
@@ -1444,7 +1444,12 @@ class Guardian:
                 c = self.cfg["cpu"]
                 v = max(c["minimum_cap_percent"], min(c["maximum_cap_percent"], float(b["cap"])))
                 self.cap = replace(self.cap, cap=v, healthy_since=None)
-                self.apply_cap("manual_cap", f"set by Stan to {v:.0f}%")
+                if self.control:
+                    self.apply_cap("manual_cap", f"set by Stan to {v:.0f}%")
+                else:
+                    self.decide("manual_cap", "AllAgents", requested={"cap_percent": v},
+                                reason=f"set by Stan to {v:.0f}% while control is off: stored, applied when control "
+                                       f"resumes")
             elif path == "/api/world":
                 self.set_world(b["cpus"], "set by Stan")
             elif path == "/api/queue_order":
@@ -1523,7 +1528,7 @@ class Guardian:
         """Remove every CPU control the Guardian set. Member priority goes back to normal explicitly, because
         clearing a priority limit does not restore the processes it already changed (E9)."""
         self.control = False
-        self.mem, self.mem_paused = P.MemState(), set()
+        self.mem, self.mem_paused, self.alloc = P.MemState(), set(), P.AllocState()
         for s in self.sessions.values():
             self.apply_session(s, None, 1)
             s.paused = False

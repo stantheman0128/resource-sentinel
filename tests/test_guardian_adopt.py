@@ -1192,6 +1192,105 @@ class MemoryLadderTests(unittest.TestCase):
         self.assertIsNone(self.P.DEFAULTS["memory"]["agent_memory_budget_gib"])  # the defaults stay untouched
 
 
+class RootJob(FakeJob):
+    """AllAgents for the control tests: records its CPU cap and limits, and holds no process."""
+
+    def set_limits(self, priority=None, clear_mem=False, mem_max_bytes=None):
+        self.calls.append(("limits", priority))
+
+    def limits(self):
+        return {"priority": None, "mem_max_bytes": None, "flags": 0}
+
+    def pids(self):
+        return []
+
+
+class ControlOffTests(unittest.TestCase):
+    """While control is off no path caps CPU, neither a session cap nor Stan's pool cap; a pause still holds."""
+
+    def setUp(self):
+        from sentinel.guardian import daemon as D
+        self.D, self.wj = D, D.wj
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        with mock.patch.object(D, "home_dir", lambda inst: Path(d.name) / inst), \
+                mock.patch.object(D, "Ledger", mock.Mock()), mock.patch.object(D, "secret", lambda path, n: "00"):
+            g = self.g = D.Guardian("t", initial_cap=10, probe=False, apps=False, desktop=False)
+        g.world, g.log, g.root = 12, mock.Mock(), RootJob()  # budget 10% of 12 CPUs = 1.2 cores
+        for p in (mock.patch.object(self.wj, "set_job_affinity", lambda job, mask: None),
+                  # the pids here are made up: never let them reach a real process
+                  mock.patch.object(self.wj, "set_io_priority", lambda pid, name: True),
+                  mock.patch.object(self.wj, "set_memory_priority", lambda pid, name: True)):
+            p.start()
+            self.addCleanup(p.stop)
+        self.a, self.b = self.add("codex/a"), self.add("codex/b")
+        self.desk = self.add("claude/desk-200", desktop=True)
+
+    def add(self, key, desktop=False):
+        provider, name = key.split("/")
+        self.g.providers.setdefault(provider, {"name": provider, "job": FakeJob(), "paused": False})
+        s = self.g.sessions[key] = self.D.Session(provider, name, "normal", MemberJob(key))
+        s.usage, s.live_runs, s.desktop = 0.6, 1, desktop
+        return s
+
+    @staticmethod
+    def caps(job, since=0):
+        return [c for c in job.calls[since:] if c[0] == "cpu" and c[1] is not None]
+
+    def test_after_rollback_no_path_caps_a_session(self):
+        g = self.g
+        g.allocate()  # 1.2 cores for three: 0.4 each
+        self.assertEqual((self.a.applied, self.desk.applied), (("rel", 0.333), ("abs", 0.4)))
+        self.assertNotIn(None, [x["cap_cores"] for x in g.state()["sessions"]])
+        g.action("/api/rollback", {})
+        st = g.state()
+        self.assertEqual((st["control"], st["mode"]), (False, "ROLLED_BACK"))
+        self.assertEqual([x["cap_cores"] for x in st["sessions"]], [None] * 3)  # no stale allocator caps
+        marks = {k: len(s.job.calls) for k, s in g.sessions.items()}
+        for body in ({"key": "codex/a", "cls": "focus"}, {"key": "claude/desk-200", "cls": "batch"},
+                     {"key": "codex/b", "cls": "exempt", "minutes": 5}, {"key": "codex/b", "cls": "normal"}):
+            g.action("/api/session", body)
+        g.action("/api/allocator", {"on": False})
+        g.action("/api/allocator", {"on": True})
+        g.allocate()
+        for k, s in g.sessions.items():
+            self.assertEqual(self.caps(s.job, marks[k]), [], k)
+            self.assertIsNone(s.applied, k)
+        self.assertEqual([x["cap_cores"] for x in g.state()["sessions"]], [None] * 3)
+        self.assertIsNone(g.budget_of(self.a)["cap_cores"])
+        g.action("/api/resume_control", {})
+        g.allocate()  # control back on: the caps come back
+        self.assertEqual(self.desk.applied[0], "abs")
+        self.assertEqual(self.a.applied[0], "rel")
+
+    def test_a_pause_still_holds_while_control_is_off(self):
+        g = self.g
+        g.action("/api/rollback", {})
+        g.action("/api/session", {"key": "codex/a", "paused": True})
+        g.action("/api/session", {"key": "claude/desk-200", "paused": True})
+        self.assertEqual((self.a.job.calls[-1], self.desk.job.calls[-1]), (("rate", 1), ("rate", 1)))
+        self.assertIsNone(self.b.applied)  # the one left running gets no share of a budget that is not there
+        g.action("/api/session", {"key": "codex/a", "paused": False})
+        self.assertEqual(self.a.job.calls[-1], ("cpu", None))
+        self.assertIsNone(self.a.applied)
+
+    def test_a_cap_set_while_control_is_off_waits_for_resume(self):
+        g, root = self.g, self.g.root
+        g.action("/api/rollback", {})
+        mark = len(root.calls)
+        g.action("/api/cap", {"cap": 40})
+        self.assertEqual(self.caps(root, mark), [])
+        self.assertEqual(g.cap.cap, 40.0)
+        kind, target, *_, reason, _ = g.ledger.decision.call_args.args
+        self.assertEqual((kind, target), ("manual_cap", "AllAgents"))
+        self.assertIn("applied when control resumes", reason)
+        st = g.state()
+        self.assertEqual((st["control"], st["cap"]), (False, 40.0))  # stored, and the dashboard shows it as such
+        g.action("/api/resume_control", {})
+        self.assertEqual(self.caps(root, mark), [("cpu", 40.0 / 100 * 12)])
+        self.assertTrue(g.state()["control"])
+
+
 class DesktopPlaceTests(unittest.TestCase):
     def test_a_desktop_job_name_that_already_exists_is_refused(self):
         from sentinel.guardian import daemon as D

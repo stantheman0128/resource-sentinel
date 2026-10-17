@@ -41,6 +41,11 @@
   model's request, which a local server answered with 401.
 - The acceptance run is in docs/guardian.md: control off and on under a mixed agent load in a 4-CPU world,
   a Cursor-style agent command included, and a second run that switches only the agents' I/O priority.
+- Fix: with control off, nothing caps CPU any more. After `rollback`, a class change, pause, exemption or allocator
+  switch used to put the per-session caps back, and `guardctl cap` or the dashboard's cap field set a hard cap on
+  AllAgents while the dashboard showed 無上限. A cap set while control is off now waits for `resume-control`, and a
+  pause still holds a session. The dashboard and `guardctl status` no longer show session caps from before the
+  rollback.
 
 ## Unreleased - 2026-10-13
 

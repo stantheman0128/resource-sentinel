@@ -147,7 +147,7 @@ function render(s) {
   else { bn.className = 'banner off'; bt.textContent = `控管關閉：agent 想用多少 CPU 就用多少，跟前景程式搶`; }
   document.getElementById('toggle').textContent = s.control ? '關閉控管' : '開啟控管';
   document.getElementById('cap').textContent = s.control ? s.cap_cores + ' 核' : '無上限';
-  document.getElementById('capc').textContent = s.control ? `所有 agent 加起來，= 開放的 ${s.world_cpus} 核 × ${s.cap.toFixed(0)}%` : '控管關閉，沒有上限';
+  document.getElementById('capc').textContent = s.control ? `所有 agent 加起來，= 開放的 ${s.world_cpus} 核 × ${s.cap.toFixed(0)}%` : `控管關閉，沒有上限；開啟控管時套用 ${s.cap.toFixed(0)}%`;
   document.getElementById('pool').textContent = f2(s.pool_cores) + ' 核';
   document.getElementById('busy').textContent = s.cpu_busy == null ? '' : `整台電腦 CPU 忙碌 ${(100 * s.cpu_busy).toFixed(0)}%`;
   const p = s.experience.probe;
@@ -193,7 +193,7 @@ function render(s) {
       (o.machine_cores == null ? '' : `<tr><td class="sub">算不到個別程序（中斷、兩次取樣間就結束的程序）</td><td>${f2(o.unattributed_cores)}</td><td></td></tr>` +
         `<tr><td class="sub">整台電腦</td><td>${f2(o.machine_cores)}</td><td></td></tr>`);
 
-  const maxc = Math.max(s.cap_cores, 0.1);
+  const maxc = Math.max(s.control ? s.cap_cores : s.world_cpus, 0.1);  // control off: no pool cap, bars span the open CPUs
   // rebuilding the table every second would close a 重要性 menu the moment it opens; wait until it loses focus
   const st = document.getElementById('sessions');
   const focused = document.activeElement;

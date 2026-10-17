@@ -91,6 +91,12 @@ canvas { width: 100%; height: 240px; display: block; }
         <button data-act="priority">切換 agent 優先權</button>
         <button data-act="allocator">切換分配器</button>
       </div>
+      <div class="row">
+        <label>agent 記憶體預算 <input id="membudget" type="number" min="1" step="1" placeholder="不設" style="width:70px"> GiB</label><button data-act="membudget">套用</button>
+        <button data-act="memtrim" id="memtrim"></button>
+        <button data-act="mempause" id="mempause"></button>
+      </div>
+      <div class="sub" id="memstate"></div>
       <div class="sub">新指令：<span id="adm">–</span> <span id="admr"></span></div>
       <div class="sub" id="notes"></div>
     </section>
@@ -151,7 +157,18 @@ function render(s) {
   document.getElementById('probek').textContent = p ? `一個一般程式每秒要用 CPU 60 次，最慢的 5% 等了這麼久，越小越順 · 沒準時 ${p.drop_pct}%` +
     (s.experience.inject_left_s ? ` · 模擬變卡剩 ${s.experience.inject_left_s} 秒` : '') : '';
   document.getElementById('ram').textContent = s.available_gib == null ? '–' : s.available_gib + ' GiB';
-  document.getElementById('commit').textContent = s.commit_headroom_gib == null ? '' : `commit 餘裕 ${s.commit_headroom_gib} GiB`;
+  document.getElementById('commit').textContent = (s.commit_headroom_gib == null ? '' : `commit 餘裕 ${s.commit_headroom_gib} GiB`) +
+    (s.memory ? ` · agent 占 ${s.memory.agents_gib} GiB` : '');
+  const mm = s.memory;
+  if (mm) {
+    const mb = document.getElementById('membudget');
+    if (document.activeElement !== mb) mb.value = mm.budget_gib ?? '';
+    document.getElementById('memtrim').textContent = mm.trim ? '記憶體壓力時不要清 working set' : '記憶體壓力時清 working set';
+    document.getElementById('mempause').textContent = mm.pause ? '記憶體壓力時不要暫停 session' : '記憶體壓力時暫停最大的 session';
+    document.getElementById('memstate').textContent = `記憶體控管：${['沒有壓力', '清 working set 中', '清 working set 並暫停最大的 session'][mm.rung]}` +
+      ` · 預算 ${mm.budget_gib == null ? '不設（只替 Stan 留可用記憶體）' : mm.budget_gib + ' GiB'} · 硬上限 ${mm.hard_limit_gib == null ? '關' : mm.hard_limit_gib + ' GiB'}` +
+      ` · 累計清出 ${mm.trimmed_gib} GiB（commit 不會變少）` + (mm.paused.length ? ` · 被暫停：${mm.paused.join('、')}` : '');
+  }
   const a = s.admission, ae = document.getElementById('adm');
   ae.textContent = a.hold ? '手動暫停' : a.open ? '開放' : '暫停'; ae.className = a.open && !a.hold ? 'ok' : 'bad';
   document.getElementById('admr').textContent = a.reason || (a.hold ? 'Stan 按了暫停' : `${s.queue.length} 個排隊中`);
@@ -185,7 +202,7 @@ function render(s) {
       <td><select data-cls="${esc(x.key)}">${Object.keys(CLS).map(c => `<option value="${c}" ${c === x.cls ? 'selected' : ''}>${CLS[c]}</option>`).join('')}</select> <span class="muted">${x.exempt_left_s != null ? `豁免剩 ${Math.ceil(x.exempt_left_s / 60)} 分` : `權重 ${x.allocation_weight}`}</span></td>
       <td>${f2(x.usage)}</td>
       <td><div class="bar"><i style="width:${Math.min(100, 100 * x.usage / maxc)}%;background:${COLORS[i % 6]}"></i>${x.cap_cores != null ? `<b style="left:${Math.min(100, 100 * x.cap_cores / maxc)}%"></b>` : ''}</div></td>
-      <td>${x.paused ? '<span class="bad">已暫停</span>' : x.provider_paused ? '<span class="bad">工具已暫停</span>' : x.cap_cores == null ? '不限' : f2(x.cap_cores)}</td>
+      <td>${x.paused ? '<span class="bad">已暫停</span>' : x.memory_paused ? '<span class="bad">記憶體不夠，暫停中</span>' : x.provider_paused ? '<span class="bad">工具已暫停</span>' : x.cap_cores == null ? '不限' : f2(x.cap_cores)}</td>
       <td>${x.runs}</td>
       <td><button data-sess="${esc(x.key)}" data-paused="${x.paused}">${x.paused ? '恢復' : '暫停'}</button></td></tr>`).join('');
 
@@ -245,6 +262,9 @@ document.addEventListener('click', async e => {
     else if (b.dataset.act === 'inject') await api('/api/inject', {level: 'degraded', seconds: 30});
     else if (b.dataset.act === 'priority') await api('/api/pool_priority', {priority: S.pool_priority === 'below_normal' ? 'normal' : 'below_normal'});
     else if (b.dataset.act === 'allocator') await api('/api/allocator', {on: !S.allocator});
+    else if (b.dataset.act === 'membudget') { const v = document.getElementById('membudget').value; await api('/api/memory', {budget_gib: v === '' ? null : Number(v)}); }
+    else if (b.dataset.act === 'memtrim') await api('/api/memory', {trim: !S.memory.trim});
+    else if (b.dataset.act === 'mempause') await api('/api/memory', {pause: !S.memory.pause});
     else if (b.dataset.act === 'toggle') await api(S.control ? '/api/rollback' : '/api/resume_control', {});
     tick();
   } catch (err) { alert(err.message); }

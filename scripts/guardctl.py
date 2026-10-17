@@ -6,6 +6,8 @@
   guardctl class claude/s1 exempt [minutes]     no session cap, queue gates skipped, new runs outside the pool
   guardctl queue-order sjf                      class_fifo (default), fifo, sjf, hrrn or fair
   guardctl pause-provider codex | resume-provider codex
+  guardctl memory-budget 6 | memory-budget off  agents' private commit together; under pressure trim, then pause
+  guardctl memory-trim on|off | memory-pause on|off | memory-limit 8 | memory-limit off   (the limit fails allocations)
   guardctl cap 40 | world 10 | hold on | hold off | inject degraded 30 | priority normal | allocator off
   guardctl desktop off | desktop on                 desktop jobs for the Claude and Codex apps' CLIs
   guardctl cancel <run_id> | rollback | resume-control | shutdown
@@ -43,6 +45,13 @@ def summary(s):
              f"admission {'open' if s['admission']['open'] else 'closed ' + s['admission']['reason']}"
              f"{'  HOLD' if s['admission']['hold'] else ''}  queue order {s.get('queue_order')}",
              f"experience {s['experience']['level']} ({s['experience']['kind']})  probe {s['experience']['probe']}"]
+    if s.get("memory"):
+        m = s["memory"]
+        gib = lambda v: "off" if v is None else f"{v:g} GiB"
+        lines.insert(2, f"agent memory {m['agents_gib']} GiB  budget {gib(m['budget_gib'])}  rung {m['rung']}  "
+                        f"trim {'on' if m['trim'] else 'off'}  pause {'on' if m['pause'] else 'off'}  "
+                        f"hard limit {gib(m['hard_limit_gib'])}  trimmed {m['trimmed_gib']} GiB"
+                        + (f"  paused {', '.join(m['paused'])}" if m["paused"] else ""))
     if s.get("agent_priority"):
         a = s["agent_priority"]
         lines.insert(1, f"agent I/O priority {a['io']}  memory priority {a['memory']}  set on {a['set']} processes"
@@ -99,6 +108,10 @@ def main(argv=None):
         "cancel": lambda: ("/api/cancel", {"run_id": x[0]}),
         "adopt": lambda: ("/api/adopt", {"pid": int(x[0]), "provider": x[1], "session": x[2] if len(x) > 2 else None}),
         "queue-order": lambda: ("/api/queue_order", {"order": x[0]}),
+        "memory-budget": lambda: ("/api/memory", {"budget_gib": None if x[0] == "off" else float(x[0])}),
+        "memory-trim": lambda: ("/api/memory", {"trim": x[0] == "on"}),
+        "memory-pause": lambda: ("/api/memory", {"pause": x[0] == "on"}),
+        "memory-limit": lambda: ("/api/memory", {"hard_limit_gib": None if x[0] == "off" else float(x[0])}),
         "rollback": lambda: ("/api/rollback", {}),
         "resume-control": lambda: ("/api/resume_control", {}),
         "shutdown": lambda: ("/api/shutdown", {}),

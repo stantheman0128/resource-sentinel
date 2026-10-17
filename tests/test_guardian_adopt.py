@@ -793,6 +793,7 @@ class DesktopAllocateTests(unittest.TestCase):
         g = self.g = D.Guardian.__new__(D.Guardian)  # no jobs, ledger or threads: allocate() and its helpers only
         g.cfg, g.world, g.cap, g.alloc = P.merged(P.DEFAULTS, None), 12, P.CapState(cap=10.0), P.AllocState()
         g.allocator_on, g.control, g.sessions, g.providers, g.ledger, g.live = True, True, {}, {}, mock.Mock(), {}
+        g.mem_paused, g.agents_gib = set(), 0.0
 
     def add(self, key, usage, desktop=False, runs=1):
         provider, name = key.split("/")
@@ -952,6 +953,78 @@ class ExemptTests(unittest.TestCase):
         self.assertEqual(self.g.cfg["queue"]["order"], "hrrn")
 
 
+class MemJob(FakeJob):
+    def __init__(self, pids):
+        super().__init__()
+        self._pids = list(pids)
+
+    def pids(self):
+        return self._pids
+
+
+class MemoryLadderTests(unittest.TestCase):
+    """R2: under memory pressure Guardian trims working sets, then pauses the session holding the most commit."""
+    add = DesktopAllocateTests.add
+
+    def setUp(self):
+        ExemptTests.setUp(self)
+        self.g.trimmed, self.g.trimmed_gib, self.g.mem = {}, 0.0, self.P.MemState()
+        self.GiB = self.D.GiB
+
+    def test_rung_one_trims_the_largest_first_once_per_spacing(self):
+        GiB = self.GiB
+        mem = {11: (1 * GiB, 2 * GiB), 12: (3 * GiB, 1 * GiB), 13: None}
+        self.g.mem = self.P.MemState(since=0.0, rung=1)
+        trimmed = []
+        with mock.patch.object(self.wj, "trim_working_set", lambda pid: (trimmed.append(pid), GiB // 2)[1]):
+            self.g.memory_ladder(mem, 100.0)
+            self.g.memory_ladder(mem, 110.0)  # inside the 30 s spacing: nothing
+            self.g.memory_ladder(mem, 131.0)
+            self.assertEqual(trimmed, [11, 12, 11, 12])  # by working set; a process that cannot be read is skipped
+            self.assertEqual(self.g.trimmed_gib, 2.0)
+            self.assertEqual(self.g.ledger.decision.call_args.args[:2], ("memory_trim", "agent processes"))
+            self.g.memory_ladder({12: mem[12]}, 200.0)
+        self.assertEqual(set(self.g.trimmed), {12})  # a process that left is forgotten
+
+    def test_rung_two_pauses_the_largest_session_until_the_pressure_ends(self):
+        GiB = self.GiB
+        big, small, mine, ex = (self.add(k, 0.5) for k in ("codex/big", "codex/small", "codex/mine", "claude/ex"))
+        big.job, small.job, mine.job, ex.job = MemJob([1, 2]), MemJob([3]), MemJob([4]), MemJob([5])
+        mine.paused, ex.cls = True, "exempt"
+        mem = {1: (2 * GiB, 0), 2: (2 * GiB, 0), 3: (3 * GiB, 0), 4: (9 * GiB, 0), 5: (9 * GiB, 0)}
+        self.g.mem = self.P.MemState(since=0.0, rung=2)
+        with mock.patch.object(self.wj, "trim_working_set", lambda pid: None):
+            self.g.memory_ladder(mem, 50.0)
+            self.g.memory_ladder(mem, 51.0)  # one session at a time
+        self.assertEqual(self.g.mem_paused, {"codex/big"})  # 4 GiB over 3; Stan's pause and the exempt one are skipped
+        self.g.allocate()
+        self.assertEqual(big.job.calls[-1], ("rate", 1))
+        self.assertNotIn(("rate", 1), small.job.calls)
+        self.g.mem = self.P.MemState()
+        self.g.memory_ladder(mem, 52.0)
+        self.assertEqual(self.g.mem_paused, set())
+        self.assertEqual(self.g.ledger.decision.call_args.args[:2], ("memory_resume", "codex/big"))
+        self.g.allocate()
+        self.assertNotEqual(big.job.calls[-1], ("rate", 1))
+
+    def test_stan_sets_the_budget_and_the_hard_limit(self):
+        root = self.g.root = mock.Mock()
+        root.limits.return_value = {"mem_max_bytes": None}
+        for bad in ({"budget_gib": 0}, {"budget_gib": 2000}, {"hard_limit_gib": -1}):
+            with self.assertRaises(ValueError):
+                self.g.action("/api/memory", bad)
+        self.g.action("/api/memory", {"budget_gib": 6, "pause": True})
+        m = self.g.cfg["memory"]
+        self.assertEqual((m["agent_memory_budget_gib"], m["pressure_pause"], m["pressure_trim"]), (6.0, True, True))
+        root.set_limits.assert_not_called()
+        self.g.action("/api/memory", {"hard_limit_gib": 8})
+        root.set_limits.assert_called_with(mem_max_bytes=8 * self.GiB)
+        self.g.action("/api/memory", {"hard_limit_gib": None, "budget_gib": None})
+        root.set_limits.assert_called_with(clear_mem=True)
+        self.assertIsNone(m["agent_memory_budget_gib"])
+        self.assertIsNone(self.P.DEFAULTS["memory"]["agent_memory_budget_gib"])  # the defaults stay untouched
+
+
 class DesktopPlaceTests(unittest.TestCase):
     def test_a_desktop_job_name_that_already_exists_is_refused(self):
         from sentinel.guardian import daemon as D
@@ -1083,7 +1156,7 @@ class NestedAdoptTests(unittest.TestCase):
         g.ledger, g.log, g.probe_proc, g.lock = mock.Mock(), mock.Mock(), None, threading.RLock()
         g.cfg, g.world, g.cap, g.alloc = P.merged(P.DEFAULTS, None), 12, P.CapState(cap=10.0), P.AllocState()
         g.allocator_on, g.control, g.mask, g.pool_priority = True, True, None, "below_normal"
-        g.desktop_on, g.desktop_skip, g.niced = False, set(), {}
+        g.desktop_on, g.desktop_skip, g.niced, g.mem_paused = False, set(), {}, set()
         # the pool already holds work, so a process in a job of its own cannot join it
         g.root = MemberJob("t.AllAgents", "AssignProcessToJobObject", members={5})
         self.jobs, self.refuse = {}, {}
@@ -1358,7 +1431,7 @@ class NestedJobLiveTests(unittest.TestCase):
         g.ledger, g.log, g.probe_proc, g.lock = mock.Mock(), mock.Mock(), None, threading.RLock()
         g.cfg, g.world, g.cap, g.alloc = P.merged(P.DEFAULTS, None), wj.NCPU, P.CapState(cap=10.0), P.AllocState()
         g.allocator_on, g.control, g.mask, g.pool_priority = True, True, None, "below_normal"
-        g.desktop_on, g.desktop_skip = False, set()
+        g.desktop_on, g.desktop_skip, g.mem_paused = False, set(), set()
         g.root = wj.Job.create(f"{inst}.AllAgents")
         self.jobs.append(g.root)
         self.addCleanup(lambda: [x.close() for x in [s.job for s in g.sessions.values()] +

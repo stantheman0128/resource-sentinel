@@ -245,6 +245,11 @@ class Guardian:
         self.busy_fn()
         self.last_core_ok = time.monotonic()
         self.pool_cores = 0.0
+        self.mem = P.MemState()    # the memory pressure ladder
+        self.agents_gib = 0.0      # private commit of every process in Guardian's jobs
+        self.trimmed = {}          # pid -> when its working set was last trimmed
+        self.trimmed_gib = 0.0     # working set the trims took out of RAM since start
+        self.mem_paused = set()    # sessions the ladder paused (Stan's own pauses are Session.paused)
 
     # ---- logging and decisions -----------------------------------------------------------------------------
     def log(self, text):
@@ -289,6 +294,8 @@ class Guardian:
                         readback=hex(self.root.extended().Basic.Affinity) if self.mask else None,
                         reason=f"world = {self.world} of {wj.NCPU} logical CPUs")
         self.apply_cap("startup", f"initial cap {self.cap.cap:.0f}% of {self.world} CPUs")
+        if self.cfg["memory"]["job_commit_hard_limit_gib"]:
+            self.set_hard_limit(self.cfg["memory"]["job_commit_hard_limit_gib"], "startup: job_commit_hard_limit_gib")
         stale = self.ledger.reconcile_on_start()
         if stale:
             self.log(f"{len(stale)} runs from an earlier daemon marked NEEDS_RECONCILIATION")
@@ -318,6 +325,22 @@ class Guardian:
         rb = self.root.cpu()
         self.decide(kind, "AllAgents", before.get("cores"), {"cap_percent": self.cap.cap, "cores": round(cores, 2)},
                     round(rb.get("cores", 0), 2), err, reason)
+
+    def set_hard_limit(self, gib, reason):
+        """AllAgents' job memory limit, or none: past it the agents' allocations fail, so it is off unless Stan sets
+        it. It counts every process in the tree, and leaves desktop and nested jobs out."""
+        before = self.root.limits()["mem_max_bytes"]
+        err = None
+        try:
+            if gib:
+                self.root.set_limits(mem_max_bytes=gib * GiB)
+            else:
+                self.root.set_limits(clear_mem=True)
+        except OSError as e:
+            err = str(e)
+        rb = self.root.limits()["mem_max_bytes"]
+        self.decide("memory_limit", "AllAgents", round(before / GiB, 2) if before else None, gib,
+                    round(rb / GiB, 2) if rb else None, err, reason)
 
     def set_world(self, n, reason):
         """Let the agents use only the top n logical CPUs, so the rest stay free for the foreground (for example a
@@ -478,13 +501,20 @@ class Guardian:
             s = P.Sample(t=now, age_s=now - self.last_core_ok, cpu_busy=busy, pool_cores=self.pool_cores,
                          available_gib=avail, commit_headroom_gib=head, experience=level, experience_kind=kind,
                          pool_priority=self.pool_priority_readback, ncpu=self.world, machine_cpus=wj.NCPU)
+            members = self.members()
+            mem = {pid: wj.process_memory(pid) for pid in members}
+            self.agents_gib = sum(m[0] for m in mem.values() if m) / GiB
             self.end_exemptions()
             if self.control:
                 self.cap, d = P.cap_step(self.cap, s, self.cfg)
                 if d:
                     self.apply_cap(d["kind"], d["reason"])
+                self.mem, d = P.memory_step(self.mem, s, self.agents_gib, self.cfg)
+                if d:
+                    self.decide(d["kind"], "agent memory", requested={"rung": d["rung"]}, reason=d["reason"])
+                self.memory_ladder(mem, now)
                 self.allocate()
-                self.nice_sweep()
+                self.nice_sweep(members)
             self.sample = s
             row = {"t": time.time(), "mode": self.cap.mode if self.control else "ROLLED_BACK", "cap": self.cap.cap,
                    "cpu_busy": busy, "pool_cores": round(self.pool_cores, 2), "available_gib": avail,
@@ -503,7 +533,7 @@ class Guardian:
         # a desktop session counts as active by its use alone: its CLI runs as long as the app's tab is open, and
         # every idle tab would otherwise ask for a share of the budget and squeeze the busy ones
         active = {k: {"allocation_weight": weights.get(s.cls, 5), "usage": s.usage,
-                      "paused": s.paused or self.providers[s.provider]["paused"]}
+                      "paused": s.paused or k in self.mem_paused or self.providers[s.provider]["paused"]}
                   for k, s in self.sessions.items()
                   if s.cls != "exempt" and (s.usage > 0.05 or (s.live_runs and not s.desktop))}
         if self.allocator_on:
@@ -516,7 +546,7 @@ class Guardian:
                 want = "paused" if s.paused or self.providers[s.provider]["paused"] else None
             elif s.desktop:
                 want = self.desktop_want(s, cap, budget)
-            elif s.paused:
+            elif s.paused or k in self.mem_paused:
                 want = "paused"
             else:
                 want = None if cap is None or cap >= 0.98 * budget else ("rel", round(cap / budget, 3))
@@ -541,10 +571,50 @@ class Guardian:
                 self.decide("session_class", s.key, "exempt", s.cls, s.cls, None,
                             "exemption ended; runs already started outside the pool stay there until they end")
 
+    def memory_ladder(self, mem, now):
+        """Act on memory_step's rung. Rung 1 trims working sets, largest first, each process at most once per
+        spacing. Rung 2 also pauses the session holding the most private commit, one session, until the pressure is
+        over; a pause stops growth but frees nothing, and an exempt session or one Stan paused is never picked."""
+        m = self.cfg["memory"]
+        for pid in self.trimmed.keys() - mem.keys():
+            del self.trimmed[pid]
+        if self.mem.rung >= 1:
+            freed = n = 0
+            for pid, x in sorted(mem.items(), key=lambda kv: -(kv[1][1] if kv[1] else 0)):
+                if x and now - self.trimmed.get(pid, -1e9) >= m["pressure_trim_spacing_seconds"]:
+                    self.trimmed[pid] = now
+                    got = wj.trim_working_set(pid)
+                    if got is not None:
+                        freed, n = freed + got, n + 1
+            if n:
+                self.trimmed_gib += freed / GiB
+                self.decide("memory_trim", "agent processes", requested=n, readback=round(freed / GiB, 2),
+                            reason=f"{n} working sets trimmed, {freed / GiB:.2f} GiB out of RAM; their commit stays")
+        if self.mem.rung >= 2 and not self.mem_paused:
+            held = {}
+            for k, x in self.sessions.items():
+                if x.cls == "exempt" or x.paused:
+                    continue
+                try:
+                    pids = x.job.pids()
+                except OSError:
+                    continue
+                held[k] = sum(mem[p][0] for p in pids if mem.get(p))
+            if held:
+                k = max(held, key=held.get)
+                self.mem_paused.add(k)
+                self.decide("memory_pause", k, requested="rate 1", readback=round(held[k] / GiB, 2),
+                            reason="memory pressure lasted: the session holding the most private commit is paused, "
+                                   "and its processes keep their memory")
+        elif self.mem.rung < 2 and self.mem_paused:
+            for k in sorted(self.mem_paused):
+                self.decide("memory_resume", k, reason="memory pressure over")
+            self.mem_paused.clear()
+
     def desktop_want(self, s, cap, budget):
         """A desktop job's cap in absolute cores, since the app's job above it has no CPU rate: the allocator's cap,
         or the whole budget when it sets none. While control is on, a desktop session never runs uncapped."""
-        if s.paused or self.providers[s.provider]["paused"]:
+        if s.paused or s.key in self.mem_paused or self.providers[s.provider]["paused"]:
             return "paused"
         if not self.control or s.cls == "exempt":
             return None
@@ -647,7 +717,8 @@ class Guardian:
             return False, "SESSION_PAUSED"
         if s.cls == "exempt":
             return True, ""
-        ok, reason, run.numbers = P.admission(run.est_gib, self.sample, unused, unused, self.cap, self.cfg, self.hold)
+        ok, reason, run.numbers = P.admission(run.est_gib, self.sample, unused, unused, self.cap, self.cfg, self.hold,
+                                              agents_gib=self.agents_gib)
         if not ok:
             return False, reason
         if run.unprofiled:
@@ -1276,7 +1347,7 @@ class Guardian:
     def state(self):
         with self.lock:
             s = self.sample
-            c = self.cfg["cpu"]
+            c, m = self.cfg["cpu"], self.cfg["memory"]
             budget = self.cap.cap / 100 * self.world
             level, kind = self.experience(time.monotonic())
             prov_cores = collections.Counter()
@@ -1296,6 +1367,10 @@ class Guardian:
                                    "set": sum(1 for v in self.niced.values() if v),
                                    "refused": sum(1 for v in self.niced.values() if not v)},
                 "desktop": self.desktop_on,
+                "memory": {"agents_gib": round(self.agents_gib, 2), "budget_gib": m["agent_memory_budget_gib"],
+                           "rung": self.mem.rung, "trim": m["pressure_trim"], "pause": m["pressure_pause"],
+                           "hard_limit_gib": m["job_commit_hard_limit_gib"], "paused": sorted(self.mem_paused),
+                           "trimmed_gib": round(self.trimmed_gib, 2)},
                 "experience": {"level": level, "kind": kind, "probe": self.probe_last,
                                "inject_left_s": round(self.inject[0] - time.monotonic())
                                if self.inject and self.inject[0] > time.monotonic() else 0},
@@ -1307,6 +1382,7 @@ class Guardian:
                               "provider_paused": self.providers[x.provider]["paused"], "usage": round(x.usage, 2),
                               "cap_cores": self.alloc.caps.get(k), "runs": x.live_runs,
                               "desktop": x.desktop and not x.nested, "nested": x.nested,
+                              "memory_paused": k in self.mem_paused,
                               "exempt_left_s": max(0, round(x.exempt_until - time.time()))
                               if x.cls == "exempt" else None}
                              for k, x in self.sessions.items()],
@@ -1363,6 +1439,8 @@ class Guardian:
                 self.decide("queue_order", "queue", self.cfg["queue"]["order"], b["order"], b["order"],
                             reason="set by Stan")
                 self.cfg["queue"]["order"] = b["order"]
+            elif path == "/api/memory":
+                self.set_memory(b)
             elif path == "/api/hold":
                 self.hold = bool(b["on"])
                 self.decide("admission_hold", "queue", requested=self.hold, reason="set by Stan")
@@ -1404,16 +1482,34 @@ class Guardian:
                 self.control = True
                 self.set_pool_priority(self.pool_priority, "control resumed")
                 self.apply_cap("resume_control", "control resumed")
+                if self.cfg["memory"]["job_commit_hard_limit_gib"]:
+                    self.set_hard_limit(self.cfg["memory"]["job_commit_hard_limit_gib"], "control resumed")
             elif path == "/api/shutdown":
                 threading.Thread(target=self.shutdown, daemon=True).start()
             else:
                 raise KeyError(path)
         return {"ok": True}
 
+    def set_memory(self, b):
+        m = self.cfg["memory"]
+        keys = {"budget_gib": "agent_memory_budget_gib", "trim": "pressure_trim", "pause": "pressure_pause",
+                "hard_limit_gib": "job_commit_hard_limit_gib"}
+        before = {k: m[v] for k, v in keys.items()}
+        for k in ("budget_gib", "hard_limit_gib"):
+            if k in b and b[k] is not None and not 0 < float(b[k]) <= 1024:
+                raise ValueError(f"{k} must be more than 0 and at most 1024 GiB, or null for none")
+        for k, v in keys.items():
+            if k in b:
+                m[v] = (bool(b[k]) if k in ("trim", "pause") else None if b[k] is None else float(b[k]))
+        self.decide("memory_settings", "agent memory", before, {k: m[v] for k, v in keys.items()}, reason="set by Stan")
+        if "hard_limit_gib" in b and self.control:
+            self.set_hard_limit(m["job_commit_hard_limit_gib"], "set by Stan")
+
     def rollback(self, why):
         """Remove every CPU control the Guardian set. Member priority goes back to normal explicitly, because
         clearing a priority limit does not restore the processes it already changed (E9)."""
         self.control = False
+        self.mem, self.mem_paused = P.MemState(), set()
         for s in self.sessions.values():
             self.apply_session(s, None, 1)
             s.paused = False
@@ -1423,12 +1519,12 @@ class Guardian:
             p["job"].set_cpu()
             p["paused"] = False
         self.root.set_cpu()
-        self.root.set_limits(priority="normal")
+        self.root.set_limits(priority="normal", clear_mem=True)
         self.pool_priority_readback = self.root.limits()["priority"]
         self.restore_priority(self.members())
         # a miniature world (--world-cpus) is the demo's safety boundary, not a control: keep it
         wj.set_job_affinity(self.root, self.mask)
-        self.decide("rollback", "AllAgents", requested="no caps, normal CPU, I/O and memory priority, " +
+        self.decide("rollback", "AllAgents", requested="no caps or memory limit, normal CPU, I/O and memory priority, " +
                     (f"affinity kept to the {self.world}-CPU demo world" if self.mask else "no affinity"),
                     readback=self.root.cpu().get("mode"), reason=why)
 
@@ -1442,7 +1538,8 @@ class Guardian:
                 for p in self.providers.values():
                     p["job"].set_cpu()
                 self.root.set_cpu()
-                self.decide("shutdown", "AllAgents", reason="daemon stopping: caps and pauses removed, "
+                self.root.set_limits(clear_mem=True)
+                self.decide("shutdown", "AllAgents", reason="daemon stopping: caps, pauses and the memory limit removed, "
                             "below_normal and the low I/O and memory priority kept so leftover work still yields "
                             "to the foreground")
             except OSError as e:

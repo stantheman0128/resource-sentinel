@@ -26,6 +26,13 @@
   for up to 24 hours from the dashboard or `guardctl class KEY exempt [minutes]`. While it lasts the session has no
   cap, its queued commands skip the memory and launch gates, and its new commands run outside AllAgents at normal
   priority. srun, the hooks and adopt cannot set it. `scripts/guardian-queue-sim.py` compares the orders offline.
+- The daemon now acts on memory pressure from running work. It adds up the private commit of every process in its
+  jobs, and when available RAM falls under Stan's 6 GiB, or the agents pass an optional budget that also gates
+  admission, it trims their working sets, largest first. With `pressure_pause` on, pressure that lasts 20 s pauses
+  the session holding the most commit until memory is 1 GiB inside the threshold again. An optional hard limit puts
+  a job memory limit on AllAgents. `guardctl memory-budget|memory-trim|memory-pause|memory-limit` set them, and the
+  dashboard sets the budget, trim and pause; rollback and shutdown remove the limit. Trim is on by default, so the
+  policy version is now guardian-policy/2.
 
 ## Unreleased - 2026-10-13
 

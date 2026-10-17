@@ -22,7 +22,7 @@ parent cap. A cap is a ceiling: it does not promise the session that much CPU.
 import math
 from dataclasses import dataclass, field, replace
 
-POLICY_VERSION = "guardian-policy/1"
+POLICY_VERSION = "guardian-policy/2"
 
 DEFAULTS = {
     "cpu": {
@@ -56,9 +56,15 @@ DEFAULTS = {
         "physical_admission_margin_gib": 2,
         "commit_headroom_target_gib": 4,
         "commit_admission_margin_gib": 1,
-        "job_commit_hard_limit_gib": None,
+        "job_commit_hard_limit_gib": None,       # R2: AllAgents' job memory limit; past it allocations fail
         "exploration_reservation_gib": 0.5,
         "agent_memory_priority": "low",          # agents' pages leave RAM's standby list before Stan's
+        "agent_memory_budget_gib": None,         # R2: the agents' private commit together; None = only Stan's 6 GiB
+        "pressure_trim": True,                   # under pressure, first take the agents' pages out of RAM
+        "pressure_trim_spacing_seconds": 30,     # a process is trimmed at most this often
+        "pressure_pause": False,                 # then pause the session holding the most memory
+        "pressure_pause_after_seconds": 20,      # how long pressure lasts before that pause
+        "pressure_release_margin_gib": 1,        # pressure ends this far inside the line
     },
     "io": {
         "agent_io_priority": "low",              # Stan's disk reads and writes go first
@@ -317,9 +323,10 @@ def _diff(old, new, active):
 
 # ---- admission -----------------------------------------------------------------------------------
 
-def admission(est_gib, s, unused_ram_gib, unused_commit_gib, cap_state, cfg, manual_hold=False):
+def admission(est_gib, s, unused_ram_gib, unused_commit_gib, cap_state, cfg, manual_hold=False, agents_gib=None):
     """Returns (ok, reason, numbers). Room = current headroom minus the target, the margin and growth that
-    running work already reserved but has not used yet (what it already uses is in the live numbers)."""
+    running work already reserved but has not used yet (what it already uses is in the live numbers). With an agent
+    memory budget, the budget minus what the agents hold and have reserved is a room as well."""
     m = cfg["memory"]
     ram_room = (s.available_gib or 0) - m["physical_available_target_gib"] - m["physical_admission_margin_gib"] \
         - unused_ram_gib
@@ -335,6 +342,12 @@ def admission(est_gib, s, unused_ram_gib, unused_commit_gib, cap_state, cfg, man
         return False, "CAPACITY_PRESSURE: RAM room {:.1f} GiB < estimate {:.1f} GiB".format(ram_room, est_gib), nums
     if est_gib > commit_room:
         return False, "CAPACITY_PRESSURE: commit room {:.1f} GiB < estimate {:.1f} GiB".format(commit_room, est_gib), nums
+    budget = m["agent_memory_budget_gib"]
+    if budget is not None and agents_gib is not None:
+        nums["budget_room_gib"] = round(budget - agents_gib - unused_ram_gib, 2)
+        if est_gib > nums["budget_room_gib"]:
+            return False, "AGENT_MEMORY_BUDGET: room {:.1f} GiB of {:g} < estimate {:.1f} GiB".format(
+                nums["budget_room_gib"], budget, est_gib), nums
     return True, "", nums
 
 
@@ -406,3 +419,46 @@ def queue_order(runs, order, now):
             return late, r["share"], r["t_request"]
         return late, CLASS_RANK.get(r["cls"], 1), r["t_request"]
     return sorted(runs, key=key)
+
+
+# ---- memory pressure on running work ----
+@dataclass
+class MemState:
+    since: float = None  # when the current pressure began
+    rung: int = 0        # 0 nothing, 1 trim working sets, 2 trim and pause the largest session
+
+
+def memory_pressure(s, agents_gib, cfg, margin=0.0):
+    """Why memory is over the line, or "" when it is not: available RAM below Stan's reserve, or the agents' private
+    commit over their budget when one is set. margin moves both lines inward (release only well inside them)."""
+    m = cfg["memory"]
+    if s.available_gib is not None and s.available_gib < m["physical_available_target_gib"] + margin:
+        return f"available RAM {s.available_gib:.1f} GiB, Stan keeps {m['physical_available_target_gib']:g}"
+    budget = m["agent_memory_budget_gib"]
+    if budget is not None and agents_gib is not None and agents_gib > budget - margin:
+        return f"agents hold {agents_gib:.1f} GiB, budget {budget:g}"
+    return ""
+
+
+def memory_step(st, s, agents_gib, cfg):
+    """The ladder for work that already runs, since a CPU cap returns no memory: trim the agents' working sets
+    (their pages go to the standby and modified lists, which hands RAM back but not commit), then, if Stan turned
+    it on and pressure lasts, pause the session holding the most. Returns (state, decision or None)."""
+    m = cfg["memory"]
+    why = memory_pressure(s, agents_gib, cfg)
+    if not why:
+        if not st.rung:
+            return MemState(), None
+        if not memory_pressure(s, agents_gib, cfg, m["pressure_release_margin_gib"]):
+            return MemState(), {"kind": "memory_relief", "rung": 0,
+                                "reason": f"{m['pressure_release_margin_gib']:g} GiB inside the line again"}
+        return st, None  # inside the line but not by the margin yet: hold the rung
+    since = s.t if st.since is None else st.since
+    rung = 1 if m["pressure_trim"] else 0
+    if m["pressure_pause"] and s.t - since >= m["pressure_pause_after_seconds"]:
+        rung = 2
+    new = MemState(since, max(rung, st.rung))
+    if new.rung == st.rung:
+        return new, None
+    what = {1: "trim the agents' working sets", 2: "pause the session holding the most memory"}.get(new.rung)
+    return new, {"kind": "memory_pressure", "rung": new.rung, "reason": f"{why}: {what}" if what else why}

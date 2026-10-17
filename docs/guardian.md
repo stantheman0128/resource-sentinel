@@ -85,6 +85,28 @@ under the pool cap. When the time is up the session goes back to its old class, 
 the pool stay there until they end. A pause still holds an exempt session. Only the dashboard and guardctl, which
 use the HTTP API and its token, can set it: srun, the hooks and adopt accept focus, normal and batch only.
 
+## Memory
+
+A CPU cap frees no memory, so the daemon has a separate ladder for the memory that running work holds. Each second
+it adds up the private commit of every process in its jobs, desktop and nested jobs included. Memory is under
+pressure when available RAM falls below Stan's 6 GiB, or when the agents hold more than `agent_memory_budget_gib`, a
+budget that is off unless Stan sets one.
+
+1. Trim (`pressure_trim`, on by default). The daemon empties the agents' working sets, largest first, each process
+   at most once per 30 s. Their pages move to the standby and modified lists, so RAM comes back but commit stays.
+2. Pause (`pressure_pause`, off by default). Pressure that lasts 20 s pauses the session holding the most private
+   commit, one session at a time, skipping exempt sessions and sessions Stan paused. Its processes keep their
+   memory.
+
+Pressure ends when memory is 1 GiB inside the threshold again, and the ladder then resumes what it paused. A budget
+is also an admission gate: a command waits with `AGENT_MEMORY_BUDGET` while the budget, minus what the agents hold
+and have reserved, is smaller than its estimate. Separately, available RAM under the 6 GiB closes admission and
+drops the pool cap to 20%. `job_commit_hard_limit_gib`, off by default, puts a job memory limit on AllAgents; past
+it the agents' allocations fail, and it does not reach desktop and nested jobs. `guardctl memory-budget 6|off`,
+`memory-trim on|off`, `memory-pause on|off` and `memory-limit 8|off` change these at run time. In the dashboard,
+進階操作 sets the budget, trim and pause and shows the rung, and the RAM card shows what the agents hold. Rollback
+clears the ladder and removes the hard limit, `resume-control` puts the limit back, and a shutdown removes it.
+
 ## Running it
 
 ```
@@ -406,11 +428,32 @@ other/vip exempt 5` ran 1.5 s later. The command started at 1.7 s, outside the p
 blocker stayed under the cap at below normal. The session showed no cap and 295 s left, and its next command waited
 0.1 s.
 
+The memory ladder, 2026-10-17, test instance `r2m`, no probe. One srun command allocated 3 GiB and touched every
+page, with 21 GiB available at the start. A 2 GiB budget created the pressure, or in the last case a reserve line
+raised to 19.4 GiB, so the machine kept more than 17 GiB available throughout.
+
+| Setting and load | Result |
+|---|---|
+| Budget 2, trim and pause off, idle load | No ladder step. A 0.5 GiB command waited with `AGENT_MEMORY_BUDGET: room -1.0 GiB of 2`. |
+| Budget 2, trim, idle load | The first trim took 2.71 GiB out of RAM 0.9 s in. Available rose from 18.1 to 20.8 GiB within 3 s, where the same load untrimmed left 17.4 to 18.3. Private commit stayed at 3.01 GiB, so the pressure lasted until the load ended, and two more trims took 0.16 and 0 GiB. |
+| Budget 2, trim, a load touching every page each second | Each trim took 0.9 to 3.0 GiB and the load faulted all of it back: the next pass took 0.41 to 0.62 s against a median of 9 ms, and available stayed at 17.9 to 18.7 GiB. |
+| Budget 2, trim and pause, the same active load | The session was paused (CPU rate 0.01%) 20 s in, and a trim then took 3.0 GiB that stayed out: available rose to 20.8 GiB. A pass that began under the pause took 29 s. When the run turned the budget off at 55.7 s, the session resumed 0.5 s later, and available fell back to 18.2 GiB within a second as it faulted its pages back. |
+| Hard limit 2 GiB, a load growing by 256 MiB a second | MemoryError at 1.75 GiB; the daemon read the limit back as 2.0 GiB. |
+| Reserve line 19.4 GiB, trim, idle load | Admission closed and the cap went to 20% 1.4 s in. A trim took 3.02 GiB 0.2 s later, available rose from 18.3 to 20.5 GiB, and the pressure ended 3 s after it began. |
+
+A trim gives RAM back from idle work within seconds. Work that keeps touching its pages gets almost nothing back and
+pays for each trim with one slow pass. The budget counts commit, which neither a trim nor a pause lowers, so under a
+budget the pressure lasts until the work ends. After the alarm the cap stayed at 20%, since the cap rises only while
+the agents use most of it and this load used no CPU. The defaults are trim on, pause off and no budget. Whether the
+line should be a total for the agents or a reserve for Stan is for Stan to decide.
+
 ## Known limits
 
 - The dashboard page embeds the HTTP token, so any local process can read it. It listens on 127.0.0.1 only.
 - Pausing a session sets its CPU rate to 0.01%. A paused CLI cannot service its network connections either, and
   they may time out, so keep pauses short.
+- A trim or a pause does not lower private commit, so pressure from an agent memory budget lasts until work ends
+  or Stan raises the budget, and a session the ladder paused stays paused until then (measured 2026-10-17).
 - Claude Code and Cursor Agent sessions started neither through gagent nor through the PATH wrapper (by full path,
   from a terminal opened before the install, or by a tool that ignores PATH) join Guardian only through the adopt
   hook that `guardian-install-hooks.py` adds, and then in a nested job outside AllAgents (see Adopt; the provider

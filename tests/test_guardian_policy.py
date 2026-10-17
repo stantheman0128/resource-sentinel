@@ -272,5 +272,49 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(P.estimate_seconds([10, 20, -1], CFG), (15.0, "median of 2"))
 
 
+class MemoryLadderTests(unittest.TestCase):
+    def cfg(self, **memory):
+        return P.merged(P.DEFAULTS, {"memory": memory})
+
+    def test_the_agents_budget_is_one_more_room_for_admission(self):
+        cap, s, cfg = P.CapState(cap=50), sample(0), self.cfg(agent_memory_budget_gib=4)
+        ok, reason, nums = P.admission(1.0, s, 0.5, 0.5, cap, cfg, agents_gib=3.0)
+        self.assertFalse(ok)
+        self.assertTrue(reason.startswith("AGENT_MEMORY_BUDGET"))
+        self.assertEqual(nums["budget_room_gib"], 0.5)  # 4 - 3 held - 0.5 reserved
+        self.assertTrue(P.admission(0.4, s, 0.5, 0.5, cap, cfg, agents_gib=3.0)[0])
+        self.assertTrue(P.admission(1.0, s, 0.5, 0.5, cap, CFG, agents_gib=30.0)[0])  # no budget: only RAM rooms
+
+    def test_trim_then_pause_and_release_only_inside_the_margin(self):
+        cfg = self.cfg(agent_memory_budget_gib=4, pressure_pause=True)
+        st, d = P.memory_step(P.MemState(), sample(0), 5.0, cfg)
+        self.assertEqual((st.rung, d["kind"]), (1, "memory_pressure"))
+        self.assertIn("budget 4", d["reason"])
+        st, d = P.memory_step(st, sample(10), 5.0, cfg)
+        self.assertIsNone(d)
+        st, d = P.memory_step(st, sample(20), 5.0, cfg)  # 20 s of pressure: the pause rung
+        self.assertEqual((st.rung, d["rung"]), (2, 2))
+        st, d = P.memory_step(st, sample(21), 3.5, cfg)  # under the budget, not by the 1 GiB margin: hold
+        self.assertEqual((st.rung, d), (2, None))
+        st, d = P.memory_step(st, sample(22), 2.5, cfg)
+        self.assertEqual((st, d["kind"]), (P.MemState(), "memory_relief"))
+
+    def test_stans_reserve_is_pressure_without_a_budget(self):
+        st, d = P.memory_step(P.MemState(), sample(0, available_gib=5.5), 1.0, CFG)
+        self.assertEqual(st.rung, 1)
+        self.assertIn("Stan keeps 6", d["reason"])
+        st, d = P.memory_step(st, sample(60, available_gib=5.5), 1.0, CFG)
+        self.assertEqual((st.rung, d), (1, None))  # pause is off by default: trimming is the last rung
+
+    def test_with_every_rung_off_nothing_happens_and_the_clock_resets(self):
+        cfg = self.cfg(agent_memory_budget_gib=4, pressure_trim=False, pressure_pause=True)
+        st, d = P.memory_step(P.MemState(), sample(0), 5.0, cfg)
+        self.assertEqual((st.rung, d), (0, None))
+        st, _ = P.memory_step(st, sample(5), 1.0, cfg)  # pressure gone before the pause
+        self.assertEqual(st, P.MemState())
+        st, d = P.memory_step(st, sample(30), 5.0, cfg)  # a new episode starts its own clock
+        self.assertEqual((st.rung, d), (0, None))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -65,13 +65,26 @@
   while pressure lasts. A pass that cannot read one of its processes keeps the pause. With trim off, memory that
   dips just inside the line no longer restarts the 20 s pause clock. A run outside the tree whose first process
   ended while its children go on is held and released like a running one: by a resume, by rollback and shutdown,
-  and when its desktop session ends. Rollback and shutdown release those runs before a session's readback can
+  and when desktop jobs are switched off. Rollback and shutdown release those runs before a session's readback can
   fail. A provider pause that fails holds nothing. Cursor agent commands are placed parents first, so a child with
   a lower pid than its parent joins the parent's chat job. `--policy` refuses NaN, Infinity and integers too large
   for a float, and guardctl prints the daemon's error in one line instead of a traceback. The dashboard and the
   budget text show memory pressure before any step is taken. Known limits says a pause sets the lowest CPU rate,
   0.01%, and suspends nothing: on the test instance, a loop that slept a second between counts kept counting
   through a 39 s pause.
+- The CPU of runs outside the tree counts in the pool's load once their session's exemption has ended, so the cap
+  controller no longer sees less agent load than there is. While the exemption lasts it stays out, as before.
+- A run outside the tree whose first process has ended while its children go on counts for its session until its
+  job is empty. Its CPU used to stop counting when the first process ended.
+- The memory ladder adds the private commit of runs outside the tree to their session. A session whose memory sits
+  in such a run can now be picked, and a ladder pause of it ends only once those runs hold no private commit either.
+  The ladder trims these runs too, and they keep normal I/O and memory priority. The runs of a desktop session that
+  switching desktop jobs off let go are not counted.
+- A cap readback that fails for one session no longer stops rollback or shutdown. The error goes into that
+  session's `session_cap` line in the ledger, and both still go on to the other sessions and the AllAgents job.
+- A desktop or nested session whose CLI has exited stays while a run of it outside the tree lingers, so a pause of
+  the session or of its provider still reaches that run. The session is dropped once the run's job is empty. Before,
+  it was dropped at once and the run released, and no later pause reached the run.
 
 ## Unreleased - 2026-10-13
 

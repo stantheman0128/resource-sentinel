@@ -85,17 +85,23 @@ pool, its queued commands go first and skip the memory and launch gates, and eac
 job outside AllAgents, at normal priority, where the pool cap does not reach. This holds for a desktop or nested
 session too. What the session started before stays in its session job: under the pool cap for a session in the tree,
 and without any cap for a desktop or nested session, whose job sits outside AllAgents. When the time is up the
-session goes back to its old class, and the commands started outside the pool stay there until they end. A pause
+session goes back to its old class, and the commands started outside the pool stay there until they end. From then
+on their CPU counts in the pool's load that the cap controller reads, as it does for a desktop session. A pause
 of the session or of its provider still holds an exempt session and the commands it started outside the pool, with
 control on or off and also after the exemption has ended. A command admitted just before such a pause is paused
-as soon as it starts. Only the HTTP API, which the dashboard and guardctl use with its token, can set it: srun, the
-hooks and adopt accept focus, normal and batch only. Any process that gets the token can call that API, though (see
-Known limits).
+as soon as it starts. A command whose first process has ended while its children go on is held and counted the
+same way until its job is empty, and a desktop or nested session whose CLI has exited stays until then too.
+Rollback and shutdown release these commands. Switching desktop jobs off releases those of desktop sessions, which
+leave Guardian with them, so their CPU and memory count no more. Only the HTTP API, which the dashboard and guardctl
+use with its token, can set it: srun, the hooks and adopt accept focus, normal and batch only. Any process that gets
+the token can call that API, though (see Known limits).
 
 ## Memory
 
 A CPU cap frees no memory, so the daemon has a separate ladder for the memory that running work holds. Each second
-it adds up the private commit of every process in its jobs, desktop and nested jobs included. Memory is under
+it adds up the private commit of every process in its jobs, desktop and nested jobs included, and of the commands
+an exempt session started outside the pool. Those count for their session, so the ladder trims them and pauses
+them with it, though they keep normal I/O and memory priority. Memory is under
 pressure when available RAM falls below Stan's 6 GiB, or when the agents hold more than `agent_memory_budget_gib`, a
 budget that is off unless Stan sets one.
 

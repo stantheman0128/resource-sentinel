@@ -167,6 +167,7 @@ class Session:
         self.cls_before = None     # the class to go back to when it ends
         self.cpu_s = 0.0           # CPU seconds so far, runs outside the tree included (fair queue order)
         self.outside_done_s = 0.0  # CPU seconds of runs outside the tree that have ended
+        self.outside_usage = 0.0   # cores its runs outside the tree used over the last tick
 
 
 class Run:
@@ -416,19 +417,43 @@ class Guardian:
                 # the flag as set, not the request: when the provider's own pause failed, nothing would release them
                 self.hold_outside(s, p["paused"] or s.paused or (s.cls != "exempt" and s.key in self.mem_paused))
 
-    def hold_outside(self, s, held):
-        """Pause or release the runs session s started while it was exempt, or those of every session when s is None
-        (rollback and shutdown, which also reach the runs of a session that has left). Each sits in a run job of its
+    def outside_runs(self, s=None):
+        """The runs session s started while it was exempt, or those of every session. Each sits in a run job of its
         own outside the tree, where neither the session's job nor its provider's job reaches. A run whose main process
-        has ended while its children go on is in self.lingering, and its job stays open until they end too, so it is
-        held and released here as well. Returns the first error."""
+        has ended while its children go on is in self.lingering, and its job stays open until they end too."""
+        return [r for r in list(self.live.values()) + self.lingering
+                if getattr(r, "outside", False) and r.job and (s is None or r.session is s)]
+
+    def outside_pids(self, tracked=False):
+        """The processes of every run outside the tree, or with tracked those of the sessions Guardian still has: the
+        runs of a session that desktop jobs switched off took away are free. A job that cannot be listed adds none."""
+        pids = set()
+        for r in self.outside_runs():
+            if tracked and self.sessions.get(r.session.key) is not r.session:
+                continue
+            try:
+                pids.update(r.job.pids())
+            except OSError:
+                pass
+        return pids
+
+    def session_pids(self, s):
+        """The processes of session s, those of its runs outside the tree included. Raises OSError when a job cannot
+        be listed: unknown is not empty."""
+        pids = list(s.job.pids())
+        for r in self.outside_runs(s):
+            pids += r.job.pids()
+        return pids
+
+    def hold_outside(self, s, held):
+        """Pause or release the runs outside the tree of session s, or those of every session when s is None (rollback
+        and shutdown, which also reach the runs of a session that has left). Returns the first error."""
         err = None
-        for r in [r for r in self.live.values() if r.state == "running"] + self.lingering:
-            if (s is None or r.session is s) and getattr(r, "outside", False) and r.job:
-                try:
-                    r.job.set_cpu_rate(1) if held else r.job.set_cpu()
-                except OSError as e:
-                    err = err or str(e)
+        for r in self.outside_runs(s):
+            try:
+                r.job.set_cpu_rate(1) if held else r.job.set_cpu()
+            except OSError as e:
+                err = err or str(e)
         return err
 
     def apply_session(self, s, want, budget):
@@ -446,10 +471,13 @@ class Guardian:
             err = str(e)
         # the runs it started while exempt follow the pause of the session and of its provider, whatever its class now
         err = self.hold_outside(s, want == "paused" or self.providers[s.provider]["paused"]) or err
-        rb = s.job.cpu()
+        try:  # a readback that fails is recorded, so rollback and shutdown still reach the next session and the pool
+            rb, rb_err = s.job.cpu(), None
+        except OSError as e:
+            rb, rb_err = {}, str(e)
         before, s.applied = s.applied, (s.applied if err else want)
         shown = lambda v: v if not isinstance(v, tuple) else f"{v[1] * (1 if v[0] == 'abs' else budget):.2f} cores"
-        self.ledger.decision("session_cap", s.key, shown(before), shown(want), rb.get("mode"), err,
+        self.ledger.decision("session_cap", s.key, shown(before), shown(want), rb.get("mode"), err or rb_err,
                              ("exempt: no session cap" if s.cls == "exempt" else f"weighted max-min, class {s.cls}") +
                              (", nested job" if s.nested else ", desktop job" if s.desktop else ""),
                              P.POLICY_VERSION)
@@ -483,15 +511,19 @@ class Guardian:
         tree = max(0.0, (cpu_s - prev[1]) / dt)
         with self.lock:
             outside = collections.Counter()
-            for r in self.live.values():
-                if getattr(r, "outside", False) and r.job and r.state == "running":
-                    outside[r.session.key] += r.job.accounting()["cpu_s"]
+            for r in self.outside_runs():  # a lingering one too: its children still run
+                outside[r.session] += r.job.accounting()["cpu_s"]
             for s in self.sessions.values():
-                a = s.cpu_s = s.job.accounting()["cpu_s"] + s.outside_done_s + outside[s.key]
-                s.usage = max(0.0, (a - s.prev[1]) / max(1e-3, now - s.prev[0])) if s.prev else 0.0
-                s.prev = (now, a)
-            # desktop jobs sit outside AllAgents, so the pool adds their use to what the tree's root job counts
-            self.pool_cores = tree + sum(x.usage for x in self.sessions.values() if x.desktop and x.cls != "exempt")
+                o = s.outside_done_s + outside[s]
+                a = s.cpu_s = s.job.accounting()["cpu_s"] + o
+                dt_s = max(1e-3, now - s.prev[0]) if s.prev else None
+                s.usage = max(0.0, (a - s.prev[1]) / dt_s) if s.prev else 0.0
+                s.outside_usage = max(0.0, (o - s.prev[2]) / dt_s) if s.prev else 0.0
+                s.prev = (now, a, o)
+            # desktop jobs sit outside AllAgents, so the pool adds their use to what the tree's root job counts, and for
+            # a session in the tree the use of its runs outside it, which stay there after its exemption has ended
+            self.pool_cores = tree + sum(x.usage if x.desktop else x.outside_usage
+                                         for x in self.sessions.values() if x.cls != "exempt")
             for r in list(self.live.values()):
                 if r.state == "running" and r.job:
                     try:
@@ -505,7 +537,10 @@ class Guardian:
                         m = wj.process_memory(r.pid)
                         r.commit_gib = m[0] / GiB if m else 0.0
             for r in list(self.lingering):
-                if r.job.accounting()["active"] == 0:
+                acc = r.job.accounting()
+                if acc["active"] == 0:
+                    if r.outside:  # counted above while it lingered, so its CPU is added here, not in finish()
+                        r.session.outside_done_s += acc["cpu_s"]
                     r.job.close()
                     self.lingering.remove(r)
             if self.probe_enabled and self.probe_proc and self.probe_proc.poll() is not None:
@@ -516,7 +551,8 @@ class Guardian:
                          available_gib=avail, commit_headroom_gib=head, experience=level, experience_kind=kind,
                          pool_priority=self.pool_priority_readback, ncpu=self.world, machine_cpus=wj.NCPU)
             members = self.members()
-            mem = {pid: wj.process_memory(pid) for pid in members}
+            # the runs outside the tree hold agent memory too, but keep normal I/O and memory priority (nice_sweep)
+            mem = {pid: wj.process_memory(pid) for pid in members | self.outside_pids(tracked=True)}
             self.agents_gib = sum(m[0] for m in mem.values() if m) / GiB
             self.end_exemptions()
             if self.control:
@@ -588,10 +624,10 @@ class Guardian:
 
     def memory_ladder(self, mem, now):
         """Act on memory_step's rung. Rung 1 trims working sets while pressure_trim is on, largest first, each process
-        at most once per spacing. Rung 2 also pauses the session holding the most private commit, one session, until
-        the pressure is over, the rung drops, or the paused session holds nothing any more (its run ended, or its CLI
-        exited while a run of it outside the tree goes on). A pause is a CPU rate of 0.01%, not a suspend: it slows
-        growth and frees nothing. An exempt session, one Stan paused or one holding no private commit is never picked."""
+        at most once per spacing. Rung 2 also pauses the session holding the most private commit, its runs outside the
+        tree included, one session, until the pressure is over, the rung drops, or the paused session holds nothing any
+        more (its runs ended). A pause is a CPU rate of 0.01%, not a suspend: it slows growth and frees nothing. An
+        exempt session, one Stan paused or one holding no private commit is never picked."""
         m = self.cfg["memory"]
         for pid in self.trimmed.keys() - mem.keys():
             del self.trimmed[pid]
@@ -614,7 +650,7 @@ class Guardian:
             for k in sorted(self.mem_paused):
                 x = self.sessions.get(k)
                 try:
-                    pids = x.job.pids() if x is not None else []
+                    pids = self.session_pids(x) if x is not None else []
                 except OSError:
                     continue  # its processes cannot be listed, so the pause stays
                 if any(mem.get(p) is None for p in pids):
@@ -628,7 +664,7 @@ class Guardian:
                 if x.cls == "exempt" or x.paused:
                     continue
                 try:
-                    pids = x.job.pids()
+                    pids = self.session_pids(x)
                 except OSError:
                     continue
                 got = sum(mem[p][0] for p in pids if mem.get(p))
@@ -698,14 +734,8 @@ class Guardian:
         obs, load = AppObserver(), LoadObserver()
         while not self.stop.wait(2.0):
             try:
-                with self.lock:
-                    members = self.members() | self.own_pids()  # the daemon and its probe
-                    for r in list(self.live.values()) + self.lingering:  # runs outside the tree: run jobs of their own
-                        if getattr(r, "outside", False) and r.job:
-                            try:
-                                members.update(r.job.pids())
-                            except OSError:
-                                pass
+                with self.lock:  # the daemon, its probe and the runs outside the tree count as Guardian's
+                    members = self.members() | self.own_pids() | self.outside_pids()
                 self.outside = load.sample(members)
             except Exception as e:
                 self.outside = {"error": str(e)}
@@ -971,11 +1001,12 @@ class Guardian:
         with self.lock:
             self.live.pop(run.run_id, None)
             run.session.live_runs -= 1
-            if run.outside and cpu_s:
+            keep = bool(run.job) and lingering and state != "cancelled"
+            if run.outside and cpu_s and not keep:  # a lingering run's CPU is added when tick() closes its job
                 run.session.outside_done_s += cpu_s
             run.state = state
             if run.job:
-                if lingering and state != "cancelled":
+                if keep:
                     self.lingering.append(run)
                 else:
                     run.job.close()
@@ -1261,9 +1292,10 @@ class Guardian:
                                   "agent command")
 
     def drop_ended(self):
-        for s in [x for x in self.sessions.values() if x.desktop and not x.live_runs]:
+        # a session stays while a run of it outside the tree lingers, so that a pause of the session or of its
+        # provider still reaches the run, and the run's CPU and memory still count for the session
+        for s in [x for x in self.sessions.values() if x.desktop and not x.live_runs and not self.outside_runs(x)]:
             if s.job.accounting()["active"] == 0:  # the CLI has exited, and so has everything it started
-                self.hold_outside(s, False)  # a run of it outside the tree may linger: no pause would reach it again
                 self.sessions.pop(s.key, None)
                 s.job.close()
                 self.log(f"{'nested' if s.nested else 'desktop'} session {s.key} ended")

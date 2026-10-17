@@ -1943,6 +1943,23 @@ class CursorCommandPlacementTests(unittest.TestCase):
                                 "its agent commands stay out of desktop jobs"])
 
 
+class CountedJob(RunJob):
+    """A run or session job whose CPU seconds, members and active processes the test sets."""
+
+    def __init__(self, pids=(), cpu_s=0.0, active=1):
+        super().__init__()
+        self._pids, self.cpu_s, self.active = list(pids), cpu_s, active
+
+    def accounting(self):
+        return {"cpu_s": self.cpu_s, "active": self.active}
+
+    def pids(self):
+        return self._pids
+
+    def memory_usage(self):
+        return 0, 0
+
+
 class OutsideRunAndControlOffTests(unittest.TestCase):
     """Review package D: the runs an exempt session starts outside the tree follow every pause, control off reports
     what is in effect, the outside load leaves Guardian's own processes out, and the hooks keep one deadline."""
@@ -1971,6 +1988,30 @@ class OutsideRunAndControlOffTests(unittest.TestCase):
             self.g.launch(run)
         return run, chains[0]
 
+    def ticking(self):
+        """What tick() reads besides the sessions and runs: an idle root, no probe, control off."""
+        g = self.g
+        g.root = mock.Mock()
+        g.root.accounting.return_value, g.root.pids.return_value, g.root.cpu.return_value = {"cpu_s": 0.0}, [], {}
+        g.busy_fn, g.last_core_ok, g.history, g.apps_rows, g.control = (lambda: 0.5), 0.0, [], [], False
+        g.probe_enabled, g.probe_proc, g.inject, g.media, g.probe_last = False, None, None, None, None
+        g.pool_priority_readback, g.agent_io, g.agent_memory = "below_normal", "low", "low"
+        g.trimmed, g.trimmed_gib, g.mem = {}, 0.0, self.P.MemState()
+
+    def tick(self, t, mem=None):
+        """One tick() at monotonic time t, one second after the last. The pids are made up: every Windows call that
+        would take one is patched, and mem gives their (private commit, working set)."""
+        GiB, mem = self.D.GiB, mem or {}
+        self.g.last_core_ok = t
+        perf = {"available": 30 * GiB, "commit_limit": 64 * GiB, "commit_total": 16 * GiB}
+        with mock.patch.object(self.D.time, "monotonic", lambda: t), \
+                mock.patch.object(self.wj, "performance_info", lambda: perf), \
+                mock.patch.object(self.wj, "process_memory", lambda pid: mem.get(pid)), \
+                mock.patch.object(self.wj, "trim_working_set", lambda pid: None), \
+                mock.patch.object(self.wj, "set_io_priority", lambda pid, name: True), \
+                mock.patch.object(self.wj, "set_memory_priority", lambda pid, name: True):
+            self.g.tick((t - 1, 0.0))
+
     def test_an_exempt_desktop_session_runs_outside_and_desktop_off_lets_the_runs_go(self):
         s = self.add("claude/desk-200", 0.0, desktop=True)
         s.job = MemberJob("t.d.claude.desk-200")
@@ -1985,20 +2026,31 @@ class OutsideRunAndControlOffTests(unittest.TestCase):
         self.assertNotIn(s.key, self.g.sessions)
         self.assertEqual(run.job.calls[-1], ("cpu", None))  # no pause reaches it once its session is gone
 
-    def test_a_desktop_session_that_ends_lets_its_lingering_run_outside_go(self):
-        s = self.add("claude/desk-200", 0.0, desktop=True)
+    def test_a_desktop_session_stays_while_its_run_outside_lingers(self):
+        g, s = self.g, self.add("claude/desk-200", 0.0, desktop=True)
         s.job = MemberJob("t.d.claude.desk-200")  # no members: the CLI has exited
-        self.g.set_exempt(s, 5, "set by Stan")
+        g.set_exempt(s, 5, "set by Stan")
         run, _ = self.launch(s)
-        s.paused, s.live_runs = True, 1
-        self.g.allocate()
+        s.live_runs = 1
+        g.action("/api/provider", {"name": "claude", "paused": True})
         self.assertEqual(run.job.calls[-1], ("rate", 1))
-        run.job.accounting = lambda: {"cpu_s": 1.0, "active": 1}  # a background child outlives the main process
-        self.g.finish(run, "done", 0)
-        self.assertEqual(self.g.lingering, [run])
-        self.g.drop_ended()
-        self.assertNotIn(s.key, self.g.sessions)
+        active = [1]  # a background child outlives the main process
+        run.job.accounting = lambda: {"cpu_s": 1.0, "active": active[0]}
+        g.finish(run, "done", 0)
+        self.assertEqual(g.lingering, [run])
+        g.drop_ended()
+        self.assertIn(s.key, g.sessions)  # kept while the run goes on, so the provider's pause still holds it
+        self.assertEqual(run.job.calls[-1], ("rate", 1))
+        g.action("/api/provider", {"name": "claude", "paused": False})
         self.assertEqual(run.job.calls[-1], ("cpu", None))
+        g.action("/api/provider", {"name": "claude", "paused": True})
+        self.assertEqual(run.job.calls[-1], ("rate", 1))
+        active[0] = 0  # the child has ended too: the tick closes its job, and the session goes
+        self.ticking()
+        self.tick(1.0)
+        g.drop_ended()
+        self.assertEqual((g.lingering, run.job.calls[-1]), ([], ("close",)))
+        self.assertNotIn(s.key, g.sessions)
 
     def test_a_run_admitted_before_a_pause_starts_paused(self):
         s = self.add("codex/a", 0.0)
@@ -2088,6 +2140,88 @@ class OutsideRunAndControlOffTests(unittest.TestCase):
                 g.rollback("test") if release == "rollback" else g.shutdown()
             self.assertEqual(run.job.calls[-1], ("cpu", None), release)
 
+    def test_a_run_outside_counts_in_the_pool_once_its_exemption_ends(self):
+        g, s = self.g, self.add("codex/a", 0.0)
+        s.job = CountedJob()
+        g.set_exempt(s, 5, "set by Stan")
+        run = self.outside_run(s)
+        run.job = CountedJob()
+        self.ticking()
+        for t, cpu in ((0.0, 0.0), (1.0, 2.0)):
+            run.job.cpu_s = cpu
+            self.tick(t)
+        self.assertEqual((s.usage, g.pool_cores), (2.0, 0.0))  # exempt: its run outside takes no share of the pool
+        s.exempt_until = time.time() - 1
+        g.end_exemptions()  # the run stays outside the tree until it ends, and its CPU is agent load again
+        run.job.cpu_s = 4.0
+        self.tick(2.0)
+        self.assertEqual((s.usage, g.pool_cores), (2.0, 2.0))
+
+    def test_a_lingering_run_outside_counts_until_its_job_is_empty(self):
+        g, s = self.g, self.add("codex/a", 0.0)
+        s.job = CountedJob(cpu_s=3.0)
+        g.set_exempt(s, 5, "set by Stan")
+        run = self.outside_run(s)
+        run.job = CountedJob()
+        self.ticking()
+        self.tick(0.0)
+        s.exempt_until = time.time() - 1
+        g.end_exemptions()
+        run.job.cpu_s = 2.0
+        g.finish(run, "done", 0)  # the main process ended, a background child goes on
+        self.assertEqual(g.lingering, [run])
+        run.job.cpu_s = 4.0
+        self.tick(1.0)
+        self.assertEqual((s.usage, g.pool_cores), (4.0, 4.0))
+        run.job.cpu_s, run.job.active = 5.0, 0  # the child has ended too
+        self.tick(2.0)
+        self.tick(3.0)
+        self.assertEqual((g.lingering, run.job.calls[-1]), ([], ("close",)))
+        self.assertEqual((s.cpu_s, s.outside_done_s, s.usage, g.pool_cores), (8.0, 5.0, 0.0, 0.0))
+
+    def test_the_memory_of_a_run_outside_counts_for_its_session(self):
+        g, GiB = self.g, self.D.GiB
+        s, other = self.add("codex/a", 0.0), self.add("codex/b", 0.0)
+        s.job, other.job = CountedJob(), CountedJob(pids=[3])
+        g.set_exempt(s, 5, "set by Stan")
+        run = self.outside_run(s)
+        run.job = CountedJob(pids=[500])
+        s.exempt_until = time.time() - 1
+        g.end_exemptions()  # its run stays outside the tree, with the session's memory in it
+        self.ticking()
+        g.root.pids.return_value, g.control = [3], True
+        g.cfg["memory"].update(agent_memory_budget_gib=1, pressure_pause=True)
+        g.mem = self.P.MemState(since=-30.0, rung=2)
+        mem = {3: (2 * GiB, GiB), 500: (4 * GiB, GiB)}
+        self.tick(0.0, mem)
+        self.assertEqual(g.agents_gib, 6.0)
+        self.assertEqual(g.mem_paused, {"codex/a"})  # it holds the most, all of it in its run outside
+        self.assertEqual(run.job.calls[-1], ("rate", 1))
+        self.assertEqual(set(g.niced), {3})  # a run outside the tree keeps normal I/O and memory priority
+        self.tick(1.0, mem)
+        self.assertEqual(g.mem_paused, {"codex/a"})  # its own job is empty, but the run still holds memory
+        mem[500] = (0, 0)
+        self.tick(2.0, mem)
+        self.assertEqual(g.mem_paused, {"codex/b"})
+        self.assertEqual(run.job.calls[-1], ("cpu", None))
+
+    def test_a_run_outside_that_desktop_off_let_go_holds_no_agent_memory(self):
+        g, GiB = self.g, self.D.GiB
+        s, other = self.add("claude/desk-200", 0.0, desktop=True), self.add("codex/b", 0.0)
+        s.job, other.job = MemberJob("t.d.claude.desk-200"), CountedJob(pids=[3])
+        g.set_exempt(s, 5, "set by Stan")
+        run = self.outside_run(s)
+        run.job = CountedJob(pids=[500])
+        g.set_desktop(False, "test")  # the session leaves Guardian, and its run outside goes free
+        self.ticking()
+        g.root.pids.return_value, g.control = [3], True
+        g.cfg["memory"].update(agent_memory_budget_gib=2, pressure_pause=True)
+        g.mem = self.P.MemState(since=-30.0, rung=2)
+        self.tick(0.0, {3: (GiB, GiB), 500: (4 * GiB, GiB)})
+        self.assertEqual((g.agents_gib, g.mem_paused), (1.0, set()))
+        self.assertNotIn(500, g.trimmed)
+        self.assertEqual(run.job.calls[-1], ("cpu", None))
+
     def test_shutdown_releases_the_runs_outside_before_a_session_readback_can_fail(self):
         g = self.g
         bad, s = self.add("codex/b", 0.0), self.add("codex/a", 0.0)  # bad first: its readback raises in the loop
@@ -2100,8 +2234,26 @@ class OutsideRunAndControlOffTests(unittest.TestCase):
         g.log = mock.Mock()
         with mock.patch.object(self.D.os, "_exit"), mock.patch.object(self.D.time, "sleep"):
             g.shutdown()
-        self.assertIn("shutdown cleanup failed: access denied", str(g.log.call_args_list))
         self.assertEqual(run.job.calls[-1], ("cpu", None))
+
+    def test_one_sessions_readback_error_stops_neither_rollback_nor_shutdown(self):
+        g = self.g
+        bad, s = self.add("codex/b", 0.0), self.add("codex/a", 0.0)  # bad first: its readback raises in the loop
+        bad.job.cpu = mock.Mock(side_effect=OSError("access denied"))
+        g.root, g.mask, g.probe_proc, g.stop, g.desktop_on = mock.Mock(), None, None, threading.Event(), False
+        g.root.limits.return_value, g.root.pids.return_value, g.root.cpu.return_value = {"priority": "normal"}, [], {}
+        for release in ("rollback", "shutdown"):
+            s.applied, bad.applied = ("rel", 0.5), ("rel", 0.5)
+            s.job.calls.clear()
+            g.root.set_cpu.reset_mock()
+            with mock.patch.object(self.wj, "set_job_affinity", mock.Mock()), \
+                    mock.patch.object(self.D.os, "_exit"), mock.patch.object(self.D.time, "sleep"):
+                g.rollback("test") if release == "rollback" else g.shutdown()
+            self.assertEqual(s.job.calls, [("cpu", None)], release)  # the next session is released all the same
+            g.root.set_cpu.assert_called_once_with()  # and so is the pool
+            cap = [c.args for c in g.ledger.decision.call_args_list if c.args[:2] == ("session_cap", "codex/b")]
+            self.assertEqual((cap[-1][4], cap[-1][5]), (None, "access denied"), release)  # no readback, the error
+            self.assertIsNone(bad.applied, release)  # its cap was lifted: only the readback failed
 
     def test_control_off_reports_the_priorities_and_the_limit_in_effect(self):
         g, s = self.g, self.add("codex/a", 0.0)

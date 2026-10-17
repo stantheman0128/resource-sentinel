@@ -29,8 +29,12 @@ from sentinel.guardian.client import home_dir
 
 def call(instance, path, body=None):
     home = home_dir(instance)
-    port = json.loads((home / "daemon.json").read_text(encoding="utf-8"))["port"]
-    token = (home / "http-token").read_text(encoding="ascii").strip()
+    try:
+        port = json.loads((home / "daemon.json").read_text(encoding="utf-8"))["port"]
+        token = (home / "http-token").read_text(encoding="ascii").strip()
+    except FileNotFoundError as e:
+        raise SystemExit(f"guardctl: Guardian {instance} has no {Path(e.filename).name} in {home}: "
+                         f"start it, or check --instance")
     req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method="POST" if body is not None else "GET",
                                  data=None if body is None else json.dumps(body).encode(),
                                  headers={"X-Guardian-Token": token, "Content-Type": "application/json"})
@@ -44,6 +48,9 @@ def call(instance, path, body=None):
         except (ValueError, AttributeError, OSError):
             why = None
         raise SystemExit(f"guardctl: {path} answered {e.code}: {why or e.reason}")
+    except urllib.error.URLError as e:  # after HTTPError, its subclass
+        raise SystemExit(f"guardctl: Guardian {instance} does not answer on 127.0.0.1:{port} ({e.reason}): check that "
+                         f"it runs; daemon.json stays behind when a daemon stops")
 
 
 def summary(s):

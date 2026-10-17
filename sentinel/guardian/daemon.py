@@ -1883,11 +1883,16 @@ def main(argv=None):
     except (OSError, ValueError) as e:
         print(f"Guardian {a.instance}: bad --policy {a.policy}: {e}", file=sys.stderr)
         return 2
+    if a.max_cap is not None:
+        # the same checks as the file, against its minimum too; type=float takes nan and inf
+        over = P.merged(over, {"cpu": {"maximum_cap_percent": a.max_cap}})
+        try:
+            P.check_over(over)
+        except ValueError as e:
+            ap.error(f"argument --max-cap: {e}")
     # only with argv from the command line: the new copy gets this process's own command line
     if argv is None and leave_job(a.stay_in_job):
         return 0
-    if a.max_cap:
-        over = P.merged(over, {"cpu": {"maximum_cap_percent": a.max_cap}})
     if over:
         print(f"policy over the defaults: {json.dumps(over)}", flush=True)
     try:

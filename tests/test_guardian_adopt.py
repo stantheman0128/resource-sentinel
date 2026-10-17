@@ -2214,6 +2214,33 @@ class GuardctlErrorTests(unittest.TestCase):
                 self.assertEqual(e.exception.code, f"guardctl: /api/session answered {told}")  # a str exits with 1
                 self.assertNotIn("t0ken", e.exception.code)
 
+    def test_no_daemon_is_one_line_naming_the_instance(self):
+        guardctl = load("scripts/guardctl.py", "guardctl")
+        refused = urllib.error.URLError(ConnectionRefusedError(10061, "No connection could be made"))
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+
+            def said():
+                with mock.patch.object(guardctl, "home_dir", return_value=home), \
+                        mock.patch.object(guardctl.urllib.request, "urlopen", side_effect=refused), \
+                        self.assertRaises(SystemExit) as e:
+                    guardctl.main(["--instance", "t", "status"])
+                self.assertIsInstance(e.exception.code, str)
+                self.assertNotIn("\n", e.exception.code)
+                return e.exception.code
+
+            no_files = said()  # never started here, or the wrong --instance
+            (home / "daemon.json").write_text('{"port": 1}', encoding="utf-8")
+            no_token = said()
+            (home / "http-token").write_text("t0ken-for-the-test", encoding="ascii")
+            no_answer = said()  # daemon.json left behind, nothing listens on its port
+        for text, names in ((no_files, ("Guardian t", "daemon.json", "--instance")),
+                            (no_token, ("Guardian t", "http-token")),
+                            (no_answer, ("Guardian t", "127.0.0.1:1", "No connection could be made"))):
+            for name in names:
+                self.assertIn(name, text)
+        self.assertNotIn("t0ken", no_answer)
+
 
 if __name__ == "__main__":
     unittest.main()

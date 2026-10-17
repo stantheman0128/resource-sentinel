@@ -442,6 +442,58 @@ class PolicyFileTests(unittest.TestCase):
                          "cpu.maximum_cap_percent must be a finite number, not Infinity")
         self.assertEqual(self.main('{"cpu": {"allocation_weights": {"batch": NaN}}}')[0], 2)
 
+    def test_numbers_outside_their_range_are_refused(self):
+        for over, told in (
+                ({"cpu": {"decrease_factor": 1}}, "cpu.decrease_factor must be more than 0 and less than 1, not 1"),
+                ({"cpu": {"decrease_factor": 0}}, "cpu.decrease_factor must be more than 0 and less than 1, not 0"),
+                ({"cpu": {"maximum_cap_percent": 101}},
+                 "cpu.maximum_cap_percent must be more than 0 and at most 100, not 101"),
+                ({"cpu": {"initial_cap_percent": 0}},
+                 "cpu.initial_cap_percent must be more than 0 and at most 100, not 0"),
+                ({"cpu": {"increase_step_percentage_points": 0}},
+                 "cpu.increase_step_percentage_points must be more than 0, not 0"),
+                ({"cpu": {"increase_spacing_seconds": -1}}, "cpu.increase_spacing_seconds must be at least 0, not -1"),
+                ({"cpu": {"backoff_idle_cores": -1}}, "cpu.backoff_idle_cores must be at least 0, or null, not -1"),
+                ({"cpu": {"demand_fraction_for_increase": 1.5}},
+                 "cpu.demand_fraction_for_increase must be at least 0 and at most 1, not 1.5"),
+                ({"cpu": {"min_session_cores": 0}}, "cpu.min_session_cores must be more than 0, not 0"),
+                ({"cpu": {"relax_after_ticks": 0}}, "cpu.relax_after_ticks must be at least 1, not 0"),
+                ({"memory": {"agent_memory_budget_gib": 0}},
+                 "memory.agent_memory_budget_gib must be more than 0 and at most 1024, or null, not 0"),
+                ({"memory": {"job_commit_hard_limit_gib": -2}},
+                 "memory.job_commit_hard_limit_gib must be more than 0 and at most 1024, or null, not -2"),
+                ({"memory": {"pressure_release_margin_gib": -1}},
+                 "memory.pressure_release_margin_gib must be at least 0, not -1"),
+                ({"observation": {"media_minimum_frame_count": 0}},  # a window of 0 frames divides by 0
+                 "observation.media_minimum_frame_count must be at least 1, not 0"),
+                ({"observation": {"probe_warning_drop_percent": 101}},
+                 "observation.probe_warning_drop_percent must be at least 0 and at most 100, not 101"),
+                ({"observation": {"sensor_valid_seconds": 0}},
+                 "observation.sensor_valid_seconds must be more than 0, not 0"),
+                ({"queue": {"exempt_minutes": 1441}},
+                 "queue.exempt_minutes must be more than 0 and at most 1440, not 1441"),
+                ({"unknown_work": {"maximum_simultaneous_launch_observations": 0}},
+                 "unknown_work.maximum_simultaneous_launch_observations must be at least 1, not 0")):
+            with self.subTest(over=over):
+                self.assertEqual(self.refused(over), told)
+        self.assertEqual(self.main('{"cpu": {"decrease_factor": 1.5}}')[0], 2)
+
+    def test_the_minimum_cap_stays_at_or_below_the_maximum(self):
+        # /api/cap clamps to max(minimum, min(maximum, cap)): a minimum above the maximum puts the cap over the maximum
+        self.assertEqual(self.refused({"cpu": {"minimum_cap_percent": 60, "maximum_cap_percent": 50}}),
+                         "cpu.minimum_cap_percent 60 must be at most cpu.maximum_cap_percent 50")
+        self.assertEqual(self.refused({"cpu": {"maximum_cap_percent": 5}}),  # under the default minimum of 10
+                         "cpu.minimum_cap_percent 10 must be at most cpu.maximum_cap_percent 5")
+        P.check_over({"cpu": {"minimum_cap_percent": 2, "maximum_cap_percent": 5}})
+
+    def test_every_range_names_a_number_slot_of_the_defaults(self):
+        for where in P.RANGES:
+            d = P.DEFAULTS
+            for k in where.split("."):
+                d = d[k]
+            with self.subTest(where=where):
+                self.assertTrue(d is None or isinstance(d, (int, float)) and not isinstance(d, bool))
+
     def test_levels_outside_their_set_are_refused(self):
         self.assertIn("io.agent_io_priority must be one of very_low, low, normal",
                       self.refused({"io": {"agent_io_priority": "below_normal"}}))
@@ -450,27 +502,51 @@ class PolicyFileTests(unittest.TestCase):
         self.assertIn("cpu.pool_priority", self.refused({"cpu": {"pool_priority": "high"}}))
 
     def test_good_files_pass_unchanged(self):
-        over = {"cpu": {"backoff_idle_cores": 2, "recover_idle_cores": None, "decrease_factor": 1,
+        over = {"cpu": {"backoff_idle_cores": 2, "recover_idle_cores": None, "decrease_factor": 0.5,
                         "allocation_weights": {"focus": 9.5}},
                 "memory": {"agent_memory_priority": "very_low", "pressure_pause": True, "agent_memory_budget_gib": 8},
                 "io": {"agent_io_priority": "very_low"}, "queue": {"order": "hrrn"}}
         self.assertIs(P.check_over(over), over)
         P.check_over(P.DEFAULTS)
         P.check_over({})
+        # the ends a range includes
+        P.check_over({"cpu": {"maximum_cap_percent": 100, "healthy_before_increase_seconds": 0,
+                              "recover_idle_share": 1},
+                      "memory": {"agent_memory_budget_gib": 1024, "physical_available_target_gib": 0},
+                      "observation": {"media_minimum_frame_count": 1}, "queue": {"exempt_minutes": 1440}})
 
-    def main(self, text, encoding="utf-8"):
-        """daemon.main with a --policy file holding text (None: no file); nothing real starts."""
+    def main(self, text, encoding="utf-8", argv=()):
+        """daemon.main with a --policy file holding text (None: no file, False: no --policy) and more argv; nothing
+        real starts. A parser error comes back as its exit code."""
         err, out = io.StringIO(), io.StringIO()
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "policy.json"
-            if text is not None:
+            if isinstance(text, str):
                 path.write_text(text, encoding=encoding)
             with mock.patch.object(D, "ping", return_value=False), mock.patch.object(D, "leave_job") as leave, \
                     mock.patch.object(D, "Guardian") as guardian, contextlib.redirect_stderr(err), \
                     contextlib.redirect_stdout(out):
-                rc = D.main(["--instance", "pc", "--policy", str(path)])
+                try:
+                    rc = D.main(["--instance", "pc"] + ([] if text is False else ["--policy", str(path)]) + list(argv))
+                except SystemExit as e:
+                    rc = e.code
         leave.assert_not_called()
         return rc, guardian, err.getvalue()
+
+    def test_main_refuses_a_max_cap_out_of_range(self):
+        # type=float takes nan and inf, so --max-cap goes through check_over as well
+        for cap in ("nan", "inf", "-inf", "1e400", "0", "-5", "101", "5"):  # 5 is under the default minimum of 10
+            with self.subTest(cap=cap):
+                rc, guardian, err = self.main(False, argv=[f"--max-cap={cap}"])  # "-inf" alone reads as an option
+                self.assertEqual(rc, 2)
+                guardian.assert_not_called()
+                self.assertIn("argument --max-cap: cpu.m", err)
+        rc, guardian, err = self.main(False, argv=["--max-cap", "80"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(guardian.call_args.args[3], {"cpu": {"maximum_cap_percent": 80.0}})
+        rc, guardian, err = self.main('{"cpu": {"minimum_cap_percent": 2}}', argv=["--max-cap", "5"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(guardian.call_args.args[3], {"cpu": {"minimum_cap_percent": 2, "maximum_cap_percent": 5.0}})
 
     def test_main_refuses_a_bad_file_before_any_guardian(self):
         for text in ('{"cpu": {"backoff_idle_core": 2}}', '{"io": {"agent_io_priority": "below_normal"}}', "",

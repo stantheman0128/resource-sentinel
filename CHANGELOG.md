@@ -72,6 +72,13 @@
   budget text show memory pressure before any step is taken. Known limits says a pause sets the lowest CPU rate,
   0.01%, and suspends nothing: on the test instance, a loop that slept a second between counts kept counting
   through a 39 s pause.
+- `--policy` also checks that each number is in range, with bounds taken from how the daemon uses the key. A cap
+  percentage must be above 0 and at most 100, and `decrease_factor` above 0 and below 1. Waits and margins take 0
+  or more, shares 0 to 1. The memory budget and hard limit take what `/api/memory` takes, and `exempt_minutes` what
+  `/api/session` takes. The minimum cap may not be above the maximum. `--max-cap` goes through the same checks, so
+  `nan`, `inf` or a value out of range stops the daemon with exit code 2, as a bad file does. When `daemon.json` or
+  `http-token` is missing, or the daemon does not answer, guardctl prints one line that names the instance and what
+  to check. That line never holds the token.
 
 ## Unreleased - 2026-10-13
 

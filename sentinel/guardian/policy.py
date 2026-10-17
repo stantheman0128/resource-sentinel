@@ -98,6 +98,57 @@ DEFAULTS = {
     },
 }
 
+# What a number slot of a --policy file may hold, from how its value is used: (low, low allowed, high or None, high
+# allowed). observation.sample_interval_ms has no range, since nothing reads it.
+CAP = (0, False, 100, True)        # percent of the world: the kernel turns 0 into 0.01%, the pause rate, and above 100
+#                                    is more than the world
+SHARE = (0, True, 1, True)         # a fraction of the cap, of the idle CPUs or of the frames
+AT_LEAST_0 = (0, True, None, True)  # a wait, a margin, a line or a count of CPUs: 0 is none
+ABOVE_0 = (0, False, None, True)
+GIB = (0, False, 1024, True)       # what /api/memory takes for the same keys
+RANGES = {
+    "cpu.initial_cap_percent": CAP, "cpu.minimum_cap_percent": CAP, "cpu.maximum_cap_percent": CAP,
+    "cpu.decrease_factor": (0, False, 1, False),          # at 1 or more a back-off never lowers the cap
+    "cpu.increase_step_percentage_points": ABOVE_0,        # 0 never recovers
+    "cpu.healthy_before_increase_seconds": AT_LEAST_0, "cpu.increase_spacing_seconds": AT_LEAST_0,
+    "cpu.decrease_cooldown_seconds": AT_LEAST_0, "cpu.backoff_idle_cores": AT_LEAST_0,
+    "cpu.recover_idle_cores": AT_LEAST_0, "cpu.recover_idle_wait_seconds": AT_LEAST_0, "cpu.recover_idle_share": SHARE,
+    "cpu.no_experience_probe_max_percent": CAP, "cpu.proxy_probe_max_percent": CAP,
+    "cpu.demand_fraction_for_increase": SHARE,             # above 1 the pool would have to pass its own hard cap
+    "cpu.memory_alarm_cap_percent": CAP, "cpu.stale_cap_percent": CAP,
+    "cpu.contention_fraction": SHARE,                      # above 1 the sessions never count as contended
+    "cpu.relax_after_ticks": (1, True, None, True),        # the count is at least 1 when it is compared
+    "cpu.min_session_cores": ABOVE_0,                      # 0 cores turns into the pause rate
+    "cpu.agent_cpu_low_cores": AT_LEAST_0,
+    "memory.physical_available_target_gib": AT_LEAST_0, "memory.physical_admission_margin_gib": AT_LEAST_0,
+    "memory.commit_headroom_target_gib": AT_LEAST_0, "memory.commit_admission_margin_gib": AT_LEAST_0,
+    "memory.job_commit_hard_limit_gib": GIB, "memory.exploration_reservation_gib": AT_LEAST_0,
+    "memory.agent_memory_budget_gib": GIB, "memory.pressure_trim_spacing_seconds": AT_LEAST_0,
+    "memory.pressure_pause_after_seconds": AT_LEAST_0, "memory.pressure_release_margin_gib": AT_LEAST_0,
+    "observation.stale_core_sample_seconds": AT_LEAST_0,  # a good tick has age 0
+    "observation.probe_warning_lag_ms": AT_LEAST_0, "observation.probe_warning_drop_percent": (0, True, 100, True),
+    "observation.probe_severe_lag_ms": ABOVE_0,            # at 0 every window is severe
+    "observation.media_window_seconds": AT_LEAST_0,
+    "observation.media_minimum_frame_count": (1, True, None, True),  # a window of 0 frames divides by 0
+    "observation.media_drop_warning_fraction": SHARE,
+    "observation.sensor_valid_seconds": ABOVE_0,           # at 0 no reading is ever valid
+    "queue.default_run_seconds": AT_LEAST_0,
+    "queue.exempt_minutes": (0, False, 24 * 60, True),     # what /api/session takes
+    "unknown_work.maximum_simultaneous_launch_observations": (1, True, None, True),  # 0 never starts unprofiled work
+    "unknown_work.launch_spacing_ms": AT_LEAST_0, "unknown_work.initial_observation_seconds": AT_LEAST_0,
+}
+
+
+def in_range(v, r):
+    lo, lo_ok, hi, hi_ok = r
+    return (lo <= v if lo_ok else lo < v) and (hi is None or (v <= hi if hi_ok else v < hi))
+
+
+def range_text(r):
+    lo, lo_ok, hi, hi_ok = r
+    low = f"{'at least' if lo_ok else 'more than'} {lo:g}"
+    return low if hi is None else f"{low} and {'at most' if hi_ok else 'less than'} {hi:g}"
+
 
 def merged(base, over):
     out = {k: (dict(v) if isinstance(v, dict) else v) for k, v in base.items()}
@@ -117,8 +168,9 @@ def finite(v):
 
 def check_over(over, base=None, path=""):
     """Raise ValueError naming the key path unless `over` (a --policy file) only uses keys of DEFAULTS with values the
-    daemon can apply: sections stay objects, a number stays a finite number, a None default (a rule or limit that is
-    off) takes a finite number or null, a bool stays a bool, and a string stays in its allowed set. Returns `over`."""
+    daemon can apply: sections stay objects, a number stays a finite number inside its RANGES entry, a None default (a
+    rule or limit that is off) takes such a number or null, a bool stays a bool, a string stays in its allowed set, and
+    the minimum cap stays at or below the maximum once `over` is merged with the defaults. Returns `over`."""
     from . import winjob as wj  # only its name tables; this module stays free of Win32 calls
     choices = {"cpu.pool_priority": ("below_normal", "normal"), "io.agent_io_priority": tuple(wj.IO_PRIORITY),
                "memory.agent_memory_priority": tuple(wj.MEMORY_PRIORITY), "queue.order": QUEUE_ORDERS}
@@ -151,6 +203,15 @@ def check_over(over, base=None, path=""):
         elif not isinstance(v, str) or (where in choices and v not in choices[where]):
             raise ValueError(f"{where} must be " + (f"one of {', '.join(choices[where])}" if where in choices else
                                                     "a string") + f", not {json.dumps(v)}")
+        if number and where in RANGES and not in_range(v, RANGES[where]):
+            raise ValueError(f"{where} must be {range_text(RANGES[where])}{', or null' if d is None else ''}, "
+                             f"not {json.dumps(v)}")
+    if not path:
+        c = merged(DEFAULTS["cpu"], over.get("cpu"))
+        if c["minimum_cap_percent"] > c["maximum_cap_percent"]:
+            # /api/cap clamps to max(minimum, min(maximum, cap)), which then lands above the maximum
+            raise ValueError(f"cpu.minimum_cap_percent {c['minimum_cap_percent']:g} must be at most "
+                             f"cpu.maximum_cap_percent {c['maximum_cap_percent']:g}")
     return over
 
 

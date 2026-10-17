@@ -3,13 +3,18 @@
 Guardian on start. Opt-in and for Stan to run himself: without --apply it only prints what it would change.
 
   python -I scripts/guardian-install-hooks.py [claude codex cursor grok antigravity] [--instance main] [--remove]
-                                              [--apply]
+                                              [--context] [--status] [--apply]
 
 Claude Code and Cursor Agent put themselves in a job of their own at start; the daemon adopts them into a job nested
 under it. Gemini CLI is left out, see NOT_SUPPORTED. The output names only the hook event that changes, never the rest
 of the file (~/.claude/settings.json can hold secrets in env), and shows other tools' hooks in that event masked.
 --apply copies a changed file to <file>.bak-guardian-<time> before writing it. --remove takes out only entries that
-run guardian-adopt.py.
+run guardian-adopt.py or guardian-status.py.
+
+--context makes the adopt hook tell the model its Guardian budget at session start (claude, codex, cursor), and
+--status adds hooks/guardian-status.py to UserPromptSubmit, one budget line before each prompt (claude, codex). The
+flags describe the hooks wanted: a run without them writes the adopt hook without --context and takes the prompt
+hook out again.
 """
 import argparse
 import json
@@ -19,8 +24,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 HOOK = ROOT / "hooks" / "guardian-adopt.py"
+STATUS = ROOT / "hooks" / "guardian-status.py"
 HOME = Path.home()
 MARK = "guardian-adopt.py"
+MARKS = (MARK, STATUS.name)
 
 NOT_SUPPORTED = {
     "gemini": "Gemini CLI 0.63 has hooks, but this installer leaves ~/.gemini/settings.json alone (it holds other "
@@ -29,11 +36,16 @@ NOT_SUPPORTED = {
 }
 
 
-def command(provider, instance, backslash):
-    py, hook = Path(sys.executable), HOOK
+def command(provider, instance, backslash, hook=HOOK, extra=""):
+    py = Path(sys.executable)
     if not backslash:
         py, hook = py.as_posix(), hook.as_posix()
-    return f"{py} -I {hook} {provider} --instance {instance}"
+    return f"{py} -I {hook} {provider} --instance {instance}{extra}"
+
+
+def ours(text):
+    """Whether a command (or a JSON dump of a hook) runs one of the Guardian hooks."""
+    return any(m in str(text) for m in MARKS)
 
 
 def read_json(path):
@@ -42,10 +54,10 @@ def read_json(path):
 
 
 def without_ours(entries):
-    """SessionStart entries with every guardian-adopt.py command removed (and entries left empty dropped)."""
+    """Hook entries with every Guardian hook command removed (and entries left empty dropped)."""
     out = []
     for e in entries:
-        hooks = [h for h in e.get("hooks", []) if MARK not in str(h.get("command", ""))]
+        hooks = [h for h in e.get("hooks", []) if not ours(h.get("command", ""))]
         if hooks:
             out.append(dict(e, hooks=hooks))
         elif not e.get("hooks"):
@@ -53,19 +65,32 @@ def without_ours(entries):
     return out
 
 
-def plan_codex(instance, remove):
+def ctx(context):
+    return " --context" if context else ""
+
+
+def status_entry(provider, instance, backslash, remove, status):
+    """The UserPromptSubmit entry for --status, or None to leave the prompt hook out."""
+    if remove or not status:
+        return None
+    return {"hooks": [{"type": "command", "command": command(provider, instance, backslash, STATUS), "timeout": 10}]}
+
+
+def plan_codex(instance, remove, context=False, status=False):
     # Codex runs hook commands with cmd /C, hence backslashes. Codex asks for trust once: open /hooks in codex.
     path = HOME / ".codex" / "hooks.json"
     data = read_json(path)
     hooks = data.setdefault("hooks", {})
     starts = without_ours(hooks.get("SessionStart", []))
     if not remove:
-        starts.append({"hooks": [{"type": "command", "command": command("codex", instance, True), "timeout": 30}]})
+        starts.append({"hooks": [{"type": "command", "command": command("codex", instance, True, extra=ctx(context)),
+                                  "timeout": 30}]})
     if starts:
         hooks["SessionStart"] = starts
     else:
         hooks.pop("SessionStart", None)
-    note = ("then open /hooks in codex once and trust the Guardian hook (Codex will not run it before that). "
+    data = set_hook(data, "UserPromptSubmit", without_ours, status_entry("codex", instance, True, remove, status))
+    note = ("then open /hooks in codex once and trust the Guardian hooks (Codex will not run them before that). "
             "The Codex app reads this file too; the hook refuses its sessions, it never assigns the app.")
     return path, data, note
 
@@ -88,14 +113,15 @@ def set_hook(data, event, keep, entry):
     return data
 
 
-def plan_claude(instance, remove):
+def plan_claude(instance, remove, context=False, status=False):
     # Claude Code runs hook commands through a POSIX shell (Git Bash) here, hence forward slashes.
     path = HOME / ".claude" / "settings.json"
     if remove and not path.exists():
         return path, None, ""
     entry = None if remove else {"matcher": "startup|resume", "hooks": [
-        {"type": "command", "command": command("claude", instance, False), "timeout": 30}]}
+        {"type": "command", "command": command("claude", instance, False, extra=ctx(context)), "timeout": 30}]}
     data = set_hook(read_json(path), "SessionStart", without_ours, entry)
+    data = set_hook(data, "UserPromptSubmit", without_ours, status_entry("claude", instance, False, remove, status))
     note = ("every new or resumed claude session joins Guardian. The Claude app's Code tab reads this file too: "
             "there the hook finds the Claude app among its parents and only logs a refusal, and the daemon puts "
             "those sessions in desktop jobs instead. VS Code is not on the desktop-app list, so a session of VS "
@@ -105,26 +131,28 @@ def plan_claude(instance, remove):
 
 
 def without_ours_flat(entries):
-    """Cursor's flat entries ({"command", "timeout"}) without the ones that run guardian-adopt.py."""
-    return [e for e in entries if MARK not in str(e.get("command", ""))]
+    """Cursor's flat entries ({"command", "timeout"}) without the ones that run a Guardian hook."""
+    return [e for e in entries if not ours(e.get("command", ""))]
 
 
-def plan_cursor(instance, remove):
+def plan_cursor(instance, remove, context=False, status=False):
+    # Cursor's beforeSubmitPrompt can only allow or block a prompt, so --status adds nothing here.
     path = HOME / ".cursor" / "hooks.json"
     if remove and not path.exists():
         return path, None, ""
     data = read_json(path)
     if not remove:
         data.setdefault("version", 1)
-    entry = None if remove else {"command": command("cursor", instance, False), "timeout": 30}
+    entry = None if remove else {"command": command("cursor", instance, False, extra=ctx(context)), "timeout": 30}
     data = set_hook(data, "sessionStart", without_ours_flat, entry)
     note = ("every new cursor-agent session joins Guardian. Cursor's editor reads this file too: there the hook "
-            "finds Cursor among its parents and only logs a refusal. The daemon has no desktop job for Cursor, so "
-            "the editor's agent sessions stay outside Guardian, and so does a cursor-agent started in its terminal.")
+            "finds Cursor among its parents and only logs a refusal, and the daemon puts the editor agent's "
+            "commands in desktop jobs instead (docs/guardian.md).")
     return path, data, note
 
 
-def plan_grok(instance, remove):
+def plan_grok(instance, remove, context=False, status=False):
+    # Grok ignores the stdout of SessionStart and UserPromptSubmit, so --context and --status add nothing here.
     # Global hooks in ~/.grok/hooks/ are trusted without a prompt. Grok runs them through pwsh or Git Bash.
     path = HOME / ".grok" / "hooks" / "guardian.json"
     if remove:
@@ -140,7 +168,7 @@ def without_ours_named(data):
     hook; an event left empty is dropped, and so is a named hook left without events."""
     out = {}
     for name, hook in data.items():
-        if not isinstance(hook, dict) or MARK not in json.dumps(hook):
+        if not isinstance(hook, dict) or not ours(json.dumps(hook)):
             out[name] = hook
             continue
         left = {}
@@ -149,7 +177,7 @@ def without_ours_named(data):
                 left[key] = entries
                 continue
             # SessionStart lists commands; PreToolUse and PostToolUse list {"matcher", "hooks": [commands]}
-            entries = [e for e in without_ours(entries) if MARK not in str(e.get("command", ""))]
+            entries = [e for e in without_ours(entries) if not ours(e.get("command", ""))]
             if entries:
                 left[key] = entries
         if any(isinstance(v, list) for v in left.values()):
@@ -157,7 +185,8 @@ def without_ours_named(data):
     return out
 
 
-def plan_antigravity(instance, remove):
+def plan_antigravity(instance, remove, context=False, status=False):
+    # agy's SessionStart output (injectSteps) is not wired yet, so --context and --status add nothing here.
     # agy loads named hooks from ~/.gemini/config/hooks.json and runs each command through cmd.exe. Antigravity 2.0
     # lists the same file; a hook run under the app finds the app among its parents and only logs a refusal.
     path = HOME / ".gemini" / "config" / "hooks.json"
@@ -182,10 +211,10 @@ OTHER = "(other hook, not shown)"
 
 
 def shown(entry):
-    """A list entry as changes() prints it: a hook whose command runs guardian-adopt.py as it is, an entry holding a
+    """A list entry as changes() prints it: a hook whose command runs a Guardian hook as it is, an entry holding a
     "hooks" list with that list shown the same way, and anything else as OTHER, never with its values. Another
     tool's hook can carry a secret in its command, url or headers."""
-    if isinstance(entry, dict) and MARK in str(entry.get("command", "")):
+    if isinstance(entry, dict) and ours(entry.get("command", "")):
         return entry
     if isinstance(entry, dict) and isinstance(entry.get("hooks"), list):
         return dict(entry, hooks=[shown(h) for h in entry["hooks"]])
@@ -222,6 +251,8 @@ def main(argv=None):
     ap.add_argument("providers", nargs="*", default=sorted(PLANS))
     ap.add_argument("--instance", default="main")
     ap.add_argument("--remove", action="store_true", help="take the Guardian hook out instead")
+    ap.add_argument("--context", action="store_true", help="the adopt hook tells the model its Guardian budget")
+    ap.add_argument("--status", action="store_true", help="a budget line before each prompt (claude, codex)")
     ap.add_argument("--apply", action="store_true", help="write the change (default: print it only)")
     a = ap.parse_args(argv)
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -229,7 +260,7 @@ def main(argv=None):
         if name not in PLANS:
             print(f"{name}: not installed. {NOT_SUPPORTED.get(name, 'unknown CLI')}")
             continue
-        path, data, note = PLANS[name](a.instance, a.remove)
+        path, data, note = PLANS[name](a.instance, a.remove, a.context, a.status)
         old = path.read_bytes().decode("utf-8-sig") if path.exists() else None
         new = None if data is None else json.dumps(data, indent=2, ensure_ascii=False) + "\n"
         if new is not None and old is not None and "\r\n" in old:
@@ -240,7 +271,7 @@ def main(argv=None):
         if old is None and new is None:
             print(f"{name}: {path} not present, nothing to remove")
             continue
-        if new is None and MARK not in old:
+        if new is None and not ours(old):
             print(f"{name}: {path} has no Guardian hook, left alone")
             continue
         verb = "remove" if new is None else ("write" if old is None else "update")

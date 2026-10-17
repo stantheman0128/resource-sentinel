@@ -360,6 +360,173 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.inst.changes({"sessionStart": [theirs, side]}, {}),
                          ["sessionStart:", '  - "(other hook, not shown)"', f"  - {json.dumps(side)}"])
 
+    def test_context_and_status_hooks_come_and_go_with_the_flags(self):
+        theirs = {"hooks": [{"type": "command", "command": "py C:/x/prompt-notes.py"}]}
+        settings = {"env": {"FAKE_TOKEN": "fake"}, "hooks": {"UserPromptSubmit": [theirs]}}
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(self.inst, "HOME", Path(d)):
+            f = Path(d, ".claude", "settings.json")
+            f.parent.mkdir(parents=True)
+            f.write_text(json.dumps(settings), encoding="utf-8")
+            out = self.run_main("claude", "--context", "--status")  # dry run
+            self.assertIn("hooks.UserPromptSubmit:", out)
+            self.assertIn("guardian-status.py", out)
+            self.assertNotIn("prompt-notes", out)
+            data = self.inst.plan_claude("main", False, True, True)[1]
+            start = data["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+            self.assertTrue(start.endswith("guardian-adopt.py claude --instance main --context"), start)
+            prompt = data["hooks"]["UserPromptSubmit"]
+            self.assertEqual(prompt[0], theirs)
+            self.assertEqual(prompt[1], {"hooks": [{"type": "command", "timeout": 10, "command":
+                                                    self.inst.command("claude", "main", False, self.inst.STATUS)}]})
+            self.assertNotIn("\\", prompt[1]["hooks"][0]["command"])
+            f.write_text(json.dumps(data), encoding="utf-8")
+            plain = self.inst.plan_claude("main", False)[1]  # no flags: the plain adopt hook, no prompt hook
+            self.assertEqual(plain["hooks"]["UserPromptSubmit"], [theirs])
+            self.assertNotIn("--context", json.dumps(plain))
+            self.assertEqual(self.inst.plan_claude("main", True)[1], settings)
+
+            c = Path(d, ".codex", "hooks.json")
+            c.parent.mkdir(parents=True)
+            stop = {"Stop": [{"hooks": [{"type": "command", "command": "py C:/x/notify.py"}]}]}
+            c.write_text(json.dumps({"hooks": stop}), encoding="utf-8")
+            data = self.inst.plan_codex("main", False, True, True)[1]
+            self.assertTrue(data["hooks"]["SessionStart"][0]["hooks"][0]["command"].endswith(" --context"))
+            status = data["hooks"]["UserPromptSubmit"][0]["hooks"][0]["command"]
+            self.assertIn("hooks\\guardian-status.py codex", status)
+            c.write_text(json.dumps(data), encoding="utf-8")
+            self.assertEqual(self.inst.plan_codex("main", True)[1], {"hooks": stop})
+
+            data = self.inst.plan_cursor("main", False, True, True)[1]
+            self.assertEqual(list(data["hooks"]), ["sessionStart"])  # no prompt hook: Cursor's only allows or blocks
+            self.assertTrue(data["hooks"]["sessionStart"][0]["command"].endswith(" --context"))
+            for plan in (self.inst.plan_grok, self.inst.plan_antigravity):
+                self.assertEqual(plan("main", False, True, True)[1], plan("main", False)[1])
+
+
+class BudgetContextTests(unittest.TestCase):
+    """R4: what the hooks tell an agent about its own Guardian session."""
+
+    def guardian(self):
+        from types import SimpleNamespace
+        from sentinel.guardian import daemon as D
+        from sentinel.guardian import policy as P
+        g = D.Guardian.__new__(D.Guardian)  # no jobs or threads: budget_of only
+        g.world, g.cap, g.alloc, g.control = 12, P.CapState(cap=50.0), P.AllocState(), True
+        g.pool_priority, g.agent_io, g.mem, g.mem_paused = "below_normal", "low", P.MemState(), set()
+        g.sample = SimpleNamespace(available_gib=18.24)
+        s, other = D.Session("claude", "abc12345", "normal", None), D.Session("codex", "s1", "batch", None)
+        g.queue = [SimpleNamespace(session=s), SimpleNamespace(session=other), SimpleNamespace(session=s)]
+        return g, s
+
+    def where(self, **budget):
+        b = {"key": "claude/abc12345", "cls": "normal", "cap_cores": 2.4, "pool_cap_cores": 6.0, "world_cpus": 12,
+             "control": True, "priority": "below_normal", "io": "low", "admission_open": True,
+             "admission_reason": "", "queued": 0, "paused": False, "memory_rung": 0, "available_gib": 18.2,
+             "exempt_left_s": None}
+        b.update(budget)
+        return {"pid": 4242, "session": b["key"], "priority": "below_normal", "budget": b}
+
+    def test_budget_of_names_the_session_cap_and_its_own_queue(self):
+        g, s = self.guardian()
+        g.alloc.caps[s.key] = 2.4
+        b = g.budget_of(s)
+        self.assertEqual((b["key"], b["cls"], b["cap_cores"], b["pool_cap_cores"], b["world_cpus"]),
+                         ("claude/abc12345", "normal", 2.4, 6.0, 12))
+        self.assertEqual((b["queued"], b["paused"], b["available_gib"], b["exempt_left_s"]), (2, False, 18.2, None))
+        g.mem_paused.add(s.key)
+        g.cap.admission_open, g.cap.admission_reason = False, "CAPACITY_PRESSURE"
+        b = g.budget_of(s)
+        self.assertEqual((b["paused"], b["admission_open"], b["admission_reason"]), (True, False, "CAPACITY_PRESSURE"))
+        s.cls, s.exempt_until = "exempt", time.time() + 300
+        self.assertTrue(295 <= g.budget_of(s)["exempt_left_s"] <= 300)
+        g.sample = None
+        self.assertIsNone(g.budget_of(s)["available_gib"])
+
+    def test_the_prompt_line_and_the_session_start_context(self):
+        line = GC.budget_text(self.where())
+        self.assertEqual(line, "Guardian: claude/abc12345 normal, CPU cap 2.4 of 12 cores, 18.2 GiB RAM available")
+        long = GC.budget_text(self.where(), long=True)
+        self.assertIn(line, long)
+        self.assertIn("The agents together may use 6 cores", long)
+        self.assertIn("below_normal CPU priority and low I/O priority", long)
+        self.assertIn("About 2 parallel workers", long)
+        self.assertIn("scripts/srun.py --provider claude --session abc12345 -- <command>", long)
+        self.assertLess(len(long), 10000)  # Claude Code's cap on hook context
+        self.assertIn("CPU cap 6 of 12 cores", GC.budget_text(self.where(cap_cores=None)))  # the pool's cap
+        self.assertIn("CPU cap 6 of 12 cores", GC.budget_text(self.where(cap_cores=8.0)))
+        busy = GC.budget_text(self.where(paused=True, admission_open=False, admission_reason="LOW_MEMORY",
+                                         memory_rung=1, queued=2, available_gib=None))
+        self.assertEqual(busy, "Guardian: claude/abc12345 normal, CPU cap 2.4 of 12 cores, paused, "
+                               "new srun commands wait (LOW_MEMORY), memory pressure, 2 queued")
+        off = GC.budget_text(self.where(control=False), long=True)
+        self.assertIn("control off, nothing capped", off)
+        self.assertNotIn("parallel workers", off)
+        exempt = GC.budget_text(self.where(cls="exempt", exempt_left_s=290))
+        self.assertIn("exempt from caps for 4 more minutes", exempt)
+        for where in (None, {}, {"pid": 1, "session": None, "budget": None}):
+            self.assertEqual(GC.budget_text(where), "")
+
+    def test_hook_output_takes_the_shape_each_cli_reads(self):
+        for provider in ("claude", "codex"):
+            for event in ("SessionStart", "UserPromptSubmit"):
+                self.assertEqual(json.loads(GC.hook_output(provider, event, "hi")),
+                                 {"hookSpecificOutput": {"hookEventName": event, "additionalContext": "hi"}})
+        self.assertEqual(json.loads(GC.hook_output("cursor", "sessionStart", "hi")), {"additional_context": "hi"})
+        for args in (("cursor", "beforeSubmitPrompt", "hi"), ("grok", "SessionStart", "hi"),
+                     ("antigravity", "SessionStart", "hi"), ("claude", "Stop", "hi"), ("claude", "SessionStart", "")):
+            self.assertEqual(GC.hook_output(*args), "")
+
+    def run_hook(self, hook, argv, env=None):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env or {}), contextlib.redirect_stdout(out):
+            hook.main(argv)
+        return out.getvalue()
+
+    def test_adopt_hook_gives_context_only_when_asked(self):
+        from sentinel.guardian import winjob as wj
+        hook, rows = load_hook(), []
+        where = self.where()
+        with mock.patch.object(hook, "read_payload", return_value={"hook_event_name": "SessionStart"}), \
+                mock.patch.object(hook, "log", side_effect=lambda instance, row: rows.append(row)), \
+                mock.patch.object(wj, "process_table", return_value={4242: (1, "claude.exe")}), \
+                mock.patch.object(PV, "find_cli", return_value=(4242, "")), \
+                mock.patch.object(GC, "adopt", return_value={"ok": True, "state": "adopted"}), \
+                mock.patch.object(GC, "whereis", return_value=where) as wi:
+            env = {"GUARDIAN_ADOPT": "", "GUARDIAN_INSTANCE": ""}
+            self.assertEqual(self.run_hook(hook, ["claude"], env), "")
+            wi.assert_not_called()
+            out = json.loads(self.run_hook(hook, ["claude", "--context"], env))
+            self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "SessionStart")
+            self.assertIn("Guardian: claude/abc12345 normal", out["hookSpecificOutput"]["additionalContext"])
+            self.assertEqual(wi.call_args[0][:2], (4242, "main"))
+            self.assertEqual(rows[-1]["context"], out["hookSpecificOutput"]["additionalContext"])
+            self.assertEqual(self.run_hook(hook, ["grok", "--context", "--stdout", "{}"], env), "{}")
+            self.assertEqual(self.run_hook(hook, ["claude", "--context"], dict(env, GUARDIAN_ADOPT="0")), "")
+            with mock.patch.object(PV, "find_cli", return_value=(None, "the Claude app is among the hook's parents")):
+                self.assertIn("additionalContext", self.run_hook(hook, ["claude", "--context"], env))
+                self.assertEqual(wi.call_args[0][0], os.getpid())  # a desktop job holds the hook itself
+            wi.side_effect = OSError("pipe gone")
+            self.assertEqual(self.run_hook(hook, ["claude", "--context"], env), "")
+            self.assertIn("pipe gone", rows[-1]["context_error"])
+
+    def test_status_hook_prints_one_line_and_never_waits_long(self):
+        hook = load("hooks/guardian-status.py", "guardian_status_hook")
+        env = {"GUARDIAN_STATUS": "", "GUARDIAN_INSTANCE": ""}
+        with mock.patch.object(hook, "read_payload", return_value={"hook_event_name": "UserPromptSubmit"}), \
+                mock.patch.object(GC, "whereis", return_value=self.where()) as wi:
+            out = json.loads(self.run_hook(hook, ["claude"], env))
+            self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit")
+            self.assertTrue(out["hookSpecificOutput"]["additionalContext"].startswith("Guardian: claude/abc12345"))
+            self.assertEqual(wi.call_args[0][:2], (os.getpid(), "main"))
+            self.assertEqual(self.run_hook(hook, ["cursor"], env), "")
+            self.assertEqual(self.run_hook(hook, ["claude"], dict(env, GUARDIAN_STATUS="0")), "")
+            wi.return_value = {"pid": 1, "session": None, "budget": None}  # not in a Guardian session
+            self.assertEqual(self.run_hook(hook, ["claude"], env), "")
+        with mock.patch.object(GC, "whereis", side_effect=lambda *a, **k: time.sleep(3)):
+            t0 = time.monotonic()
+            self.assertEqual(hook.status("claude", "main", {}, wait=0.2), "")
+            self.assertLess(time.monotonic() - t0, 1.5)
+
 
 class ShimTests(unittest.TestCase):
     def setUp(self):

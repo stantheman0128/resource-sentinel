@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Hook for any agent CLI: put the CLI that runs this hook into its Guardian session job.
 
-  python -I <repo>/hooks/guardian-adopt.py <provider> [--instance main] [--cls normal] [--stdout TEXT]
+  python -I <repo>/hooks/guardian-adopt.py <provider> [--instance main] [--cls normal] [--context] [--stdout TEXT]
 
 Wire it to the CLI's session-start hook (docs/guardian.md lists the place for each CLI). It walks up from its own
 process to the CLI (claude.exe, codex.exe, grok.exe, agy.exe, or the node.exe running gemini or cursor-agent) and asks
@@ -10,6 +10,11 @@ the daemon to adopt it. Children the CLI starts afterwards inherit the job.
 It never blocks the CLI or changes its decisions: stdout stays empty unless --stdout gives the exact text a CLI
 expects, the exit code is always 0, and the outcome goes to ~/.resource-sentinel/guardian/<instance>/adopt.log.
 GUARDIAN_ADOPT=0 in the environment turns it off.
+
+--context also tells the model what the session may use (CPU cap, priority, free RAM, how to queue a long command),
+in the output shape the CLI reads: Claude Code and Codex take SessionStart additionalContext, Cursor takes
+sessionStart additional_context. For the other CLIs it prints nothing more. A CLI that a desktop app runs is refused
+adoption, but when the daemon already holds it in a desktop job the hook still gives the context.
 """
 import argparse
 import json
@@ -64,12 +69,26 @@ def log(instance, row):
         pass
 
 
+def context(provider, row, instance):
+    """--context: the budget of the session holding the CLI, or the hook itself when no CLI was adopted, in the
+    shape the CLI's hook output takes; "" when there is none."""
+    try:
+        from sentinel.guardian.client import budget_text, hook_output, whereis
+        where = whereis(row.get("cli_pid") or os.getpid(), instance, timeout=3.0)
+        row["context"] = budget_text(where, long=True)
+        return hook_output(provider, row.get("event") or "SessionStart", row["context"])
+    except Exception as e:  # never break the CLI over the context
+        row["context_error"] = f"{e.__class__.__name__}: {e}"
+        return ""
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("provider")
     ap.add_argument("--instance", default="main")
     ap.add_argument("--cls", default="normal")
     ap.add_argument("--stdout", default="", help="exact text to print for CLIs that parse hook output")
+    ap.add_argument("--context", action="store_true", help="give the model the session's Guardian budget")
     a, _ = ap.parse_known_args(argv)
     instance = os.environ.get("GUARDIAN_INSTANCE") or a.instance
     row = {"t": time.strftime("%Y-%m-%d %H:%M:%S"), "provider": a.provider, "hook_pid": os.getpid()}
@@ -98,9 +117,12 @@ def main(argv=None):
     except Exception as e:  # a hook must never break the CLI that runs it
         row.update(state="error", reason=f"{e.__class__.__name__}: {e}")
     finally:
+        out = a.stdout
+        if a.context and row.get("state") != "off":
+            out = context(a.provider, row, instance) or out
         log(instance, row)
-        if a.stdout:
-            sys.stdout.write(a.stdout)
+        if out:
+            sys.stdout.write(out)
             sys.stdout.flush()
 
 

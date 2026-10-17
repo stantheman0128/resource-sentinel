@@ -181,18 +181,71 @@ def adopt(pid, provider, session, cls="normal", instance="main", via="hook", ski
         conn.close()
 
 
-def whereis(pid, instance="main"):
-    """The daemon's view of pid: {"in_guardian", "session", "priority", ...}, or None when it is not running."""
-    conn = connect(instance)
+def whereis(pid, instance="main", timeout=10.0):
+    """The daemon's view of pid: {"in_guardian", "session", "priority", "budget", ...}, or None when it is not
+    running or does not answer within timeout."""
+    conn = connect(instance, timeout=min(timeout, HANDSHAKE_SECONDS))
     if conn is None:
         return None
     try:
         send_json(conn, {"op": "whereis", "pid": int(pid)})
-        return json.loads(conn.recv_bytes()[1:]) if conn.poll(10) else None
+        return json.loads(conn.recv_bytes()[1:]) if conn.poll(timeout) else None
     except (EOFError, OSError, ValueError):
         return None
     finally:
         conn.close()
+
+
+def budget_text(where, long=False):
+    """What a hook tells an agent about its own Guardian session, from a whereis() answer; "" outside a session.
+    long is the session-start context, otherwise the one line given before each prompt."""
+    b = (where or {}).get("budget")
+    if not b:
+        return ""
+    pool, world = b["pool_cap_cores"], b["world_cpus"]
+    if not b["control"]:
+        cpu = "control off, nothing capped"
+    elif b["cls"] == "exempt":
+        cpu = f"exempt from caps for {(b['exempt_left_s'] or 0) // 60} more minutes"
+    else:
+        cap = pool if b["cap_cores"] is None else min(b["cap_cores"], pool)
+        cpu = f"CPU cap {cap:g} of {world} cores"
+    state = []
+    if b["paused"]:
+        state.append("paused")
+    if not b["admission_open"]:
+        state.append(f"new srun commands wait ({b['admission_reason']})")
+    if b["memory_rung"]:
+        state.append("memory pressure")
+    if b["queued"]:
+        state.append(f"{b['queued']} queued")
+    ram = f"{b['available_gib']:g} GiB RAM available" if b["available_gib"] is not None else ""
+    short = ", ".join(x for x in [f"Guardian: {b['key']} {b['cls']}", cpu, ram] + state if x)
+    if not long:
+        return short
+    provider, _, session = b["key"].partition("/")
+    srun = Path(__file__).resolve().parents[2] / "scripts" / "srun.py"
+    workers = "" if not b["control"] or b["cls"] == "exempt" else (
+        f" About {max(1, int(cap))} parallel workers fit in that cap.")
+    return (f"This session runs under Guardian, the resource controller on Stan's machine. {short}."
+            f" The agents together may use {pool:g} cores. Their processes run at {where.get('priority') or '?'}"
+            f" CPU priority and {b['io']} I/O priority, so Stan's own apps go first.{workers}"
+            f" A long build or test can wait for room instead of slowing the machine:"
+            f" python -I {srun.as_posix()} --provider {provider} --session {session} -- <command>.")
+
+
+def hook_output(provider, event, text):
+    """The stdout a CLI's hook needs to hand text to the model, or "" where the hook has no such channel.
+    Claude Code and Codex: SessionStart and UserPromptSubmit take additionalContext. Cursor: sessionStart takes
+    additional_context. Grok ignores the stdout of these events."""
+    if not text:
+        return ""
+    event = (event or "")[:1].upper() + (event or "")[1:]  # Cursor names it sessionStart
+    if provider in ("claude", "codex") and event in ("SessionStart", "UserPromptSubmit"):
+        return json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}})
+    if provider == "cursor" and event == "SessionStart":
+        return json.dumps({"additional_context": text})
+    return ""
 
 
 def start_daemon(instance="main", port=8765, extra=(), wait=20.0):

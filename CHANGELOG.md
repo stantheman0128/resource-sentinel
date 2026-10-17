@@ -33,6 +33,12 @@
   a job memory limit on AllAgents. `guardctl memory-budget|memory-trim|memory-pause|memory-limit` set them, and the
   dashboard sets the budget, trim and pause; rollback and shutdown remove the limit. Trim is on by default, so the
   policy version is now guardian-policy/2.
+- An agent can learn its own budget. With `--context` the adopt hook gives the model, at session start, its Guardian
+  session, CPU cap, priorities, free RAM and the srun line for a long command, in the output shape of Claude Code,
+  Codex or Cursor. `hooks/guardian-status.py` gives a one-line form before each prompt in Claude Code and Codex.
+  `whereis` answers with the session's budget, and `guardian-install-hooks.py --context --status` installs both
+  hooks, as a dry run until `--apply`. Measured with a real `claude -p` on a test instance: both texts reached the
+  model's request, which a local server answered with 401.
 
 ## Unreleased - 2026-10-13
 

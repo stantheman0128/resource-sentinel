@@ -107,6 +107,34 @@ it the agents' allocations fail, and it does not reach desktop and nested jobs. 
 進階操作 sets the budget, trim and pause and shows the rung, and the RAM card shows what the agents hold. Rollback
 clears the ladder and removes the hard limit, `resume-control` puts the limit back, and a shutdown removes it.
 
+## The agent's own budget
+
+An agent that knows its CPU cap can start as many parallel workers as fit in it. With `--context`, the adopt hook
+asks the daemon about the CLI it has just placed and gives the answer to the model when the session starts: the
+session and its class, its CPU cap against the machine's cores, what the agents may use together, the CPU and I/O
+priority, the free RAM, and the srun line for a long build or test. `hooks/guardian-status.py` gives a one-line form
+before each prompt, such as `Guardian: claude/7162daab normal, CPU cap 6 of 12 cores, 22.1 GiB RAM available`, and
+adds `paused`, `new srun commands wait (REASON)`, `memory pressure` or `N queued` when they apply. The two hooks
+read `whereis`, which answers with the budget of the session holding the process. Outside a Guardian session, or
+when the daemon does not answer within about 3 s, they print nothing, and they always exit 0. A CLI that a desktop
+app runs is refused adoption, but when the daemon already holds it in a desktop job the hook still gives the
+context.
+
+Each CLI's hook docs, read on 2026-10-17, say what it does with a hook's stdout:
+
+| CLI | Session start | Before each prompt |
+|---|---|---|
+| Claude Code | SessionStart `additionalContext` | UserPromptSubmit `additionalContext` |
+| Codex | SessionStart `additionalContext` | UserPromptSubmit `additionalContext` |
+| Cursor Agent | sessionStart `additional_context` | none, beforeSubmitPrompt only allows or blocks a prompt |
+| Grok | none, the stdout of these events is ignored | none |
+| agy | not wired: SessionStart returns `injectSteps`, and its docs disagree on their shape | not wired |
+
+`python -I scripts/guardian-install-hooks.py claude codex cursor --context --status` prints the change, and
+`--apply` writes it with a backup, like the plain adopt hook. The flags describe the hooks wanted, so a later run
+without them takes `--context` and the prompt hook out again. The hooks installed on this machine give no context
+until Stan applies this, and Codex wants the new prompt hook trusted in `/hooks` first.
+
 ## Running it
 
 ```
@@ -270,7 +298,7 @@ hook `guardian-adopt` in `~/.gemini/config/hooks.json`). The user's own keys and
 they were, and the dry run and `--apply` print only the hook event that changes, so the env block of
 `~/.claude/settings.json` never shows. The Claude app's Code tab and Cursor's editor read the same files as the
 CLIs; there the hook finds the app among its parents and only logs a refusal. The Claude app's sessions go into
-desktop jobs instead, while Cursor's editor has none. On 2026-10-15 both hooks were run live from Stan's own
+desktop jobs instead, as do the Cursor editor agent's commands. On 2026-10-15 both hooks were run live from Stan's own
 files. A claude.exe and a cursor-agent, each started by full path from a plain console and given no prompt,
 joined a nested session of the main daemon when their session started, enforced at below_normal. claude.exe
 brought 8 children. cursor-agent's node.exe brought 32; 4 more were refused with Access denied and 1 had already
@@ -446,6 +474,17 @@ pays for each trim with one slow pass. The budget counts commit, which neither a
 budget the pressure lasts until the work ends. After the alarm the cap stayed at 20%, since the cap rises only while
 the agents use most of it and this load used no CPU. The defaults are trim on, pause off and no budget. Whether the
 line should be a total for the agents or a reserve for Stan is for Stan to decide.
+
+The agent's own budget, 2026-10-17, test instance `r4`. A real `claude -p` of Claude Code 2.1.301, started from a
+cmd that Explorer opened, ran this checkout's two hooks from a `--settings` file with `--setting-sources project`,
+so none of Stan's own hooks or plugins ran. `ANTHROPIC_BASE_URL` pointed at a local server that answered every
+request with 401, so no model was called. The adopt hook put claude.exe and 1 child in nested session
+`claude/7162daab`, which whereis showed at below_normal 0.9 s after the start. Claude Code logged "Successfully
+parsed and validated hook JSON output" for both hooks, and the prompt hook took 174 ms. The first request to the
+fake API, 1.05 s after the start, carried the session start text as "SessionStart hook additional context" and the
+prompt line as "UserPromptSubmit hook additional context". Claude Code makes up to 11 attempts after a 401, so the
+run was stopped at 150 s, and it left no process behind. For Codex and Cursor only unit tests check the output shape
+their docs give: a live Codex run needs its hook trust, and cursor-agent asks to trust a new folder.
 
 ## Known limits
 

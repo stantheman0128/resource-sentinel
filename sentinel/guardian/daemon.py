@@ -1099,7 +1099,21 @@ class Guardian:
             return {"pid": pid, "in_guardian": bool(wj.in_job(pid, self.root.h)) or outside,
                     "in_any_job": wj.in_job(pid), "session": holder.key if holder else None,
                     "desktop": outside and not nested, "nested": nested, "priority": wj.priority_class(pid),
-                    "adopted": pid in self.adopted, "instance": self.instance}
+                    "adopted": pid in self.adopted, "instance": self.instance,
+                    "budget": self.budget_of(holder) if holder else None}
+
+    def budget_of(self, s):
+        """What session s may use right now, told to the agent itself by the adopt hook's --context and by
+        hooks/guardian-status.py. cap_cores None: no session cap, so the pool's cap is the limit."""
+        smp = getattr(self, "sample", None)
+        return {"key": s.key, "cls": s.cls, "cap_cores": self.alloc.caps.get(s.key),
+                "pool_cap_cores": round(self.cap.cap / 100 * self.world, 2), "world_cpus": self.world,
+                "control": self.control, "priority": self.pool_priority, "io": self.agent_io,
+                "admission_open": self.cap.admission_open, "admission_reason": self.cap.admission_reason,
+                "queued": sum(1 for r in self.queue if r.session is s),
+                "paused": s.paused or s.key in self.mem_paused, "memory_rung": self.mem.rung,
+                "available_gib": round(smp.available_gib, 1) if smp and smp.available_gib else None,
+                "exempt_left_s": max(0, round(s.exempt_until - time.time())) if s.cls == "exempt" else None}
 
     def coverage_of(self, pid, s):
         if s and s.desktop:

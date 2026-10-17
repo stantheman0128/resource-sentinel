@@ -1,3 +1,4 @@
+import io
 import json
 import os
 import sys
@@ -5,8 +6,10 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from sentinel.adapters import local_runner
 from sentinel.adapters import (
     AdapterConfigurationError,
     ConfiguredHttpAdapter,
@@ -161,6 +164,23 @@ class PersistentLocalCommandAdapterTests(unittest.TestCase):
             self.assertTrue(result["output_truncated"], result)
             self.assertEqual(len(result["stdout"].encode("utf-8")), 1024)
             self.assertGreaterEqual(result["stdout_total_bytes"], 200000)
+
+
+@unittest.skipUnless(os.name == "nt", "the runner reads an exited root through its Windows handle")
+class LocalRunnerMetricsTests(unittest.TestCase):
+    def test_a_command_that_exits_before_any_sample_still_has_metrics(self):
+        # psutil cannot open an exited process; on a busy machine a short command used to
+        # finish before the first sample and the job came back with metrics_available False
+        request = {"command": [sys.executable, "-c", "print('quick')"], "timeout_seconds": 5}
+        stdin = SimpleNamespace(buffer=io.BytesIO(json.dumps(request).encode("utf-8")))
+        with tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parent) as temp, \
+                patch.object(local_runner.ProcessTreeMetrics, "sample"), patch.object(sys, "stdin", stdin):
+            self.assertEqual(local_runner.run(Path(temp)), 0)
+            result = json.loads((Path(temp) / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["status"], "SUCCEEDED", result)
+        self.assertTrue(result["metrics_available"], result)
+        self.assertEqual(result["metric_samples"], 1)
+        self.assertGreater(result["peak_working_set_gib"], 0)
 
 
 class ManualAdapterTests(unittest.TestCase):

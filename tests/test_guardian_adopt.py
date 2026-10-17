@@ -901,22 +901,23 @@ class AgentPriorityTests(unittest.TestCase):
         code = ("import subprocess, sys; sys.stdin.readline(); "
                 "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
                 "print(c.pid, flush=True); sys.stdin.readline(); c.kill()")
-        p = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-        try:
-            self.assertTrue(wj.set_io_priority(p.pid, "low"))
-            self.assertTrue(wj.set_memory_priority(p.pid, "low"))
-            self.assertEqual((wj.io_priority(p.pid), wj.memory_priority(p.pid)), ("low", "low"))
-            p.stdin.write("go\n")
-            p.stdin.flush()
-            child = int(p.stdout.readline())
-            self.assertEqual((wj.io_priority(child), wj.memory_priority(child)), ("low", "low"))
-            self.assertTrue(wj.set_io_priority(p.pid, "normal") and wj.set_memory_priority(p.pid, "normal"))
-            self.assertEqual((wj.io_priority(p.pid), wj.memory_priority(p.pid)), ("normal", "normal"))
-            p.stdin.write("done\n")
-            p.stdin.flush()
-        finally:
-            p.kill()
-            p.wait()
+        with subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                              text=True) as p:  # closes both pipes on the way out
+            try:
+                self.assertTrue(wj.set_io_priority(p.pid, "low"))
+                self.assertTrue(wj.set_memory_priority(p.pid, "low"))
+                self.assertEqual((wj.io_priority(p.pid), wj.memory_priority(p.pid)), ("low", "low"))
+                p.stdin.write("go\n")
+                p.stdin.flush()
+                child = int(p.stdout.readline())
+                self.assertEqual((wj.io_priority(child), wj.memory_priority(child)), ("low", "low"))
+                self.assertTrue(wj.set_io_priority(p.pid, "normal") and wj.set_memory_priority(p.pid, "normal"))
+                self.assertEqual((wj.io_priority(p.pid), wj.memory_priority(p.pid)), ("normal", "normal"))
+                p.stdin.write("done\n")
+                p.stdin.flush()
+                p.wait(10)  # it kills its sleeping child first; killing it here left that child running for 30 s
+            finally:
+                p.kill()
 
 
 class OutsideLoadTests(unittest.TestCase):

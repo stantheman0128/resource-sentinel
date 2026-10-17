@@ -72,6 +72,48 @@ def drain_stream(
         state.update(total_bytes=total, retained_bytes=retained, truncated=total > retained)
 
 
+def root_counters(process: subprocess.Popen[Any]) -> tuple[float, int, int, int, int] | None:
+    """CPU seconds, read bytes, write bytes, peak working set and peak private bytes of the root.
+
+    psutil cannot open a process that has exited, but the handle Popen keeps still answers
+    these calls. The values equal psutil's cpu_times, io_counters and memory_full_info.
+    """
+    handle = getattr(process, "_handle", None)
+    if os.name != "nt" or handle is None:
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class MemoryCounters(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+            (name, ctypes.c_size_t) for name in (
+                "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+                "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage",
+            )
+        ]
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_ulonglong) for name in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+        )]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    native = wintypes.HANDLE(int(handle))
+    times = [wintypes.FILETIME() for _ in range(4)]
+    memory = MemoryCounters(cb=ctypes.sizeof(MemoryCounters))
+    io = IoCounters()
+    if not (
+        kernel32.GetProcessTimes(native, *(ctypes.byref(item) for item in times))
+        and kernel32.K32GetProcessMemoryInfo(native, ctypes.byref(memory), memory.cb)
+        and kernel32.GetProcessIoCounters(native, ctypes.byref(io))
+    ):
+        return None
+    cpu = sum((item.dwHighDateTime << 32) | item.dwLowDateTime for item in times[2:]) / 1e7
+    return (cpu, int(io.ReadTransferCount), int(io.WriteTransferCount),
+            int(memory.PeakWorkingSetSize), int(memory.PeakPagefileUsage))
+
+
 class ProcessTreeMetrics:
     """Best-effort aggregate counters for a changing subprocess tree."""
 
@@ -86,6 +128,7 @@ class ProcessTreeMetrics:
         self.disk_write_bytes = 0
         self.samples = 0
         self._last: dict[tuple[int, float], tuple[float, int, int]] = {}
+        self._root_last = (0.0, 0, 0)
         self._last_sample_at: float | None = None
 
     def sample(self) -> None:
@@ -113,18 +156,21 @@ class ProcessTreeMetrics:
                     pass
                 cpu_times = item.cpu_times()
                 cpu = float(cpu_times.user + cpu_times.system)
+                previous = self._last.get(key, (0.0, 0, 0))
                 try:
                     io = item.io_counters()
                     read_bytes, write_bytes = int(io.read_bytes), int(io.write_bytes)
                 except Exception:
-                    read_bytes, write_bytes = 0, 0
-                previous = self._last.get(key, (0.0, 0, 0))
+                    # keep the last totals; zeros would make the next reading count them again
+                    read_bytes, write_bytes = previous[1], previous[2]
                 cpu_delta = max(0.0, cpu - previous[0])
                 interval_cpu += cpu_delta
                 self.cpu_seconds += cpu_delta
                 self.disk_read_bytes += max(0, read_bytes - previous[1])
                 self.disk_write_bytes += max(0, write_bytes - previous[2])
                 current[key] = (cpu, read_bytes, write_bytes)
+                if key[0] == self.root_pid:
+                    self._root_last = current[key]
                 observed += 1
             except Exception:
                 continue
@@ -138,6 +184,30 @@ class ProcessTreeMetrics:
                 self.peak_cpu_equivalent, interval_cpu / (now - self._last_sample_at)
             )
         self._last_sample_at = now
+        self.samples += 1
+        self.available = True
+
+    def sample_root_after_exit(self, process: subprocess.Popen[Any]) -> None:
+        """Add the root's final totals once it has exited.
+
+        sample() cannot see an exited root, so a short command that finished before the
+        first sample (a busy machine delays that by over a second) left the job with no
+        metrics at all. Children that exited unsampled stay uncounted.
+        """
+        try:
+            counters = root_counters(process)
+        except Exception:
+            return
+        if counters is None:
+            return
+        cpu, read_bytes, write_bytes, peak_working_set, peak_private = counters
+        previous = self._root_last
+        self.cpu_seconds += max(0.0, cpu - previous[0])
+        self.disk_read_bytes += max(0, read_bytes - previous[1])
+        self.disk_write_bytes += max(0, write_bytes - previous[2])
+        self._root_last = (cpu, read_bytes, write_bytes)
+        self.peak_working_set = max(self.peak_working_set, peak_working_set)
+        self.peak_private = max(self.peak_private, peak_private)
         self.samples += 1
         self.available = True
 
@@ -232,6 +302,7 @@ def run(job_dir: Path) -> int:
             except subprocess.TimeoutExpired:
                 pass
         metrics.sample()
+        metrics.sample_root_after_exit(process)
         return_code = process.poll()
         for drainer in drainers:
             drainer.join(timeout=2)

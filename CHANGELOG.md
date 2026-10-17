@@ -72,6 +72,15 @@
   budget text show memory pressure before any step is taken. Known limits says a pause sets the lowest CPU rate,
   0.01%, and suspends nothing: on the test instance, a loop that slept a second between counts kept counting
   through a 39 s pause.
+- A local command that exits before the runner's first sample still gets metrics. psutil cannot open a process that
+  has exited, and with the CPU capped at half a core the runner took up to 2 s to reach its first sample, so a short
+  command could finish first and its job came back with `metrics_available: false` and no samples. Once the command
+  exits, the runner reads its CPU time, disk bytes and peak memory through the process handle it already holds.
+  Children that exit before any sample are still not counted. When a sample cannot read a process's disk counters,
+  the runner keeps that process's last totals instead of zeros, which the next reading used to count a second time.
+  This was the suite's intermittent failure, in `test_new_adapter_instance_reconciles_detached_job`. It failed in 1
+  of 30 full runs before the change and in 5 of 30 runs of that test alone at half a core. After it, 30 full runs
+  passed and none of 30 runs at half a core came back without metrics.
 
 ## Unreleased - 2026-10-13
 

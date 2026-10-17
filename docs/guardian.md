@@ -19,6 +19,11 @@ every tool command it runs stay inside it:
 - **Dynamic cap.** The AllAgents cap is a percent of the CPUs open to agents. When the foreground probe is over the
   line in 2 of the last 3 one-second windows (p95 lateness above 10 ms or more than 2% late), the cap is multiplied
   by 0.8. After 20 healthy seconds it rises by 5 points. Range 10% to 95% by default; the demos use 80%.
+  Two more rules look at the idle CPUs and are off by default. With `backoff_idle_cores` set, a degraded window
+  while at least that many CPUs sit idle holds the cap, since the foreground did not wait for a CPU; a severe window
+  still backs off. With `recover_idle_cores` set, at least that many idle CPUs let the cap rise after 5 healthy
+  seconds instead of 20, by a step that hands the agents half of them (`recover_idle_share`). Idle counts only
+  the CPUs open to agents: the machine's idle CPUs minus the ones kept from them.
 - **Allocation weights.** focus 8, normal 5, batch 2. Weighted max-min turns them into per-session hard caps; a
   light session lends what it does not use and gets it back when it resumes. A cap is a ceiling, not a guarantee.
 - **CPUs open to agents.** `--world-cpus N` at start, or the dashboard / `guardctl world N` at run time, limits the
@@ -58,6 +63,8 @@ python -I scripts/srun.py --provider claude --session s1 -- <cmd>  # run a comma
 python -I scripts/srun.py --provider claude --session s1 --console -- claude   # a whole interactive CLI
 python -I scripts/srun.py --provider codex --session api1 -- python my_api.py   # an API or SDK script
 python -I scripts/guardctl.py status | pause claude/s1 | class claude/s1 focus | cap 40 | world 10 | rollback
+python -I scripts/guardian.py --instance t1 --policy my.json     # JSON merged over the policy defaults
+python scripts/guardian-sim.py --ledger ~/.resource-sentinel/guardian/main/guardian.sqlite3   # cap settings, offline
 ```
 
 Demos (instance `onoff`, dashboard on port 8767 unless noted):
@@ -318,6 +325,27 @@ other 190 or so gave GetProcessTimes no reading, Defender and services among the
 the top row, at 0.45 to 2.7 cores while tests ran. Over three 4-second windows the processes added up to 2.0 to
 3.0 cores against 2.7 to 5.3 busy cores from GetSystemTimes; the dashboard shows that gap as its own row. The
 daemon, without the probe, used 0.015 cores over 20 s with the sampler running.
+
+The idle-CPU rules of the cap controller, 2026-10-17. `guardian-sim.py --seeds 30` replays the controller over
+main's ledger from 10-16 18:11 to 10-17 18:18 (86,050 seconds), under a model in which a window is late more often
+the fewer CPUs sit idle. It compared the 10-13 controller with the setting below: back-off held with 2 or more
+idle CPUs, faster recovery with 1 or more, a step every 5 s, and a decrease factor of 0.5. In the three of four
+scenarios where the sweep lists that setting, the agents got 0.06 to 0.29 more cores and the cap backed off 0.6 to
+3.6 fewer times per half hour. Lateness moved by -0.03 to +0.19 points, the rise in the busiest hour with the agents
+asking for 9 cores (3.45% to 3.64%). A live ABBA run on test instance `r1lo` followed: four blocks of 170 s, four
+busy workers, the probe on, the cap starting at 10%.
+
+| Block | Rules | Seconds to 3.6 agent cores | Agent cores, first minute | Agent cores, whole block | Late windows |
+|---|---|---|---|---|---|
+| 1 | off | 39.6 | 2.60 | 3.37 | 0.0% |
+| 2 | on | 3.2 | 3.68 | 3.46 | 2.94% |
+| 3 | on | 8.3 | 3.55 | 3.50 | 1.76% |
+| 4 | off | 99.1 | 1.38 | 2.58 | 2.96% |
+
+The rules reach the agents' demand within seconds where the 10-13 controller takes one to two minutes. Two blocks
+a side cannot tell whether the late windows changed. Both rules stay off by default, and
+`{"cpu": {"backoff_idle_cores": 2, "recover_idle_cores": 1, "increase_spacing_seconds": 5, "decrease_factor": 0.5}}`
+in a `--policy` file turns on the tested setting.
 
 ## Known limits
 

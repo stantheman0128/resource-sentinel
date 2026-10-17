@@ -34,6 +34,11 @@ DEFAULTS = {
         "healthy_before_increase_seconds": 20,
         "increase_spacing_seconds": 10,
         "decrease_cooldown_seconds": 3,
+        # R1 (2026-10-17). None turns a rule off and gives the controller of 10-13.
+        "backoff_idle_cores": None,              # degraded while this many CPUs sit idle: not contention, cap held
+        "recover_idle_cores": None,              # this many idle CPUs allow the faster recovery below
+        "recover_idle_wait_seconds": 5,          # healthy seconds before a faster recovery step
+        "recover_idle_share": 0.5,               # a faster step hands the agents this share of the idle CPUs
         "no_experience_probe_max_percent": 50,   # doc rule when nothing measures the foreground
         "proxy_probe_max_percent": 95,           # scheduler probe healthy and pool below_normal (E9)
         "demand_fraction_for_increase": 0.8,
@@ -136,7 +141,8 @@ class Sample:
     experience: str = None            # ok | degraded | severe | None (no valid sensor)
     experience_kind: str = None       # media | probe | injected
     pool_priority: str = "below_normal"
-    ncpu: int = 12
+    ncpu: int = 12                    # CPUs open to agents
+    machine_cpus: int = None          # every logical CPU; None = ncpu
 
 
 @dataclass
@@ -202,11 +208,21 @@ def cap_step(state, s, cfg):
     ceiling = max_allowed(s, cfg)
     pool = s.pool_cores or 0.0
     cap_cores = st.cap / 100 * s.ncpu
+    machine = s.machine_cpus or s.ncpu
+    # idle CPUs open to the agents, at least: the CPUs kept from them count as idle, and the probe runs pinned to
+    # the agents' CPUs, so only theirs can explain its lateness
+    idle = max(0.0, machine * (1 - s.cpu_busy) - (machine - s.ncpu))
     if s.experience in ("degraded", "severe"):
-        st.healthy_since = None
         if pool < c["agent_cpu_low_cores"]:
+            st.healthy_since = None
             st.notes.append("intervention_no_observed_benefit: foreground degraded but agents use little CPU")
             return st, None
+        if s.experience == "degraded" and c["backoff_idle_cores"] is not None and idle >= c["backoff_idle_cores"]:
+            # with CPUs left idle over the window the foreground did not wait for a CPU, so a lower agent cap would
+            # not have helped; the healthy clock keeps running. A severe window still backs off.
+            st.notes.append(f"not_cpu_contention: foreground degraded with {idle:.1f} CPUs idle, cap held")
+            return st, None
+        st.healthy_since = None
         cooled = s.t - st.last_decrease >= c["decrease_cooldown_seconds"]
         if cooled and st.cap > c["minimum_cap_percent"]:
             after = max(c["minimum_cap_percent"], math.floor(st.cap * c["decrease_factor"]))
@@ -220,11 +236,18 @@ def cap_step(state, s, cfg):
         st.healthy_since = s.t
     healthy_for = s.t - st.healthy_since
     wants_more = pool >= c["demand_fraction_for_increase"] * cap_cores
-    if (healthy_for >= c["healthy_before_increase_seconds"] and wants_more and st.cap < ceiling
+    free = min(idle, s.ncpu - pool)  # idle CPUs the agents could grow into
+    fast = c["recover_idle_cores"] is not None and free >= c["recover_idle_cores"]
+    wait = c["recover_idle_wait_seconds"] if fast else c["healthy_before_increase_seconds"]
+    if (healthy_for >= wait and wants_more and st.cap < ceiling
             and s.t - st.last_increase >= c["increase_spacing_seconds"]):
-        after = min(ceiling, st.cap + c["increase_step_percentage_points"])
+        step = c["increase_step_percentage_points"]
+        if fast:
+            step = max(step, math.floor(100 * c["recover_idle_share"] * free / s.ncpu))
+        after = min(ceiling, st.cap + step)
         return decide("recover", after, f"healthy {healthy_for:.0f} s and agents use "
-                      f"{pool:.1f} of {cap_cores:.1f} cores: +{c['increase_step_percentage_points']} points")
+                      f"{pool:.1f} of {cap_cores:.1f} cores"
+                      + (f", {free:.1f} CPUs idle" if fast else "") + f": +{step} points")
     return st, None
 
 

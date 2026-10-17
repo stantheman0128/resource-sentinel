@@ -15,6 +15,11 @@
 - The dashboard and `guardctl status` show the load outside Guardian: the top five image names by CPU among the
   processes not in its jobs, protected ones included, next to the whole machine's busy cores and the part no process
   row accounts for.
+- Two cap controller rules look at idle CPUs, and both are off by default. `backoff_idle_cores` holds the cap
+  through a degraded window while that many CPUs sit idle, and `recover_idle_cores` lets it rise after 5 healthy
+  seconds instead of 20, by a step that hands the agents half of the idle CPUs. `guardian.py --policy FILE` merges a
+  JSON file over the policy defaults, and `scripts/guardian-sim.py` replays the controller over a ledger to compare
+  settings offline. The simulation and a live ABBA run are in docs/guardian.md.
 
 ## Unreleased - 2026-10-13
 

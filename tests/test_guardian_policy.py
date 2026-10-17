@@ -14,9 +14,13 @@ def sample(t, **kw):
 
 
 def run(state, samples):
+    return run_cfg(state, samples, CFG)
+
+
+def run_cfg(state, samples, cfg):
     out = []
     for s in samples:
-        state, d = P.cap_step(state, s, CFG)
+        state, d = P.cap_step(state, s, cfg)
         out.append((s.t, state.cap, d))
     return state, out
 
@@ -69,6 +73,41 @@ class CapControllerTests(unittest.TestCase):
         self.assertEqual(st.cap, 50)
         st, _ = run(P.CapState(cap=70), [sample(0)])
         self.assertEqual(st.cap, 70)
+
+    def test_idle_cpus_mean_not_contention_and_keep_the_healthy_clock(self):
+        cfg = P.merged(CFG, {"cpu": {"backoff_idle_cores": 2}})
+        st = P.CapState(cap=60, healthy_since=0.0)
+        # 3 of 12 CPUs idle: degraded, but no back-off; the healthy clock started at 0 keeps running
+        st, d = P.cap_step(st, sample(30, experience="degraded", pool_cores=7.0, cpu_busy=0.75), cfg)
+        self.assertEqual((st.cap, d, st.healthy_since), (60, None, 0.0))
+        self.assertIn("not_cpu_contention", st.notes[0])
+        # under 2 idle: back-off as before; a severe window backs off even with idle CPUs
+        st, d = P.cap_step(st, sample(31, experience="degraded", pool_cores=7.0, cpu_busy=0.9), cfg)
+        self.assertEqual((d["kind"], st.cap), ("foreground_backoff", 48))
+        st, d = P.cap_step(st, sample(35, experience="severe", pool_cores=7.0, cpu_busy=0.5), cfg)
+        self.assertEqual((d["kind"], st.cap), ("foreground_backoff", 38))
+        # 10 of 12 CPUs open to agents: the 2 kept from them count as idle, so 3 idle in all is 1 idle of theirs
+        st, d = P.cap_step(P.CapState(cap=60), sample(0, experience="degraded", pool_cores=6.0, cpu_busy=0.75,
+                                                     ncpu=10, machine_cpus=12), cfg)
+        self.assertEqual(d["kind"], "foreground_backoff")
+        # rule off (the default): idle CPUs do not matter
+        st, d = P.cap_step(P.CapState(cap=60), sample(0, experience="degraded", pool_cores=7.0, cpu_busy=0.5), CFG)
+        self.assertEqual(d["kind"], "foreground_backoff")
+
+    def test_idle_cpus_bring_the_cap_back_faster(self):
+        cfg = P.merged(CFG, {"cpu": {"recover_idle_cores": 1, "recover_idle_share": 0.5}})
+        # agents use their whole cap and others 6 cores, so 6 - cap cores sit idle: after 5 healthy s each step hands
+        # the agents half the idle CPUs, at most every 10 s
+        st, ups = P.CapState(cap=10), []
+        for t in range(40):
+            use = st.cap / 100 * 12
+            st, d = P.cap_step(st, sample(t, pool_cores=use, cpu_busy=(6 + use) / 12), cfg)
+            if d:
+                ups.append((t, d["after"]))
+        self.assertEqual(ups, [(5, 30), (15, 40), (25, 45), (35, 50)])  # +floor(50 * 4.8 / 12), +10, +5 (normal step)
+        # under 1 free CPU the normal path: 20 s healthy, +5
+        st, trace = run_cfg(P.CapState(cap=10), [sample(t, pool_cores=1.2, cpu_busy=0.95) for t in range(30)], cfg)
+        self.assertEqual([(t, d["after"]) for t, _, d in trace if d], [(20, 15)])
 
     def test_cap_never_leaves_bounds(self):
         st, _ = run(P.CapState(cap=12), [sample(t, experience="degraded", pool_cores=5) for t in range(0, 60, 3)])

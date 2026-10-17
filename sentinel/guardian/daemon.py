@@ -456,7 +456,7 @@ class Guardian:
             level, kind = self.experience(now)
             s = P.Sample(t=now, age_s=now - self.last_core_ok, cpu_busy=busy, pool_cores=self.pool_cores,
                          available_gib=avail, commit_headroom_gib=head, experience=level, experience_kind=kind,
-                         pool_priority=self.pool_priority_readback, ncpu=self.world)
+                         pool_priority=self.pool_priority_readback, ncpu=self.world, machine_cpus=wj.NCPU)
             if self.control:
                 self.cap, d = P.cap_step(self.cap, s, self.cfg)
                 if d:
@@ -1575,6 +1575,8 @@ def main(argv=None):
     ap.add_argument("--world-cpus", type=int, help="miniature world: pool and probe use only the top N CPUs")
     ap.add_argument("--initial-cap", type=float)
     ap.add_argument("--max-cap", type=float, help="upper cap in percent of the world (default 95)")
+    ap.add_argument("--policy", metavar="FILE", help='JSON merged over the policy defaults, e.g. '
+                    '{"cpu": {"decrease_factor": 0.5}}; for experiments on a test instance')
     ap.add_argument("--no-probe", action="store_true")
     ap.add_argument("--no-apps", action="store_true")
     ap.add_argument("--desktop", choices=("on", "off"),
@@ -1591,7 +1593,11 @@ def main(argv=None):
     # only with argv from the command line: the new copy gets this process's own command line
     if argv is None and leave_job(a.stay_in_job):
         return 0
-    over = {"cpu": {"maximum_cap_percent": a.max_cap}} if a.max_cap else {}
+    over = json.loads(Path(a.policy).read_text(encoding="utf-8")) if a.policy else {}
+    if a.max_cap:
+        over = P.merged(over, {"cpu": {"maximum_cap_percent": a.max_cap}})
+    if over:
+        print(f"policy over the defaults: {json.dumps(over)}", flush=True)
     try:
         Guardian(a.instance, a.world_cpus, a.initial_cap, over, a.port, not a.no_probe, not a.no_apps,
                  None if a.desktop is None else a.desktop == "on").run_forever()

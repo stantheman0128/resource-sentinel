@@ -299,7 +299,9 @@ class Guardian:
             self.set_hard_limit(self.cfg["memory"]["job_commit_hard_limit_gib"], "startup: job_commit_hard_limit_gib")
         stale = self.ledger.reconcile_on_start()
         if stale:
-            self.log(f"{len(stale)} runs from an earlier daemon marked NEEDS_RECONCILIATION")
+            n = collections.Counter(state for _, state in stale)
+            self.log(f"{len(stale)} runs an earlier daemon left open: {n['orphaned']} closed as orphaned, "
+                     f"{n['cancelled']} as cancelled")
 
     def set_pool_priority(self, name, reason):
         before = self.root.limits()["priority"]
@@ -915,6 +917,8 @@ class Guardian:
             return
 
     def launch(self, run):
+        if run.cancelled:  # a shutdown after the admission
+            raise Cancelled(run.cancelled)
         s = run.session
         run.job = wj.Job.create()
         # a desktop or nested session too: its job sits under another job, so the tree's chain could not reach it
@@ -1636,6 +1640,29 @@ class Guardian:
                     (f"affinity kept to the {self.world}-CPU demo world" if self.mask else "no affinity"),
                     readback=self.root.cpu().get("mode"), reason=why)
 
+    def leave_runs(self):
+        """The ledger rows of the work a shutdown leaves. No job kills on close, so a run of srun goes on outside
+        Guardian with no client left to take its exit code: its row ends orphaned, with the CPU time and peak commit
+        so far and no end time. A run that has not started never starts, and its client is told it was cancelled if
+        the exit leaves time for that. An adopted or desktop CLI is let go as when desktop jobs are switched off."""
+        self.queue.clear()  # admit_once starts nothing after this
+        for r in list(self.live.values()):
+            if isinstance(r, Adopted):
+                self.end_adopted(r, "daemon shut down; the CLI keeps running outside Guardian")
+            elif r.state != "running":  # queued, or admitted and not started yet: launch() checks the flag
+                r.cancelled = "daemon shut down before the run started"
+                self.ledger.run_update(r.run_id, state="cancelled", t_end=time.time(), reason=r.cancelled)
+            else:
+                acc = {}
+                try:
+                    acc = {"cpu_s": r.job.accounting()["cpu_s"],
+                           "peak_commit_bytes": r.job.limits()["peak_job_mem_bytes"]}
+                except OSError:
+                    pass
+                self.ledger.run_update(r.run_id, state="orphaned", **acc,
+                                       reason="daemon shut down while the run was running; it goes on outside "
+                                              "Guardian, and its end and exit code are not recorded")
+
     def shutdown(self):
         """Leave no throttle behind: work still running after the daemon exits must not stay capped or paused."""
         with self.lock:
@@ -1661,6 +1688,10 @@ class Guardian:
                             "to the foreground")
             except OSError as e:
                 self.log(f"shutdown cleanup failed: {e}")
+            try:
+                self.leave_runs()
+            except Exception as e:  # the exit below must come anyway; the next start closes what is left open
+                self.log(f"closing the run rows at shutdown failed: {e}")
         if self.probe_proc:
             self.probe_proc.kill()
         self.stop.set()

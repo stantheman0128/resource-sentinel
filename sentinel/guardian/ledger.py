@@ -1,8 +1,9 @@
 """guardian.sqlite3: runs, decisions, samples and reservations.
 
 Kept apart from the collector's sentinel.db so the 1 Hz Guardian loop never waits on the collector's writes.
-A run row is written before its process starts; a run found 'starting' or 'running' when the daemon starts
-again is marked NEEDS_RECONCILIATION instead of being guessed.
+A run row is written before its process starts. A shutdown closes the rows of the work it leaves (see
+Guardian.leave_runs); a row still open when the daemon starts again is closed then, without an end time or exit code,
+since neither is known.
 """
 import json
 import sqlite3
@@ -48,10 +49,15 @@ class Ledger:
             return self.db.execute(sql, args).fetchall()
 
     def reconcile_on_start(self):
-        rows = self._x("SELECT run_id FROM runs WHERE state IN ('starting', 'running', 'queued')")
-        self._x("UPDATE runs SET state='NEEDS_RECONCILIATION', reason='daemon restarted while the run was open' "
-                "WHERE state IN ('starting', 'running', 'queued')")
-        return [r[0] for r in rows]
+        """Close the rows an earlier daemon left open: it stopped without a shutdown, or a run started between its
+        shutdown and its exit. A queued run never started and ends cancelled. One that had started may still go on
+        outside Guardian and ends orphaned. Returns (run_id, new state) pairs."""
+        rows = self._x("SELECT run_id, state FROM runs WHERE state IN ('starting', 'running', 'queued')")
+        self._x("UPDATE runs SET state = CASE state WHEN 'queued' THEN 'cancelled' ELSE 'orphaned' END, "
+                "reason = CASE state WHEN 'queued' THEN ? ELSE ? END WHERE state IN ('starting', 'running', 'queued')",
+                ("the daemon stopped before the run started", "the daemon stopped while the run was open; it may "
+                 "have gone on outside Guardian, and its end and exit code are not recorded"))
+        return [(run_id, "cancelled" if state == "queued" else "orphaned") for run_id, state in rows]
 
     def run_requested(self, r):
         self._x("INSERT INTO runs (run_id, provider, session, cls, fingerprint, cwd, label, state, reason, est_gib, "

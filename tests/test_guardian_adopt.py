@@ -2196,6 +2196,90 @@ class OutsideRunAndControlOffTests(unittest.TestCase):
         self.assertIn("TimeoutError", row["context_error"])
 
 
+class LeftRunRowsTests(unittest.TestCase):
+    """No job kills on close, so an srun run goes on after a shutdown (measured on a test instance 2026-10-17: the
+    row stayed 'running' and the next start parked it as NEEDS_RECONCILIATION for good). The shutdown closes each
+    open row, and the next start closes what a crash left open. A real ledger in a temporary directory; every pid
+    here is made up and only ever written to it."""
+    add, run_in = DesktopAllocateTests.add, ExemptTests.run_in
+
+    def setUp(self):
+        from sentinel.guardian.ledger import Ledger
+        ExemptTests.setUp(self)
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        g = self.g
+        g.ledger = Ledger(Path(d.name) / "guardian.sqlite3")
+        self.addCleanup(g.ledger.close)  # before the directory goes: cleanups run last in, first out
+        g.adopted, g.desktop_skip, g.niced = {}, set(), {}
+        g.root, g.mask, g.probe_proc, g.stop, g.desktop_on = mock.Mock(), None, None, threading.Event(), False
+        g.root.cpu.return_value = {}
+
+    def open_row(self, run_id, state, pid=None):
+        self.g.ledger.run_requested({"run_id": run_id, "provider": "codex", "session": "a", "cls": "normal",
+                                     "fingerprint": "f", "est_gib": 1.0, "est_source": "requested",
+                                     "unprofiled": False, "t_request": time.time()})
+        if state != "queued":
+            self.g.ledger.run_update(run_id, state=state, t_start=time.time(), pid=pid)
+
+    def rows(self):
+        return {r["run_id"]: r for r in self.g.ledger.recent_runs()}
+
+    def test_a_shutdown_closes_the_row_of_each_run_it_leaves(self):
+        g, s = self.g, self.add("codex/a", 0.0)
+        running, queued = self.run_in(s, 0, 1), self.run_in(s, 0, 1)
+        running.job, running.state = RunJob(), "running"
+        cli = self.D.Adopted("cli0001", s, 4242, object(), "codex.exe (adopted)", "enforced")
+        for r, state in ((running, "running"), (queued, "queued"), (cli, "running")):
+            g.live[r.run_id] = r
+            self.open_row(r.run_id, state, pid=4242)
+        g.queue.append(queued)
+        g.adopted[cli.pid] = cli
+        with mock.patch.object(self.wj, "CloseHandle") as close, mock.patch.object(self.D.os, "_exit") as exit_, \
+                mock.patch.object(self.D.time, "sleep"):
+            g.shutdown()
+        exit_.assert_called_once_with(0)
+        rows = self.rows()
+        mine = rows[running.run_id]
+        self.assertEqual((mine["state"], mine["cpu_s"], mine["t_end"], mine["exit_code"]),
+                         ("orphaned", 3.0, None, None))
+        self.assertIn("goes on outside Guardian", mine["reason"])
+        self.assertIsNone(running.cancelled)  # never cancelled, so serve_run does not terminate its job
+        why = "daemon shut down before the run started"  # its serve_run thread raises Cancelled on it
+        self.assertEqual((rows[queued.run_id]["state"], rows[queued.run_id]["reason"], queued.cancelled, g.queue),
+                         ("cancelled", why, why, []))
+        self.assertIsNotNone(rows[queued.run_id]["t_end"])
+        self.assertEqual((rows[cli.run_id]["state"], rows[cli.run_id]["reason"]),
+                         ("done", "daemon shut down; the CLI keeps running outside Guardian"))
+        close.assert_called_once_with(cli.handle)
+        self.assertEqual((sorted(g.live), g.adopted), (sorted([running.run_id, queued.run_id]), {}))  # finish() pops
+        self.assertEqual(g.ledger.reconcile_on_start(), [])  # the next start finds nothing left open
+
+    def test_a_run_a_shutdown_cancelled_after_its_admission_never_starts(self):
+        s = self.add("codex/a", 0.0)
+        run = self.run_in(s, 0, 1)
+        run.state, run.cancelled = "admitted", "daemon shut down before the run started"
+        with mock.patch.object(self.wj.Job, "create") as create, mock.patch.object(self.wj, "spawn_in_jobs") as spawn:
+            with self.assertRaises(self.D.Cancelled):
+                self.g.launch(run)
+        create.assert_not_called()
+        spawn.assert_not_called()
+
+    def test_the_next_start_closes_the_rows_a_crash_left_open(self):
+        ledger = self.g.ledger
+        for run_id, state in (("q", "queued"), ("s", "starting"), ("r", "running"), ("d", "done")):
+            self.open_row(run_id, state, pid=4242)
+        self.assertEqual(sorted(ledger.reconcile_on_start()),
+                         [("q", "cancelled"), ("r", "orphaned"), ("s", "orphaned")])
+        rows = self.rows()
+        self.assertEqual({k: rows[k]["state"] for k in rows}, {"q": "cancelled", "s": "orphaned", "r": "orphaned",
+                                                               "d": "done"})
+        self.assertEqual(rows["q"]["reason"], "the daemon stopped before the run started")
+        self.assertIn("may have gone on outside Guardian", rows["r"]["reason"])
+        self.assertEqual([rows[k]["t_end"] for k in "qsr"], [None, None, None])  # not known, so not written
+        self.assertEqual(ledger.reconcile_on_start(), [])  # closed for good: a second start finds nothing
+
+
 class GuardctlErrorTests(unittest.TestCase):
     def test_an_error_answer_is_one_line_without_the_token(self):
         guardctl = load("scripts/guardctl.py", "guardctl")

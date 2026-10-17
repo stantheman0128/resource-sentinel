@@ -72,6 +72,15 @@
   budget text show memory pressure before any step is taken. Known limits says a pause sets the lowest CPU rate,
   0.01%, and suspends nothing: on the test instance, a loop that slept a second between counts kept counting
   through a 39 s pause.
+- A shutdown closes the ledger rows of the runs it leaves. A run of srun goes on outside Guardian, since no job
+  kills its processes on close, and its row ends `orphaned` with the CPU time and peak commit so far and no end time
+  or exit code. A queued run never starts and ends `cancelled`. An adopted or desktop CLI is let go and its row ends
+  `done`, as when the desktop jobs are switched off. Before, these rows stayed `running` and the next start marked
+  them NEEDS_RECONCILIATION for good. The next start now closes a row still open after a crash, or after a run that
+  started between the shutdown and the exit: a queued row ends cancelled, a started one orphaned, and the daemon logs
+  the count. Rows an existing ledger already marks NEEDS_RECONCILIATION stay as they are. A restarted daemon never
+  counted the runs left behind against a cap, since they sit in old, nameless jobs it does not see. Measured on a
+  test instance with a shutdown, a hard kill and two restarts.
 
 ## Unreleased - 2026-10-13
 

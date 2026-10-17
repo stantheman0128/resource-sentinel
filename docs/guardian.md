@@ -38,7 +38,8 @@ every tool command it runs stay inside it:
 - **Control off.** `rollback` removes every cap and puts the agents back at normal CPU, I/O and memory priority;
   the CPU limit stays. The daemon does not lower the I/O and memory priority of processes that join while control
   is off, so the dashboard and `guardctl status` show normal, with the configured level next to it.
-  `resume-control` turns control back on. A shutdown lifts the caps and keeps the low priorities.
+  `resume-control` turns control back on. A shutdown lifts the caps and keeps the low priorities. Runs still going
+  then go on outside Guardian, and their ledger rows end orphaned.
 
 Guardian only controls work it launched, adopted or put in a desktop job (see below). It reads the Claude, Codex and
 Cursor desktop apps but never assigns the apps' own processes to a job. Cloud sessions run on remote machines and

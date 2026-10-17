@@ -53,6 +53,10 @@ DEFAULTS = {
         "commit_admission_margin_gib": 1,
         "job_commit_hard_limit_gib": None,
         "exploration_reservation_gib": 0.5,
+        "agent_memory_priority": "low",          # agents' pages leave RAM's standby list before Stan's
+    },
+    "io": {
+        "agent_io_priority": "low",              # Stan's disk reads and writes go first
     },
     "observation": {
         "sample_interval_ms": 1000,

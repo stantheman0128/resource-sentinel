@@ -679,6 +679,71 @@ class CursorAppTests(unittest.TestCase):
             p.wait()
 
 
+class AgentPriorityTests(unittest.TestCase):
+    def guardian(self):
+        from sentinel.guardian import daemon as D
+        g = D.Guardian.__new__(D.Guardian)
+        g.niced, g.agent_io, g.agent_memory, g.decide = {}, "low", "low", mock.Mock()
+        return D, g
+
+    def test_each_new_member_is_set_once_and_forgotten_when_it_leaves(self):
+        D, g = self.guardian()
+        calls = []
+        refused = {3}
+
+        def setter(kind):
+            return lambda pid, name: calls.append((kind, pid, name)) or pid not in refused
+        with mock.patch.object(D.wj, "set_io_priority", setter("io")), \
+                mock.patch.object(D.wj, "set_memory_priority", setter("mem")):
+            g.nice_sweep({1, 2})
+            self.assertEqual(sorted(calls), [("io", 1, "low"), ("io", 2, "low"), ("mem", 1, "low"), ("mem", 2, "low")])
+            calls.clear()
+            g.nice_sweep({1, 2, 3})
+            self.assertEqual(sorted(calls), [("io", 3, "low"), ("mem", 3, "low")])
+            self.assertEqual(g.niced, {1: True, 2: True, 3: False})
+            calls.clear()
+            g.nice_sweep({2, 3})  # a refused pid is not tried again while it stays
+            self.assertEqual((calls, g.niced), ([], {2: True, 3: False}))
+
+    def test_restore_and_a_new_level_set_every_member_again(self):
+        D, g = self.guardian()
+        g.niced = {1: True, 2: True}
+        calls = []
+        with mock.patch.object(D.wj, "set_io_priority", lambda pid, name: calls.append(("io", pid, name))), \
+                mock.patch.object(D.wj, "set_memory_priority", lambda pid, name: calls.append(("mem", pid, name))):
+            g.restore_priority([1])
+        self.assertEqual(calls, [("io", 1, "normal"), ("mem", 1, "normal")])
+        self.assertEqual(g.niced, {2: True})
+        with self.assertRaises(ValueError):
+            g.set_agent_priority(io="high")
+        with self.assertRaises(ValueError):
+            g.set_agent_priority(memory="lowest")
+        g.set_agent_priority(io="very_low")
+        self.assertEqual((g.agent_io, g.agent_memory, g.niced), ("very_low", "low", {}))
+
+    def test_a_lowered_process_passes_both_priorities_to_later_children(self):
+        from sentinel.guardian import winjob as wj
+        code = ("import subprocess, sys; sys.stdin.readline(); "
+                "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+                "print(c.pid, flush=True); sys.stdin.readline(); c.kill()")
+        p = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertTrue(wj.set_io_priority(p.pid, "low"))
+            self.assertTrue(wj.set_memory_priority(p.pid, "low"))
+            self.assertEqual((wj.io_priority(p.pid), wj.memory_priority(p.pid)), ("low", "low"))
+            p.stdin.write("go\n")
+            p.stdin.flush()
+            child = int(p.stdout.readline())
+            self.assertEqual((wj.io_priority(child), wj.memory_priority(child)), ("low", "low"))
+            self.assertTrue(wj.set_io_priority(p.pid, "normal") and wj.set_memory_priority(p.pid, "normal"))
+            self.assertEqual((wj.io_priority(p.pid), wj.memory_priority(p.pid)), ("normal", "normal"))
+            p.stdin.write("done\n")
+            p.stdin.flush()
+        finally:
+            p.kill()
+            p.wait()
+
+
 class FakeJob:
     def __init__(self):
         self.calls = []
@@ -853,6 +918,9 @@ class MemberJob(FakeJob):
     def limits(self):
         return {"priority": None, "flags": 0}
 
+    def pids(self):
+        return sorted(self.members)
+
     def accounting(self):
         return {"active": len(self.members), "total": self.total, "cpu_s": 0.0}
 
@@ -873,7 +941,7 @@ class NestedAdoptTests(unittest.TestCase):
         g.ledger, g.log, g.probe_proc, g.lock = mock.Mock(), mock.Mock(), None, threading.RLock()
         g.cfg, g.world, g.cap, g.alloc = P.merged(P.DEFAULTS, None), 12, P.CapState(cap=10.0), P.AllocState()
         g.allocator_on, g.control, g.mask, g.pool_priority = True, True, None, "below_normal"
-        g.desktop_on, g.desktop_skip = False, set()
+        g.desktop_on, g.desktop_skip, g.niced = False, set(), {}
         # the pool already holds work, so a process in a job of its own cannot join it
         g.root = MemberJob("t.AllAgents", "AssignProcessToJobObject", members={5})
         self.jobs, self.refuse = {}, {}
@@ -886,7 +954,10 @@ class NestedAdoptTests(unittest.TestCase):
                   mock.patch.object(self.wj, "open_waitable", lambda pid: 99),
                   mock.patch.object(self.wj, "CloseHandle", mock.Mock()),
                   mock.patch.object(self.wj, "priority_class", lambda pid: "below_normal"),
-                  mock.patch.object(self.wj, "is_elevated", lambda: False)):
+                  mock.patch.object(self.wj, "is_elevated", lambda: False),
+                  # the pids here are made up: never let them reach a real process
+                  mock.patch.object(self.wj, "set_io_priority", lambda pid, name: True),
+                  mock.patch.object(self.wj, "set_memory_priority", lambda pid, name: True)):
             p.start()
             self.addCleanup(p.stop)
 

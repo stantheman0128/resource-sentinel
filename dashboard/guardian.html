@@ -116,6 +116,7 @@ const MODE = {OBSERVED_OK: '前景順暢', PROXY_OK: '前景順暢', DEGRADED: '
 const LEVEL = {ok: '順暢', warn: '偏慢', degraded: '卡', severe: '很卡'};
 const CLS = {focus: '重要', normal: '一般', batch: '背景'};
 const PRIO = {below_normal: '低於正常', normal: '正常'};
+const NICE = {very_low: '很低', low: '低', medium: '中', below_normal: '低於正常', normal: '正常'};
 
 async function api(path, body) {
   const r = await fetch(path, {method: body ? 'POST' : 'GET', headers: {'X-Guardian-Token': TOKEN, 'Content-Type': 'application/json'},
@@ -130,7 +131,7 @@ function render(s) {
   S = s;
   const m = document.getElementById('mode'); m.textContent = MODE[s.mode] || s.mode; m.className = 'badge ' + modeClass(s.mode);
   const scope = s.world_cpus < s.ncpu ? `示範範圍：全機 ${s.ncpu} 顆邏輯 CPU 只開放 ${s.world_cpus} 顆` : `範圍：全部 ${s.ncpu} 顆邏輯 CPU`;
-  document.getElementById('subtitle').textContent = `${scope} · agent 優先權 ${PRIO[s.pool_priority] || s.pool_priority} · 分配器 ${s.allocator ? '開' : '關'} · 執行個體 ${s.instance}`;
+  document.getElementById('subtitle').textContent = `${scope} · agent 優先權 ${PRIO[s.pool_priority] || s.pool_priority}${s.agent_priority ? ` · 磁碟 ${NICE[s.agent_priority.io] || s.agent_priority.io} · 記憶體 ${NICE[s.agent_priority.memory] || s.agent_priority.memory}` : ''} · 分配器 ${s.allocator ? '開' : '關'} · 執行個體 ${s.instance}`;
   const bn = document.getElementById('banner'), bt = document.getElementById('bannertext');
   if (s.control) { bn.className = 'banner on'; bt.textContent = `控管中：agent 加起來最多用 ${s.cap_cores} 核，而且讓前景程式先跑`; }
   else { bn.className = 'banner off'; bt.textContent = `控管關閉：agent 想用多少 CPU 就用多少，跟前景程式搶`; }

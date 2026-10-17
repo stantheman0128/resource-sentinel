@@ -224,6 +224,9 @@ class Guardian:
         self.last_launch, self.launch_starts = -1e9, []
         self.pool_priority = c["pool_priority"]
         self.pool_priority_readback = None
+        self.agent_io = self.cfg["io"]["agent_io_priority"]
+        self.agent_memory = self.cfg["memory"]["agent_memory_priority"]
+        self.niced = {}  # pid in a Guardian job -> whether Windows took its I/O and memory priority
         self.token = secret(self.home / "http-token", 24)
         self.authkey = secret(self.home / "pipe-authkey", 32).encode()
         self.stop = threading.Event()
@@ -458,6 +461,7 @@ class Guardian:
                 if d:
                     self.apply_cap(d["kind"], d["reason"])
                 self.allocate()
+                self.nice_sweep()
             self.sample = s
             row = {"t": time.time(), "mode": self.cap.mode if self.control else "ROLLED_BACK", "cap": self.cap.cap,
                    "cpu_busy": busy, "pool_cores": round(self.pool_cores, 2), "available_gib": avail,
@@ -1147,6 +1151,7 @@ class Guardian:
                     s.job.set_limits(priority="normal")  # clearing the limit would not restore the members (E9)
                 if s.job.limits()["flags"] & wj.LIMIT_AFFINITY:
                     wj.set_job_affinity(s.job, (1 << wj.NCPU) - 1)  # the same holds for a narrowed CPU set
+                self.restore_priority(s.job.pids())
             except OSError as e:
                 self.log(f"releasing {s.key} failed: {e}")
             for r in [r for r in self.live.values() if r.session is s and isinstance(r, Adopted)]:
@@ -1165,6 +1170,47 @@ class Guardian:
             s.job.set_limits(priority=name)
         except OSError as e:
             self.log(f"priority {name} for {s.key} failed: {e}")
+
+    # ---- I/O and memory priority -------------------------------------------------------------------------------
+    def members(self):
+        """Every process in Guardian's jobs: the root lists the processes of the jobs nested in it too, and the
+        desktop and nested jobs sit outside it."""
+        pids = set()
+        for job in [self.root] + [s.job for s in self.sessions.values() if s.desktop]:
+            try:
+                pids.update(job.pids())
+            except OSError:
+                pass
+        return pids
+
+    def nice_sweep(self, members=None):
+        """Give each process that has joined a Guardian job the agents' I/O and memory priority. A job has no limit
+        for either, but a process passes both on to the children it starts afterwards (measured 2026-10-17), so a
+        pid is set once, when it first shows up in a job, and is read again only after it leaves."""
+        members = self.members() if members is None else members
+        for pid in members - self.niced.keys():
+            self.niced[pid] = wj.set_io_priority(pid, self.agent_io) & wj.set_memory_priority(pid, self.agent_memory)
+        for pid in self.niced.keys() - members:
+            del self.niced[pid]
+
+    def restore_priority(self, pids):
+        """Normal I/O and memory priority again (rollback, desktop jobs off); it does not follow by itself, as with
+        the CPU priority class (E9)."""
+        for pid in pids:
+            wj.set_io_priority(pid, "normal")
+            wj.set_memory_priority(pid, "normal")
+            self.niced.pop(pid, None)
+
+    def set_agent_priority(self, io=None, memory=None, reason="set by Stan"):
+        if io is not None and io not in wj.IO_PRIORITY:
+            raise ValueError(f"io must be one of {', '.join(wj.IO_PRIORITY)}")
+        if memory is not None and memory not in wj.MEMORY_PRIORITY:
+            raise ValueError(f"memory must be one of {', '.join(wj.MEMORY_PRIORITY)}")
+        before = {"io": self.agent_io, "memory": self.agent_memory}
+        self.agent_io, self.agent_memory = io or self.agent_io, memory or self.agent_memory
+        self.niced.clear()  # the next tick sets every member again
+        self.decide("agent_priority", "agent processes", before, {"io": self.agent_io, "memory": self.agent_memory},
+                    reason=reason)
 
     # ---- dashboard API ---------------------------------------------------------------------------------------
     def state(self):
@@ -1186,6 +1232,9 @@ class Guardian:
                 "commit_headroom_gib": round(s.commit_headroom_gib, 1) if s and s.commit_headroom_gib else None,
                 "admission": {"open": self.cap.admission_open, "reason": self.cap.admission_reason, "hold": self.hold},
                 "pool_priority": self.pool_priority_readback, "allocator": self.allocator_on,
+                "agent_priority": {"io": self.agent_io, "memory": self.agent_memory,
+                                   "set": sum(1 for v in self.niced.values() if v),
+                                   "refused": sum(1 for v in self.niced.values() if not v)},
                 "desktop": self.desktop_on,
                 "experience": {"level": level, "kind": kind, "probe": self.probe_last,
                                "inject_left_s": round(self.inject[0] - time.monotonic())
@@ -1254,6 +1303,8 @@ class Guardian:
                 self.allocate()
             elif path == "/api/desktop":
                 self.set_desktop(bool(b["on"]), "set by Stan")
+            elif path == "/api/agent_priority":
+                self.set_agent_priority(b.get("io"), b.get("memory"))
             elif path == "/api/cancel":
                 run = self.live[b["run_id"]]
                 if isinstance(run, Adopted):
@@ -1294,9 +1345,10 @@ class Guardian:
         self.root.set_cpu()
         self.root.set_limits(priority="normal")
         self.pool_priority_readback = self.root.limits()["priority"]
+        self.restore_priority(self.members())
         # a miniature world (--world-cpus) is the demo's safety boundary, not a control: keep it
         wj.set_job_affinity(self.root, self.mask)
-        self.decide("rollback", "AllAgents", requested="no caps, normal priority, " +
+        self.decide("rollback", "AllAgents", requested="no caps, normal CPU, I/O and memory priority, " +
                     (f"affinity kept to the {self.world}-CPU demo world" if self.mask else "no affinity"),
                     readback=self.root.cpu().get("mode"), reason=why)
 
@@ -1311,7 +1363,8 @@ class Guardian:
                     p["job"].set_cpu()
                 self.root.set_cpu()
                 self.decide("shutdown", "AllAgents", reason="daemon stopping: caps and pauses removed, "
-                            "below_normal kept so leftover work still yields to the foreground")
+                            "below_normal and the low I/O and memory priority kept so leftover work still yields "
+                            "to the foreground")
             except OSError as e:
                 self.log(f"shutdown cleanup failed: {e}")
         if self.probe_proc:

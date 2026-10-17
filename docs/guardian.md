@@ -23,8 +23,14 @@ every tool command it runs stay inside it:
   light session lends what it does not use and gets it back when it resumes. A cap is a ceiling, not a guarantee.
 - **CPUs open to agents.** `--world-cpus N` at start, or the dashboard / `guardctl world N` at run time, limits the
   agents to the top N logical CPUs. The rest stay free for the foreground, for example a remote desktop session.
-- **Control off.** `rollback` removes every cap and puts the agents back at normal priority; the CPU limit stays.
-  `resume-control` turns it back on.
+- **Disk and memory priority.** Every process in a Guardian job, desktop and nested jobs included, gets low I/O
+  priority, so Stan's disk reads and writes go first, and low memory priority, so the agents' pages leave the
+  standby list before his. A job has no limit for either, but a process passes both to the children it starts
+  afterwards, so the daemon sets each process once, when it first shows up in a job (checked every second).
+  `guardctl io-priority very_low|low|normal` and `guardctl memory-priority very_low|low|medium|below_normal|normal`
+  change the level for every member; the dashboard's subtitle shows it.
+- **Control off.** `rollback` removes every cap and puts the agents back at normal CPU, I/O and memory priority;
+  the CPU limit stays. `resume-control` turns it back on. A shutdown lifts the caps and keeps the low priorities.
 
 Guardian only controls work it launched, adopted or put in a desktop job (see below). It reads the Claude, Codex and
 Cursor desktop apps but never assigns the apps' own processes to a job. Cloud sessions run on remote machines and
@@ -293,6 +299,11 @@ without a chat id went into `cmd-<pid>`, and the unmarked one stayed out at norm
 ran at below normal. In the same minutes a real chat in Cursor ran powershell.exe and python.exe commands; the
 daemon placed each in `chat-938e5e53d86a` within 2 s, and ended the session when they exited. With the pipe cut
 off, whereami still answered CONTROLLED for the chat and `cmd-` jobs and for a child of a placed command.
+
+Disk and memory priority, 2026-10-17, test instance `r6live`: a srun run (python with one python child, and its
+conhost) read low I/O and low memory priority within a second. `guardctl io-priority normal` set I/O back to normal
+on all three and left memory low; rollback set I/O, memory and CPU priority to normal, and `resume-control` brought
+low back. In a unit test a process set to low passed low I/O and memory priority to a child it started afterwards.
 
 ## Known limits
 

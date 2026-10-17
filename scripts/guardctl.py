@@ -41,6 +41,10 @@ def summary(s):
              f"admission {'open' if s['admission']['open'] else 'closed ' + s['admission']['reason']}"
              f"{'  HOLD' if s['admission']['hold'] else ''}",
              f"experience {s['experience']['level']} ({s['experience']['kind']})  probe {s['experience']['probe']}"]
+    if s.get("agent_priority"):
+        a = s["agent_priority"]
+        lines.insert(1, f"agent I/O priority {a['io']}  memory priority {a['memory']}  set on {a['set']} processes"
+                        f"{'  refused ' + str(a['refused']) if a['refused'] else ''}")
     for p in s["providers"]:
         lines.append(f"  provider {p['name']:<8} {'PAUSED' if p['paused'] else 'running':<8} {p['cores']} cores")
     for x in s["sessions"]:
@@ -75,6 +79,8 @@ def main(argv=None):
         "hold": lambda: ("/api/hold", {"on": x[0] == "on"}),
         "inject": lambda: ("/api/inject", {"level": x[0], "seconds": int(x[1]) if len(x) > 1 else 30}),
         "priority": lambda: ("/api/pool_priority", {"priority": x[0]}),
+        "io-priority": lambda: ("/api/agent_priority", {"io": x[0]}),
+        "memory-priority": lambda: ("/api/agent_priority", {"memory": x[0]}),
         "allocator": lambda: ("/api/allocator", {"on": x[0] == "on"}),
         "desktop": lambda: ("/api/desktop", {"on": x[0] == "on"}),
         "cancel": lambda: ("/api/cancel", {"run_id": x[0]}),

@@ -9,6 +9,9 @@
   name. Measured live on a test instance: both workers, three spoofed commands of one chat, one without a chat id,
   and the commands of a real Cursor chat were placed within 2 s; an unmarked command was left alone.
 - winjob gains `environment(pid)`, I/O and memory priority setters and readers, and `trim_working_set(pid)`.
+- Agent processes get low I/O and low memory priority. The daemon sets both once on each process that shows up in
+  one of its jobs, and children started afterwards inherit them. `guardctl io-priority` and `memory-priority` change
+  the level, the dashboard shows it, rollback restores normal, and a shutdown keeps it low.
 
 ## Unreleased - 2026-10-13
 

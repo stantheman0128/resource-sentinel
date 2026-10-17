@@ -413,14 +413,18 @@ class Guardian:
             if s.desktop:  # the provider job does not hold desktop jobs
                 self.apply_session(s, self.desktop_want(s, self.alloc.caps.get(s.key), budget), budget)
             else:  # nor the runs a session started outside the tree while exempt; this holds with control off too
-                self.hold_outside(s, paused or s.paused or (s.cls != "exempt" and s.key in self.mem_paused))
+                # the flag as set, not the request: when the provider's own pause failed, nothing would release them
+                self.hold_outside(s, p["paused"] or s.paused or (s.cls != "exempt" and s.key in self.mem_paused))
 
     def hold_outside(self, s, held):
-        """Pause or release the runs session s started while it was exempt. Each sits in a run job of its own outside
-        the tree, where neither the session's job nor its provider's job reaches. Returns the first error."""
+        """Pause or release the runs session s started while it was exempt, or those of every session when s is None
+        (rollback and shutdown, which also reach the runs of a session that has left). Each sits in a run job of its
+        own outside the tree, where neither the session's job nor its provider's job reaches. A run whose main process
+        has ended while its children go on is in self.lingering, and its job stays open until they end too, so it is
+        held and released here as well. Returns the first error."""
         err = None
-        for r in self.live.values():
-            if r.session is s and getattr(r, "outside", False) and r.job and r.state == "running":
+        for r in [r for r in self.live.values() if r.state == "running"] + self.lingering:
+            if (s is None or r.session is s) and getattr(r, "outside", False) and r.job:
                 try:
                     r.job.set_cpu_rate(1) if held else r.job.set_cpu()
                 except OSError as e:
@@ -585,8 +589,9 @@ class Guardian:
     def memory_ladder(self, mem, now):
         """Act on memory_step's rung. Rung 1 trims working sets while pressure_trim is on, largest first, each process
         at most once per spacing. Rung 2 also pauses the session holding the most private commit, one session, until
-        the pressure is over or the rung drops; a pause stops growth but frees nothing, and an exempt session, one
-        Stan paused or one holding no private commit is never picked."""
+        the pressure is over, the rung drops, or the paused session holds nothing any more (its run ended, or its CLI
+        exited while a run of it outside the tree goes on). A pause is a CPU rate of 0.01%, not a suspend: it slows
+        growth and frees nothing. An exempt session, one Stan paused or one holding no private commit is never picked."""
         m = self.cfg["memory"]
         for pid in self.trimmed.keys() - mem.keys():
             del self.trimmed[pid]
@@ -602,6 +607,21 @@ class Guardian:
                 self.trimmed_gib += freed / GiB
                 self.decide("memory_trim", "agent processes", requested=n, readback=round(freed / GiB, 2),
                             reason=f"{n} working sets trimmed, {freed / GiB:.2f} GiB out of RAM; their commit stays")
+        if self.mem.rung >= 2:
+            # drop_ended ends the pause of a desktop session it drops, but a session in the tree outlives its runs, and
+            # a desktop one stays while a run of it outside the tree goes on. One that holds no private commit any
+            # more (the pick's measure) would block every other pause, so its pause ends and the pick below goes on
+            for k in sorted(self.mem_paused):
+                x = self.sessions.get(k)
+                try:
+                    pids = x.job.pids() if x is not None else []
+                except OSError:
+                    continue  # its processes cannot be listed, so the pause stays
+                if any(mem.get(p) is None for p in pids):
+                    continue  # one could not be read this pass (or joined after it): unknown is not empty
+                if not sum(mem[p][0] for p in pids):
+                    self.end_memory_pause(k, "the paused session holds no private commit any more"
+                                          if x is not None else "the session ended")
         if self.mem.rung >= 2 and not self.mem_paused:
             held = {}
             for k, x in self.sessions.items():
@@ -1146,6 +1166,7 @@ class Guardian:
                 "admission_open": self.cap.admission_open, "admission_reason": self.cap.admission_reason,
                 "queued": sum(1 for r in self.queue if r.session is s),
                 "paused": s.paused or s.key in self.mem_paused, "memory_rung": self.mem.rung,
+                "memory_pressure": self.mem.since is not None,
                 "available_gib": round(smp.available_gib, 1) if smp and smp.available_gib else None,
                 "exempt_left_s": max(0, round(s.exempt_until - time.time())) if s.cls == "exempt" else None}
 
@@ -1208,7 +1229,10 @@ class Guardian:
             if f"{provider}/desk-{pid}" not in self.sessions and pid not in self.desktop_skip:
                 self.place_desktop(pid, provider, table)
         clis = {p for p, _ in targets}
-        for pid, provider, chat in commands:
+        # ancestors first, since a Windows pid says nothing about which process is older: a marked command under
+        # another one may have the lower pid, and placed first it would get a job of its own instead of going with the
+        # sweep of the command above it. The sort is stable, so pid order holds within one depth
+        for pid, provider, chat in sorted(commands, key=lambda c: len(wj.ancestors(c[0], table))):
             # a command under a desktop CLI is left to that CLI's job, as desktop_targets leaves a target under another
             # target, and one that a sweep of this pass already put in a desktop job stays there: a job placed for it
             # would nest inside that one, and the pool figure would count its CPU twice
@@ -1221,8 +1245,10 @@ class Guardian:
 
     def place_command(self, pid, provider, chat, table):
         """An agent command an app started outside its agent CLI (Cursor's extension host runs some itself): it goes
-        into the desktop job of its chat, so one chat is one session, or into a job of its own when it sits under
-        another host than the chat's first command, since a job nests under one parent job only."""
+        into the desktop job of its chat, so one chat is one session. When that job exists, the command tries to join
+        it first and gets a job of its own only when joining fails, for example under another host than the chat's
+        first command, since a job nests under one parent job only. A command without a chat id gets a job of its
+        own."""
         var, value = PV.AGENT_ENV[provider][:2]
         still = lambda: (wj.environment(pid) or {}).get(var) == value
         if not chat:
@@ -1237,6 +1263,7 @@ class Guardian:
     def drop_ended(self):
         for s in [x for x in self.sessions.values() if x.desktop and not x.live_runs]:
             if s.job.accounting()["active"] == 0:  # the CLI has exited, and so has everything it started
+                self.hold_outside(s, False)  # a run of it outside the tree may linger: no pause would reach it again
                 self.sessions.pop(s.key, None)
                 s.job.close()
                 self.log(f"{'nested' if s.nested else 'desktop'} session {s.key} ended")
@@ -1439,7 +1466,8 @@ class Guardian:
                                    "refused": sum(1 for v in self.niced.values() if not v)},
                 "desktop": self.desktop_on,
                 "memory": {"agents_gib": round(self.agents_gib, 2), "budget_gib": m["agent_memory_budget_gib"],
-                           "rung": self.mem.rung, "trim": m["pressure_trim"], "pause": m["pressure_pause"],
+                           "rung": self.mem.rung, "pressure": self.mem.since is not None, "trim": m["pressure_trim"],
+                           "pause": m["pressure_pause"],
                            "hard_limit_gib": m["job_commit_hard_limit_gib"] if self.control else None,
                            "hard_limit_configured_gib": m["job_commit_hard_limit_gib"],
                            "paused": sorted(self.mem_paused),
@@ -1587,6 +1615,10 @@ class Guardian:
         self.mem, self.mem_paused = P.MemState(), set()
         for p in self.providers.values():  # first, so that apply_session also releases the runs outside the tree
             p["paused"] = False
+        # every run outside the tree, those of sessions that have left too, before a session's readback can raise
+        err = self.hold_outside(None, False)
+        if err:
+            self.log(f"releasing the runs outside the pool failed: {err}")
         for s in self.sessions.values():
             self.apply_session(s, None, 1)
             s.paused = False
@@ -1614,6 +1646,10 @@ class Guardian:
             try:
                 for p in self.providers.values():  # first, so apply_session also releases the runs outside the tree
                     p["paused"] = False
+                # every run outside the tree, those of sessions that have left too, before a readback can raise
+                err = self.hold_outside(None, False)
+                if err:
+                    self.log(f"releasing the runs outside the pool failed: {err}")
                 for s in self.sessions.values():
                     self.apply_session(s, None, 1)
                 for p in self.providers.values():

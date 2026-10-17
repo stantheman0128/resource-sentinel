@@ -220,7 +220,7 @@ def budget_text(where, long=False):
         state.append("paused")
     if not b["admission_open"]:
         state.append(f"new srun commands wait ({b['admission_reason']})")
-    if b["memory_rung"]:
+    if b.get("memory_pressure", b["memory_rung"]):  # pressure can last at rung 0 while trim is off
         state.append("memory pressure")
     if b["queued"]:
         state.append(f"{b['queued']} queued")

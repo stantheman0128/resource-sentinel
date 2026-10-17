@@ -16,6 +16,7 @@
 import argparse
 import json
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -33,8 +34,16 @@ def call(instance, path, body=None):
     req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method="POST" if body is not None else "GET",
                                  data=None if body is None else json.dumps(body).encode(),
                                  headers={"X-Guardian-Token": token, "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=5) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        # the daemon answers an error with {"error": text}: one line instead of a traceback, and never the token
+        try:
+            why = json.loads(e.read()).get("error")
+        except (ValueError, AttributeError, OSError):
+            why = None
+        raise SystemExit(f"guardctl: {path} answered {e.code}: {why or e.reason}")
 
 
 def summary(s):

@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import uuid
 from multiprocessing.connection import Pipe
 from pathlib import Path
@@ -433,6 +434,9 @@ class BudgetContextTests(unittest.TestCase):
         self.assertEqual((b["key"], b["cls"], b["cap_cores"], b["pool_cap_cores"], b["world_cpus"]),
                          ("claude/abc12345", "normal", 2.4, 6.0, 12))
         self.assertEqual((b["queued"], b["paused"], b["available_gib"], b["exempt_left_s"]), (2, False, 18.2, None))
+        self.assertFalse(b["memory_pressure"])
+        g.mem.since = 0.0  # pressure timed at rung 0, as while pressure_trim is off
+        self.assertEqual((g.budget_of(s)["memory_pressure"], g.budget_of(s)["memory_rung"]), (True, 0))
         g.mem_paused.add(s.key)
         g.cap.admission_open, g.cap.admission_reason = False, "CAPACITY_PRESSURE"
         b = g.budget_of(s)
@@ -458,6 +462,9 @@ class BudgetContextTests(unittest.TestCase):
                                          memory_rung=1, queued=2, available_gib=None))
         self.assertEqual(busy, "Guardian: claude/abc12345 normal, CPU cap 2.4 of 12 cores, paused, "
                                "new srun commands wait (LOW_MEMORY), memory pressure, 2 queued")
+        # pressure timed at rung 0 (pressure_trim off) counts; a daemon without the key falls back to the rung
+        self.assertIn("memory pressure", GC.budget_text(self.where(memory_rung=0, memory_pressure=True)))
+        self.assertNotIn("memory pressure", GC.budget_text(self.where(memory_rung=1, memory_pressure=False)))
         off = GC.budget_text(self.where(control=False), long=True)
         self.assertIn("control off, nothing capped", off)
         self.assertNotIn("parallel workers", off)
@@ -961,7 +968,7 @@ class DesktopAllocateTests(unittest.TestCase):
         g = self.g = D.Guardian.__new__(D.Guardian)  # no jobs, ledger or threads: allocate() and its helpers only
         g.cfg, g.world, g.cap, g.alloc = P.merged(P.DEFAULTS, None), 12, P.CapState(cap=10.0), P.AllocState()
         g.allocator_on, g.control, g.sessions, g.providers, g.ledger, g.live = True, True, {}, {}, mock.Mock(), {}
-        g.mem_paused, g.agents_gib = set(), 0.0
+        g.mem_paused, g.agents_gib, g.lingering = set(), 0.0, []
 
     def add(self, key, usage, desktop=False, runs=1):
         provider, name = key.split("/")
@@ -1320,7 +1327,7 @@ class NestedAdoptTests(unittest.TestCase):
         from sentinel.guardian import policy as P
         self.D, self.wj = D, D.wj
         g = self.g = D.Guardian.__new__(D.Guardian)  # no threads, and every job is a MemberJob
-        g.instance, g.sessions, g.providers, g.live, g.adopted = "t", {}, {}, {}, {}
+        g.instance, g.sessions, g.providers, g.live, g.adopted, g.lingering = "t", {}, {}, {}, {}, []
         g.ledger, g.log, g.probe_proc, g.lock = mock.Mock(), mock.Mock(), None, threading.RLock()
         g.cfg, g.world, g.cap, g.alloc = P.merged(P.DEFAULTS, None), 12, P.CapState(cap=10.0), P.AllocState()
         g.allocator_on, g.control, g.mask, g.pool_priority = True, True, None, "below_normal"
@@ -1595,7 +1602,7 @@ class NestedJobLiveTests(unittest.TestCase):
         wj = D.wj
         inst = f"nesttest-{uuid.uuid4().hex[:12]}"
         g = D.Guardian.__new__(D.Guardian)
-        g.instance, g.sessions, g.providers, g.live, g.adopted = inst, {}, {}, {}, {}
+        g.instance, g.sessions, g.providers, g.live, g.adopted, g.lingering = inst, {}, {}, {}, {}, []
         g.ledger, g.log, g.probe_proc, g.lock = mock.Mock(), mock.Mock(), None, threading.RLock()
         g.cfg, g.world, g.cap, g.alloc = P.merged(P.DEFAULTS, None), wj.NCPU, P.CapState(cap=10.0), P.AllocState()
         g.allocator_on, g.control, g.mask, g.pool_priority = True, True, None, "below_normal"
@@ -1732,6 +1739,35 @@ class MemoryLadderPauseTests(unittest.TestCase):
         again = self.add("cursor/chat-a", 0.5, desktop=True)  # a later command of the same chat gets the same key
         g.allocate()
         self.assertNotIn(("rate", 1), again.job.calls)
+
+    def test_a_paused_session_that_holds_nothing_any_more_lets_the_ladder_pause_the_next(self):
+        g, GiB = self.g, self.GiB
+        g.memory_ladder({**self.mem, 3: (5 * GiB, GiB)}, 50.0)
+        g.allocate()
+        self.assertEqual((g.mem_paused, self.small.job.calls[-1]), ({"codex/small"}, ("rate", 1)))
+        g.memory_ladder({**self.mem, 3: None}, 50.5)  # a pass that cannot read its process cannot tell it is empty
+        self.assertEqual((g.mem_paused, self.resumed()), ({"codex/small"}, []))
+        # its run was cancelled: a session in the tree stays with an empty job, and drop_ended leaves it alone
+        self.small.job._pids = []
+        g.drop_ended()
+        desk = {1: self.mem[1], 2: self.mem[2]}
+        self.small.job.pids = mock.Mock(side_effect=OSError("job closed"))  # cannot tell, so the pause stays
+        g.memory_ladder(desk, 51.0)
+        self.assertEqual((g.mem_paused, self.resumed()), ({"codex/small"}, []))
+        del self.small.job.pids
+        g.memory_ladder(desk, 52.0)
+        self.assertEqual(self.resumed(), [("codex/small", "the paused session holds no private commit any more")])
+        self.assertEqual(g.mem_paused, {"cursor/chat-a"})  # the same pass pauses the next largest
+        g.allocate()
+        self.assertEqual((self.big.job.calls[-1], self.small.job.calls[-1][0]), (("rate", 1), "cpu"))
+        # a desktop session whose CLI exited while one of its runs outside the tree goes on: drop_ended keeps it
+        self.big.job.members.clear()
+        self.big.live_runs = 1
+        g.drop_ended()
+        self.small.job._pids = [3]
+        g.memory_ladder({3: self.mem[3]}, 53.0)
+        self.assertEqual(self.resumed()[-1], ("cursor/chat-a", "the paused session holds no private commit any more"))
+        self.assertEqual(g.mem_paused, {"codex/small"})
 
     def test_desktop_jobs_switched_off_end_the_pause_of_a_desktop_session(self):
         g = self.g
@@ -1870,6 +1906,14 @@ class CursorCommandPlacementTests(unittest.TestCase):
         self.assertEqual(sorted(self.jobs), [self.CHAT_JOB, "t.p.cursor"])
         self.assertEqual(self.jobs[self.CHAT_JOB].members, {530, 540, 545})
 
+    def test_a_command_under_another_command_with_a_lower_pid_is_not_placed_first(self):
+        # as above, but the grandchild has the lower pid (505): Windows pids say nothing about which process is older
+        self.env = lambda pid: ({"CURSOR_AGENT": "1", "CURSOR_CONVERSATION_ID": CHAT} if pid == 530 else
+                                {"CURSOR_AGENT": "1"} if pid == 505 else {})
+        self.scan(*self.COMMAND, (505, 540, "python.exe", ""))
+        self.assertEqual(sorted(self.jobs), [self.CHAT_JOB, "t.p.cursor"])
+        self.assertEqual(self.jobs[self.CHAT_JOB].members, {530, 540, 505})
+
     def test_nothing_under_a_cursor_that_carries_the_mark_is_a_command(self):
         # `cursor .` run by an agent command: Cursor starts with the mark, and everything under it inherits it
         table, path = tree(*self.HOST, *self.COMMAND, *self.WORKER)
@@ -1941,6 +1985,21 @@ class OutsideRunAndControlOffTests(unittest.TestCase):
         self.assertNotIn(s.key, self.g.sessions)
         self.assertEqual(run.job.calls[-1], ("cpu", None))  # no pause reaches it once its session is gone
 
+    def test_a_desktop_session_that_ends_lets_its_lingering_run_outside_go(self):
+        s = self.add("claude/desk-200", 0.0, desktop=True)
+        s.job = MemberJob("t.d.claude.desk-200")  # no members: the CLI has exited
+        self.g.set_exempt(s, 5, "set by Stan")
+        run, _ = self.launch(s)
+        s.paused, s.live_runs = True, 1
+        self.g.allocate()
+        self.assertEqual(run.job.calls[-1], ("rate", 1))
+        run.job.accounting = lambda: {"cpu_s": 1.0, "active": 1}  # a background child outlives the main process
+        self.g.finish(run, "done", 0)
+        self.assertEqual(self.g.lingering, [run])
+        self.g.drop_ended()
+        self.assertNotIn(s.key, self.g.sessions)
+        self.assertEqual(run.job.calls[-1], ("cpu", None))
+
     def test_a_run_admitted_before_a_pause_starts_paused(self):
         s = self.add("codex/a", 0.0)
         s.job = RunJob()
@@ -1979,6 +2038,16 @@ class OutsideRunAndControlOffTests(unittest.TestCase):
         act("/api/session", {"key": "codex/a", "paused": False})
         self.assertEqual(run.job.calls[-1], ("cpu", None))
 
+    def test_a_provider_pause_that_fails_holds_no_run_outside(self):
+        s = self.add("codex/a", 0.0)
+        self.g.set_exempt(s, 5, "set by Stan")
+        run = self.outside_run(s)
+        self.g.providers["codex"]["job"].set_cpu_rate = mock.Mock(side_effect=OSError("access denied"))
+        self.g.action("/api/provider", {"name": "codex", "paused": True})
+        self.assertFalse(self.g.providers["codex"]["paused"])
+        self.assertEqual(self.g.ledger.decision.call_args.args[5], "access denied")
+        self.assertNotIn(("rate", 1), run.job.calls)  # nothing would release it: allocate() sees no provider pause
+
     def test_rollback_releases_the_runs_outside_that_a_provider_pause_held(self):
         s = self.add("codex/a", 0.0)
         self.g.set_exempt(s, 5, "set by Stan")
@@ -1992,6 +2061,47 @@ class OutsideRunAndControlOffTests(unittest.TestCase):
             self.g.rollback("test")
         self.assertEqual(run.job.calls[-1], ("cpu", None))
         self.assertFalse(self.g.providers["codex"]["paused"])
+
+    def test_a_run_outside_that_lingers_after_its_main_process_still_follows_pauses(self):
+        g, s = self.g, self.add("codex/a", 0.0)
+        g.set_exempt(s, 5, "set by Stan")
+        run, act = self.outside_run(s), g.action
+        run.job.accounting = lambda: {"cpu_s": 3.0, "active": 1}  # a background child outlives the main process
+        act("/api/session", {"key": "codex/a", "paused": True})
+        g.finish(run, "done", 0)
+        self.assertEqual((g.lingering, run.job.calls[-1]), ([run], ("rate", 1)))  # its job stays open, still held
+        act("/api/session", {"key": "codex/a", "paused": False})
+        self.assertEqual(run.job.calls[-1], ("cpu", None))
+        act("/api/provider", {"name": "codex", "paused": True})
+        self.assertEqual(run.job.calls[-1], ("rate", 1))
+        act("/api/provider", {"name": "codex", "paused": False})
+        self.assertEqual(run.job.calls[-1], ("cpu", None))
+        g.root, g.mask, g.probe_proc, g.stop, g.desktop_on = mock.Mock(), None, None, threading.Event(), False
+        g.root.limits.return_value, g.root.pids.return_value, g.root.cpu.return_value = {"priority": "normal"}, [], {}
+        for release in ("rollback", "shutdown"):  # each reaches it after its session has left Guardian too
+            g.sessions[s.key] = s
+            act("/api/provider", {"name": "codex", "paused": True})
+            self.assertEqual(run.job.calls[-1], ("rate", 1), release)
+            del g.sessions[s.key]
+            with mock.patch.object(self.wj, "set_job_affinity", mock.Mock()), \
+                    mock.patch.object(self.D.os, "_exit"), mock.patch.object(self.D.time, "sleep"):
+                g.rollback("test") if release == "rollback" else g.shutdown()
+            self.assertEqual(run.job.calls[-1], ("cpu", None), release)
+
+    def test_shutdown_releases_the_runs_outside_before_a_session_readback_can_fail(self):
+        g = self.g
+        bad, s = self.add("codex/b", 0.0), self.add("codex/a", 0.0)  # bad first: its readback raises in the loop
+        g.set_exempt(s, 5, "set by Stan")
+        run = self.outside_run(s)
+        g.action("/api/session", {"key": "codex/a", "paused": True})
+        self.assertEqual(run.job.calls[-1], ("rate", 1))
+        bad.job.cpu = mock.Mock(side_effect=OSError("access denied"))
+        g.root, g.mask, g.probe_proc, g.stop, g.desktop_on = mock.Mock(), None, None, threading.Event(), False
+        g.log = mock.Mock()
+        with mock.patch.object(self.D.os, "_exit"), mock.patch.object(self.D.time, "sleep"):
+            g.shutdown()
+        self.assertIn("shutdown cleanup failed: access denied", str(g.log.call_args_list))
+        self.assertEqual(run.job.calls[-1], ("cpu", None))
 
     def test_control_off_reports_the_priorities_and_the_limit_in_effect(self):
         g, s = self.g, self.add("codex/a", 0.0)
@@ -2084,6 +2194,25 @@ class OutsideRunAndControlOffTests(unittest.TestCase):
             self.assertEqual(hook.context("claude", row, "main", wait=0.2), "")
             self.assertLess(time.monotonic() - t0, 1.5)
         self.assertIn("TimeoutError", row["context_error"])
+
+
+class GuardctlErrorTests(unittest.TestCase):
+    def test_an_error_answer_is_one_line_without_the_token(self):
+        guardctl = load("scripts/guardctl.py", "guardctl")
+        with tempfile.TemporaryDirectory() as d:
+            home = Path(d)
+            (home / "daemon.json").write_text('{"port": 1}', encoding="utf-8")
+            (home / "http-token").write_text("t0ken-for-the-test", encoding="ascii")
+            for code, body, told in ((404, b'{"error": "unknown \'other/ex1\'"}', "404: unknown 'other/ex1'"),
+                                     (502, b"", "502: Bad Gateway")):  # no body: the status text stands in
+                answer = urllib.error.HTTPError("http://127.0.0.1:1/api/session", code,
+                                                "Not Found" if body else "Bad Gateway", {}, io.BytesIO(body))
+                with mock.patch.object(guardctl, "home_dir", return_value=home), \
+                        mock.patch.object(guardctl.urllib.request, "urlopen", side_effect=answer), \
+                        self.assertRaises(SystemExit) as e:
+                    guardctl.main(["--instance", "t", "class", "other/ex1", "exempt", "5"])
+                self.assertEqual(e.exception.code, f"guardctl: /api/session answered {told}")  # a str exits with 1
+                self.assertNotIn("t0ken", e.exception.code)
 
 
 if __name__ == "__main__":

@@ -104,9 +104,9 @@ budget that is off unless Stan sets one.
 2. Pause (`pressure_pause`, off by default). Pressure that lasts 20 s pauses the session holding the most private
    commit, one session at a time, skipping exempt sessions, sessions Stan paused and sessions holding no private
    commit. Its processes keep their memory. The pause ends when memory is 1 GiB inside the threshold again, when
-   `memory-pause` is turned off, when the session is exempted or ends, when desktop jobs are switched off and
-   release it, or on rollback. Stan's own resume does not end it. If Stan pauses the session, that pause holds it
-   from then on, and the ladder may pause the next largest session.
+   `memory-pause` is turned off, when the session is exempted, ends or holds no private commit any more, when
+   desktop jobs are switched off and release it, or on rollback. Stan's own resume does not end it. If Stan pauses
+   the session, that pause holds it from then on, and the ladder may pause the next largest session.
 
 Pressure ends when memory is 1 GiB inside the threshold again, and the ladder then resumes what it paused. A budget
 is also an admission gate: a command waits with `AGENT_MEMORY_BUDGET` while the budget, minus what the agents hold
@@ -243,9 +243,10 @@ A CLI gets into Guardian one of four ways:
    `CURSOR_CONVERSATION_ID`, which Cursor's agent code sets and which commands Stan types in Cursor's terminal do
    not have. A Cursor that itself started with the mark (`cursor .` run by an agent command while Cursor was closed)
    passes it to every process it starts, Stan's terminal shells too, so the daemon checks the Cursor.exe right above
-   each marked process, keeping only whether it has the mark, and places nothing under one that has it or cannot be
-   read; the log says so once per Cursor.exe. Every 2 s the daemon reads the environment of the processes under
-   Cursor that no desktop job holds yet (from the process's PEB, about 3 ms for 620 processes), and puts the topmost
+   each marked process, keeping only whether it has the mark. Agent commands under a Cursor.exe that has it or
+   cannot be read stay out of desktop jobs, while its agent worker still gets one; the log says so once per
+   Cursor.exe. Every 2 s the daemon reads the environment of the processes under Cursor that no desktop job holds
+   yet (from the process's PEB, about 3 ms for 620 processes), and puts the topmost
    marked one of each chain into a desktop job named after the chat,
    `cursor/chat-<first 12 letters and digits of the id>`. More commands of the same chat join that job; one that
    cannot join it (it sits in another job) gets `chat-<id>-<pid>`, and a marked command without a chat id gets
@@ -567,11 +568,15 @@ rate back.
   guardctl and the HTTP API, so an agent can exempt its own session, lift its cap, turn control off or shut the
   daemon down. The token and the Host check keep out web pages in a browser, not local processes. The HTTP server
   listens on 127.0.0.1 only.
-- Pausing a session sets its CPU rate to 0.01%. A paused CLI cannot service its network connections either, and
-  they may time out, so keep pauses short.
+- A pause, whether Stan pauses a session or a provider or the memory ladder pauses a session, sets the lowest CPU
+  rate a job can have, 0.01%, and does not suspend anything. A job nested in the tree gets that share of its
+  parent's rate, so its ceiling is lower still. A process that needs little CPU keeps going: on 2026-10-17 a loop
+  that slept a second between counts printed 39 lines during a 39 s ladder pause. A busy CLI slows to a crawl, and
+  its network connections may time out, so keep pauses short.
 - A trim or a pause does not lower private commit, so pressure from an agent memory budget lasts until work ends
   or Stan raises the budget (measured 2026-10-17). A session the ladder paused stays paused for that long unless
-  Stan turns `memory-pause` off, exempts the session or rolls back, or the session ends (see Memory).
+  Stan turns `memory-pause` off, exempts the session or rolls back, or the session ends or holds no private
+  commit any more (see Memory).
 - Claude Code and Cursor Agent sessions started neither through gagent nor through the PATH wrapper (by full path,
   from a terminal opened before the install, or by a tool that ignores PATH) join Guardian only through the adopt
   hook that `guardian-install-hooks.py` adds, and then in a nested job outside AllAgents (see Adopt; the provider

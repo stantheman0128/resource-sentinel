@@ -106,10 +106,19 @@ def merged(base, over):
     return out
 
 
+def finite(v):
+    """math.isfinite for a JSON number: an int too large for a float (a 400-digit one) is not finite either, since
+    the policy turns it into a float."""
+    try:
+        return math.isfinite(v)
+    except OverflowError:
+        return False
+
+
 def check_over(over, base=None, path=""):
     """Raise ValueError naming the key path unless `over` (a --policy file) only uses keys of DEFAULTS with values the
-    daemon can apply: sections stay objects, a number stays a number, a None default (a rule or limit that is off)
-    takes a number or null, a bool stays a bool, and a string stays in its allowed set. Returns `over`."""
+    daemon can apply: sections stay objects, a number stays a finite number, a None default (a rule or limit that is
+    off) takes a finite number or null, a bool stays a bool, and a string stays in its allowed set. Returns `over`."""
     from . import winjob as wj  # only its name tables; this module stays free of Win32 calls
     choices = {"cpu.pool_priority": ("below_normal", "normal"), "io.agent_io_priority": tuple(wj.IO_PRIORITY),
                "memory.agent_memory_priority": tuple(wj.MEMORY_PRIORITY), "queue.order": QUEUE_ORDERS}
@@ -127,6 +136,10 @@ def check_over(over, base=None, path=""):
         elif isinstance(d, bool):
             if not isinstance(v, bool):
                 raise ValueError(f"{where} must be true or false, not {json.dumps(v)}")
+        elif (d is None or isinstance(d, (int, float))) and number and not finite(v):
+            # json.loads takes NaN, Infinity and -Infinity, and 1e400 turns into inf; NaN passes every comparison
+            # (a NaN weight is not <= 0), so a number slot takes only finite numbers
+            raise ValueError(f"{where} must be a finite number, not {json.dumps(v)}")
         elif d is None:
             if v is not None and not number:
                 raise ValueError(f"{where} must be a number or null, not {json.dumps(v)}")
@@ -461,7 +474,8 @@ def queue_order(runs, order, now):
 @dataclass
 class MemState:
     since: float = None  # when the current pressure began
-    rung: int = 0        # 0 nothing, 1 trim working sets, 2 trim and pause the largest session
+    rung: int = 0        # 0 nothing, 1 trim working sets while pressure_trim is on, 2 pause the largest session
+    #                      (and trim while pressure_trim is on)
 
 
 def memory_pressure(s, agents_gib, cfg, margin=0.0):
@@ -484,10 +498,14 @@ def memory_step(st, s, agents_gib, cfg):
     m = cfg["memory"]
     why, held = memory_pressure(s, agents_gib, cfg), None
     if not why:
-        if not st.rung:
+        if not st.rung and st.since is None:
             return MemState(), None
+        # pressure is being timed, at rung 0 too (pressure_trim off, the pause not due yet): the same band holds, so
+        # memory hovering at the line does not restart the clock and put the pause off
         why = memory_pressure(s, agents_gib, cfg, m["pressure_release_margin_gib"])
         if not why:
+            if not st.rung:  # no step was taken, so there is nothing to relieve
+                return MemState(), None
             return MemState(), {"kind": "memory_relief", "rung": 0,
                                 "reason": f"{m['pressure_release_margin_gib']:g} GiB inside the line again"}
         # inside the line but not by the margin yet: hold the rung, so no step is added, but a step turned off ends

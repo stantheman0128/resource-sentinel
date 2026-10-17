@@ -168,7 +168,13 @@ function render(s) {
     if (document.activeElement !== mb) mb.value = mm.budget_gib ?? '';
     document.getElementById('memtrim').textContent = mm.trim ? '記憶體壓力時不要清 working set' : '記憶體壓力時清 working set';
     document.getElementById('mempause').textContent = mm.pause ? '記憶體壓力時不要暫停 session' : '記憶體壓力時暫停最大的 session';
-    document.getElementById('memstate').textContent = `記憶體控管：${['沒有壓力', '清 working set 中', '清 working set 並暫停最大的 session'][mm.rung]}` +
+    // rung 2 trims only while trim is on. Pressure can last at rung 0: while trim is off and the pause waits, or
+    // when trim was turned on while memory sat just inside the line, where the next step waits for it to cross again
+    const memnow = mm.rung >= 2 ? (mm.trim ? '清 working set 並暫停最大的 session' : '暫停最大的 session') :
+      mm.rung === 1 ? '清 working set 中' :
+      (mm.pressure ?? false) ? (mm.trim ? '有壓力，再超過門檻就清 working set' :
+        mm.pause ? '有壓力，持續下去就暫停最大的 session' : '有壓力，清理和暫停都關著') : '沒有壓力';
+    document.getElementById('memstate').textContent = `記憶體控管：${memnow}` +
       ` · 預算 ${mm.budget_gib == null ? '不設（只替 Stan 留可用記憶體）' : mm.budget_gib + ' GiB'} · 硬上限 ${mm.hard_limit_gib == null ? '關' : mm.hard_limit_gib + ' GiB'}${later(mm.hard_limit_gib, mm.hard_limit_configured_gib, v => v + ' GiB')}` +
       ` · 累計清出 ${mm.trimmed_gib} GiB（commit 不會變少）` + (mm.paused.length ? ` · 被暫停：${mm.paused.join('、')}` : '');
   }

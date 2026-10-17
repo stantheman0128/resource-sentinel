@@ -382,6 +382,30 @@ class MemoryLadderSettingsTests(unittest.TestCase):
         self.assertEqual((st, d["rung"]), (P.MemState(30, 0), 0))
         self.assertIn("pressure_trim turned off, no step taken", d["reason"])
 
+    def test_with_trim_off_a_dip_inside_the_line_keeps_the_pause_clock(self):
+        cfg = self.cfg(pressure_trim=False, pressure_pause=True)
+        st, d = P.memory_step(P.MemState(), sample(0), 5.0, cfg)
+        self.assertEqual((st, d), (P.MemState(0, 0), None))
+        st, d = P.memory_step(st, sample(10), 3.5, cfg)  # inside the budget, not by the 1 GiB margin: still timed
+        self.assertEqual((st, d), (P.MemState(0, 0), None))
+        for t in range(11, 20):
+            st, d = P.memory_step(st, sample(t), 5.0, cfg)
+            self.assertEqual((st, d), (P.MemState(0, 0), None), t)
+        st, d = P.memory_step(st, sample(20), 5.0, cfg)  # 20 s since the pressure began, as with trim on
+        self.assertEqual((st, d["kind"], d["rung"]), (P.MemState(0, 2), "memory_pressure", 2))
+
+    def test_with_trim_off_the_margin_stops_the_clock_and_has_nothing_to_relieve(self):
+        cfg = self.cfg(pressure_trim=False, pressure_pause=True)
+        st, _ = P.memory_step(P.MemState(), sample(0), 5.0, cfg)
+        st, d = P.memory_step(st, sample(10), 2.5, cfg)  # 1 GiB inside: no step was taken at rung 0, so no relief
+        self.assertEqual((st, d), (P.MemState(), None))
+        st, d = P.memory_step(st, sample(11), 5.0, cfg)  # a new episode starts its own clock
+        self.assertEqual((st, d), (P.MemState(11, 0), None))
+        st, _ = P.memory_step(st, sample(30), 5.0, cfg)
+        self.assertEqual(st.rung, 0)
+        st, _ = P.memory_step(st, sample(31), 5.0, cfg)
+        self.assertEqual(st.rung, 2)
+
 
 class PolicyFileTests(unittest.TestCase):
     def refused(self, over):
@@ -403,6 +427,20 @@ class PolicyFileTests(unittest.TestCase):
         self.assertIn("must be true or false", self.refused({"safety": {"auto_kill_user_work": 1}}))
         self.assertIn("must be more than 0", self.refused({"cpu": {"allocation_weights": {"focus": 0}}}))
         self.assertEqual(self.refused([{"cpu": {}}]), "the file must hold a JSON object")
+
+    def test_numbers_that_are_not_finite_are_refused(self):
+        # json.loads takes NaN, Infinity and -Infinity, and 1e400 parses to inf; a NaN weight passed "v <= 0"
+        slots = (('{"cpu": {"allocation_weights": {"focus": %s}}}', "cpu.allocation_weights.focus"),
+                 ('{"cpu": {"decrease_factor": %s}}', "cpu.decrease_factor"),
+                 ('{"memory": {"agent_memory_budget_gib": %s}}', "memory.agent_memory_budget_gib"))
+        for text in ("NaN", "Infinity", "-Infinity", "1e400", "1" + "0" * 400):  # the last stays an int
+            for slot, where in slots:
+                with self.subTest(text=text, where=where):
+                    self.assertTrue(self.refused(json.loads(slot % text)).startswith(
+                        f"{where} must be a finite number, not "))
+        self.assertEqual(self.refused(json.loads('{"cpu": {"maximum_cap_percent": 1e400}}')),
+                         "cpu.maximum_cap_percent must be a finite number, not Infinity")
+        self.assertEqual(self.main('{"cpu": {"allocation_weights": {"batch": NaN}}}')[0], 2)
 
     def test_levels_outside_their_set_are_refused(self):
         self.assertIn("io.agent_io_priority must be one of very_low, low, normal",

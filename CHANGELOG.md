@@ -42,8 +42,8 @@
 - The acceptance run is in docs/guardian.md: control off and on under a mixed agent load in a 4-CPU world,
   a Cursor-style agent command included, and a second run that switches only the agents' I/O priority.
 - The memory ladder follows its settings while pressure lasts. Turning `memory-trim` or `memory-pause` off stops
-  that step on the next tick, and a ladder pause also ends when its session ends, is exempted, leaves with the
-  desktop jobs or is paused by Stan. The ladder never picks a session that holds no private commit, and a tick that
+  that step on the next tick, and a ladder pause also ends when its session ends, holds no private commit any
+  more, is exempted, leaves with the desktop jobs or is paused by Stan. The ladder never picks a session that holds no private commit, and a tick that
   runs after shutdown trims and pauses nothing.
 - `guardian.py --policy FILE` checks the file against the policy defaults before the daemon starts. An unknown
   key, a wrong type, a level outside its set or an allocation weight that is not above 0 stops it with exit code 2
@@ -51,8 +51,8 @@
 - Each Cursor agent command is placed once. A command under a Cursor agent worker, or one an earlier command
   already swept into a chat job, no longer gets a job of its own, so its CPU is not counted twice. A Cursor started
   with `CURSOR_AGENT=1` passes the mark to every process under it, so the daemon also reads the mark of the nearest
-  Cursor.exe above a command and places nothing under one that carries it or cannot be read. It logs that once per
-  Cursor.exe.
+  Cursor.exe above a command. Agent commands under one that carries it or cannot be read stay out of desktop jobs,
+  while its agent worker still gets one. It logs that once per Cursor.exe.
 - Exempt runs of desktop and nested sessions start outside AllAgents too. Their in-tree job chain was refused by
   Windows, so they ran without Guardian. A session or provider pause now reaches outside runs, one that starts
   during the pause included, with control on or off. While control is off, the dashboard, `guardctl status` and the
@@ -60,6 +60,18 @@
   beside them. The load outside Guardian leaves out the daemon, its probe and outside runs. The budget text's srun
   line names a test instance, `whereis` keeps one deadline, and the adopt hook stops waiting after about 3.5 s.
   Known limits says that any local process can get the HTTP token.
+- A second review, with probes and a live run on a test instance, found these gaps. A ladder pause now ends once
+  the paused session holds no private commit, so a session whose runs have ended no longer blocks the next pause
+  while pressure lasts. A pass that cannot read one of its processes keeps the pause. With trim off, memory that
+  dips just inside the line no longer restarts the 20 s pause clock. A run outside the tree whose first process
+  ended while its children go on is held and released like a running one: by a resume, by rollback and shutdown,
+  and when its desktop session ends. Rollback and shutdown release those runs before a session's readback can
+  fail. A provider pause that fails holds nothing. Cursor agent commands are placed parents first, so a child with
+  a lower pid than its parent joins the parent's chat job. `--policy` refuses NaN, Infinity and integers too large
+  for a float, and guardctl prints the daemon's error in one line instead of a traceback. The dashboard and the
+  budget text show memory pressure before any step is taken. Known limits says a pause sets the lowest CPU rate,
+  0.01%, and suspends nothing: on the test instance, a loop that slept a second between counts kept counting
+  through a 39 s pause.
 
 ## Unreleased - 2026-10-13
 
